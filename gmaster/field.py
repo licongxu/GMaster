@@ -54,23 +54,22 @@ class NmtField:
         self._Nw = self._Nf = 0
         self._alpha = None
 
-        mask = np.asarray(mask, dtype=np.float64)
+        mask = jnp.asarray(mask, dtype=jnp.float64)
         if (mask_22 is None) != (mask_12 is None):
             raise ValueError("Both mask_22 and mask_12 must be passed together")
         if mask_22 is not None:
-            mask_22 = np.asarray(mask_22, dtype=np.float64)
-            mask_12 = np.asarray(mask_12, dtype=np.float64)
+            mask_22 = jnp.asarray(mask_22, dtype=jnp.float64)
+            mask_12 = jnp.asarray(mask_12, dtype=jnp.float64)
             if mask_22.shape != mask.shape or mask_12.shape != mask.shape:
                 raise ValueError("All anisotropic mask components must have the same shape")
-            mask_scale = np.mean(mask + mask_22)
-            if np.any(mask * mask_22 - mask_12**2 < -1e-5 * mask_scale):
+            mask_scale = jnp.mean(mask + mask_22)
+            if bool(jnp.any(mask * mask_22 - mask_12**2 < -1e-5 * mask_scale)):
                 raise ValueError("The anisotropic mask does not seem positive-definite")
             mask0 = 0.5 * (mask + mask_22)
             mask_a = np.stack([0.5 * (mask - mask_22), mask_12])
             mask = mask0
             self.anisotropic_mask = True
 
-        mask = jnp.asarray(mask)
         self.minfo = NmtMapInfo(wcs, mask.shape)
         self.mask = self.minfo.reform_map(mask)
         if self.anisotropic_mask:
