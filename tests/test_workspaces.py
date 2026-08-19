@@ -5,6 +5,11 @@ import pytest
 jax.config.update("jax_enable_x64", True)
 
 import gmaster as nmt
+from gmaster.workspaces import (
+    _apply_toeplitz,
+    _coupling_matrix_tt,
+    _coupling_matrix_tt_toeplitz,
+)
 
 
 def test_public_coupling_helpers_match_namaster():
@@ -81,6 +86,19 @@ def test_toeplitz_master_coefficients_match_namaster(spin1, spin2, is_teb):
     for name in ("00", "0s", "pp", "mm"):
         if expected[name] is not None:
             np.testing.assert_allclose(got[name], expected[name], atol=2e-13)
+
+
+def test_selective_scalar_toeplitz_matches_full_kernel():
+    lmax = 31
+    options = dict(l_toeplitz=16, l_exact=4, dl_band=3)
+    window = np.random.default_rng(19).uniform(size=2 * lmax + 1)
+    columns = 2 * np.arange(lmax + 1) + 1
+    expected = _apply_toeplitz(
+        _coupling_matrix_tt(window, lmax=lmax) / columns[None],
+        **options,
+    ) * columns[None]
+    got = _coupling_matrix_tt_toeplitz(window, lmax=lmax, **options)
+    np.testing.assert_allclose(got, expected, atol=2e-14)
 
 
 def test_uncorrelated_noise_deprojection_bias_matches_namaster():

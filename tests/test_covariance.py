@@ -181,13 +181,14 @@ def test_covariance_validation():
         nmt.NmtCovarianceWorkspace.from_fields(field, field, l_toeplitz=4)
 
 
-def test_toeplitz_covariance_matches_namaster():
+@pytest.mark.parametrize("spin", [0, 2])
+def test_toeplitz_covariance_matches_namaster(spin):
     reference = pytest.importorskip("pymaster")
     rng = np.random.default_rng(74)
     lmax = 12
     mask = rng.uniform(0.2, 1, 12 * 8**2)
     options = dict(
-        spin=2, lmax=lmax, lmax_mask=lmax, n_iter=0, n_iter_mask=0
+        spin=spin, lmax=lmax, lmax_mask=lmax, n_iter=0, n_iter_mask=0
     )
     got_field = nmt.NmtField(mask, None, **options)
     ref_field = reference.NmtField(mask, None, **options)
@@ -199,7 +200,9 @@ def test_toeplitz_covariance_matches_namaster():
         ref_field, ref_field, **toeplitz
     )
     for wick in range(2):
-        for name in ("pp", "mm"):
+        for name in (("00",) if spin == 0 else ("pp", "mm")):
             np.testing.assert_allclose(
-                got.xiSS[wick][name], expected.xiSS[wick][name], atol=3e-14
+                got.xiSS[wick][name],
+                expected.xiSS[wick][name],
+                atol=3e-14,
             )
