@@ -65,7 +65,16 @@ XLA_PYTHON_CLIENT_PREALLOCATE=false JAX_PLATFORM_NAME=gpu \
   python -m benchmarks.benchmark_scalar_toeplitz --lmax 2047 4095
 ```
 
-## Multi-GPU spherical harmonic transforms
+## Fused and multi-GPU spherical harmonic transforms
+
+Scalar HEALPix transforms on NVIDIA GPUs use a fused Pallas/Triton kernel at
+`L>=128`. One persistent program evaluates each associated-Legendre recurrence,
+instead of launching three small kernels per harmonic order. Exact north-south
+parity halves the latitude domain, powers-of-two rescaling protects forbidden
+regions without changing float64 values, and HEALPix quadrature and ring phases
+are fused into the recurrence. This avoids materializing the complex
+`ntheta x L` phase matrix. The custom JAX transpose uses the same fused kernels,
+so map and alm gradients remain available.
 
 HEALPix analysis now splits the on-the-fly Wigner recurrence by harmonic band,
 and synthesis splits it by latitude. The two independent kernels are dispatched
@@ -74,7 +83,8 @@ than a GPU scatter; at `L=384` this unpack kernel fell from 0.925 s to 0.00161 s
 Spin E/B alms are fused directly into one complex harmonic grid so full E, B,
 and combined grids are not simultaneously materialized.
 
-The default `jax` calculator automatically uses two GPUs at `L>=768` when they
+The default `jax` calculator selects the fused scalar kernel on NVIDIA GPUs and
+continues to select two GPUs for generic spin transforms at `L>=768` when they
 are available. Selection can be controlled explicitly:
 
 ```python
@@ -97,12 +107,16 @@ CUDA_VISIBLE_DEVICES=0,1 XLA_PYTHON_CLIENT_PREALLOCATE=false \
   python -m benchmarks.benchmark_sht --nside 512
 ```
 
-This does **not** yet beat NaMaster's CPU DUCC transform: in the same Nside 512
-run NaMaster took 0.0153 s for analysis and 0.0112 s for synthesis. GMaster's
-maximum differences from NaMaster were `6.1e-13` for alms (relative
-`7.9e-11`) and `1.7e-6` for a white unit-variance synthesis map (relative
-`5.5e-10`). The large demonstrated NaMaster speedups currently apply to the
-MASTER coupling, flat-workspace, and covariance kernels above, not to the SHT.
+The fused kernel changes the single-GPU result substantially. At `Nside=512`,
+warmed analysis takes 0.0470 s and synthesis 0.0528 s, versus 0.8097 s and
+0.7494 s for the generic single-GPU path: 17.2x and 14.2x faster. Maximum
+differences from NaMaster in that run were `1.93e-14` for alms (relative
+`2.51e-12`) and `3.20e-8` for a white unit-variance synthesis map (relative
+`1.02e-11`). NaMaster's CPU DUCC transform still took 0.0207 s and 0.0136 s,
+respectively. The fused GPU SHT is therefore a large acceleration over the
+previous GPU algorithm, but it does **not** yet beat DUCC. The demonstrated
+NaMaster speedups apply to the MASTER coupling, flat-workspace, and covariance
+kernels above.
 
 ## Nside 4096 memory
 
@@ -120,28 +134,29 @@ CUDA_VISIBLE_DEVICES=0,1 XLA_PYTHON_CLIENT_PREALLOCATE=false \
   python -m benchmarks.benchmark_nside4096_memory
 ```
 
-A full scalar `Nside=4096`, `lmax=12287`, `n_iter=0` constant-sky analysis has
-now run successfully on two GPUs. First compilation plus execution took 390.7 s
-and the warmed transform took 222.4 s. It returned
-`a00=3.5449077018110318+1.2e-16j`, matching `sqrt(4*pi)`. Comparison of all
-75.5 million packed coefficients with NaMaster gave maximum absolute difference
-`3.13e-10` (relative `8.83e-11`). NaMaster took 1.788 s, so this is a verified
-correctness and memory-feasibility result, not an SHT speedup.
+A full scalar `Nside=4096`, `lmax=12287`, `n_iter=0` constant-sky analysis now
+runs on one GPU. First compilation plus execution took 182.0 s and the warmed
+transform took 12.248 s, 18.2x faster than the former 222.4 s generic two-GPU
+path. It returned `a00=3.544907701811031+1.2e-16j`, matching `sqrt(4*pi)`.
+Comparison of all 75.5 million packed coefficients with NaMaster gave maximum
+absolute difference `4.78e-13` (relative `1.35e-13`). NaMaster took 1.764 s, so
+the exact fused transform is still 6.95x slower than DUCC.
 
-Actual allocator telemetry was about 35 GiB on the primary and 32 GiB additional
-memory on the secondary. Use two devices with at least 48 GiB free each for
-headroom; XLA allocator pools can exceed compiled live-buffer estimates. If the
-first visible GPU is occupied, order `CUDA_VISIBLE_DEVICES` with the emptier GPU
-first because it owns the ring FFT and full-band output.
+Actual device telemetry peaked at 36,652 MiB including the 236 MiB baseline,
+or about 35.6 GiB incremental. This removes the former 32 GiB allocation on a
+second GPU. Use a device with at least 48 GiB free for allocator and FFT
+workspace headroom. XLA allocator pools can exceed the principal-array inventory
+reported by `benchmark_nside4096_memory`.
 
 Use `lite=True` for fields when input maps and templates do not need to remain
 resident after their alms are computed. Device-resident JAX masks are accepted
 without a GPU-to-host-to-GPU round trip. The memory estimates remain planning
 aids rather than substitutes for telemetry, especially for spin-2 and
 Jacobi-refined runs that have not yet been executed at full resolution. The
-current on-the-fly S2FFT transform is correctness-tested against NaMaster, but
-an end-to-end runtime speedup over DUCC has not been demonstrated;
-coupling-matrix acceleration is the currently measured GPU speedup.
+fused scalar and generic spin S2FFT transforms are correctness-tested against
+NaMaster, but an end-to-end SHT runtime speedup over DUCC has not been
+demonstrated; coupling-matrix acceleration is the currently measured NaMaster
+speedup.
 
 Run the parity suite on CPU with:
 
@@ -149,6 +164,7 @@ Run the parity suite on CPU with:
 JAX_ENABLE_X64=1 JAX_PLATFORMS=cpu python -m pytest -q
 ```
 
-The current CPU suite contains 111 passing tests and 2 hardware-dependent skips,
-including direct API/numerical comparisons against NaMaster. Dedicated two-GPU
-tests cover scalar and spin-2 analysis, synthesis, and Jacobi refinement.
+The current CPU suite contains 111 passing tests and 4 hardware-dependent skips,
+including direct API/numerical comparisons against NaMaster. Dedicated NVIDIA
+tests cover fused scalar parity and gradients; two-GPU tests cover scalar and
+spin-2 analysis, synthesis, and Jacobi refinement.

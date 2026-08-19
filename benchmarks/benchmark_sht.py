@@ -77,7 +77,7 @@ if __name__ == "__main__":
     )
 
     rows = []
-    calculators = ["jax-single"]
+    calculators = ["jax", "jax-single"]
     if len([device for device in jax.devices() if device.platform == "gpu"]) >= 2:
         calculators.append("jax-mgpu")
     for calculator in calculators:

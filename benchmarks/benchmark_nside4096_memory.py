@@ -100,6 +100,23 @@ if __name__ == "__main__":
     print(f"target Nside={target}, npix={npix:,}, lmax={lmax:,}")
     print(f"one float64 map: {_gib(npix * 8):.3f} GiB")
     print(f"one packed complex128 alm: {_gib(nelem * 16):.3f} GiB")
+    L = lmax + 1
+    ntheta = 4 * target - 1
+    fused_analysis_arrays = (
+        npix * 8 + ntheta * 2 * L * 16 + L**2 * 16 + nelem * 16
+    )
+    fused_synthesis_arrays = (
+        nelem * 16
+        + L**2 * 16
+        + ntheta * L * 16
+        + ntheta * 2 * L * 16
+        + npix * 16
+    )
+    print(
+        "fused scalar principal arrays: "
+        f"analysis={_gib(fused_analysis_arrays):.2f} GiB, "
+        f"synthesis={_gib(fused_synthesis_arrays):.2f} GiB"
+    )
     print("spin  initial temp  Jacobi temp  estimated peak per compiled step")
     for spin in (0, 2):
         initial, iteration = compiled_memory(args.probe_nside, spin)

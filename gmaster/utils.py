@@ -11,6 +11,11 @@ from s2fft.recursions import turok_jax
 from s2fft.transforms import _ftm_flm_primitive
 from s2fft.utils import healpix_ffts, quadrature_jax
 
+from ._sht_pallas import (
+    scalar_forward_latitudinal,
+    scalar_inverse_latitudinal,
+)
+
 
 class NmtParams:
     def __init__(self):
@@ -564,6 +569,47 @@ def _use_multi_gpu_sht(L):
     return calculator == "jax-mgpu" or L >= 768
 
 
+def _use_pallas_sht(L, spin):
+    if nmt_params.sht_calculator != "jax" or spin != 0 or L < 128:
+        return False
+    return any(
+        device.platform == "gpu" and "NVIDIA" in device.device_kind.upper()
+        for device in jax.devices()
+    )
+
+
+def _pallas_block_size(nside):
+    return min(1024, 2 * nside)
+
+
+def _pallas_fft_method():
+    extension = getattr(healpix_ffts, "_s2fft", None)
+    return (
+        "cuda"
+        if extension is not None
+        and getattr(extension, "COMPILED_WITH_CUDA", False)
+        else "jax"
+    )
+
+
+@partial(jax.jit, static_argnames=("L", "nside", "reality"))
+def _forward_healpix_fft(maps, *, L, nside, reality):
+    return healpix_ffts.healpix_fft(
+        maps, L, nside, _pallas_fft_method(), reality
+    )
+
+
+@partial(jax.jit, static_argnames=("L", "nside"))
+def _finish_inverse_pallas(ftm_positive, *, L, nside):
+    ftm = jnp.concatenate((jnp.zeros_like(ftm_positive), ftm_positive), axis=1)
+    ftm = ftm.at[:, 1:L].set(
+        jnp.flip(jnp.conj(ftm[:, L + 1 :]), axis=-1)
+    )
+    return healpix_ffts.healpix_ifft(
+        ftm, L, nside, _pallas_fft_method(), True
+    )
+
+
 @lru_cache(maxsize=32)
 def _forward_latitudinal_device(L, spin, nside, reality, L_lower, device_index):
     def transform(ftm):
@@ -743,6 +789,62 @@ def _map2alm_core(maps, ell, order, *, spin, nside, L, L_work, n_iter):
     return alm
 
 
+@partial(jax.jit, static_argnames=("L", "L_work"))
+def _positive_alm(alm, *, L, L_work):
+    positive = _packed_triangle(alm, L)
+    return jnp.pad(positive, ((0, L_work - L), (0, L_work - L)))
+
+
+def _alm2map_core_pallas(alm, *, nside, L, L_work):
+    positive = _positive_alm(alm[0], L=L, L_work=L_work)
+    theta = _stable_thetas(L_work, nside)
+    phase = healpix_ffts.p2phi_rings_jax(jnp.arange(len(theta)), nside)
+    ftm_positive = scalar_inverse_latitudinal(
+        positive,
+        theta,
+        phase=phase,
+        L=L_work,
+        block_size=_pallas_block_size(nside),
+    )
+    maps = _finish_inverse_pallas(ftm_positive, L=L_work, nside=nside)
+    return jnp.real(maps)[None, :]
+
+
+def _map2alm_once_pallas(maps, ell, order, *, nside, L_work):
+    ftm = _forward_healpix_fft(maps[0], L=L_work, nside=nside, reality=True)
+    theta = _stable_thetas(L_work, nside)
+    weights = quadrature_jax.quad_weights_transform(
+        L_work, "healpix", nside
+    )
+    phase = -healpix_ffts.p2phi_rings_jax(jnp.arange(len(theta)), nside)
+    positive = scalar_forward_latitudinal(
+        ftm[:, L_work:],
+        theta,
+        weights=weights,
+        phase=phase,
+        L=L_work,
+        block_size=_pallas_block_size(nside),
+    )
+    return positive[ell, order][None, :]
+
+
+def _map2alm_core_pallas(
+    maps, ell, order, *, nside, L, L_work, n_iter
+):
+    alm = _map2alm_once_pallas(
+        maps, ell, order, nside=nside, L_work=L_work
+    )
+    for _ in range(n_iter):
+        residual = (
+            _alm2map_core_pallas(alm, nside=nside, L=L, L_work=L_work)
+            - maps
+        )
+        alm -= _map2alm_once_pallas(
+            residual, ell, order, nside=nside, L_work=L_work
+        )
+    return alm
+
+
 def _alm2map_core_multi_gpu(alm, ell, order, *, spin, nside, L, L_work):
     if spin == 0:
         elm = _unpack_real(alm[0], L, L_work)
@@ -838,6 +940,16 @@ def map2alm(map, spin, map_info, alm_info, *, n_iter):
         return alm
     L = alm_info.lmax + 1
     L_work = max(L, 2 * map_info.nside)
+    if _use_pallas_sht(L_work, spin):
+        return _map2alm_core_pallas(
+            maps,
+            alm_info._ell,
+            alm_info._m,
+            nside=map_info.nside,
+            L=L,
+            L_work=L_work,
+            n_iter=int(n_iter),
+        )
     if _use_multi_gpu_sht(L_work):
         return _map2alm_core_multi_gpu(
             maps,
@@ -873,6 +985,10 @@ def alm2map(alm, spin, map_info, alm_info):
         return alm2catalog(alm, map_info.si.positions, spin, alm_info.lmax)
     L = alm_info.lmax + 1
     L_work = max(L, 2 * map_info.nside)
+    if _use_pallas_sht(L_work, spin):
+        return _alm2map_core_pallas(
+            alm, nside=map_info.nside, L=L, L_work=L_work
+        )
     if _use_multi_gpu_sht(L_work):
         alm = _copy_to_device(alm, _gpu_devices()[0])
         return _alm2map_core_multi_gpu(
