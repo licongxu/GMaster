@@ -541,19 +541,34 @@ def _map2alm_once(maps, ell, order, *, spin, nside, L, L_work):
     return jnp.stack([-(plus_m + minus_m) / 2, 0.5j * (plus_m - minus_m)])
 
 
-@partial(
-    jax.jit,
-    static_argnames=("spin", "nside", "L", "L_work", "n_iter"),
-)
-def _map2alm_core(maps, ell, order, *, spin, nside, L, L_work, n_iter):
-    alm = _map2alm_once(maps, ell, order, spin=spin, nside=nside, L=L, L_work=L_work)
-    for _ in range(n_iter):
-        residual = (
-            _alm2map_core(alm, ell, order, spin=spin, nside=nside, L=L, L_work=L_work)
-            - maps
+@partial(jax.jit, static_argnames=("spin", "nside", "L", "L_work"))
+def _map2alm_iteration(alm, maps, ell, order, *, spin, nside, L, L_work):
+    residual = (
+        _alm2map_core(
+            alm, ell, order, spin=spin, nside=nside, L=L, L_work=L_work
         )
-        alm -= _map2alm_once(
-            residual, ell, order, spin=spin, nside=nside, L=L, L_work=L_work
+        - maps
+    )
+    return alm - _map2alm_once(
+        residual, ell, order, spin=spin, nside=nside, L=L, L_work=L_work
+    )
+
+
+def _map2alm_core(maps, ell, order, *, spin, nside, L, L_work, n_iter):
+    """Run Jacobi refinement without retaining every iteration in one XLA graph."""
+    alm = _map2alm_once(
+        maps, ell, order, spin=spin, nside=nside, L=L, L_work=L_work
+    )
+    for _ in range(n_iter):
+        alm = _map2alm_iteration(
+            alm,
+            maps,
+            ell,
+            order,
+            spin=spin,
+            nside=nside,
+            L=L,
+            L_work=L_work,
         )
     return alm
 
