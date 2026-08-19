@@ -65,28 +65,83 @@ XLA_PYTHON_CLIENT_PREALLOCATE=false JAX_PLATFORM_NAME=gpu \
   python -m benchmarks.benchmark_scalar_toeplitz --lmax 2047 4095
 ```
 
+## Multi-GPU spherical harmonic transforms
+
+HEALPix analysis now splits the on-the-fly Wigner recurrence by harmonic band,
+and synthesis splits it by latitude. The two independent kernels are dispatched
+concurrently. Packed Healpy alms are expanded with an algebraic gather rather
+than a GPU scatter; at `L=384` this unpack kernel fell from 0.925 s to 0.00161 s.
+Spin E/B alms are fused directly into one complex harmonic grid so full E, B,
+and combined grids are not simultaneously materialized.
+
+The default `jax` calculator automatically uses two GPUs at `L>=768` when they
+are available. Selection can be controlled explicitly:
+
+```python
+import gmaster as nmt
+
+nmt.set_sht_calculator("jax")         # automatic, the default
+nmt.set_sht_calculator("jax-single")  # force one device
+nmt.set_sht_calculator("jax-mgpu")    # request two devices
+```
+
+On two RTX PRO 6000 Blackwell GPUs, warmed scalar analysis at `Nside=512`
+improves from 0.7057 s on one GPU to 0.3255 s on two (2.17x), while synthesis
+improves from 0.6517 s to 0.3750 s (1.74x). At `Nside=1024`, analysis improves
+from 7.934 s to 3.406 s (2.33x). Single- and two-GPU analysis agree to better
+than `4.6e-16` maximum absolute error in that run. Reproduce the complete
+single-GPU, two-GPU, and NaMaster comparison with:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 XLA_PYTHON_CLIENT_PREALLOCATE=false \
+  python -m benchmarks.benchmark_sht --nside 512
+```
+
+This does **not** yet beat NaMaster's CPU DUCC transform: in the same Nside 512
+run NaMaster took 0.0153 s for analysis and 0.0112 s for synthesis. GMaster's
+maximum differences from NaMaster were `6.1e-13` for alms (relative
+`7.9e-11`) and `1.7e-6` for a white unit-variance synthesis map (relative
+`5.5e-10`). The large demonstrated NaMaster speedups currently apply to the
+MASTER coupling, flat-workspace, and covariance kernels above, not to the SHT.
+
 ## Nside 4096 memory
 
 At `Nside=4096`, one float64 HEALPix map is 1.50 GiB and one packed complex128
 alm array at the default `lmax=12287` is 1.125 GiB. Jacobi refinements are
 dispatched as repeated single-iteration XLA programs, rather than unrolled in
-one graph. A quadratic extrapolation of XLA's compiled buffers from `Nside=16`
-estimates 38.0 GiB peak for scalar refinement and 51.9 GiB for spin-2 on the
-current S2FFT backend. Inspect the estimate on the target accelerator with:
+one graph. A quadratic extrapolation of the single-device compiled graphs from
+`Nside=16` estimates 36.3 GiB peak for scalar refinement and 43.9 GiB for
+spin-2. The two-GPU staged recurrence estimate is about 19 GiB on each device
+for scalar and at most 24 GiB on either device for spin-2, before caller-retained
+buffers, FFT workspaces, and allocator headroom. Inspect both estimates with:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 XLA_PYTHON_CLIENT_PREALLOCATE=false \
+CUDA_VISIBLE_DEVICES=0,1 XLA_PYTHON_CLIENT_PREALLOCATE=false \
   python -m benchmarks.benchmark_nside4096_memory
 ```
 
+A full scalar `Nside=4096`, `lmax=12287`, `n_iter=0` constant-sky analysis has
+now run successfully on two GPUs. First compilation plus execution took 390.7 s
+and the warmed transform took 222.4 s. It returned
+`a00=3.5449077018110318+1.2e-16j`, matching `sqrt(4*pi)`. Comparison of all
+75.5 million packed coefficients with NaMaster gave maximum absolute difference
+`3.13e-10` (relative `8.83e-11`). NaMaster took 1.788 s, so this is a verified
+correctness and memory-feasibility result, not an SHT speedup.
+
+Actual allocator telemetry was about 35 GiB on the primary and 32 GiB additional
+memory on the secondary. Use two devices with at least 48 GiB free each for
+headroom; XLA allocator pools can exceed compiled live-buffer estimates. If the
+first visible GPU is occupied, order `CUDA_VISIBLE_DEVICES` with the emptier GPU
+first because it owns the ring FFT and full-band output.
+
 Use `lite=True` for fields when input maps and templates do not need to remain
 resident after their alms are computed. Device-resident JAX masks are accepted
-without a GPU-to-host-to-GPU round trip. The memory figures above are planning
-estimates, not a substitute for hardware telemetry during a full-resolution
-run. The current on-the-fly S2FFT transform is correctness-tested against
-NaMaster, but an end-to-end `Nside=4096` runtime speedup over DUCC has not yet
-been demonstrated; coupling-matrix acceleration is the currently measured GPU
-speedup.
+without a GPU-to-host-to-GPU round trip. The memory estimates remain planning
+aids rather than substitutes for telemetry, especially for spin-2 and
+Jacobi-refined runs that have not yet been executed at full resolution. The
+current on-the-fly S2FFT transform is correctness-tested against NaMaster, but
+an end-to-end runtime speedup over DUCC has not been demonstrated;
+coupling-matrix acceleration is the currently measured GPU speedup.
 
 Run the parity suite on CPU with:
 
@@ -94,5 +149,6 @@ Run the parity suite on CPU with:
 JAX_ENABLE_X64=1 JAX_PLATFORMS=cpu python -m pytest -q
 ```
 
-The current suite contains 108 tests, including direct API/numerical comparisons
-against NaMaster. GPU tests use the same suite with a CUDA JAX platform.
+The current CPU suite contains 111 passing tests and 2 hardware-dependent skips,
+including direct API/numerical comparisons against NaMaster. Dedicated two-GPU
+tests cover scalar and spin-2 analysis, synthesis, and Jacobi refinement.
