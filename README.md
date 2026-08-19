@@ -28,6 +28,10 @@ Curved general-spin and pure-E/B coupling matrices use exact Gauss-Legendre
 quadrature, stable fixed-index Wigner-d/Jacobi recurrences, and accelerator
 matrix multiplication. This replaces the former quartic Racah fallback with a
 cubic algorithm. The scalar TT kernel retains its optimized recurrence. The
+Toeplitz scalar path evaluates only entries retained by NaMaster's approximation
+(the exact low multipoles, protected diagonal band, diagonal, and reference
+column), then reconstructs the rest. It therefore avoids computing a full exact
+matrix that would immediately be overwritten. The
 flat-sky coupling and covariance kernels use circular FFT convolutions instead
 of NaMaster's nested Fourier-mode loops. Direct CAR and arbitrary-position
 catalog transforms still scale as `O(npix*lmax^2)` and are the main remaining
@@ -50,11 +54,45 @@ arbitrary-spin coupling matrix (0.0533 s versus 0.825 s) and 4.14x for pure
 that run were approximately `3.1e-8` and `7.1e-9`. Reproduce it with
 `XLA_PYTHON_CLIENT_PREALLOCATE=false JAX_PLATFORM_NAME=gpu python -m benchmarks.benchmark_curved_coupling --lmax 2047`.
 
+For a scalar kernel at `lmax=4095` with `l_toeplitz=600`, `l_exact=100`, and
+`dl_band=50`, selective evaluation takes 0.0576 s after compilation versus
+1.709 s for ordinary exact NaMaster on the same host: 29.7x faster. Its output
+matches NaMaster's Toeplitz result to a maximum absolute difference of
+`8.7e-14`. Reproduce this with:
+
+```bash
+XLA_PYTHON_CLIENT_PREALLOCATE=false JAX_PLATFORM_NAME=gpu \
+  python -m benchmarks.benchmark_scalar_toeplitz --lmax 2047 4095
+```
+
+## Nside 4096 memory
+
+At `Nside=4096`, one float64 HEALPix map is 1.50 GiB and one packed complex128
+alm array at the default `lmax=12287` is 1.125 GiB. Jacobi refinements are
+dispatched as repeated single-iteration XLA programs, rather than unrolled in
+one graph. A quadratic extrapolation of XLA's compiled buffers from `Nside=16`
+estimates 38.0 GiB peak for scalar refinement and 51.9 GiB for spin-2 on the
+current S2FFT backend. Inspect the estimate on the target accelerator with:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 XLA_PYTHON_CLIENT_PREALLOCATE=false \
+  python -m benchmarks.benchmark_nside4096_memory
+```
+
+Use `lite=True` for fields when input maps and templates do not need to remain
+resident after their alms are computed. Device-resident JAX masks are accepted
+without a GPU-to-host-to-GPU round trip. The memory figures above are planning
+estimates, not a substitute for hardware telemetry during a full-resolution
+run. The current on-the-fly S2FFT transform is correctness-tested against
+NaMaster, but an end-to-end `Nside=4096` runtime speedup over DUCC has not yet
+been demonstrated; coupling-matrix acceleration is the currently measured GPU
+speedup.
+
 Run the parity suite on CPU with:
 
 ```bash
 JAX_ENABLE_X64=1 JAX_PLATFORMS=cpu python -m pytest -q
 ```
 
-The current suite contains 106 tests, including direct API/numerical comparisons
+The current suite contains 108 tests, including direct API/numerical comparisons
 against NaMaster. GPU tests use the same suite with a CUDA JAX platform.
