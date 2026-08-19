@@ -124,6 +124,74 @@ def _coupling_matrix_tt(window_cls, *, lmax):
     return matrix * (2 * column + 1)
 
 
+@lru_cache(maxsize=32)
+def _toeplitz_exact_pairs(size, l_toeplitz, l_exact, dl_band):
+    """Indices of the exact entries consumed by NaMaster's Toeplitz fill."""
+    pairs = {(ell, ell) for ell in range(size)}
+    pairs.update((ell, l_toeplitz) for ell in range(size))
+    pairs.update(
+        (ell, column)
+        for column in range(l_exact + 1)
+        for ell in range(size)
+    )
+    pairs.update(
+        (ell, ell + offset)
+        for offset in range(dl_band + 1)
+        for ell in range(size - offset)
+    )
+    encoded = np.fromiter(
+        (row * size + column for row, column in pairs), dtype=np.int64
+    )
+    encoded.sort()
+    return encoded // size, encoded % size
+
+
+@partial(
+    jax.jit,
+    static_argnames=("lmax", "l_toeplitz", "l_exact", "dl_band"),
+)
+def _coupling_matrix_tt_toeplitz(
+    window_cls, *, lmax, l_toeplitz, l_exact, dl_band
+):
+    """Scalar MASTER matrix without evaluating entries Toeplitz will replace."""
+    size = lmax + 1
+    rows, columns = _toeplitz_exact_pairs(
+        size, l_toeplitz, l_exact, dl_band
+    )
+    rows = jnp.asarray(rows)
+    columns = jnp.asarray(columns)
+    lower = jnp.minimum(rows, columns)
+    upper = jnp.maximum(rows, columns)
+
+    p = jnp.arange(1, 2 * lmax + 1, dtype=window_cls.dtype)
+    log_g = jnp.concatenate(
+        [jnp.zeros(1, dtype=window_cls.dtype), jnp.cumsum(jnp.log((p - 0.5) / p))]
+    )
+    g = jnp.exp(log_g)
+    mask_power = window_cls * (2 * jnp.arange(2 * lmax + 1) + 1) / (4 * jnp.pi)
+
+    def add_offset(offset, values):
+        mask_ell = upper - lower + 2 * offset
+        total = upper + offset
+        term = (
+            mask_power[jnp.minimum(mask_ell, 2 * lmax)]
+            * g[upper - lower + offset]
+            * g[offset]
+            * g[jnp.maximum(lower - offset, 0)]
+            / (g[total] * (2 * total + 1))
+        )
+        return values + jnp.where(offset <= lower, term, 0)
+
+    values = jax.lax.fori_loop(
+        0, size, add_offset, jnp.zeros(len(rows), dtype=window_cls.dtype)
+    )
+    exact = jnp.zeros((size, size), dtype=window_cls.dtype)
+    exact = exact.at[rows, columns].set(values)
+    exact = exact.at[columns, rows].set(values)
+    correlation = _apply_toeplitz(exact, l_toeplitz, l_exact, dl_band)
+    return correlation * (2 * jnp.arange(size) + 1)[None]
+
+
 @lru_cache(maxsize=16)
 def _gauss_legendre(order):
     return roots_legendre(order)
@@ -548,7 +616,17 @@ def get_master_coefficients(
         )
         result = {}
         if has_00:
-            result["00"] = _coupling_matrix_tt(padded, lmax=lmax) / columns
+            result["00"] = (
+                _coupling_matrix_tt_toeplitz(
+                    padded,
+                    lmax=lmax,
+                    l_toeplitz=l_toeplitz,
+                    l_exact=l_exact,
+                    dl_band=dl_band,
+                )
+                if l_toeplitz > 0
+                else _coupling_matrix_tt(padded, lmax=lmax)
+            ) / columns
         if has_0s:
             if spin1 in (0, 2) and spin2 in (0, 2):
                 mixed, _, _ = (
@@ -582,7 +660,7 @@ def get_master_coefficients(
                 ) / columns
                 result["pp"], result["mm"] = matrices[0], matrices[1]
         if l_toeplitz > 0:
-            for name in ("00", "0s", "pp", "mm"):
+            for name in ("0s", "pp", "mm"):
                 if name in result:
                     result[name] = _apply_toeplitz(
                         result[name], l_toeplitz, l_exact, dl_band
@@ -820,7 +898,17 @@ class NmtWorkspace:
         )
         scalar = None
         if self.ncls in (1, 7):
-            scalar = _coupling_matrix_tt(window_cls, lmax=self.lmax)
+            scalar = (
+                _coupling_matrix_tt_toeplitz(
+                    window_cls,
+                    lmax=self.lmax,
+                    l_toeplitz=l_toeplitz,
+                    l_exact=l_exact,
+                    dl_band=dl_band,
+                )
+                if l_toeplitz > 0
+                else _coupling_matrix_tt(window_cls, lmax=self.lmax)
+            )
         te = even = odd = None
         if self.ncls != 1:
             if self.spin1 in (0, 2) and self.spin2 in (0, 2):
@@ -861,9 +949,7 @@ class NmtWorkspace:
                     value / column_factor, l_toeplitz, l_exact, dl_band
                 ) * column_factor
 
-            scalar, te, even, odd = map(
-                approximate, (scalar, te, even, odd)
-            )
+            te, even, odd = map(approximate, (te, even, odd))
         if pure_any:
             pure_te, even_one, odd_one, even_two, odd_two = (
                 spin2_pure[3:]

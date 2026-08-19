@@ -14,6 +14,7 @@ from .workspaces import (
     _binning_operators,
     _compute_coupled_cell,
     _coupling_matrix_tt,
+    _coupling_matrix_tt_toeplitz,
     _coupling_matrices_spin2,
     _toeplitz_sanity,
     compute_coupled_cell,
@@ -79,7 +80,15 @@ def _alm_cross_cell(first, second, ainfo, lmax):
     )[0]
 
 
-def _covariance_kernels(mask_cell, spin1, spin2, lmax):
+def _covariance_kernels(
+    mask_cell,
+    spin1,
+    spin2,
+    lmax,
+    l_toeplitz=-1,
+    l_exact=-1,
+    dl_band=-1,
+):
     """Return NaMaster's Xi kernels using GMaster's existing recurrences."""
     padded = jnp.pad(
         jnp.asarray(mask_cell),
@@ -88,7 +97,17 @@ def _covariance_kernels(mask_cell, spin1, spin2, lmax):
     columns = (2 * jnp.arange(lmax + 1) + 1)[None]
     kernels = {name: None for name in _KERNEL_NAMES}
     if spin1 == 0 and spin2 == 0:
-        kernels["00"] = _coupling_matrix_tt(padded, lmax=lmax) / columns
+        kernels["00"] = (
+            _coupling_matrix_tt_toeplitz(
+                padded,
+                lmax=lmax,
+                l_toeplitz=l_toeplitz,
+                l_exact=l_exact,
+                dl_band=dl_band,
+            )
+            if l_toeplitz > 0
+            else _coupling_matrix_tt(padded, lmax=lmax)
+        ) / columns
     elif (spin1 == 0) != (spin2 == 0):
         mixed, _, _ = _coupling_matrices_spin2(padded, lmax=lmax)
         kernels["0s"] = mixed / columns
@@ -96,6 +115,12 @@ def _covariance_kernels(mask_cell, spin1, spin2, lmax):
         _, even, odd = _coupling_matrices_spin2(padded, lmax=lmax)
         kernels["pp"] = even / columns
         kernels["mm"] = odd / columns
+    if l_toeplitz > 0:
+        for name in ("0s", "pp", "mm"):
+            if kernels[name] is not None:
+                kernels[name] = _apply_toeplitz(
+                    kernels[name], l_toeplitz, l_exact, dl_band
+                )
     return kernels
 
 
@@ -200,17 +225,16 @@ class NmtCovarianceWorkspace:
         kernels = [
             _zero_kernel_set()[0]
             if cell is None
-            else _covariance_kernels(cell, *pair, self.lmax)
+            else _covariance_kernels(
+                cell,
+                *pair,
+                self.lmax,
+                self.l_toeplitz,
+                self.l_exact,
+                self.dl_band,
+            )
             for cell, pair in zip((cell_1122, cell_1221), pairs)
         ]
-        if self.l_toeplitz > 0:
-            for values in kernels:
-                for name in _KERNEL_NAMES:
-                    if values[name] is not None:
-                        values[name] = _apply_toeplitz(
-                            values[name], self.l_toeplitz,
-                            self.l_exact, self.dl_band,
-                        )
         return kernels
 
     def compute_coupling_coefficients(
