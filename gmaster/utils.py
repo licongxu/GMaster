@@ -1,6 +1,7 @@
 """Map metadata and JAX spherical-harmonic transforms."""
 
-from functools import partial
+from concurrent.futures import ThreadPoolExecutor
+from functools import lru_cache, partial
 
 import jax
 import jax.numpy as jnp
@@ -23,8 +24,10 @@ nmt_params = NmtParams()
 
 
 def set_sht_calculator(calc_name):
-    if calc_name != "jax":
-        raise KeyError("GMaster's SHT calculator must be 'jax'")
+    if calc_name not in ("jax", "jax-single", "jax-mgpu"):
+        raise KeyError(
+            "GMaster's SHT calculator must be 'jax', 'jax-single', or 'jax-mgpu'"
+        )
     nmt_params.sht_calculator = calc_name
 
 
@@ -419,9 +422,8 @@ def _stable_thetas(L, nside):
     return theta + 8 * jnp.finfo(theta.dtype).eps
 
 
-@partial(jax.jit, static_argnames=("L", "spin", "nside", "reality"))
-def _forward_s2fft(maps, *, L, spin, nside, reality):
-    theta = _stable_thetas(L, nside)
+@partial(jax.jit, static_argnames=("L", "nside", "reality"))
+def _forward_s2fft_ftm(maps, *, L, nside, reality):
     m_start = L - 1 if reality else 0
     ftm = healpix_ffts.healpix_fft(maps, L, nside, "jax", reality)
     ftm = jnp.einsum(
@@ -433,18 +435,27 @@ def _forward_s2fft(maps, *, L, spin, nside, reality):
     ftm = ftm.at[:, m_start + 1 :].multiply(
         healpix_ffts.ring_phase_shifts_hp_jax(L, nside, True, reality)
     )
-    flm = _ftm_flm_primitive.ftm_to_flm(
+    return ftm
+
+
+def _forward_latitudinal(ftm, *, L, spin, nside, reality, L_lower):
+    return _ftm_flm_primitive.ftm_to_flm(
         ftm,
-        theta,
+        _stable_thetas(L, nside),
         L=L,
         spin=spin,
         nside=nside,
         sampling="healpix",
         reality=reality,
         spmd=False,
-        L_lower=0,
+        L_lower=L_lower,
         precomps=None,
     )
+
+
+@partial(jax.jit, static_argnames=("L", "spin", "reality"))
+def _finish_forward_s2fft(flm, *, L, spin, reality):
+    m_start = L - 1 if reality else 0
     flm = jnp.einsum(
         "lm,l->lm",
         flm,
@@ -463,16 +474,26 @@ def _forward_s2fft(maps, *, L, spin, nside, reality):
 
 
 @partial(jax.jit, static_argnames=("L", "spin", "nside", "reality"))
-def _inverse_s2fft(flm, *, L, spin, nside, reality):
-    theta = _stable_thetas(L, nside)
-    m_start = L - 1 if reality else 0
-    flm = jnp.einsum(
+def _forward_s2fft(maps, *, L, spin, nside, reality):
+    ftm = _forward_s2fft_ftm(maps, L=L, nside=nside, reality=reality)
+    flm = _forward_latitudinal(
+        ftm, L=L, spin=spin, nside=nside, reality=reality, L_lower=0
+    )
+    return _finish_forward_s2fft(flm, L=L, spin=spin, reality=reality)
+
+
+@partial(jax.jit, static_argnames=("L",))
+def _prepare_inverse_s2fft(flm, *, L):
+    return jnp.einsum(
         "lm,l->lm",
         flm,
         jnp.sqrt((2 * jnp.arange(L) + 1) / (4 * jnp.pi)),
         optimize=True,
     )
-    ftm = _ftm_flm_primitive.flm_to_ftm(
+
+
+def _inverse_latitudinal(flm, theta, *, L, spin, nside, reality):
+    return _ftm_flm_primitive.flm_to_ftm(
         flm,
         theta,
         L=L,
@@ -484,6 +505,11 @@ def _inverse_s2fft(flm, *, L, spin, nside, reality):
         L_lower=0,
         precomps=None,
     )
+
+
+@partial(jax.jit, static_argnames=("L", "spin", "nside", "reality"))
+def _finish_inverse_s2fft(ftm, *, L, spin, nside, reality):
+    m_start = L - 1 if reality else 0
     ftm = ftm.at[:, m_start + 1 :].multiply(
         healpix_ffts.ring_phase_shifts_hp_jax(L, nside, False, reality)
     )
@@ -493,11 +519,156 @@ def _inverse_s2fft(flm, *, L, spin, nside, reality):
     return healpix_ffts.healpix_ifft(ftm, L, nside, "jax", reality)
 
 
-def _unpack_real(alm, ell, order, L, L_work):
-    flm = jnp.zeros((L_work, 2 * L_work - 1), dtype=alm.dtype)
-    flm = flm.at[ell, L_work - 1 + order].set(alm)
-    negative = jnp.where(order > 0, (-1) ** order * jnp.conj(alm), alm)
-    return flm.at[ell, L_work - 1 - order].set(negative)
+@partial(jax.jit, static_argnames=("L", "spin", "nside", "reality"))
+def _inverse_s2fft(flm, *, L, spin, nside, reality):
+    flm = _prepare_inverse_s2fft(flm, L=L)
+    ftm = _inverse_latitudinal(
+        flm,
+        _stable_thetas(L, nside),
+        L=L,
+        spin=spin,
+        nside=nside,
+        reality=reality,
+    )
+    return _finish_inverse_s2fft(
+        ftm, L=L, spin=spin, nside=nside, reality=reality
+    )
+
+
+@lru_cache(maxsize=1)
+def _gpu_devices():
+    return tuple(device for device in jax.devices() if device.platform == "gpu")
+
+
+def _copy_to_device(array, target):
+    source = getattr(array, "device", None)
+    if source == target:
+        return array
+    if source is not None:
+        array = np.asarray(array)
+    copied = jax.device_put(array, target)
+    copied.block_until_ready()
+    return copied
+
+
+def _run_blocking(transform, array):
+    result = transform(array)
+    result.block_until_ready()
+    return result
+
+
+def _use_multi_gpu_sht(L):
+    calculator = nmt_params.sht_calculator
+    if calculator == "jax-single" or len(_gpu_devices()) < 2:
+        return False
+    return calculator == "jax-mgpu" or L >= 768
+
+
+@lru_cache(maxsize=32)
+def _forward_latitudinal_device(L, spin, nside, reality, L_lower, device_index):
+    def transform(ftm):
+        return _forward_latitudinal(
+            ftm,
+            L=L,
+            spin=spin,
+            nside=nside,
+            reality=reality,
+            L_lower=L_lower,
+        )
+
+    return jax.jit(transform)
+
+
+@lru_cache(maxsize=32)
+def _inverse_latitudinal_device(L, spin, nside, reality, half, device_index):
+    def transform(flm):
+        theta = _stable_thetas(L, nside)
+        cut = (len(theta) + 1) // 2
+        theta = theta[:cut] if half == 0 else theta[cut:]
+        return _inverse_latitudinal(
+            flm,
+            theta,
+            L=L,
+            spin=spin,
+            nside=nside,
+            reality=reality,
+        )
+
+    return jax.jit(transform)
+
+
+def _forward_s2fft_multi_gpu(maps, *, L, spin, nside, reality):
+    primary, secondary = _gpu_devices()[:2]
+    maps = _copy_to_device(maps, primary)
+    ftm = _forward_s2fft_ftm(maps, L=L, nside=nside, reality=reality)
+    split = max(abs(spin) + 1, 2 * L // 3)
+    if split >= L:
+        return _forward_s2fft(maps, L=L, spin=spin, nside=nside, reality=reality)
+
+    low_input = _copy_to_device(ftm[:, L - split : L + split], secondary)
+    low_transform = _forward_latitudinal_device(
+        split, spin, nside, reality, 0, 1
+    )
+    high_transform = _forward_latitudinal_device(
+        L, spin, nside, reality, split, 0
+    )
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        low_future = executor.submit(_run_blocking, low_transform, low_input)
+        high_future = executor.submit(_run_blocking, high_transform, ftm)
+        low, high = low_future.result(), high_future.result()
+    low = _copy_to_device(low, primary)
+    flm = high.at[:split, L - split : L + split - 1].set(low)
+    return _finish_forward_s2fft(flm, L=L, spin=spin, reality=reality)
+
+
+def _inverse_s2fft_multi_gpu(flm, *, L, spin, nside, reality):
+    primary, secondary = _gpu_devices()[:2]
+    flm = _copy_to_device(flm, primary)
+    flm = _prepare_inverse_s2fft(flm, L=L)
+    other = _copy_to_device(flm, secondary)
+    north_transform = _inverse_latitudinal_device(L, spin, nside, reality, 0, 0)
+    south_transform = _inverse_latitudinal_device(L, spin, nside, reality, 1, 1)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        north_future = executor.submit(_run_blocking, north_transform, flm)
+        south_future = executor.submit(_run_blocking, south_transform, other)
+        north, south = north_future.result(), south_future.result()
+    south = _copy_to_device(south, primary)
+    ftm = jnp.concatenate((north, south))
+    return _finish_inverse_s2fft(
+        ftm, L=L, spin=spin, nside=nside, reality=reality
+    )
+
+
+def _packed_triangle(alm, L):
+    ell = jnp.arange(L)[:, None]
+    order = jnp.arange(L)[None, :]
+    packed_index = order * (2 * L - 1 - order) // 2 + ell
+    return jnp.where(ell >= order, alm[packed_index], 0)
+
+
+@partial(jax.jit, static_argnums=(1, 2))
+def _unpack_real(alm, L, L_work):
+    positive = _packed_triangle(alm, L)
+    positive = jnp.pad(positive, ((0, L_work - L), (0, L_work - L)))
+    negative = jnp.conj(positive[:, 1:L][:, ::-1])
+    negative *= (-1) ** jnp.arange(L - 1, 0, -1)[None, :]
+    negative = jnp.pad(negative, ((0, 0), (L_work - L, 0)))
+    return jnp.concatenate((negative, positive), axis=1)
+
+
+@partial(jax.jit, static_argnums=(1, 2))
+def _unpack_spin(alm, L, L_work):
+    e_positive = _packed_triangle(alm[0], L)
+    b_positive = _packed_triangle(alm[1], L)
+    positive = -(e_positive + 1j * b_positive)
+    positive = jnp.pad(positive, ((0, L_work - L), (0, L_work - L)))
+    negative = -(
+        jnp.conj(e_positive[:, 1:L][:, ::-1])
+        + 1j * jnp.conj(b_positive[:, 1:L][:, ::-1])
+    )
+    negative *= (-1) ** jnp.arange(L - 1, 0, -1)[None, :]
+    negative = jnp.pad(negative, ((0, L_work - L), (L_work - L, 0)))
+    return jnp.concatenate((negative, positive), axis=1)
 
 
 @partial(
@@ -505,13 +676,12 @@ def _unpack_real(alm, ell, order, L, L_work):
     static_argnames=("spin", "nside", "L", "L_work"),
 )
 def _alm2map_core(alm, ell, order, *, spin, nside, L, L_work):
-    elm = _unpack_real(alm[0], ell, order, L, L_work)
     if spin == 0:
+        elm = _unpack_real(alm[0], L, L_work)
         maps = _inverse_s2fft(elm, L=L_work, spin=0, nside=nside, reality=True)
         return jnp.real(maps)[None, :]
-    blm = _unpack_real(alm[1], ell, order, L, L_work)
     maps = _inverse_s2fft(
-        -(elm + 1j * blm),
+        _unpack_spin(alm, L, L_work),
         L=L_work,
         spin=spin,
         nside=nside,
@@ -573,6 +743,73 @@ def _map2alm_core(maps, ell, order, *, spin, nside, L, L_work, n_iter):
     return alm
 
 
+def _alm2map_core_multi_gpu(alm, ell, order, *, spin, nside, L, L_work):
+    if spin == 0:
+        elm = _unpack_real(alm[0], L, L_work)
+        maps = _inverse_s2fft_multi_gpu(
+            elm, L=L_work, spin=0, nside=nside, reality=True
+        )
+        return jnp.real(maps)[None, :]
+    maps = _inverse_s2fft_multi_gpu(
+        _unpack_spin(alm, L, L_work),
+        L=L_work,
+        spin=spin,
+        nside=nside,
+        reality=False,
+    )
+    return jnp.stack([jnp.real(maps), jnp.imag(maps)])
+
+
+def _map2alm_once_multi_gpu(maps, ell, order, *, spin, nside, L, L_work):
+    if spin == 0:
+        flm = _forward_s2fft_multi_gpu(
+            maps[0], L=L_work, spin=0, nside=nside, reality=True
+        )
+        return flm[ell, L_work - 1 + order][None, :]
+    plus = _forward_s2fft_multi_gpu(
+        maps[0] + 1j * maps[1],
+        L=L_work,
+        spin=spin,
+        nside=nside,
+        reality=False,
+    )
+    plus_m = plus[ell, L_work - 1 + order]
+    minus_m = (-1) ** order * jnp.conj(plus[ell, L_work - 1 - order])
+    return jnp.stack([-(plus_m + minus_m) / 2, 0.5j * (plus_m - minus_m)])
+
+
+def _map2alm_core_multi_gpu(
+    maps, ell, order, *, spin, nside, L, L_work, n_iter
+):
+    maps = _copy_to_device(maps, _gpu_devices()[0])
+    alm = _map2alm_once_multi_gpu(
+        maps, ell, order, spin=spin, nside=nside, L=L, L_work=L_work
+    )
+    for _ in range(n_iter):
+        residual = (
+            _alm2map_core_multi_gpu(
+                alm,
+                ell,
+                order,
+                spin=spin,
+                nside=nside,
+                L=L,
+                L_work=L_work,
+            )
+            - maps
+        )
+        alm -= _map2alm_once_multi_gpu(
+            residual,
+            ell,
+            order,
+            spin=spin,
+            nside=nside,
+            L=L,
+            L_work=L_work,
+        )
+    return alm
+
+
 def map2alm(map, spin, map_info, alm_info, *, n_iter):
     """Transform HEALPix maps to NaMaster/Healpy-packed E/B coefficients."""
     maps = jnp.asarray(map)
@@ -601,6 +838,17 @@ def map2alm(map, spin, map_info, alm_info, *, n_iter):
         return alm
     L = alm_info.lmax + 1
     L_work = max(L, 2 * map_info.nside)
+    if _use_multi_gpu_sht(L_work):
+        return _map2alm_core_multi_gpu(
+            maps,
+            alm_info._ell,
+            alm_info._m,
+            spin=int(spin),
+            nside=map_info.nside,
+            L=L,
+            L_work=L_work,
+            n_iter=int(n_iter),
+        )
     return _map2alm_core(
         maps,
         alm_info._ell,
@@ -625,6 +873,17 @@ def alm2map(alm, spin, map_info, alm_info):
         return alm2catalog(alm, map_info.si.positions, spin, alm_info.lmax)
     L = alm_info.lmax + 1
     L_work = max(L, 2 * map_info.nside)
+    if _use_multi_gpu_sht(L_work):
+        alm = _copy_to_device(alm, _gpu_devices()[0])
+        return _alm2map_core_multi_gpu(
+            alm,
+            alm_info._ell,
+            alm_info._m,
+            spin=int(spin),
+            nside=map_info.nside,
+            L=L,
+            L_work=L_work,
+        )
     return _alm2map_core(
         alm,
         alm_info._ell,
@@ -691,9 +950,10 @@ def _alm2catalog_core(alms, positions, *, spin, lmax):
     L = lmax + 1
     theta, phi = positions
     alm_info = NmtAlmInfo(lmax)
-    elm = _unpack_real(alms[0], alm_info._ell, alm_info._m, L, L)
-    full = elm if spin == 0 else -(
-        elm + 1j * _unpack_real(alms[1], alm_info._ell, alm_info._m, L, L)
+    full = (
+        _unpack_real(alms[0], L, L)
+        if spin == 0
+        else _unpack_spin(alms, L, L)
     )
     signal = jnp.zeros(len(theta), dtype=jnp.complex128)
     for ell in range(abs(spin), L):

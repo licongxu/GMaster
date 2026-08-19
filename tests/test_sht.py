@@ -6,6 +6,7 @@ import pytest
 jax.config.update("jax_enable_x64", True)
 
 import gmaster as nmt
+from gmaster import utils
 
 
 def _random_alms(rng, nmaps, ainfo, spin):
@@ -107,3 +108,51 @@ def test_transform_shape_validation():
         nmt.map2alm(np.ones((2, minfo.npix)), 0, minfo, ainfo, n_iter=0)
     with pytest.raises(ValueError, match="wrong shape"):
         nmt.alm2map(np.ones((1, ainfo.nelem)), 2, minfo, ainfo)
+
+
+@pytest.mark.parametrize("L,L_work", [(1, 1), (4, 4), (4, 7)])
+def test_gathered_alm_unpack_matches_healpy_layout(L, L_work):
+    ainfo = nmt.NmtAlmInfo(L - 1)
+    rng = np.random.default_rng(L_work)
+    alm = rng.normal(size=ainfo.nelem) + 1j * rng.normal(size=ainfo.nelem)
+    expected = np.zeros((L_work, 2 * L_work - 1), dtype=np.complex128)
+    expected[ainfo._ell, L_work - 1 + ainfo._m] = alm
+    expected[ainfo._ell, L_work - 1 - ainfo._m] = np.where(
+        ainfo._m > 0, (-1) ** ainfo._m * np.conj(alm), alm
+    )
+    np.testing.assert_array_equal(utils._unpack_real(alm, L, L_work), expected)
+    b_alm = rng.normal(size=ainfo.nelem) + 1j * rng.normal(size=ainfo.nelem)
+    b_expected = np.zeros_like(expected)
+    b_expected[ainfo._ell, L_work - 1 + ainfo._m] = b_alm
+    b_expected[ainfo._ell, L_work - 1 - ainfo._m] = np.where(
+        ainfo._m > 0, (-1) ** ainfo._m * np.conj(b_alm), b_alm
+    )
+    np.testing.assert_array_equal(
+        utils._unpack_spin(np.stack((alm, b_alm)), L, L_work),
+        -(expected + 1j * b_expected),
+    )
+
+
+@pytest.mark.skipif(
+    len([device for device in jax.devices() if device.platform == "gpu"]) < 2,
+    reason="requires two GPUs",
+)
+@pytest.mark.parametrize("spin", [0, 2])
+def test_multi_gpu_transforms_match_single_gpu(spin):
+    nside = 4
+    ainfo = nmt.NmtAlmInfo(3 * nside - 1)
+    minfo = nmt.NmtMapInfo(None, (12 * nside**2,))
+    nmaps = 1 if spin == 0 else 2
+    maps = np.random.default_rng(spin + 10).normal(size=(nmaps, minfo.npix))
+    original = nmt.nmt_params.sht_calculator
+    try:
+        nmt.set_sht_calculator("jax-single")
+        single_alm = nmt.map2alm(maps, spin, minfo, ainfo, n_iter=1)
+        single_map = nmt.alm2map(single_alm, spin, minfo, ainfo)
+        nmt.set_sht_calculator("jax-mgpu")
+        multi_alm = nmt.map2alm(maps, spin, minfo, ainfo, n_iter=1)
+        multi_map = nmt.alm2map(multi_alm, spin, minfo, ainfo)
+        np.testing.assert_allclose(multi_alm, single_alm, atol=1e-12)
+        np.testing.assert_allclose(multi_map, single_map, atol=1e-12)
+    finally:
+        nmt.set_sht_calculator(original)

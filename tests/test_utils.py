@@ -64,9 +64,13 @@ def test_default_parameters_control_new_fields():
         assert field.n_iter == 1
         assert field.n_iter_mask == 2
         assert nmt.get_default_params()["tol_pinv_default"] == 1e-8
+        for calculator in ("jax", "jax-single", "jax-mgpu"):
+            nmt.set_sht_calculator(calculator)
+            assert nmt.get_default_params()["sht_calculator"] == calculator
         with pytest.raises(KeyError, match="jax"):
             nmt.set_sht_calculator("healpy")
     finally:
         nmt.set_n_iter_default(original["n_iter_default"])
         nmt.set_n_iter_default(original["n_iter_mask_default"], mask=True)
         nmt.set_tol_pinv_default(original["tol_pinv_default"])
+        nmt.set_sht_calculator(original["sht_calculator"])
