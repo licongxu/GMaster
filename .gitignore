@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+dist/
+build/
+
+# Native / CUDA
+*.o
+*.a
+*.so
+*.ptx
+*.cubin
+*.fatbin
+
+# Secrets / local env
+.env
+.env.*
