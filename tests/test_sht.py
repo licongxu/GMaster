@@ -160,7 +160,7 @@ def test_fused_scalar_transforms_match_namaster_and_generic_jax():
             for n_iter in (0, 1)
         ]
 
-        nmt.set_sht_calculator("jax-single")
+        nmt.set_sht_calculator("jax-generic")
         generic_map = nmt.alm2map(alms, 0, minfo, ainfo)
         generic_alms = [
             nmt.map2alm(fused_map, 0, minfo, ainfo, n_iter=n_iter)
@@ -219,7 +219,7 @@ def test_fused_scalar_transform_gradients_match_generic_jax():
         fused_analysis_grad = jax.jit(jax.grad(fused_analysis_loss))(maps)
         fused_synthesis_grad = jax.jit(jax.grad(fused_synthesis_loss))(alms)
 
-        nmt.set_sht_calculator("jax-single")
+        nmt.set_sht_calculator("jax-generic")
 
         def generic_analysis_loss(values):
             transformed = nmt.map2alm(
@@ -269,5 +269,30 @@ def test_multi_gpu_transforms_match_single_gpu(spin):
         multi_map = nmt.alm2map(multi_alm, spin, minfo, ainfo)
         np.testing.assert_allclose(multi_alm, single_alm, atol=1e-12)
         np.testing.assert_allclose(multi_map, single_map, atol=1e-12)
+    finally:
+        nmt.set_sht_calculator(original)
+
+
+@pytest.mark.skipif(
+    len([device for device in jax.devices() if device.platform == "gpu"]) < 2,
+    reason="requires two GPUs",
+)
+def test_fused_multi_gpu_scalar_transforms_match_single_gpu():
+    nside = 64
+    ainfo = nmt.NmtAlmInfo(3 * nside - 1)
+    minfo = nmt.NmtMapInfo(None, (12 * nside**2,))
+    rng = np.random.default_rng(64)
+    maps = rng.normal(size=(1, minfo.npix))
+    alms = _random_alms(rng, 1, ainfo, spin=0)
+    original = nmt.nmt_params.sht_calculator
+    try:
+        nmt.set_sht_calculator("jax")
+        single_alm = nmt.map2alm(maps, 0, minfo, ainfo, n_iter=1)
+        single_map = nmt.alm2map(alms, 0, minfo, ainfo)
+        nmt.set_sht_calculator("jax-mgpu")
+        multi_alm = nmt.map2alm(maps, 0, minfo, ainfo, n_iter=1)
+        multi_map = nmt.alm2map(alms, 0, minfo, ainfo)
+        np.testing.assert_allclose(multi_alm, single_alm, atol=2e-13)
+        np.testing.assert_allclose(multi_map, single_map, atol=2e-12)
     finally:
         nmt.set_sht_calculator(original)

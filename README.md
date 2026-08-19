@@ -83,16 +83,19 @@ than a GPU scatter; at `L=384` this unpack kernel fell from 0.925 s to 0.00161 s
 Spin E/B alms are fused directly into one complex harmonic grid so full E, B,
 and combined grids are not simultaneously materialized.
 
-The default `jax` calculator selects the fused scalar kernel on NVIDIA GPUs and
-continues to select two GPUs for generic spin transforms at `L>=768` when they
-are available. Selection can be controlled explicitly:
+The default `jax` calculator selects the fused scalar kernel on NVIDIA GPUs,
+shards it across two GPUs at `L>=2048` when available, and continues to select
+two GPUs for generic spin transforms at `L>=768`. Traced/autodifferentiated
+scalar calls stay on one GPU because the explicit cross-device staging is not a
+JAX primitive. Selection can be controlled explicitly:
 
 ```python
 import gmaster as nmt
 
 nmt.set_sht_calculator("jax")         # automatic, the default
-nmt.set_sht_calculator("jax-single")  # force one device
+nmt.set_sht_calculator("jax-single")  # force one fused device
 nmt.set_sht_calculator("jax-mgpu")    # request two devices
+nmt.set_sht_calculator("jax-generic") # force generic S2FFT reference path
 ```
 
 On two RTX PRO 6000 Blackwell GPUs, warmed scalar analysis at `Nside=512`
@@ -118,6 +121,11 @@ previous GPU algorithm, but it does **not** yet beat DUCC. The demonstrated
 NaMaster speedups apply to the MASTER coupling, flat-workspace, and covariance
 kernels above.
 
+At `Nside=1024`, two fused GPUs improve analysis from 0.2532 s to 0.2092 s
+(1.21x) and synthesis from 0.4556 s to 0.3168 s (1.44x). At `Nside=512`, PCIe
+staging outweighs the analysis gain, which is why automatic sharding starts at
+`L=2048` rather than whenever a second GPU exists.
+
 ## Nside 4096 memory
 
 At `Nside=4096`, one float64 HEALPix map is 1.50 GiB and one packed complex128
@@ -137,16 +145,23 @@ CUDA_VISIBLE_DEVICES=0,1 XLA_PYTHON_CLIENT_PREALLOCATE=false \
 A full scalar `Nside=4096`, `lmax=12287`, `n_iter=0` constant-sky analysis now
 runs on one GPU. First compilation plus execution took 182.0 s and the warmed
 transform took 12.248 s, 18.2x faster than the former 222.4 s generic two-GPU
-path. It returned `a00=3.544907701811031+1.2e-16j`, matching `sqrt(4*pi)`.
+path. The fused two-GPU path takes 7.059 s, a further 1.74x improvement and a
+31.5x total GPU-algorithm speedup. It returned
+`a00=3.544907701811031+1.2e-16j`, matching `sqrt(4*pi)`.
 Comparison of all 75.5 million packed coefficients with NaMaster gave maximum
 absolute difference `4.78e-13` (relative `1.35e-13`). NaMaster took 1.764 s, so
-the exact fused transform is still 6.95x slower than DUCC.
+the exact fused transforms remain 6.95x (one GPU) and 4.03x (two GPUs) slower
+than DUCC.
 
 Actual device telemetry peaked at 36,652 MiB including the 236 MiB baseline,
 or about 35.6 GiB incremental. This removes the former 32 GiB allocation on a
 second GPU. Use a device with at least 48 GiB free for allocator and FFT
 workspace headroom. XLA allocator pools can exceed the principal-array inventory
 reported by `benchmark_nside4096_memory`.
+
+For the fused two-GPU run, the primary peak was unchanged and the secondary
+needed about 9.9 GiB beyond its existing allocation, versus roughly 32 GiB for
+the old generic replica.
 
 Use `lite=True` for fields when input maps and templates do not need to remain
 resident after their alms are computed. Device-resident JAX masks are accepted
@@ -164,7 +179,7 @@ Run the parity suite on CPU with:
 JAX_ENABLE_X64=1 JAX_PLATFORMS=cpu python -m pytest -q
 ```
 
-The current CPU suite contains 111 passing tests and 4 hardware-dependent skips,
+The current CPU suite contains 111 passing tests and 5 hardware-dependent skips,
 including direct API/numerical comparisons against NaMaster. Dedicated NVIDIA
 tests cover fused scalar parity and gradients; two-GPU tests cover scalar and
 spin-2 analysis, synthesis, and Jacobi refinement.

@@ -61,8 +61,10 @@ def _analysis_kernel(
     L,
     ntheta,
     block_size,
+    m_start,
 ):
-    m = pl.program_id(0)
+    local_m = pl.program_id(0)
+    m = local_m + m_start
     m_float = m.astype(jnp.float64)
     offsets = jnp.arange(block_size)
     diagonal = plt.load(diagonal_ref.at[m])
@@ -92,12 +94,12 @@ def _analysis_kernel(
         real = jnp.sum(values * (north_real + parity * south_real))
         imag = jnp.sum(values * (north_imag + parity * south_imag))
         plt.store(
-            out_real_ref.at[ell, m],
-            plt.load(out_real_ref.at[ell, m]) + real,
+            out_real_ref.at[ell, local_m],
+            plt.load(out_real_ref.at[ell, local_m]) + real,
         )
         plt.store(
-            out_imag_ref.at[ell, m],
-            plt.load(out_imag_ref.at[ell, m]) + imag,
+            out_imag_ref.at[ell, local_m],
+            plt.load(out_imag_ref.at[ell, local_m]) + imag,
         )
 
     def latitude_chunk(chunk, _):
@@ -108,16 +110,20 @@ def _analysis_kernel(
         sine = plt.load(sine_ref.at[theta], mask=valid, other=1.0)
         cosine = plt.load(cosine_ref.at[theta], mask=valid, other=0.0)
         north_real = plt.load(
-            ftm_real_ref.at[theta, m], mask=valid, other=0.0
+            ftm_real_ref.at[theta, local_m], mask=valid, other=0.0
         )
         north_imag = plt.load(
-            ftm_imag_ref.at[theta, m], mask=valid, other=0.0
+            ftm_imag_ref.at[theta, local_m], mask=valid, other=0.0
         )
         south_real = plt.load(
-            ftm_real_ref.at[south_theta, m], mask=has_pair, other=0.0
+            ftm_real_ref.at[south_theta, local_m],
+            mask=has_pair,
+            other=0.0,
         )
         south_imag = plt.load(
-            ftm_imag_ref.at[south_theta, m], mask=has_pair, other=0.0
+            ftm_imag_ref.at[south_theta, local_m],
+            mask=has_pair,
+            other=0.0,
         )
         north_real, north_imag = apply_factor(
             north_real, north_imag, theta, valid
@@ -199,8 +205,10 @@ def _synthesis_kernel(
     L,
     ntheta,
     block_size,
+    m_start,
 ):
-    m = pl.program_id(0)
+    local_m = pl.program_id(0)
+    m = local_m + m_start
     chunk = pl.program_id(1)
     m_float = m.astype(jnp.float64)
     theta = chunk * block_size + jnp.arange(block_size)
@@ -217,8 +225,8 @@ def _synthesis_kernel(
         diagonal < 0, -jnp.ones_like(sine), jnp.ones_like(sine)
     ) * jnp.exp2(log2_scale - scale_exponent)
 
-    alm_real = plt.load(alm_real_ref.at[m, m])
-    alm_imag = plt.load(alm_imag_ref.at[m, m])
+    alm_real = plt.load(alm_real_ref.at[m, local_m])
+    alm_imag = plt.load(alm_imag_ref.at[m, local_m])
     value = _scaled_value(qmm, scale_exponent)
     result_real = value * alm_real
     result_imag = value * alm_imag
@@ -228,10 +236,10 @@ def _synthesis_kernel(
     qm1 = jnp.sqrt(2.0 * m_float + 3.0) * cosine * qmm
     first_valid = m + 1 < L
     alm_real = plt.load(
-        alm_real_ref.at[m + 1, m], mask=first_valid, other=0.0
+        alm_real_ref.at[m + 1, local_m], mask=first_valid, other=0.0
     )
     alm_imag = plt.load(
-        alm_imag_ref.at[m + 1, m], mask=first_valid, other=0.0
+        alm_imag_ref.at[m + 1, local_m], mask=first_valid, other=0.0
     )
     value = _scaled_value(qm1, scale_exponent)
     result_real += value * alm_real
@@ -259,8 +267,8 @@ def _synthesis_kernel(
         )
         current = coefficient_1 * cosine * qm1 - coefficient_2 * qm2
         value = _scaled_value(current, scale_exponent)
-        alm_real = plt.load(alm_real_ref.at[ell, m])
-        alm_imag = plt.load(alm_imag_ref.at[ell, m])
+        alm_real = plt.load(alm_real_ref.at[ell, local_m])
+        alm_imag = plt.load(alm_imag_ref.at[ell, local_m])
         result_real += value * alm_real
         result_imag += value * alm_imag
         parity = 1.0 - 2.0 * jnp.bitwise_and(ell + m, 1).astype(jnp.float64)
@@ -333,33 +341,39 @@ def _synthesis_kernel(
             + south_cosine * south_result_imag
         ),
     )
-    plt.store(out_real_ref.at[theta, m], result_real, mask=valid)
-    plt.store(out_imag_ref.at[theta, m], result_imag, mask=valid)
+    plt.store(out_real_ref.at[theta, local_m], result_real, mask=valid)
+    plt.store(out_imag_ref.at[theta, local_m], result_imag, mask=valid)
     plt.store(
-        out_real_ref.at[south_theta, m], south_result_real, mask=has_pair
+        out_real_ref.at[south_theta, local_m],
+        south_result_real,
+        mask=has_pair,
     )
     plt.store(
-        out_imag_ref.at[south_theta, m], south_result_imag, mask=has_pair
+        out_imag_ref.at[south_theta, local_m],
+        south_result_imag,
+        mask=has_pair,
     )
 
 
 def _scalar_forward_latitudinal_impl(
-    positive, theta, weights, phase, L, block_size
+    positive, theta, weights, phase, L, block_size, m_start
 ):
     sine = jnp.sin(theta)
     cosine = jnp.cos(theta)
     diagonal = jnp.asarray(_diagonal_normalization(L))
-    zeros = jnp.zeros((L, L), dtype=jnp.float64)
-    shape = jax.ShapeDtypeStruct((L, L), jnp.float64)
+    m_count = positive.shape[1]
+    zeros = jnp.zeros((L, m_count), dtype=jnp.float64)
+    shape = jax.ShapeDtypeStruct((L, m_count), jnp.float64)
     real, imag = pl.pallas_call(
         partial(
             _analysis_kernel,
             L=L,
             ntheta=len(theta),
             block_size=block_size,
+            m_start=m_start,
         ),
         out_shape=(shape, shape),
-        grid=(L,),
+        grid=(m_count,),
         input_output_aliases={7: 0, 8: 1},
         compiler_params=plt.CompilerParams(num_warps=2),
         name="gmaster_scalar_analysis",
@@ -378,22 +392,24 @@ def _scalar_forward_latitudinal_impl(
 
 
 def _scalar_inverse_latitudinal_impl(
-    positive_alm, theta, weights, phase, L, block_size
+    positive_alm, theta, weights, phase, L, block_size, m_start
 ):
     sine = jnp.sin(theta)
     cosine = jnp.cos(theta)
     diagonal = jnp.asarray(_diagonal_normalization(L))
-    zeros = jnp.zeros((len(theta), L), dtype=jnp.float64)
-    shape = jax.ShapeDtypeStruct((len(theta), L), jnp.float64)
+    m_count = positive_alm.shape[1]
+    zeros = jnp.zeros((len(theta), m_count), dtype=jnp.float64)
+    shape = jax.ShapeDtypeStruct((len(theta), m_count), jnp.float64)
     real, imag = pl.pallas_call(
         partial(
             _synthesis_kernel,
             L=L,
             ntheta=len(theta),
             block_size=block_size,
+            m_start=m_start,
         ),
         out_shape=(shape, shape),
-        grid=(L, pl.cdiv((len(theta) + 1) // 2, block_size)),
+        grid=(m_count, pl.cdiv((len(theta) + 1) // 2, block_size)),
         input_output_aliases={7: 0, 8: 1},
         compiler_params=plt.CompilerParams(num_warps=2),
         name="gmaster_scalar_synthesis",
@@ -411,29 +427,29 @@ def _scalar_inverse_latitudinal_impl(
     return real + 1j * imag
 
 
-@partial(jax.custom_vjp, nondiff_argnums=(4, 5))
+@partial(jax.custom_vjp, nondiff_argnums=(4, 5, 6))
 def _scalar_forward_adjoint(
-    positive_ftm, theta, weights, phase, L, block_size
+    positive_ftm, theta, weights, phase, L, block_size, m_start
 ):
     return _scalar_forward_latitudinal_impl(
-        positive_ftm, theta, weights, phase, L, block_size
+        positive_ftm, theta, weights, phase, L, block_size, m_start
     )
 
 
 def _scalar_forward_fwd(
-    positive_ftm, theta, weights, phase, L, block_size
+    positive_ftm, theta, weights, phase, L, block_size, m_start
 ):
     result = _scalar_forward_latitudinal_impl(
-        positive_ftm, theta, weights, phase, L, block_size
+        positive_ftm, theta, weights, phase, L, block_size, m_start
     )
     return result, (theta, weights, phase)
 
 
-def _scalar_forward_bwd(L, block_size, residual, cotangent):
+def _scalar_forward_bwd(L, block_size, m_start, residual, cotangent):
     theta, weights, phase = residual
     return (
         _scalar_inverse_latitudinal_impl(
-            cotangent, theta, weights, phase, L, block_size
+            cotangent, theta, weights, phase, L, block_size, m_start
         ),
         jnp.zeros_like(theta),
         jnp.zeros_like(weights),
@@ -444,29 +460,29 @@ def _scalar_forward_bwd(L, block_size, residual, cotangent):
 _scalar_forward_adjoint.defvjp(_scalar_forward_fwd, _scalar_forward_bwd)
 
 
-@partial(jax.custom_vjp, nondiff_argnums=(4, 5))
+@partial(jax.custom_vjp, nondiff_argnums=(4, 5, 6))
 def _scalar_inverse_adjoint(
-    positive_alm, theta, weights, phase, L, block_size
+    positive_alm, theta, weights, phase, L, block_size, m_start
 ):
     return _scalar_inverse_latitudinal_impl(
-        positive_alm, theta, weights, phase, L, block_size
+        positive_alm, theta, weights, phase, L, block_size, m_start
     )
 
 
 def _scalar_inverse_fwd(
-    positive_alm, theta, weights, phase, L, block_size
+    positive_alm, theta, weights, phase, L, block_size, m_start
 ):
     result = _scalar_inverse_latitudinal_impl(
-        positive_alm, theta, weights, phase, L, block_size
+        positive_alm, theta, weights, phase, L, block_size, m_start
     )
     return result, (theta, weights, phase)
 
 
-def _scalar_inverse_bwd(L, block_size, residual, cotangent):
+def _scalar_inverse_bwd(L, block_size, m_start, residual, cotangent):
     theta, weights, phase = residual
     return (
         _scalar_forward_latitudinal_impl(
-            cotangent, theta, weights, phase, L, block_size
+            cotangent, theta, weights, phase, L, block_size, m_start
         ),
         jnp.zeros_like(theta),
         jnp.zeros_like(weights),
@@ -477,7 +493,7 @@ def _scalar_inverse_bwd(L, block_size, residual, cotangent):
 _scalar_inverse_adjoint.defvjp(_scalar_inverse_fwd, _scalar_inverse_bwd)
 
 
-@partial(jax.jit, static_argnames=("L", "block_size"))
+@partial(jax.jit, static_argnames=("L", "block_size", "m_start"))
 def scalar_forward_latitudinal(
     positive_ftm,
     theta,
@@ -486,15 +502,16 @@ def scalar_forward_latitudinal(
     *,
     L,
     block_size=256,
+    m_start=0,
 ):
     weights = jnp.ones_like(theta) if weights is None else weights
     phase = jnp.zeros_like(theta) if phase is None else phase
     return _scalar_forward_adjoint(
-        positive_ftm, theta, weights, phase, L, block_size
+        positive_ftm, theta, weights, phase, L, block_size, m_start
     )
 
 
-@partial(jax.jit, static_argnames=("L", "block_size"))
+@partial(jax.jit, static_argnames=("L", "block_size", "m_start"))
 def scalar_inverse_latitudinal(
     positive_alm,
     theta,
@@ -503,9 +520,10 @@ def scalar_inverse_latitudinal(
     *,
     L,
     block_size=256,
+    m_start=0,
 ):
     weights = jnp.ones_like(theta) if weights is None else weights
     phase = jnp.zeros_like(theta) if phase is None else phase
     return _scalar_inverse_adjoint(
-        positive_alm, theta, weights, phase, L, block_size
+        positive_alm, theta, weights, phase, L, block_size, m_start
     )

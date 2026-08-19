@@ -29,9 +29,10 @@ nmt_params = NmtParams()
 
 
 def set_sht_calculator(calc_name):
-    if calc_name not in ("jax", "jax-single", "jax-mgpu"):
+    if calc_name not in ("jax", "jax-single", "jax-mgpu", "jax-generic"):
         raise KeyError(
-            "GMaster's SHT calculator must be 'jax', 'jax-single', or 'jax-mgpu'"
+            "GMaster's SHT calculator must be 'jax', 'jax-single', "
+            "'jax-mgpu', or 'jax-generic'"
         )
     nmt_params.sht_calculator = calc_name
 
@@ -564,13 +565,17 @@ def _run_blocking(transform, array):
 
 def _use_multi_gpu_sht(L):
     calculator = nmt_params.sht_calculator
-    if calculator == "jax-single" or len(_gpu_devices()) < 2:
+    if calculator in ("jax-single", "jax-generic") or len(_gpu_devices()) < 2:
         return False
     return calculator == "jax-mgpu" or L >= 768
 
 
 def _use_pallas_sht(L, spin):
-    if nmt_params.sht_calculator != "jax" or spin != 0 or L < 128:
+    if (
+        nmt_params.sht_calculator not in ("jax", "jax-single", "jax-mgpu")
+        or spin != 0
+        or L < 128
+    ):
         return False
     return any(
         device.platform == "gpu" and "NVIDIA" in device.device_kind.upper()
@@ -580,6 +585,24 @@ def _use_pallas_sht(L, spin):
 
 def _pallas_block_size(nside):
     return min(1024, 2 * nside)
+
+
+def _use_multi_gpu_pallas(L, values):
+    if len(_gpu_devices()) < 2 or isinstance(values, jax.core.Tracer):
+        return False
+    calculator = nmt_params.sht_calculator
+    return calculator == "jax-mgpu" or (calculator == "jax" and L >= 2048)
+
+
+@lru_cache(maxsize=16)
+def _pallas_order_split(L):
+    approximate = round(L * (1 - 1 / np.sqrt(2)))
+    candidates = range(max(1, approximate - 2), min(L, approximate + 3))
+    total = L * (L + 1) // 2
+    return min(
+        candidates,
+        key=lambda split: abs(split * (2 * L - split + 1) - total),
+    )
 
 
 def _pallas_fft_method():
@@ -845,6 +868,131 @@ def _map2alm_core_pallas(
     return alm
 
 
+@partial(jax.jit, static_argnames=("split",))
+def _pack_pallas_parts(low, high, ell, order, *, split):
+    low_order = jnp.minimum(order, split - 1)
+    high_order = jnp.clip(order - split, 0, high.shape[1] - 1)
+    return jnp.where(
+        order < split,
+        low[ell, low_order],
+        high[ell, high_order],
+    )
+
+
+def _pallas_parameters(L, nside):
+    theta = _stable_thetas(L, nside)
+    weights = quadrature_jax.quad_weights_transform(L, "healpix", nside)
+    phase = healpix_ffts.p2phi_rings_jax(jnp.arange(len(theta)), nside)
+    return theta, weights, phase
+
+
+def _map2alm_once_pallas_multi_gpu(maps, ell, order, *, nside, L_work):
+    primary, secondary = _gpu_devices()[:2]
+    maps = _copy_to_device(maps, primary)
+    ftm = _forward_healpix_fft(maps[0], L=L_work, nside=nside, reality=True)
+    positive = ftm[:, L_work:]
+    split = _pallas_order_split(L_work)
+    high_input = _copy_to_device(positive[:, split:], secondary)
+    theta, weights, phase = _pallas_parameters(L_work, nside)
+    other_theta = _copy_to_device(theta, secondary)
+    other_weights = _copy_to_device(weights, secondary)
+    other_phase = _copy_to_device(phase, secondary)
+    block_size = _pallas_block_size(nside)
+
+    def low_transform(values):
+        return scalar_forward_latitudinal(
+            values,
+            theta,
+            weights=weights,
+            phase=-phase,
+            L=L_work,
+            block_size=block_size,
+        )
+
+    def high_transform(values):
+        return scalar_forward_latitudinal(
+            values,
+            other_theta,
+            weights=other_weights,
+            phase=-other_phase,
+            L=L_work,
+            block_size=block_size,
+            m_start=split,
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        low_future = executor.submit(
+            _run_blocking, low_transform, positive[:, :split]
+        )
+        high_future = executor.submit(_run_blocking, high_transform, high_input)
+        low, high = low_future.result(), high_future.result()
+    high = _copy_to_device(high, primary)
+    packed = _pack_pallas_parts(low, high, ell, order, split=split)
+    return packed[None, :]
+
+
+def _alm2map_core_pallas_multi_gpu(alm, *, nside, L, L_work):
+    primary, secondary = _gpu_devices()[:2]
+    alm = _copy_to_device(alm, primary)
+    positive = _positive_alm(alm[0], L=L, L_work=L_work)
+    split = _pallas_order_split(L_work)
+    high_input = _copy_to_device(positive[:, split:], secondary)
+    theta = _stable_thetas(L_work, nside)
+    phase = healpix_ffts.p2phi_rings_jax(jnp.arange(len(theta)), nside)
+    other_theta = _copy_to_device(theta, secondary)
+    other_phase = _copy_to_device(phase, secondary)
+    block_size = _pallas_block_size(nside)
+
+    def low_transform(values):
+        return scalar_inverse_latitudinal(
+            values,
+            theta,
+            phase=phase,
+            L=L_work,
+            block_size=block_size,
+        )
+
+    def high_transform(values):
+        return scalar_inverse_latitudinal(
+            values,
+            other_theta,
+            phase=other_phase,
+            L=L_work,
+            block_size=block_size,
+            m_start=split,
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        low_future = executor.submit(
+            _run_blocking, low_transform, positive[:, :split]
+        )
+        high_future = executor.submit(_run_blocking, high_transform, high_input)
+        low, high = low_future.result(), high_future.result()
+    high = _copy_to_device(high, primary)
+    ftm_positive = jnp.concatenate((low, high), axis=1)
+    maps = _finish_inverse_pallas(ftm_positive, L=L_work, nside=nside)
+    return jnp.real(maps)[None, :]
+
+
+def _map2alm_core_pallas_multi_gpu(
+    maps, ell, order, *, nside, L, L_work, n_iter
+):
+    alm = _map2alm_once_pallas_multi_gpu(
+        maps, ell, order, nside=nside, L_work=L_work
+    )
+    for _ in range(n_iter):
+        residual = (
+            _alm2map_core_pallas_multi_gpu(
+                alm, nside=nside, L=L, L_work=L_work
+            )
+            - maps
+        )
+        alm -= _map2alm_once_pallas_multi_gpu(
+            residual, ell, order, nside=nside, L_work=L_work
+        )
+    return alm
+
+
 def _alm2map_core_multi_gpu(alm, ell, order, *, spin, nside, L, L_work):
     if spin == 0:
         elm = _unpack_real(alm[0], L, L_work)
@@ -941,6 +1089,16 @@ def map2alm(map, spin, map_info, alm_info, *, n_iter):
     L = alm_info.lmax + 1
     L_work = max(L, 2 * map_info.nside)
     if _use_pallas_sht(L_work, spin):
+        if _use_multi_gpu_pallas(L_work, maps):
+            return _map2alm_core_pallas_multi_gpu(
+                maps,
+                alm_info._ell,
+                alm_info._m,
+                nside=map_info.nside,
+                L=L,
+                L_work=L_work,
+                n_iter=int(n_iter),
+            )
         return _map2alm_core_pallas(
             maps,
             alm_info._ell,
@@ -986,6 +1144,10 @@ def alm2map(alm, spin, map_info, alm_info):
     L = alm_info.lmax + 1
     L_work = max(L, 2 * map_info.nside)
     if _use_pallas_sht(L_work, spin):
+        if _use_multi_gpu_pallas(L_work, alm):
+            return _alm2map_core_pallas_multi_gpu(
+                alm, nside=map_info.nside, L=L, L_work=L_work
+            )
         return _alm2map_core_pallas(
             alm, nside=map_info.nside, L=L, L_work=L_work
         )
