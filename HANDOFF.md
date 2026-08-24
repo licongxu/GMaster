@@ -255,6 +255,14 @@ missing GPU counter permissions and CPU interpreter.
 
 ### Session 3 status: block_size tuning confirmed; remaining levers identified
 
+- Tile-parallel analysis (split latitude tiles across the grid, 3D partials
+  buffer `(num_tiles, m_count, L)` + final `jnp.sum` over the tile axis,
+  replacing the per-degree global RMW) was TRIED and REVERTED: it changed
+  analysis by <1% (Nside 512: 27.3->26.5ms; Nside 1024: 193->189ms) but adds a
+  3D partials buffer that is small at 512 (0.33GB/dir) but ~50GB/dir at Nside
+  4096 — prohibitive. The per-degree RMW was NOT the bottleneck; the 3D buffer
+  + reduction pass cost ~= the RMW it removed. Do NOT re-attempt unless the
+  RMW is first proven to be the stall via ncu.
 - `block_size` default lowered from `min(1024, 2*nside)` to `min(512, 2*nside)`
   in `_pallas_block_size`. Validated: GPU SHT+utils tests 14 passed / 3 skipped.
   Effect: synthesis ~1.5-1.6x faster at Nside >= 1024 (171ms vs 260ms at
