@@ -55,6 +55,52 @@ therefore remain on one GPU; `_use_multi_gpu_pallas` detects JAX tracers.
 Hardware: two RTX PRO 6000 Blackwell GPUs. Physical GPU 0 also hosted VLLM with
 about 64.8 GiB allocated, so runs used `CUDA_VISIBLE_DEVICES=1,0`.
 
+### Session update (ring-FFT rewrite and recurrence tables)
+
+Two structural changes landed on top of the fused-kernel work:
+
+1. **Batched chirp-Z ring FFT** (`gmaster/utils.py`, `_forward_ring_fft` /
+   `_inverse_ring_fft`). Replaces s2fft's per-ring-size JAX path (which unrolls
+   ~nside tiny polar FFT groups) with ONE uniform batched chirp-Z transform over
+   all rings per direction. Chirp angles are reduced exactly with integer
+   modular arithmetic (`q^2 mod 2*nside`) so no precision is lost to large
+   arguments. Verified against `healpix_ffts.healpix_fft/healpix_ifft` to
+   `<=5e-13` at Nside 512 on identical grids. Measured at Nside 512:
+   forward 20.2 ms -> 4.8 ms, inverse 31.1 ms -> 10.7 ms.
+2. **Normalized-recurrence coefficient tables** (`gmaster/_sht_pallas.py`,
+   `_normalized_coefficients_numpy`). The stable normalized recurrence keeps
+   its exact arithmetic, but `c1/c2` are now computed once as parallel vector
+   ops outside the kernel and loaded per degree, removing two square roots and
+   a division from the sequential chain. Analysis/synthesis inputs, outputs,
+   and accumulators use transposed layouts for contiguous streaming.
+   An unnormalized-recurrence variant (DLMF 14.10.7 with deferred K
+   normalization) was implemented and REJECTED: it is numerically unstable in
+   forward-l order because P_l^m is the minimal solution for m > 0; measured
+   relative error 5.8e-5 versus the 3e-11 gate.
+
+Measured end-to-end (warmed, this session):
+
+| Case | Before | After | NaMaster | Accuracy |
+|---|---:|---:|---:|---|
+| Nside 512 analysis | 45.0 ms | 25.3 ms | 14.2 ms | max abs `1.94e-14`, rel `2.5e-12` |
+| Nside 512 synthesis | 51.7 ms | 29.4 ms | 11.5 ms | max abs `3.24e-8`, rel `1.03e-11` |
+| Nside 1024 analysis | ~200 ms | 177 ms | ~55 ms | max abs `2.06e-14` |
+| Nside 4096 analysis, 1 GPU | 12.248 s | 10.843 s | ~1.76 s | `a00=sqrt(4pi)` to 1e-15 |
+| Nside 4096 compile | 182 s | 51 s | - | - |
+
+Multi-GPU staging still loses below L~2048 because cross-device copies pass
+through host memory; unchanged this session. `num_warps=2` remains optimal;
+block_size 512 is slightly better than 1024 for analysis (~20%).
+
+Profiling note: `ncu` is installed but GPU performance-counter permission is
+missing (`ERR_NVGPUCTRPERM`). Granting counters would enable stall-reason
+analysis of the fused kernel.
+
+### Previous baseline
+
+Hardware: two RTX PRO 6000 Blackwell GPUs. Physical GPU 0 also hosted VLLM with
+about 64.8 GiB allocated, so runs used `CUDA_VISIBLE_DEVICES=1,0`.
+
 | Case | GMaster | Comparison | Accuracy |
 |---|---:|---:|---:|
 | Nside 512 analysis, fused 1 GPU | 0.0470 s | 17.2x faster than generic GPU; 2.27x slower than NaMaster | max abs `1.93e-14` |
@@ -118,17 +164,23 @@ both generic estimates and fused principal arrays.
 
 ## Recommended next work
 
-1. Commit the current two-GPU changes after reviewing `git diff --check` and the
-   test results above.
-2. Profile the fused high-resolution recurrence for achieved FP64 throughput and
-   register/local-memory traffic. Further constant-factor tuning is unlikely to
-   close the remaining 4x DUCC gap; a compressed/butterfly fast Legendre
-   transform is the likely mathematical route, but it must have bounded
-   Nside-4096 precomputation memory and exact validation.
-3. Generalize the persistent recurrence to spin-weighted harmonics so spin-2
+1. Commit the current ring-FFT rewrite and recurrence-table changes after
+   reviewing `git diff --check` and the test results above (all suites green:
+   CPU 111 passed, GPU 14 passed, two-GPU 3 passed).
+2. Close the remaining ~1.8x SHT gap with double-single fp32 emulation of the
+   recurrence hot loop. The GPU's FP64 peak is 1.89 TFLOP/s versus 238 TFLOP/s
+   FP32, so even 10x-emulation overhead wins. Design: keep seeds, phase
+   rotations, `_scaled_value` reconstruction, and lane reductions in fp64
+   (cheap); convert only the recurrence state `(qm1, qm2)` and coefficient
+   products to Dekker two-product/two-sum fp32 pairs (~40 fp32 ops per degree
+   replacing 6 fp64). Validate every stage against the fp64 kernel; watch for
+   Triton FMA contraction breaking error-free transforms (empirically test
+   before trusting Dekker splits).
+3. Grant GPU performance-counter permission (`ERR_NVGPUCTRPERM`) so `ncu` can
+   attribute stalls in the fused kernel; measured throughput is ~30% of the
+   FP64 peak with unknown stall mix.
+4. Generalize the persistent recurrence to spin-weighted harmonics so spin-2
    fields do not fall back to generic S2FFT. Derive and test signs/conventions
    against NaMaster before benchmarking.
-4. Make the upstream CUDA HEALPix FFT a documented optional build and validate
-   its small-ring failure modes before enabling it by default in release builds.
 5. Execute full-band Nside-4096 synthesis and spin-2 memory telemetry; only
    scalar analysis has been run end to end at that size.

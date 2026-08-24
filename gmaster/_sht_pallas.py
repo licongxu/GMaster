@@ -19,14 +19,41 @@ def _diagonal_normalization(L):
     return values
 
 
-def _scaled_value(value, exponent):
-    biased = (exponent.astype(jnp.int64) + 1023) << 52
-    factor = lax.bitcast_convert_type(biased, jnp.float64)
-    factor = jnp.where(exponent >= -1022, factor, 0.0)
-    return value * factor
+@lru_cache(maxsize=128)
+def _normalized_coefficients_numpy(L, m_start, m_count):
+    """Stable normalized-recurrence coefficient tables c1[l, m], c2[l, m].
+
+    Computed as parallel vector operations outside the kernel so the
+    sequential degree loop performs no square roots or divisions.
+    """
+    m = (m_start + np.arange(m_count, dtype=np.float64))[:, None]
+    ell = np.arange(L, dtype=np.float64)[None, :]
+    denominator = ell**2 - m**2
+    safe = np.where(denominator > 0.0, denominator, 1.0)
+    valid = denominator > 0.0
+    with np.errstate(invalid="ignore"):
+        c1 = np.sqrt((4.0 * ell**2 - 1.0) / safe)
+        c2 = np.sqrt(
+            (2.0 * ell + 1.0)
+            / (2.0 * ell - 3.0)
+            * ((ell - 1.0) ** 2 - m**2)
+            / safe
+        )
+    c1 = np.where(valid, c1, 0.0)
+    c2 = np.where(valid, c2, 0.0)
+    return c1, c2
 
 
-def _renormalize(previous, current, exponent):
+def _initial_factor(exponent):
+    """Exact power-of-two scale factor; zero below the double range."""
+    return jnp.where(
+        exponent >= -1022,
+        lax.exp2(exponent.astype(jnp.float64)),
+        0.0,
+    )
+
+
+def _renormalize_with_factor(previous, current, exponent, factor):
     largest = jnp.maximum(jnp.abs(previous), jnp.abs(current))
     large = largest > 2.0**100
     small = (largest < 2.0**-100) & (largest > 0)
@@ -34,14 +61,21 @@ def _renormalize(previous, current, exponent):
         large, 2.0**-100, jnp.where(small, 2.0**100, 1.0)
     )
     exponent += jnp.where(large, 100, jnp.where(small, -100, 0))
-    return previous * multiplier, current * multiplier, exponent
+    factor = jnp.where(
+        large | small,
+        _initial_factor(exponent),
+        factor,
+    )
+    return previous * multiplier, current * multiplier, exponent, factor
 
 
-def _renormalize_periodically(previous, current, exponent, ell, m):
+def _renormalize_periodically(previous, current, exponent, factor, ell, m):
     return lax.cond(
         jnp.bitwise_and(ell - m, 15) == 0,
-        lambda: _renormalize(previous, current, exponent),
-        lambda: (previous, current, exponent),
+        lambda: _renormalize_with_factor(
+            previous, current, exponent, factor
+        ),
+        lambda: (previous, current, exponent, factor),
     )
 
 
@@ -53,6 +87,8 @@ def _analysis_kernel(
     diagonal_ref,
     weight_ref,
     phase_ref,
+    coefficient_1_ref,
+    coefficient_2_ref,
     _zero_real_ref,
     _zero_imag_ref,
     out_real_ref,
@@ -94,12 +130,12 @@ def _analysis_kernel(
         real = jnp.sum(values * (north_real + parity * south_real))
         imag = jnp.sum(values * (north_imag + parity * south_imag))
         plt.store(
-            out_real_ref.at[ell, local_m],
-            plt.load(out_real_ref.at[ell, local_m]) + real,
+            out_real_ref.at[local_m, ell],
+            plt.load(out_real_ref.at[local_m, ell]) + real,
         )
         plt.store(
-            out_imag_ref.at[ell, local_m],
-            plt.load(out_imag_ref.at[ell, local_m]) + imag,
+            out_imag_ref.at[local_m, ell],
+            plt.load(out_imag_ref.at[local_m, ell]) + imag,
         )
 
     def latitude_chunk(chunk, _):
@@ -110,18 +146,18 @@ def _analysis_kernel(
         sine = plt.load(sine_ref.at[theta], mask=valid, other=1.0)
         cosine = plt.load(cosine_ref.at[theta], mask=valid, other=0.0)
         north_real = plt.load(
-            ftm_real_ref.at[theta, local_m], mask=valid, other=0.0
+            ftm_real_ref.at[local_m, theta], mask=valid, other=0.0
         )
         north_imag = plt.load(
-            ftm_imag_ref.at[theta, local_m], mask=valid, other=0.0
+            ftm_imag_ref.at[local_m, theta], mask=valid, other=0.0
         )
         south_real = plt.load(
-            ftm_real_ref.at[south_theta, local_m],
+            ftm_real_ref.at[local_m, south_theta],
             mask=has_pair,
             other=0.0,
         )
         south_imag = plt.load(
-            ftm_imag_ref.at[south_theta, local_m],
+            ftm_imag_ref.at[local_m, south_theta],
             mask=has_pair,
             other=0.0,
         )
@@ -133,12 +169,13 @@ def _analysis_kernel(
         )
         log2_scale = jnp.log2(jnp.abs(diagonal)) + m_float * jnp.log2(sine)
         scale_exponent = jnp.floor(log2_scale).astype(jnp.int32)
+        scale_factor = _initial_factor(scale_exponent)
         qmm = jnp.where(
             diagonal < 0, -jnp.ones_like(sine), jnp.ones_like(sine)
         ) * jnp.exp2(log2_scale - scale_exponent)
         add_coefficient(
             m,
-            _scaled_value(qmm, scale_exponent),
+            qmm * scale_factor,
             north_real,
             north_imag,
             south_real,
@@ -151,7 +188,7 @@ def _analysis_kernel(
         def add_first_off_diagonal():
             add_coefficient(
                 m + 1,
-                _scaled_value(qm1, scale_exponent),
+                qm1 * scale_factor,
                 north_real,
                 north_imag,
                 south_real,
@@ -159,31 +196,27 @@ def _analysis_kernel(
             )
 
         def degree_step(ell, state):
-            qm2, qm1, scale_exponent = state
-            ell_float = ell.astype(jnp.float64)
-            denominator = ell_float**2 - m_float**2
-            coefficient_1 = jnp.sqrt((4 * ell_float**2 - 1) / denominator)
-            coefficient_2 = jnp.sqrt(
-                (2 * ell_float + 1)
-                / (2 * ell_float - 3)
-                * (((ell_float - 1) ** 2 - m_float**2) / denominator)
-            )
+            qm2, qm1, scale_exponent, scale_factor = state
+            coefficient_1 = plt.load(coefficient_1_ref.at[local_m, ell])
+            coefficient_2 = plt.load(coefficient_2_ref.at[local_m, ell])
             current = coefficient_1 * cosine * qm1 - coefficient_2 * qm2
             add_coefficient(
                 ell,
-                _scaled_value(current, scale_exponent),
+                current * scale_factor,
                 north_real,
                 north_imag,
                 south_real,
                 south_imag,
             )
-            qm1, current, scale_exponent = _renormalize_periodically(
-                qm1, current, scale_exponent, ell, m
+            qm1, current, scale_exponent, scale_factor = (
+                _renormalize_periodically(
+                    qm1, current, scale_exponent, scale_factor, ell, m
+                )
             )
-            return qm1, current, scale_exponent
+            return qm1, current, scale_exponent, scale_factor
 
         lax.fori_loop(
-            m + 2, L, degree_step, (qmm, qm1, scale_exponent)
+            m + 2, L, degree_step, (qmm, qm1, scale_exponent, scale_factor)
         )
 
     lax.fori_loop(0, pl.cdiv(north_count, block_size), latitude_chunk, None)
@@ -197,6 +230,8 @@ def _synthesis_kernel(
     diagonal_ref,
     weight_ref,
     phase_ref,
+    coefficient_1_ref,
+    coefficient_2_ref,
     _zero_real_ref,
     _zero_imag_ref,
     out_real_ref,
@@ -221,13 +256,14 @@ def _synthesis_kernel(
     diagonal = plt.load(diagonal_ref.at[m])
     log2_scale = jnp.log2(jnp.abs(diagonal)) + m_float * jnp.log2(sine)
     scale_exponent = jnp.floor(log2_scale).astype(jnp.int32)
+    scale_factor = _initial_factor(scale_exponent)
     qmm = jnp.where(
         diagonal < 0, -jnp.ones_like(sine), jnp.ones_like(sine)
     ) * jnp.exp2(log2_scale - scale_exponent)
 
-    alm_real = plt.load(alm_real_ref.at[m, local_m])
-    alm_imag = plt.load(alm_imag_ref.at[m, local_m])
-    value = _scaled_value(qmm, scale_exponent)
+    alm_real = plt.load(alm_real_ref.at[local_m, m])
+    alm_imag = plt.load(alm_imag_ref.at[local_m, m])
+    value = qmm * scale_factor
     result_real = value * alm_real
     result_imag = value * alm_imag
     south_result_real = result_real
@@ -236,12 +272,12 @@ def _synthesis_kernel(
     qm1 = jnp.sqrt(2.0 * m_float + 3.0) * cosine * qmm
     first_valid = m + 1 < L
     alm_real = plt.load(
-        alm_real_ref.at[m + 1, local_m], mask=first_valid, other=0.0
+        alm_real_ref.at[local_m, m + 1], mask=first_valid, other=0.0
     )
     alm_imag = plt.load(
-        alm_imag_ref.at[m + 1, local_m], mask=first_valid, other=0.0
+        alm_imag_ref.at[local_m, m + 1], mask=first_valid, other=0.0
     )
-    value = _scaled_value(qm1, scale_exponent)
+    value = qm1 * scale_factor
     result_real += value * alm_real
     result_imag += value * alm_imag
     south_result_real -= value * alm_real
@@ -252,35 +288,33 @@ def _synthesis_kernel(
             qm2,
             qm1,
             scale_exponent,
+            scale_factor,
             result_real,
             result_imag,
             south_result_real,
             south_result_imag,
         ) = state
-        ell_float = ell.astype(jnp.float64)
-        denominator = ell_float**2 - m_float**2
-        coefficient_1 = jnp.sqrt((4 * ell_float**2 - 1) / denominator)
-        coefficient_2 = jnp.sqrt(
-            (2 * ell_float + 1)
-            / (2 * ell_float - 3)
-            * (((ell_float - 1) ** 2 - m_float**2) / denominator)
-        )
+        coefficient_1 = plt.load(coefficient_1_ref.at[local_m, ell])
+        coefficient_2 = plt.load(coefficient_2_ref.at[local_m, ell])
         current = coefficient_1 * cosine * qm1 - coefficient_2 * qm2
-        value = _scaled_value(current, scale_exponent)
-        alm_real = plt.load(alm_real_ref.at[ell, local_m])
-        alm_imag = plt.load(alm_imag_ref.at[ell, local_m])
+        value = current * scale_factor
+        alm_real = plt.load(alm_real_ref.at[local_m, ell])
+        alm_imag = plt.load(alm_imag_ref.at[local_m, ell])
         result_real += value * alm_real
         result_imag += value * alm_imag
         parity = 1.0 - 2.0 * jnp.bitwise_and(ell + m, 1).astype(jnp.float64)
         south_result_real += parity * value * alm_real
         south_result_imag += parity * value * alm_imag
-        qm1, current, scale_exponent = _renormalize_periodically(
-            qm1, current, scale_exponent, ell, m
+        qm1, current, scale_exponent, scale_factor = (
+            _renormalize_periodically(
+                qm1, current, scale_exponent, scale_factor, ell, m
+            )
         )
         return (
             qm1,
             current,
             scale_exponent,
+            scale_factor,
             result_real,
             result_imag,
             south_result_real,
@@ -288,6 +322,7 @@ def _synthesis_kernel(
         )
 
     (
+        _,
         _,
         _,
         _,
@@ -303,6 +338,7 @@ def _synthesis_kernel(
             qmm,
             qm1,
             scale_exponent,
+            scale_factor,
             result_real,
             result_imag,
             south_result_real,
@@ -361,9 +397,13 @@ def _scalar_forward_latitudinal_impl(
     sine = jnp.sin(theta)
     cosine = jnp.cos(theta)
     diagonal = jnp.asarray(_diagonal_normalization(L))
+    coefficient_1, coefficient_2 = _normalized_coefficients_numpy(
+        L, m_start, positive.shape[1]
+    )
     m_count = positive.shape[1]
-    zeros = jnp.zeros((L, m_count), dtype=jnp.float64)
-    shape = jax.ShapeDtypeStruct((L, m_count), jnp.float64)
+    transposed_input = jnp.asarray(positive).T
+    zeros = jnp.zeros((m_count, L), dtype=jnp.float64)
+    shape = jax.ShapeDtypeStruct((m_count, L), jnp.float64)
     real, imag = pl.pallas_call(
         partial(
             _analysis_kernel,
@@ -374,21 +414,23 @@ def _scalar_forward_latitudinal_impl(
         ),
         out_shape=(shape, shape),
         grid=(m_count,),
-        input_output_aliases={7: 0, 8: 1},
+        input_output_aliases={9: 0, 10: 1},
         compiler_params=plt.CompilerParams(num_warps=2),
         name="gmaster_scalar_analysis",
     )(
-        jnp.real(positive),
-        jnp.imag(positive),
+        jnp.real(transposed_input),
+        jnp.imag(transposed_input),
         sine,
         cosine,
         diagonal,
         weights,
         phase,
+        jnp.asarray(coefficient_1),
+        jnp.asarray(coefficient_2),
         zeros,
         zeros,
     )
-    return real + 1j * imag
+    return (real + 1j * imag).T
 
 
 def _scalar_inverse_latitudinal_impl(
@@ -397,7 +439,11 @@ def _scalar_inverse_latitudinal_impl(
     sine = jnp.sin(theta)
     cosine = jnp.cos(theta)
     diagonal = jnp.asarray(_diagonal_normalization(L))
+    coefficient_1, coefficient_2 = _normalized_coefficients_numpy(
+        L, m_start, positive_alm.shape[1]
+    )
     m_count = positive_alm.shape[1]
+    transposed = jnp.asarray(positive_alm).T
     zeros = jnp.zeros((len(theta), m_count), dtype=jnp.float64)
     shape = jax.ShapeDtypeStruct((len(theta), m_count), jnp.float64)
     real, imag = pl.pallas_call(
@@ -410,17 +456,19 @@ def _scalar_inverse_latitudinal_impl(
         ),
         out_shape=(shape, shape),
         grid=(m_count, pl.cdiv((len(theta) + 1) // 2, block_size)),
-        input_output_aliases={7: 0, 8: 1},
+        input_output_aliases={9: 0, 10: 1},
         compiler_params=plt.CompilerParams(num_warps=2),
         name="gmaster_scalar_synthesis",
     )(
-        jnp.real(positive_alm),
-        jnp.imag(positive_alm),
+        jnp.real(transposed),
+        jnp.imag(transposed),
         sine,
         cosine,
         diagonal,
         weights,
         phase,
+        jnp.asarray(coefficient_1),
+        jnp.asarray(coefficient_2),
         zeros,
         zeros,
     )

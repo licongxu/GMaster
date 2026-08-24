@@ -594,6 +594,111 @@ def _use_multi_gpu_pallas(L, values):
     return calculator == "jax-mgpu" or (calculator == "jax" and L >= 2048)
 
 
+def _next_fast_len_pow2(size):
+    return 1 << max(1, int(size) - 1).bit_length()
+
+
+@lru_cache(maxsize=32)
+def _ring_czt_constants_numpy(L, nside):
+    ntheta = 4 * nside - 1
+    npix = 12 * nside**2
+    ring = np.arange(ntheta)
+    nphi = 4 * np.minimum(np.minimum(ring + 1, nside), ntheta - ring)
+    start = np.empty(ntheta, dtype=np.int64)
+    north = np.arange(nside - 1)
+    start[: nside - 1] = 2 * north * (north + 1)
+    start[nside - 1 : 3 * nside] = 2 * nside * (nside - 1) + 4 * nside * np.arange(
+        2 * nside + 1
+    )
+    k = np.arange(1, nside)
+    start[4 * nside - 1 - k] = npix - 2 * k * (k + 1)
+    width = 4 * nside
+    offsets = np.arange(width, dtype=np.int64)[None, :]
+    valid = offsets < nphi[:, None]
+    gather = np.where(valid, start[:, None] + offsets, 0)
+    return nphi, start, gather, valid.astype(bool), width
+
+
+def _ring_czt_constants(L, nside):
+    nphi, start, gather, valid, width = _ring_czt_constants_numpy(L, nside)
+    return (
+        jnp.asarray(nphi),
+        jnp.asarray(start),
+        jnp.asarray(gather),
+        jnp.asarray(valid),
+        width,
+    )
+
+
+def _chirp_angle(index, two_nphi, inverse):
+    """exp(+-i*pi*q^2/nphi) angles with exact integer modular reduction."""
+    reduced = (index.astype(jnp.int64) ** 2) % two_nphi
+    angle = reduced * (jnp.pi / two_nphi) * 2.0
+    return jnp.where(inverse, -angle, angle)
+
+
+@partial(jax.jit, static_argnames=("L", "nside"))
+def _forward_ring_fft(map_flat, *, L, nside):
+    """Exact HEALPix ring FFT for every ring as one batched chirp-Z transform."""
+    nphi, _, gather, valid, width = _ring_czt_constants(L, nside)
+    pixels = jnp.reshape(jnp.asarray(map_flat), (-1,))
+    two_nphi = (2 * nphi)[:, None]
+    rows = jnp.where(valid, pixels[gather], 0.0)
+    transform_size = _next_fast_len_pow2(L + width)
+
+    n_index = jnp.arange(width, dtype=jnp.int64)
+    embedded = rows * jnp.exp(-1j * _chirp_angle(n_index, two_nphi, False))
+    embedded = jnp.pad(embedded, ((0, 0), (0, transform_size - width)))
+    shift = jnp.arange(transform_size, dtype=jnp.int64) - (width - 1)
+    kernel = jnp.exp(1j * _chirp_angle(shift, two_nphi, False))
+    convolution = jnp.fft.ifft(
+        jnp.fft.fft(embedded, axis=-1) * jnp.fft.fft(kernel, axis=-1), axis=-1
+    )
+
+    m_index = jnp.arange(L, dtype=jnp.int64)
+    positive = jnp.exp(-1j * _chirp_angle(m_index, two_nphi, False)) * convolution[
+        :, width - 1 : width - 1 + L
+    ]
+    ftm = jnp.zeros((4 * nside - 1, 2 * L), dtype=positive.dtype)
+    ftm = ftm.at[:, L:].set(positive)
+    ftm = ftm.at[:, 1:L].set(jnp.flip(jnp.conj(positive[:, 1:L]), axis=-1))
+    return ftm
+
+
+@partial(jax.jit, static_argnames=("L", "nside"))
+def _inverse_ring_fft(ftm_positive, *, L, nside):
+    """Exact HEALPix ring inverse FFT as one batched chirp-Z transform."""
+    nphi, start, gather, valid, width = _ring_czt_constants(L, nside)
+    ntheta = 4 * nside - 1
+    positive = jnp.asarray(ftm_positive)
+    full = jnp.zeros((ntheta, 2 * L), dtype=positive.dtype)
+    full = full.at[:, L:].set(positive)
+    full = full.at[:, 1:L].set(jnp.flip(jnp.conj(positive[:, 1:L]), axis=-1))
+    two_nphi = (2 * nphi)[:, None]
+    transform_size = _next_fast_len_pow2(2 * L - 1 + width)
+
+    c_index = jnp.arange(2 * L, dtype=jnp.int64)
+    embedded = full * jnp.exp(1j * _chirp_angle(c_index, two_nphi, False))
+    embedded = jnp.pad(embedded, ((0, 0), (0, transform_size - 2 * L)))
+    shift = jnp.arange(transform_size, dtype=jnp.int64) - (2 * L - 1)
+    kernel = jnp.exp(-1j * _chirp_angle(shift, two_nphi, False))
+    convolution = jnp.fft.ifft(
+        jnp.fft.fft(embedded, axis=-1) * jnp.fft.fft(kernel, axis=-1), axis=-1
+    )
+
+    p_index = jnp.arange(width, dtype=jnp.int64)
+    result = jnp.exp(1j * _chirp_angle(p_index, two_nphi, False)) * convolution[
+        :, 2 * L - 1 : 2 * L - 1 + width
+    ]
+    wrap_phase = ((L % nphi)[:, None] * p_index[None, :]) % nphi[:, None]
+    result *= jnp.exp(-1j * wrap_phase * (2 * jnp.pi / nphi)[:, None])
+
+    pixels = jnp.zeros((12 * nside**2,), dtype=result.real.dtype)
+    contributions = jnp.where(valid, result.real, 0.0)
+    pixels = pixels.at[gather.ravel()].add(contributions.ravel())
+    return pixels
+
+
 @lru_cache(maxsize=16)
 def _pallas_order_split(L):
     approximate = round(L * (1 - 1 / np.sqrt(2)))
@@ -617,20 +722,12 @@ def _pallas_fft_method():
 
 @partial(jax.jit, static_argnames=("L", "nside", "reality"))
 def _forward_healpix_fft(maps, *, L, nside, reality):
-    return healpix_ffts.healpix_fft(
-        maps, L, nside, _pallas_fft_method(), reality
-    )
+    return _forward_ring_fft(maps, L=L, nside=nside)
 
 
 @partial(jax.jit, static_argnames=("L", "nside"))
 def _finish_inverse_pallas(ftm_positive, *, L, nside):
-    ftm = jnp.concatenate((jnp.zeros_like(ftm_positive), ftm_positive), axis=1)
-    ftm = ftm.at[:, 1:L].set(
-        jnp.flip(jnp.conj(ftm[:, L + 1 :]), axis=-1)
-    )
-    return healpix_ffts.healpix_ifft(
-        ftm, L, nside, _pallas_fft_method(), True
-    )
+    return _inverse_ring_fft(ftm_positive, L=L, nside=nside)
 
 
 @lru_cache(maxsize=32)

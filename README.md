@@ -121,6 +121,31 @@ previous GPU algorithm, but it does **not** yet beat DUCC. The demonstrated
 NaMaster speedups apply to the MASTER coupling, flat-workspace, and covariance
 kernels above.
 
+## Batched chirp-Z ring FFT and coefficient tables
+
+HEALPix ring FFTs use one uniform batched chirp-Z transform per direction for
+all rings simultaneously, replacing s2fft's per-ring-size JAX path that unrolls
+hundreds of tiny polar FFT groups. Chirp angles use exact integer modular
+reduction, so results match the reference transforms to floating-point
+round-off (`<=5e-13` at Nside 512). At Nside 512 the forward ring FFT drops
+from 20.2 ms to 4.8 ms and the inverse from 31.1 ms to 10.7 ms; Nside-4096
+compilation drops from 182 s to 51 s because the polar no longer unrolls.
+
+The fused latitudinal kernel keeps NaMaster-exact normalized-recurrence
+arithmetic but loads its `c1/c2` coefficients from tables computed once by
+parallel vector operations, removing square roots and divisions from the
+sequential degree loop, and streams inputs, outputs, and accumulators through
+transposed contiguous layouts. Combined effect at Nside 512: warmed analysis
+45.0 -> 25.3 ms and synthesis 51.7 -> 29.4 ms against NaMaster's 14.2 / 11.5 ms,
+with unchanged parity (alms max abs `1.94e-14`). The full Nside-4096
+constant-map analysis now takes 10.84 s warm on one GPU (was 12.25 s) with
+`a00=sqrt(4*pi)` exact to 1e-15.
+
+An unnormalized-recurrence variant with deferred K normalization was built and
+rejected: forward-l application of the DLMF recurrence is numerically unstable
+for m > 0 (measured relative error 5.8e-5); the normalized recurrence is kept.
+
+
 At `Nside=1024`, two fused GPUs improve analysis from 0.2532 s to 0.2092 s
 (1.21x) and synthesis from 0.4556 s to 0.3168 s (1.44x). At `Nside=512`, PCIe
 staging outweighs the analysis gain, which is why automatic sharding starts at
