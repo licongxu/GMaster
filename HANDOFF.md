@@ -253,25 +253,60 @@ per-degree error profiles before any structural refactor; (4) an in-kernel
 debug channel (store intermediates to a debug array) substitutes for the
 missing GPU counter permissions and CPU interpreter.
 
+### Session 3 status: block_size tuning confirmed; remaining levers identified
+
+- `block_size` default lowered from `min(1024, 2*nside)` to `min(512, 2*nside)`
+  in `_pallas_block_size`. Validated: GPU SHT+utils tests 14 passed / 3 skipped.
+  Effect: synthesis ~1.5-1.6x faster at Nside >= 1024 (171ms vs 260ms at
+  L=2047; 1354ms vs 2191ms at Nside 2048). Analysis is block-size-insensitive
+  (degree-loop work dominates). Block 2048 cliffs hard on synthesis.
+- `num_warps` sweep at Nside 512 confirmed 2 is optimal: analysis 29.3ms /
+  synthesis 32.8ms at warps=2; 31.6/32.5 at 4; 40.7/33.4 at 8.
+- Component decomposition at Nside 512, L=1023, block_size=512:
+  - chirp-Z forward ring FFT ~3.4 ms, inverse ~4.9 ms
+  - full map2alm (n_iter=0) ~15.4 ms  => latitudinal ~12 ms
+  - full alm2map  (n_iter=0) ~15.7 ms  => latitudinal ~10.7 ms
+- End-to-end benchmark (lmax = 3*Nside-1):
+  - Nside 512:  NaMaster 15.0/11.9 ms, GMaster 27.3/30.5 ms (0.55x / 0.39x)
+  - Nside 1024: NaMaster 54.5/51.9 ms, GMaster 193/203 ms (0.28x / 0.25x)
+  Gap widens with Nside; the latitudinal recurrence kernel is the bottleneck.
+- Analysis tile-parallelism: the analysis kernel currently keeps the latitude-
+  tile loop INSIDE the program so the per-degree RMW into `out[m, ell]` is
+  serialized. Splitting tiles across programs requires a partials buffer
+  `out_partial[tile, m, ell]` + a final reduction pass, or it becomes a
+  data race. Memory: ~9 x m_count x L x 16B ~ 0.23 GB at Nside 512, ~4 GB at
+  Nside 2048 (fits), ~17 GB at 4096 (does not fit, needs tiling/recompute).
+- 2-m-chain interleave: each program handles two adjacent m's to raise in-
+  program ILP from 8 to 16. Register pressure is the risk: at block_size 512
+  with num_warps=2 each thread already holds 8 lanes x 8 carried state doubles
+  = 128 doubles = 1024 B; doubling the state would spill. Needs to pair with
+  a smaller block_size (256) and num_warps=4/8. Untested.
+
 ## Recommended next work
 
-1. Commit the current ring-FFT rewrite and recurrence-table changes after
-   reviewing `git diff --check` and the test results above (all suites green:
-   CPU 111 passed, GPU 14 passed, two-GPU 3 passed).
-2. Close the remaining ~1.8x SHT gap with double-single fp32 emulation of the
-   recurrence hot loop. The GPU's FP64 peak is 1.89 TFLOP/s versus 238 TFLOP/s
-   FP32, so even 10x-emulation overhead wins. Design: keep seeds, phase
-   rotations, `_scaled_value` reconstruction, and lane reductions in fp64
-   (cheap); convert only the recurrence state `(qm1, qm2)` and coefficient
-   products to Dekker two-product/two-sum fp32 pairs (~40 fp32 ops per degree
-   replacing 6 fp64). Validate every stage against the fp64 kernel; watch for
-   Triton FMA contraction breaking error-free transforms (empirically test
-   before trusting Dekker splits).
-3. Grant GPU performance-counter permission (`ERR_NVGPUCTRPERM`) so `ncu` can
-   attribute stalls in the fused kernel; measured throughput is ~30% of the
-   FP64 peak with unknown stall mix.
-4. Generalize the persistent recurrence to spin-weighted harmonics so spin-2
+1. Commit the `block_size=512` change (only validated SHT win this session;
+   ring-FFT and recurrence-table changes were already committed).
+2. Two-m-chain interleave for synthesis first (no in-loop reduction / RMW,
+   pure register accumulation, single end store), paired with
+   `block_size=256` and `num_warps=4` to control register pressure. Validate
+   against current kernel output (~1e-11 rel) at Nside 8/16/64, then bench.
+   Then mirror into analysis (RMW per degree step preserved, one program owns
+   two m's so no cross-program race).
+3. Analysis tile-parallelism via partials buffer + reduction pass (grid
+   becomes `(m_count, num_tiles)`); ship for Nside <= 2048 where partials
+   fit (~4 GB at 2048); add lane tiling or recompute for 4096.
+4. Ring-FFT: the chirp-Z pads every ring to `next_pow2(L + 4*nside)` (4096
+   at Nside 512) and does 3 batched FFTs of that length. Rings come in
+   length groups (4k north/south, 4*nside equator, equator band is wide).
+   A per-length-group batched `jnp.fft` (or cuFFT) of the actual ring length
+   would cut the transform length ~2x for the equator and much more for
+   polar rings. Validate against `_forward_ring_fft`/`_inverse_ring_fft`
+   to <=5e-13 before replacing.
+5. Grant GPU performance-counter permission (`ERR_NVGPUCTRPERM`) so `ncu`
+   can attribute stalls in the fused kernel; measured throughput is ~30% of
+   the FP64 peak with unknown stall mix.
+6. Generalize the persistent recurrence to spin-weighted harmonics so spin-2
    fields do not fall back to generic S2FFT. Derive and test signs/conventions
    against NaMaster before benchmarking.
-5. Execute full-band Nside-4096 synthesis and spin-2 memory telemetry; only
+7. Execute full-band Nside-4096 synthesis and spin-2 memory telemetry; only
    scalar analysis has been run end to end at that size.

@@ -594,7 +594,11 @@ def _use_pallas_sht(L, spin):
 
 
 def _pallas_block_size(nside):
-    return min(1024, 2 * nside)
+    # 512 lanes per program is the throughput sweet spot: larger tiles
+    # under-utilize the SMs (the synthesis kernel degrades ~1.5-1.6x at
+    # 1024 and cliffs hard at 2048), while smaller tiles add redundant
+    # degree-loop work in analysis. 2*nside keeps the small-Nside case.
+    return min(512, 2 * nside)
 
 
 def _use_multi_gpu_pallas(L, values):
