@@ -208,6 +208,30 @@ guard keeps every spin transform on the generic path (mainline stays exact).
   from there since coupling is already ahead and multi-GPU sharding halves
   the residual deficit at L >= 2048.
 
+### VALIDATED NEXT BIG ROCK: blocked parallel-prefix recurrence
+
+The fused recurrence is LATENCY-bound on its L-step dependency chain
+(measured: quartering the order count cuts runtime only ~30%), which caps
+any constant-factor tuning. A blocked two-phase scheme was derived and
+VALIDATED EXACTLY (numpy prototype, diff=0 vs sequential):
+
+  Phase A (parallel over degree-blocks, grid = orders x blocks):
+    each block runs the recurrence from CANONICAL seeds (1,0),(0,1),
+    emitting data-weighted partial sums CA/CB and the block's composed
+    2x2 transfer matrix M_j (per theta-lane).
+  Phase B (serial scan over ~sqrt(L) blocks, vectorized over lanes):
+    carry the physical per-lane seeds through M_j and combine partials:
+    alm = sum_j u_j*CA_j + v_j*CB_j (+ seed-degree terms).
+
+Sequential depth drops L -> G + L/G (minimized at G~sqrt(L)); per-degree
+RMW stores and reduction trees disappear. Scratch requirement for the
+per-lane matrices: orders x blocks x lanes x 4 doubles ~ 4.8 GB at
+Nside 2048 (fits) but ~19 GB at 4096 => ship at <=2048 first; for 4096
+either tile lanes through Phase B with recomputation or move M to fp32
+pairs. Expected transform win: 3-6x (latency no longer floors runtime),
+taking scalar transforms decisively past DUCC and making pipelines win
+at every Nside. Synthesis uses the identical scheme transposed.
+
 ## Recommended next work
 
 1. Commit the current ring-FFT rewrite and recurrence-table changes after
