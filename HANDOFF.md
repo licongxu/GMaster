@@ -232,6 +232,27 @@ pairs. Expected transform win: 3-6x (latency no longer floors runtime),
 taking scalar transforms decisively past DUCC and making pipelines win
 at every Nside. Synthesis uses the identical scheme transposed.
 
+### DS-fp32 experiment (this session): two-product exact, integration blocked
+
+Dekker/Veltkamp double-single arithmetic was verified MACHINE-EXACT inside
+a Pallas/Triton kernel on this GPU/compiler (max rel 7.9e-15 <= 2^-47), so
+compilation does not break error-free transforms. However the full DS
+analysis kernel integration produced wrong values (seed-degree entries off,
+NaN rows for high orders) and a chunked-output refactor simultaneously
+regressed the previously-green fp64 kernel (nside-64 alm err 5.0). Both were
+REVERTED to the last green commit. Root cause candidates: Pallas out_shape
+buffers are UNINITIALIZED (untouched cells leak pool garbage/NaN patterns),
+and the load-modify-store accumulation pattern reads that memory; the
+original design's input_output_aliases+jnp.zeros pairing apparently relies
+on subtle XLA zeroing behavior that broke under refactoring.
+
+Resume recipe: (1) restore DS kernel from session history on top of the
+green base; (2) keep the original aliases/zeros pattern EXACTLY, changing
+only the degree-step products to DS; (3) validate at nside 8/16 with
+per-degree error profiles before any structural refactor; (4) an in-kernel
+debug channel (store intermediates to a debug array) substitutes for the
+missing GPU counter permissions and CPU interpreter.
+
 ## Recommended next work
 
 1. Commit the current ring-FFT rewrite and recurrence-table changes after
