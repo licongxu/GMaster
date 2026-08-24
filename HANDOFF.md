@@ -342,3 +342,15 @@ missing GPU counter permissions and CPU interpreter.
   covariance kernels that already lead by 20-200x, and (c) end-to-end
   pipeline amortization. ncu stall attribution (item 5) is the prerequisite
   for any further single-kernel rewrite.
+- Multi-GPU measured at Nside 1024 and 2048 (eager, jax-mgpu, 2 GPUs):
+  - Nside 1024: analysis 170ms (0.33x NMT 55.9ms), synthesis 205ms (0.25x NMT
+    50.3ms). Single-GPU was 190/203ms, so multi-GPU saves ~10% on analysis.
+  - Nside 2048: analysis 1096ms (0.25x NMT 275ms), synthesis 1499ms (0.18x
+    NMT 271ms). Single-GPU was 1407/1354ms, so multi-GPU helps analysis
+    ~28% but HURTS synthesis (host-staging overhead dominates the shorter
+    kernel).
+  - Correctness confirmed at both sizes (max |dalm| ~1e-14, |dmap| ~1e-10).
+  - The cross-device staging path goes through host memory (known JAX
+    limitation on this machine), which caps the multi-GPU win. Fixing that
+    would require device-to-device P2P or a restructured split that avoids
+    staging the full high-order column block.
