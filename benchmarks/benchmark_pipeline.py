@@ -85,6 +85,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--nside", type=int, default=512)
     parser.add_argument("--repeats", type=int, default=3)
+    parser.add_argument("--spins", type=str, default="0,2")
     args = parser.parse_args()
 
     nside = args.nside
@@ -98,7 +99,7 @@ if __name__ == "__main__":
     map_u = rng.normal(size=npix)
 
     print(f"nside={nside} devices={[str(d) for d in jax.devices()]}")
-    for spin in (0, 2):
+    for spin in [int(s) for s in args.spins.split(',') if s.strip()]:
         ref_out, ref_times = _run_pipeline(
             reference, nside, spin, 30, args.repeats,
             mask_np, map_t, map_q, map_u,
@@ -116,9 +117,13 @@ if __name__ == "__main__":
             f"({ref_times[s]/max(gm_times[s], 1e-12):.0f}x)"
             for s in stages
         )
+        import resource
+        rss_gb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1e6
+        gmem = jax.devices()[0].memory_stats()
         print(
             f"spin={spin}: TOTAL {ref_times['total']*1e3:.0f}->"
             f"{gm_times['total']*1e3:.0f}ms "
             f"({ref_times['total']/gm_times['total']:.1f}x) | {line} | "
-            f"max|dCl|={diff:.2e} rel={diff/scale:.2e}"
+            f"max|dCl|={diff:.2e} rel={diff/scale:.2e} | "
+            f"peakRSS={rss_gb:.1f}GB GPUpeak={gmem.get('bytes_in_use', 0)/2**30:.1f}GiB"
         )

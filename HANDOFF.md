@@ -162,6 +162,52 @@ both generic estimates and fused principal arrays.
   speedup. Existing genuine NaMaster speedups are in MASTER/covariance kernels
   (for example 29.7x selective scalar coupling and 208x flat covariance).
 
+## Session 2 status: spin kernels built (guarded); the road to destroying NaMaster
+
+### What works now
+- Scalar fused SHT: CZT ring FFT + table-driven normalized recurrence.
+  Nside 512: analysis 25.3 ms / synthesis 29.4 ms (NaMaster 14.2 / 11.5).
+  Nside 4096 single-GPU warm analysis 10.84 s (NaMaster 1.76 s); compile 51 s.
+- Exact TT coupling at lmax=3071: GMaster 0.72 s vs NaMaster 0.84-1.19 s
+  (~parity). The large historical speedups apply to arbitrary-spin,
+  pure-E/B, Toeplitz and flat-covariance kernels, not plain exact TT.
+- End-to-end scalar pipelines currently LOSE ~2-2.6x at Nside 1024-2048:
+  field construction (n_iter=3 => 4 analyses + 3 syntheses) dominates and
+  each fused transform is still 1.8-3x slower than CPU DUCC.
+
+### Spin-weighted kernels: built, correct at small L, blocked at scale
+Fused spin synthesis/analysis + two-helicity E/B estimator implemented and
+wired; matches NaMaster coupled cells to 2e-14 at L=48 but diverges beyond
+L~96. Root causes, both nailed down experimentally:
+1. Closed-form Wigner-d seeds cancel catastrophically for |m|->l (terms
+   e^{+6000} cancelling below fp64 range): direct sums cannot work at any
+   precision. Exponent-tracked evaluation fixes NaN/inf semantics but not
+   relative precision of representable values.
+2. s2fft's generic forward carries extra operator structure in the
+   |m| < |spin| columns that a naive single-ladder adjoint does not
+   reproduce (verified by delta-probing columns independently).
+Resolution path (next session): port the Turok-Bucher sideways m-recursion
+(with retrospective base-10 renormalization) as an in-kernel seed generator,
+validated entry-by-entry against `turok_jax.compute_slice`. A literal numpy
+port exists in session notes; its padded-index bookkeeping still diverges.
+Alternative: Trapani-Navaza three-times recursion. Until then the dispatch
+guard keeps every spin transform on the generic path (mainline stays exact).
+
+### Raw-SHT gap analysis (why DUCC still wins per-transform)
+- GPU FP64 peak is 1.89 TFLOP/s (FP32: 238). The fused recurrence runs at
+  ~0.56 TFLOP/s effective: ~3.4x stall headroom exists but ncu lacks
+  permission (ERR_NVGPUCTRPERM) so stall mix is unmeasured.
+- Op accounting per lane-degree: ~3 FMA recurrence + 1 scale-mul + 4
+  accumulation + ~2 reduction-amortized + RMW stores. Double-single fp32
+  emulation of the recurrence products projects only ~1.4x (accumulation
+  and reductions must stay fp64 for the 3e-12 gates).
+- Highest-value levers, in order: (a) atomic_add stores to drop RMW reads;
+  (b) two interleaved chains per program for latency hiding; (c) DS-fp32
+  core; (d) counter permission for targeted stall fixes. Composite
+  projection: 2-3x, reaching DUCC parity-to-better; pipeline wins grow
+  from there since coupling is already ahead and multi-GPU sharding halves
+  the residual deficit at L >= 2048.
+
 ## Recommended next work
 
 1. Commit the current ring-FFT rewrite and recurrence-table changes after
