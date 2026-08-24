@@ -318,3 +318,27 @@ missing GPU counter permissions and CPU interpreter.
    against NaMaster before benchmarking.
 7. Execute full-band Nside-4096 synthesis and spin-2 memory telemetry; only
    scalar analysis has been run end to end at that size.
+
+### Session 3 analysis: why the SHT gap to DUCC persists
+
+- The chirp-Z ring FFT is **necessary**, not overkill: the chirp rate is
+  per-ring (`two_nphi = 2 * actual_ring_length`), so a single plain FFT of the
+  zero-padded `4*nside` width would compute DFTs at the wrong frequency
+  spacing for the short polar rings. Per-length-group batched FFTs could save
+  on polar rings but the equatorial band (2*nside-1 rings) still forces the
+  full-size transform, so the realistic win is small (<1ms at Nside 512).
+- "Quartering L cuts analysis time only ~30%" shows the analysis kernel is
+  NOT recurrence-latency-bound. The dominant cost is the cross-lane
+  `jnp.sum` reduction at every degree step (~2 reductions over block_size
+  lanes per degree, ~70% of the FLOPs). This is a GPU-vs-AVX512 mismatch in
+  reduction throughput, not something the 2-m interleave (which targets the
+  ~30% latency slice) will meaningfully fix.
+- Synthesis has NO in-loop reduction (pure register accumulation + 4 scalar
+  broadcast loads per degree); at ~38% of NaMaster it is near the throughput
+  limit for this FP64 access pattern.
+- Practical conclusion: single-GPU scalar SHT will stay ~2-4x behind DUCC at
+  Nside<=1024. The realistic paths to "massively surpass" NaMaster are
+  (a) multi-GPU sharding at L>=2048 (halves SHT time), (b) the coupling/
+  covariance kernels that already lead by 20-200x, and (c) end-to-end
+  pipeline amortization. ncu stall attribution (item 5) is the prerequisite
+  for any further single-kernel rewrite.
