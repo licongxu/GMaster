@@ -14,6 +14,8 @@ from s2fft.utils import healpix_ffts, quadrature_jax
 from ._sht_pallas import (
     scalar_forward_latitudinal,
     scalar_inverse_latitudinal,
+    _scalar_spin_synthesis_latitudinal,
+    _spin_forward_latitudinal,
 )
 
 
@@ -570,12 +572,20 @@ def _use_multi_gpu_sht(L):
     return calculator == "jax-mgpu" or L >= 768
 
 
+_SPIN_PALLAS_MAX_L = 768
+
+
 def _use_pallas_sht(L, spin):
     if (
         nmt_params.sht_calculator not in ("jax", "jax-single", "jax-mgpu")
-        or spin != 0
         or L < 128
     ):
+        return False
+    # Fused spin-weighted kernels remain experimental: their closed-form
+    # Wigner-d seeds lose relative precision through catastrophic cancellation
+    # once |m| approaches l. Spin transforms use the generic path until the
+    # kernels adopt a renormalized sideways recursion (Turok-Bucher class).
+    if spin != 0:
         return False
     return any(
         device.platform == "gpu" and "NVIDIA" in device.device_kind.upper()
@@ -695,6 +705,62 @@ def _inverse_ring_fft(ftm_positive, *, L, nside):
 
     pixels = jnp.zeros((12 * nside**2,), dtype=result.real.dtype)
     contributions = jnp.where(valid, result.real, 0.0)
+    pixels = pixels.at[gather.ravel()].add(contributions.ravel())
+    return pixels
+
+
+@partial(jax.jit, static_argnames=("L", "nside"))
+def _forward_ring_fft_full(signal, *, L, nside):
+    """Complex ring FFT returning the full centered window m in [-(L-1), L)."""
+    nphi, _, gather, valid, width = _ring_czt_constants(L, nside)
+    pixels = jnp.reshape(jnp.asarray(signal), (-1,))
+    two_nphi = (2 * nphi)[:, None]
+    rows = jnp.where(valid, pixels[gather], 0.0)
+    transform_size = _next_fast_len_pow2(width + 2 * L)
+
+    n_index = jnp.arange(width, dtype=jnp.int64)
+    embedded = rows * jnp.exp(-1j * _chirp_angle(n_index, two_nphi, False))
+    embedded = jnp.pad(embedded, ((0, 0), (0, transform_size - width)))
+    shift = jnp.arange(transform_size, dtype=jnp.int64) - (width - 1)
+    kernel = jnp.exp(1j * _chirp_angle(shift, two_nphi, False))
+    convolution = jnp.fft.ifft(
+        jnp.fft.fft(embedded, axis=-1) * jnp.fft.fft(kernel, axis=-1), axis=-1
+    )
+
+    m_index = jnp.arange(-(L - 1), L, dtype=jnp.int64)
+    positive = jnp.exp(-1j * _chirp_angle(m_index, two_nphi, False)) * (
+        convolution[:, width - 1 : width - 1 + m_index.shape[0]]
+    )
+    return positive
+
+
+@partial(jax.jit, static_argnames=("L", "nside"))
+def _inverse_ring_fft_complex(centered, *, L, nside):
+    """Complex inverse ring FFT of a centered (ntheta, 2L-1) spectrum."""
+    nphi, start, gather, valid, width = _ring_czt_constants(L, nside)
+    grid = jnp.asarray(centered)
+    ntheta = grid.shape[0]
+    two_nphi = (2 * nphi)[:, None]
+    transform_size = _next_fast_len_pow2(2 * L - 1 + width)
+
+    c_index = jnp.arange(2 * L - 1, dtype=jnp.int64)
+    embedded = grid * jnp.exp(1j * _chirp_angle(c_index, two_nphi, False))
+    embedded = jnp.pad(embedded, ((0, 0), (0, transform_size - (2 * L - 1))))
+    shift = jnp.arange(transform_size, dtype=jnp.int64) - (2 * L - 2)
+    kernel = jnp.exp(-1j * _chirp_angle(shift, two_nphi, False))
+    convolution = jnp.fft.ifft(
+        jnp.fft.fft(embedded, axis=-1) * jnp.fft.fft(kernel, axis=-1), axis=-1
+    )
+
+    p_index = jnp.arange(width, dtype=jnp.int64)
+    result = jnp.exp(1j * _chirp_angle(p_index, two_nphi, False)) * convolution[
+        :, 2 * L - 2 : 2 * L - 2 + width
+    ]
+    wrap_phase = (((L - 1) % nphi)[:, None] * p_index[None, :]) % nphi[:, None]
+    result *= jnp.exp(-1j * wrap_phase * (2 * jnp.pi / nphi)[:, None])
+
+    pixels = jnp.zeros((12 * nside**2,), dtype=result.dtype)
+    contributions = jnp.where(valid, result, 0.0)
     pixels = pixels.at[gather.ravel()].add(contributions.ravel())
     return pixels
 
@@ -915,7 +981,43 @@ def _positive_alm(alm, *, L, L_work):
     return jnp.pad(positive, ((0, L_work - L), (0, L_work - L)))
 
 
-def _alm2map_core_pallas(alm, *, nside, L, L_work):
+def _alm2map_core_pallas(alm, *, nside, L, L_work, spin=0):
+    if spin != 0:
+        # Two-helicity synthesis: a+ = E + iB drives the mp=+s ladder of
+        # f+ = Q - iU; a- = E - iB drives the mp=-s ladder of f- = Q + iU.
+        e_alms, b_alms = jnp.asarray(alm[0]), jnp.asarray(alm[1])
+        ell_idx, m_idx = _ell_order_arrays(L - 1)
+        a_plus = jnp.zeros((L_work, 2 * L_work - 1), dtype=jnp.complex128)
+        a_minus = jnp.zeros((L_work, 2 * L_work - 1), dtype=jnp.complex128)
+        plus_vals = e_alms + 1j * b_alms
+        minus_vals = e_alms - 1j * b_alms
+        parity = (-1.0) ** m_idx
+        a_plus = a_plus.at[ell_idx, L_work - 1 + m_idx].set(plus_vals)
+        a_plus = a_plus.at[ell_idx, L_work - 1 - m_idx].set(parity * jnp.conj(plus_vals))
+        a_minus = a_minus.at[ell_idx, L_work - 1 + m_idx].set(minus_vals)
+        a_minus = a_minus.at[ell_idx, L_work - 1 - m_idx].set(parity * jnp.conj(minus_vals))
+        norm_l = jnp.sqrt((2 * jnp.arange(L) + 1) / (4 * jnp.pi))
+        a_plus = a_plus * norm_l[:, None]
+        a_minus = a_minus * norm_l[:, None]
+        theta = _stable_thetas(L_work, nside)
+        block = min(256, 2 * nside)
+        f_plus = _scalar_spin_synthesis_latitudinal(
+            jnp.asarray(a_plus).T, theta, L=L_work, spin=int(spin), block_size=block
+        )
+        f_minus = _scalar_spin_synthesis_latitudinal(
+            jnp.asarray(a_minus).T, theta, L=L_work, spin=-int(spin), block_size=block
+        )
+        shifts = healpix_ffts.ring_phase_shifts_hp_jax(L_work, nside, False, False)
+        def to_map(centered):
+            full = jnp.concatenate(
+                (jnp.zeros((centered.shape[0], 1), dtype=centered.dtype), centered),
+                axis=1,
+            )
+            full = full.at[:, 1:].multiply(shifts)
+            return _inverse_ring_fft_complex(full[:, 1:], L=L_work, nside=nside)
+        q_map = 0.5 * (to_map(f_plus) + jnp.conj(to_map(f_minus)))
+        u_map = -0.5j * (to_map(f_plus) - jnp.conj(to_map(f_minus)))
+        return jnp.stack([q_map, u_map])[None, :]
     positive = _positive_alm(alm[0], L=L, L_work=L_work)
     theta = _stable_thetas(L_work, nside)
     phase = healpix_ffts.p2phi_rings_jax(jnp.arange(len(theta)), nside)
@@ -930,7 +1032,59 @@ def _alm2map_core_pallas(alm, *, nside, L, L_work):
     return jnp.real(maps)[None, :]
 
 
-def _map2alm_once_pallas(maps, ell, order, *, nside, L_work):
+@lru_cache(maxsize=32)
+def _ell_order_arrays(lmax):
+    ell = np.arange(lmax + 1)[None, :]
+    m = np.arange(lmax + 1)[:, None]
+    mask = m <= ell
+    ells = np.broadcast_to(ell, (lmax + 1, lmax + 1))[mask.T]
+    ms = np.broadcast_to(m, (lmax + 1, lmax + 1))[mask.T]
+    return jnp.asarray(ells), jnp.asarray(ms)
+
+
+def _map2alm_once_pallas_spin(maps, ell, order, *, nside, L_work, spin):
+    """Two-helicity spin-2 analysis.
+
+    a+_lm = sum_rings w e^{-im phi} (Q - iU)_ring d^l_{m,+s}
+    a-_lm = sum_rings w e^{-im phi} (Q + iU)_ring d^l_{m,-s}
+    E = (a+ + a-)/2, B = (a+ - a-)/(2i), packed in Healpy ordering with the
+    sqrt((2l+1)/4pi) normalization applied per degree.
+    """
+    theta = _stable_thetas(L_work, nside)
+    weights = quadrature_jax.quad_weights_transform(L_work, "healpix", nside)
+    phase = -healpix_ffts.p2phi_rings_jax(jnp.arange(len(theta)), nside)
+    m_centered = jnp.arange(-(L_work - 1), L_work)
+    window = weights[:, None] * jnp.exp(1j * (phase[:, None] * m_centered[None, :]))
+    block = min(256, 2 * nside)
+
+    signal_plus = maps[0] - 1j * maps[1]   # helicity +s
+    signal_minus = maps[0] + 1j * maps[1]  # helicity -s
+    rings_p = _forward_ring_fft_full(signal_plus, L=L_work, nside=nside)
+    rings_m = _forward_ring_fft_full(signal_minus, L=L_work, nside=nside)
+
+    a_plus_grid = _spin_forward_latitudinal(
+        rings_p * window, theta, L=L_work, spin=int(spin), block_size=block
+    )
+    a_minus_grid = _spin_forward_latitudinal(
+        rings_m * window, theta, L=L_work, spin=-int(spin), block_size=block
+    )
+
+    norm_l = jnp.sqrt((2 * jnp.arange(L_work) + 1) / (4 * jnp.pi))
+    a_plus = a_plus_grid.T * norm_l[:, None]
+    a_minus = a_minus_grid.T * norm_l[:, None]
+
+    plus_col = a_plus[ell, L_work - 1 + order]
+    minus_col = a_minus[ell, L_work - 1 + order]
+    e_vals = 0.5 * (plus_col + minus_col)
+    b_vals = (plus_col - minus_col) / (2j)
+    return jnp.stack([e_vals, b_vals])
+
+
+def _map2alm_once_pallas(maps, ell, order, *, nside, L_work, spin=0):
+    if spin != 0:
+        return _map2alm_once_pallas_spin(
+            maps, ell, order, nside=nside, L_work=L_work, spin=spin
+        )
     ftm = _forward_healpix_fft(maps[0], L=L_work, nside=nside, reality=True)
     theta = _stable_thetas(L_work, nside)
     weights = quadrature_jax.quad_weights_transform(
@@ -949,18 +1103,20 @@ def _map2alm_once_pallas(maps, ell, order, *, nside, L_work):
 
 
 def _map2alm_core_pallas(
-    maps, ell, order, *, nside, L, L_work, n_iter
+    maps, ell, order, *, nside, L, L_work, n_iter, spin=0
 ):
     alm = _map2alm_once_pallas(
-        maps, ell, order, nside=nside, L_work=L_work
+        maps, ell, order, nside=nside, L_work=L_work, spin=spin
     )
     for _ in range(n_iter):
         residual = (
-            _alm2map_core_pallas(alm, nside=nside, L=L, L_work=L_work)
+            _alm2map_core_pallas(
+                alm, nside=nside, L=L, L_work=L_work, spin=spin
+            )
             - maps
         )
         alm -= _map2alm_once_pallas(
-            residual, ell, order, nside=nside, L_work=L_work
+            residual, ell, order, nside=nside, L_work=L_work, spin=spin
         )
     return alm
 
@@ -1186,7 +1342,17 @@ def map2alm(map, spin, map_info, alm_info, *, n_iter):
     L = alm_info.lmax + 1
     L_work = max(L, 2 * map_info.nside)
     if _use_pallas_sht(L_work, spin):
-        if _use_multi_gpu_pallas(L_work, maps):
+        if False:
+            return _map2alm_core_pallas_multi_gpu(
+                maps,
+                alm_info._ell,
+                alm_info._m,
+                nside=map_info.nside,
+                L=L,
+                L_work=L_work,
+                n_iter=int(n_iter),
+            )
+        if _use_multi_gpu_pallas(L_work, maps) and spin == 0:
             return _map2alm_core_pallas_multi_gpu(
                 maps,
                 alm_info._ell,
@@ -1204,6 +1370,7 @@ def map2alm(map, spin, map_info, alm_info, *, n_iter):
             L=L,
             L_work=L_work,
             n_iter=int(n_iter),
+            spin=int(spin),
         )
     if _use_multi_gpu_sht(L_work):
         return _map2alm_core_multi_gpu(
@@ -1241,12 +1408,12 @@ def alm2map(alm, spin, map_info, alm_info):
     L = alm_info.lmax + 1
     L_work = max(L, 2 * map_info.nside)
     if _use_pallas_sht(L_work, spin):
-        if _use_multi_gpu_pallas(L_work, alm):
-            return _alm2map_core_pallas_multi_gpu(
-                alm, nside=map_info.nside, L=L, L_work=L_work
-            )
         return _alm2map_core_pallas(
-            alm, nside=map_info.nside, L=L, L_work=L_work
+            alm,
+            nside=map_info.nside,
+            L=L,
+            L_work=L_work,
+            spin=int(spin),
         )
     if _use_multi_gpu_sht(L_work):
         alm = _copy_to_device(alm, _gpu_devices()[0])
