@@ -1344,7 +1344,12 @@ def map2alm(map, spin, map_info, alm_info, *, n_iter):
             )
         return alm
     L = alm_info.lmax + 1
-    L_work = max(L, 2 * map_info.nside)
+    # The Pallas latitudinal SHT resolves m up to L-1 from the HEALPix rings
+    # directly and is accurate for L < 2*nside (NaMaster likewise only
+    # integrates m <= lmax), so let the working order track L there.  The
+    # generic s2fft reference ring FFT cannot concatenate its ring regions
+    # when L < 2*nside, so it still needs the working order lifted to 2*nside.
+    L_work = L
     if _use_pallas_sht(L_work, spin):
         if False:
             return _map2alm_core_pallas_multi_gpu(
@@ -1376,6 +1381,11 @@ def map2alm(map, spin, map_info, alm_info, *, n_iter):
             n_iter=int(n_iter),
             spin=int(spin),
         )
+    # Non-Pallas paths use the s2fft reference ring FFT, whose JAX kernel
+    # concatenates the polar/equatorial/south ring regions and only works for
+    # L >= 2*nside. Lift the working order so those paths stay valid; the
+    # Pallas path above already returned with L_work == L.
+    L_work = max(L_work, 2 * map_info.nside)
     if _use_multi_gpu_sht(L_work):
         return _map2alm_core_multi_gpu(
             maps,
@@ -1410,7 +1420,7 @@ def alm2map(alm, spin, map_info, alm_info):
     if not map_info.is_healpix:
         return alm2catalog(alm, map_info.si.positions, spin, alm_info.lmax)
     L = alm_info.lmax + 1
-    L_work = max(L, 2 * map_info.nside)
+    L_work = L
     if _use_pallas_sht(L_work, spin):
         return _alm2map_core_pallas(
             alm,
@@ -1419,6 +1429,9 @@ def alm2map(alm, spin, map_info, alm_info):
             L_work=L_work,
             spin=int(spin),
         )
+    # Non-Pallas paths use the s2fft reference ring FFT, which requires
+    # L >= 2*nside; the Pallas path above already returned with L_work == L.
+    L_work = max(L_work, 2 * map_info.nside)
     if _use_multi_gpu_sht(L_work):
         alm = _copy_to_device(alm, _gpu_devices()[0])
         return _alm2map_core_multi_gpu(
