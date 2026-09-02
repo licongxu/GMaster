@@ -18,6 +18,8 @@ from ._sht_pallas import (
     _spin_forward_latitudinal,
 )
 from ._sht_dfp32 import scalar_forward_latitudinal_dfp32
+from ._theta_matrix import band_bytes as _theta_band_bytes
+from ._theta_matrix import positive_latitudinal as _theta_matrix_latitudinal
 
 
 class NmtParams:
@@ -38,10 +40,11 @@ def set_sht_calculator(calc_name):
         "jax-mgpu",
         "jax-generic",
         "jax-dfp32",
+        "jax-matrix",
     ):
         raise KeyError(
             "GMaster's SHT calculator must be 'jax', 'jax-single', "
-            "'jax-mgpu', 'jax-generic', or 'jax-dfp32'"
+            "'jax-mgpu', 'jax-generic', 'jax-dfp32', or 'jax-matrix'"
         )
     nmt_params.sht_calculator = calc_name
 
@@ -581,11 +584,16 @@ def _use_multi_gpu_sht(L):
 
 _SPIN_PALLAS_MAX_L = 768
 
+# The precomputed Legendre band is O(L^2 * nside): 1.3 GB at Nside 256, 10 GB
+# at 512, 77 GB at 1024. Anything above this falls back to the fused kernel
+# rather than trading a 2.6x theta stage for an OOM.
+_MATRIX_BAND_BUDGET = 32 * 1024**3
+
 
 def _use_pallas_sht(L, spin):
     if (
         nmt_params.sht_calculator
-        not in ("jax", "jax-single", "jax-mgpu", "jax-dfp32")
+        not in ("jax", "jax-single", "jax-mgpu", "jax-dfp32", "jax-matrix")
         or L < 128
     ):
         return False
@@ -622,7 +630,19 @@ def _fused_forward_sht(positive, theta, weights, phase, *, L, block_size,
 
     The double-fp32 (DFP32) kernel is analysis-only and slightly different
     in precision; every other calculator uses the fp64 Pallas kernel.
+    `jax-matrix` replaces the recurrence with a precomputed Legendre band
+    (same fp64 values, memory-bound instead of recurrence-bound) and falls
+    back to the kernel when the band would not fit in device memory or cannot
+    be materialized concretely, which is what happens on `jax.grad` paths.
     """
+    if nmt_params.sht_calculator == "jax-matrix" and m_start == 0:
+        nside = (len(theta) + 1) // 4
+        if _theta_band_bytes(nside, L) <= _MATRIX_BAND_BUDGET:
+            positive_alm = _theta_matrix_latitudinal(
+                positive, L=L, nside=nside, weights=weights, phase=phase
+            )
+            if positive_alm is not None:
+                return positive_alm
     if nmt_params.sht_calculator == "jax-dfp32":
         return scalar_forward_latitudinal_dfp32(
             positive, theta, weights=weights, phase=phase,

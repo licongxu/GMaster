@@ -1169,3 +1169,122 @@ Two independent disqualifications, neither of them the one the comment describes
   reason plan item 4 exists: a future spin-2 matrix stage verified against the
   generic path inherits that error, so the gate must be NaMaster, not "matches
   the current path".
+
+## Session 5l (2026-09-02): precomputed-Legendre theta stage shipped as `jax-matrix`
+
+`gmaster/_theta_matrix.py` is live behind `set_sht_calculator("jax-matrix")`
+(`utils.py`: allowed-calculator tuple, `_fused_forward_sht` dispatch,
+`_MATRIX_BAND_BUDGET = 32 GiB` fit gate). It replaces the in-kernel regeneration of
+`d^l_{m,0}(theta_j)` with a cached m-banded matrix, moving the theta stage from
+recurrence-bound to memory-bound. Values come from the same normalised 3-term
+recurrence, seed, rescale schedule and equator rule as
+`_sht_pallas._analysis_kernel`, so this is a reorganisation, not an approximation.
+
+Theta stage against the fused kernel (`.qwen/tmp/matrix_module_test.py`, GPU
+warmed, both sides timed twice in one process):
+
+| nside | kernel | matrix | speedup | rel vs kernel |
+|---|---|---|---|---|
+| 64 | 0.30 ms | 0.15 ms | 1.96x | 1.9e-15 |
+| 128 | 0.87 ms | 0.34 ms | 2.58x | 3.1e-15 |
+| 256 | 4.03 ms | 1.51 ms | 2.66x | 5.2e-15 |
+
+Zero leakage into `ell < m` in all three. The parity split is what got it there:
+carrying the `(-1)^(ell+m)` north/south fold as four real RHS columns measured only
+1.34x at nside 256 — arithmetic, not bytes, was the limit. Splitting rows by parity
+of `i = ell - m0` turns the fold into a per-column sign, so each half contracts with
+one complex RHS: half the flops at identical bytes. `BLOCK = 64` being even is
+load-bearing for `(-1)^(m-m0) == (-1)^m`.
+
+Whole pipeline with the calculator selected through the public switch (nothing
+monkeypatched) and `pymaster` as reference (`.qwen/tmp/matrix_pipeline.py`,
+`.qwen/tmp/matrix_512.py`):
+
+| config | `jax` | `jax-matrix` | speedup | rel vs NaMaster |
+|---|---|---|---|---|
+| nside 256 spin 0 | 90.0 ms | 70.1 ms | 1.28x | 4.84e-13 (both) |
+| nside 512 spin 0 | 501.4 ms | 411.0 ms | 1.22x | 1.70e-12 (both) |
+
+NaMaster runs the nside-256 spin-0 pipeline in 59.6 ms, so this closes the gap from
+0.66x to 0.85x. Band cost is 1.3 GiB at 256 and 10.1 GiB at 512 (measured
+`bytes_in_use`, matches `band_bytes`); at 1024 it would be ~77 GiB and the gate
+falls back to the kernel. Tests: `115 passed, 3 skipped` (was 114), including the new
+`test_matrix_theta_stage_matches_fused_kernel`; the suite also passes with
+`jax-matrix` forced for every test.
+
+**Two measurement traps cost a full detour and must be pinned down.**
+
+1. *XLA scatter is pathological.* The first `_transform` wrote blocks into the
+   `(ell, m)` output with `out.at[rows[:, None], cols[None, :]].set()` and measured
+   150-1900 ms — 500x slower than the kernel it replaces, while numerically exact.
+   `.qwen/tmp/bisect_matrix.py` separated reduction from assembly at nside 128
+   (kernel 0.87 ms): chained 2-D scatter **519.9 ms**, one flattened scatter
+   **588 ms**, strided slice `at[m0+off::2]` **8.44 ms**, contiguous
+   `dynamic_update_slice` **0.366 ms**, `jnp.pad` + `jnp.concatenate` **0.354 ms**,
+   reduction alone **0.243 ms**. Assembly was the entire cost. Banded blocks are
+   rectangles at `(m0, m0)`, so they must be assembled with pad-and-concatenate —
+   never a scatter, never a strided slice. This applies to any future matrix stage,
+   including the spin-2 one.
+2. *Cold-GPU clock ramp.* Timing the Pallas kernel as the first GPU work in a
+   process inflated it ~50x (221.90 ms vs 4.03 ms steady). That single artifact
+   explains the mutually contradictory times across earlier probes. Harnesses must
+   `burn()` the GPU and time the incumbent both before and after the contender.
+
+Also: `compute_coupled_cell` memoises onto the field, so timing it against a warm
+field measures a dict lookup (0.1 ms). Every stage split in this session rebuilds
+its inputs.
+
+**Trace safety.** `jax.ensure_compile_time_eval()` does *not* make the band builder
+concrete under `jax.grad`/`jax.linear_transpose` —
+`test_fused_scalar_transform_gradients_match_generic_jax` caught it. `_BAND_CACHE`
+is therefore an explicit dict that stores a geometry only once its slabs are real
+device buffers (tested with `hasattr(slab, "block_until_ready")`) and returns `None`
+otherwise, which makes `_fused_forward_sht` fall back to the kernel. Gradients still
+flow; they just do not get the speedup.
+
+**Where the remaining time is.** `NmtField.__init__` runs `map2alm` itself
+(`field.py:197`), so the SHT lives in the *field* stage and `compute_coupled_cell`
+only multiplies cached alms. Any stage table that rebuilds fields inside each timed
+closure therefore counts the SHT two or three times — the first version of this
+table summed to 6357 ms at nside 256, which was an artifact. Attributing the SHT to
+the stage that actually pays for it:
+
+| stage (nside 256, unique work) | spin 0 | spin 2 |
+|---|---|---|
+| field, incl. the SHT | 35.7 ms | **1248.0 ms** |
+| coupled cell (alm products on cached alms) | ~3 ms | ~3 ms |
+| coupling matrix | ~90 ms | ~113 ms |
+| whole pipeline, `jax` | 90.1 ms | 1332.9 ms |
+| whole pipeline, `jax-matrix` | **70.6 ms** | 1324.8 ms (1.01x, noise) |
+| whole pipeline, NaMaster | 58.4 ms | 166.2 ms |
+
+(`.qwen/tmp/matrix_pipeline.py`, `.qwen/tmp/matrix_pipeline_spin2.py`,
+`.qwen/tmp/matrix_512.py`.) The spin-2 accuracy floor against NaMaster is
+`2.682e-08` under both calculators — the pre-existing generic-path gap, unchanged by
+this work.
+
+`jax-matrix` moved the spin-0 field stage 35.7 → 25.5 ms (1.40x) and the spin-2
+field stage 1248.0 → 1248.0 ms (**exactly 1.00x**), because `_use_pallas_sht` refuses
+`spin != 0` and the polarised path never reaches `_fused_forward_sht`. The spin-2 SHT
+is ~91% of the polarised pipeline on its own, so ~96% of the distance to NaMaster
+sits in the generic s2fft spin-2 latitudinal transform (`_forward_latitudinal` →
+`ftm_to_flm`). Together with Session 5k (the purpose-built fused spin kernel is
+disqualified and 12-20x slower than generic), the only credible route to "massively
+faster" is plan item 1: an `m' = ±2` column transform for spin 2 — two extra
+Wigner-d columns, ideally reusing this module's banded layout and pad-and-concatenate
+assembly — which would price a spin-2 SHT at roughly 2x scalar instead of ~35x.
+
+Do not try to answer this by wrapping `map2alm`/`_forward_s2fft` in timing
+decorators: the calls nest, the decorators double-count each other, forcing
+synchronisation destroys the async pipeline being measured, and the probe OOMed on
+CUDA-graph instantiation ("22 alive graphs"). Read `field.py` and take the
+difference of whole-pipeline measurements instead.
+
+Reduced precision is the other lever and is still blocked: the Pallas kernels are
+fp64-hard-wired through their `plt` reference dtypes (`ValueError: Invalid dtype for
+swap. Ref dtype: float64. Value dtype: float32`), and cuBLAS 13.0.2.14 on this host
+exposes only FP32 BF16x9 emulation, no FP64 emulation. Achieved streaming is already
+865-1600 GB/s against a 1603 GB/s measured peak, so within exact fp64 this stage is
+close to its ceiling.
+
+
