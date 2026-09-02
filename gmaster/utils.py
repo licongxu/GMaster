@@ -17,6 +17,7 @@ from ._sht_pallas import (
     _scalar_spin_synthesis_latitudinal,
     _spin_forward_latitudinal,
 )
+from ._sht_dfp32 import scalar_forward_latitudinal_dfp32
 
 
 class NmtParams:
@@ -31,10 +32,16 @@ nmt_params = NmtParams()
 
 
 def set_sht_calculator(calc_name):
-    if calc_name not in ("jax", "jax-single", "jax-mgpu", "jax-generic"):
+    if calc_name not in (
+        "jax",
+        "jax-single",
+        "jax-mgpu",
+        "jax-generic",
+        "jax-dfp32",
+    ):
         raise KeyError(
             "GMaster's SHT calculator must be 'jax', 'jax-single', "
-            "'jax-mgpu', or 'jax-generic'"
+            "'jax-mgpu', 'jax-generic', or 'jax-dfp32'"
         )
     nmt_params.sht_calculator = calc_name
 
@@ -577,7 +584,8 @@ _SPIN_PALLAS_MAX_L = 768
 
 def _use_pallas_sht(L, spin):
     if (
-        nmt_params.sht_calculator not in ("jax", "jax-single", "jax-mgpu")
+        nmt_params.sht_calculator
+        not in ("jax", "jax-single", "jax-mgpu", "jax-dfp32")
         or L < 128
     ):
         return False
@@ -606,6 +614,24 @@ def _use_multi_gpu_pallas(L, values):
         return False
     calculator = nmt_params.sht_calculator
     return calculator == "jax-mgpu" or (calculator == "jax" and L >= 2048)
+
+
+def _fused_forward_sht(positive, theta, weights, phase, *, L, block_size,
+                       m_start=0):
+    """Forward latitudinal SHT, dispatched on the configured calculator.
+
+    The double-fp32 (DFP32) kernel is analysis-only and slightly different
+    in precision; every other calculator uses the fp64 Pallas kernel.
+    """
+    if nmt_params.sht_calculator == "jax-dfp32":
+        return scalar_forward_latitudinal_dfp32(
+            positive, theta, weights=weights, phase=phase,
+            L=L, block_size=block_size, m_start=m_start,
+        )
+    return scalar_forward_latitudinal(
+        positive, theta, weights=weights, phase=phase,
+        L=L, block_size=block_size, m_start=m_start,
+    )
 
 
 def _next_fast_len_pow2(size):
@@ -1095,11 +1121,11 @@ def _map2alm_once_pallas(maps, ell, order, *, nside, L_work, spin=0):
         L_work, "healpix", nside
     )
     phase = -healpix_ffts.p2phi_rings_jax(jnp.arange(len(theta)), nside)
-    positive = scalar_forward_latitudinal(
+    positive = _fused_forward_sht(
         ftm[:, L_work:],
         theta,
-        weights=weights,
-        phase=phase,
+        weights,
+        phase,
         L=L_work,
         block_size=_pallas_block_size(nside),
     )
@@ -1157,21 +1183,21 @@ def _map2alm_once_pallas_multi_gpu(maps, ell, order, *, nside, L_work):
     block_size = _pallas_block_size(nside)
 
     def low_transform(values):
-        return scalar_forward_latitudinal(
+        return _fused_forward_sht(
             values,
             theta,
-            weights=weights,
-            phase=-phase,
+            weights,
+            -phase,
             L=L_work,
             block_size=block_size,
         )
 
     def high_transform(values):
-        return scalar_forward_latitudinal(
+        return _fused_forward_sht(
             values,
             other_theta,
-            weights=other_weights,
-            phase=-other_phase,
+            other_weights,
+            -other_phase,
             L=L_work,
             block_size=block_size,
             m_start=split,

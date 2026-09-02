@@ -187,6 +187,55 @@ def test_fused_scalar_transforms_match_namaster_and_generic_jax():
 
 
 @pytest.mark.skipif(not _HAS_NVIDIA_GPU, reason="requires an NVIDIA GPU")
+def test_dfp32_scalar_analysis_matches_namaster():
+    # jax-dfp32 runs the double-fp32 latitudinal SHT (analysis only; the
+    # iterative-refinement residual synthesis stays fp64). The Pallas path is
+    # active at L >= 128; double-fp32 retains the 3e-11 gate up to L ~ 192
+    # at nside 64, so test at L = 160 with a large margin.
+    reference = pytest.importorskip("pymaster")
+    nside = 64
+    lmax = 159
+    npix = 12 * nside**2
+    minfo = nmt.NmtMapInfo(None, (npix,))
+    ainfo = nmt.NmtAlmInfo(lmax)
+    ref_minfo = reference.NmtMapInfo(None, (npix,))
+    ref_ainfo = reference.NmtAlmInfo(lmax)
+    alms = _random_alms(np.random.default_rng(41), 1, ainfo, spin=0)
+    original = nmt.nmt_params.sht_calculator
+    try:
+        nmt.set_sht_calculator("jax")
+        fused_map = nmt.alm2map(alms, 0, minfo, ainfo)
+        fused_alms = [
+            nmt.map2alm(fused_map, 0, minfo, ainfo, n_iter=n_iter)
+            for n_iter in (0, 1)
+        ]
+        reference_map = reference.alm2map(alms, 0, ref_minfo, ref_ainfo)
+
+        nmt.set_sht_calculator("jax-dfp32")
+        for n_iter in (0, 1):
+            dfp32_alm = nmt.map2alm(fused_map, 0, minfo, ainfo, n_iter=n_iter)
+            np.testing.assert_allclose(
+                dfp32_alm, fused_alms[n_iter], atol=3e-11
+            )
+            np.testing.assert_allclose(
+                dfp32_alm,
+                reference.map2alm(
+                    np.asarray(fused_map),
+                    0,
+                    ref_minfo,
+                    ref_ainfo,
+                    n_iter=n_iter,
+                ),
+                atol=3e-11,
+            )
+        # the synthesis direction is unaffected by the calculator choice
+        dfp32_map = nmt.alm2map(alms, 0, minfo, ainfo)
+        np.testing.assert_allclose(dfp32_map, reference_map, atol=3e-11)
+    finally:
+        nmt.set_sht_calculator(original)
+
+
+@pytest.mark.skipif(not _HAS_NVIDIA_GPU, reason="requires an NVIDIA GPU")
 def test_fused_scalar_transform_gradients_match_generic_jax():
     nside = 16
     L = 3 * nside
