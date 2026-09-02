@@ -20,6 +20,7 @@ from ._sht_pallas import (
 from ._sht_dfp32 import scalar_forward_latitudinal_dfp32
 from ._theta_matrix import band_bytes as _theta_band_bytes
 from ._theta_matrix import positive_latitudinal as _theta_matrix_latitudinal
+from . import _spin_slice
 
 
 class NmtParams:
@@ -590,6 +591,19 @@ _SPIN_PALLAS_MAX_L = 768
 _MATRIX_BAND_BUDGET = 32 * 1024**3
 
 
+def _spin_slab(L_work, spin, *, nside):
+    """Cached Wigner-d slab for a polarised transform.
+
+    ``None`` means keep the generic s2fft scatter loop: either the calculator
+    asked for it explicitly, or the slab would not fit in device memory.
+    """
+    if nmt_params.sht_calculator in ("jax-generic", "jax-mgpu"):
+        return None
+    return _spin_slice.slab_for(
+        _stable_thetas(L_work, nside), L=L_work, spin=spin, nside=nside
+    )
+
+
 def _use_pallas_sht(L, spin):
     if (
         nmt_params.sht_calculator
@@ -1004,6 +1018,54 @@ def _map2alm_iteration(alm, maps, ell, order, *, spin, nside, L, L_work):
     return alm - _map2alm_once(
         residual, ell, order, spin=spin, nside=nside, L=L, L_work=L_work
     )
+
+
+@partial(jax.jit, static_argnames=("spin", "nside", "L", "L_work"))
+def _map2alm_once_slab(maps, ell, order, *, spin, nside, L, L_work, slab):
+    """Polarised analysis with the latitudinal step replaced by a slab contraction."""
+    ftm = _forward_s2fft_ftm(
+        maps[0] + 1j * maps[1], L=L_work, nside=nside, reality=False
+    )
+    plus = _finish_forward_s2fft(
+        _spin_slice.forward_latitudinal(ftm, slab, L=L_work),
+        L=L_work,
+        spin=spin,
+        reality=False,
+    )
+    plus_m = plus[ell, L_work - 1 + order]
+    minus_m = (-1) ** order * jnp.conj(plus[ell, L_work - 1 - order])
+    return jnp.stack([-(plus_m + minus_m) / 2, 0.5j * (plus_m - minus_m)])
+
+
+@partial(jax.jit, static_argnames=("spin", "nside", "L", "L_work"))
+def _alm2map_core_slab(alm, *, spin, nside, L, L_work, slab):
+    flm = _prepare_inverse_s2fft(_unpack_spin(alm, L, L_work), L=L_work)
+    ftm = _spin_slice.inverse_latitudinal(flm, slab, L=L_work)
+    maps = _finish_inverse_s2fft(
+        ftm, L=L_work, spin=spin, nside=nside, reality=False
+    )
+    return jnp.stack([jnp.real(maps), jnp.imag(maps)])
+
+
+@partial(jax.jit, static_argnames=("spin", "nside", "L", "L_work"))
+def _map2alm_iteration_slab(alm, maps, ell, order, *, spin, nside, L, L_work, slab):
+    residual = (
+        _alm2map_core_slab(alm, spin=spin, nside=nside, L=L, L_work=L_work, slab=slab)
+        - maps
+    )
+    return alm - _map2alm_once_slab(
+        residual, ell, order, spin=spin, nside=nside, L=L, L_work=L_work, slab=slab
+    )
+
+
+def _map2alm_core_slab(maps, ell, order, *, spin, nside, L, L_work, n_iter, slab):
+    alm = _map2alm_once_slab(maps, ell, order, spin=spin, nside=nside, L=L,
+                             L_work=L_work, slab=slab)
+    for _ in range(n_iter):
+        alm = _map2alm_iteration_slab(
+            alm, maps, ell, order, spin=spin, nside=nside, L=L, L_work=L_work, slab=slab
+        )
+    return alm
 
 
 def _map2alm_core(maps, ell, order, *, spin, nside, L, L_work, n_iter):
@@ -1432,6 +1494,20 @@ def map2alm(map, spin, map_info, alm_info, *, n_iter):
     # L >= 2*nside. Lift the working order so those paths stay valid; the
     # Pallas path above already returned with L_work == L.
     L_work = max(L_work, 2 * map_info.nside)
+    if spin != 0:
+        slab = _spin_slab(L_work, int(spin), nside=map_info.nside)
+        if slab is not None:
+            return _map2alm_core_slab(
+                maps,
+                alm_info._ell,
+                alm_info._m,
+                spin=int(spin),
+                nside=map_info.nside,
+                L=L,
+                L_work=L_work,
+                n_iter=int(n_iter),
+                slab=slab,
+            )
     if _use_multi_gpu_sht(L_work):
         return _map2alm_core_multi_gpu(
             maps,
@@ -1478,6 +1554,17 @@ def alm2map(alm, spin, map_info, alm_info):
     # Non-Pallas paths use the s2fft reference ring FFT, which requires
     # L >= 2*nside; the Pallas path above already returned with L_work == L.
     L_work = max(L_work, 2 * map_info.nside)
+    if spin != 0:
+        slab = _spin_slab(L_work, int(spin), nside=map_info.nside)
+        if slab is not None:
+            return _alm2map_core_slab(
+                alm,
+                spin=int(spin),
+                nside=map_info.nside,
+                L=L,
+                L_work=L_work,
+                slab=slab,
+            )
     if _use_multi_gpu_sht(L_work):
         alm = _copy_to_device(alm, _gpu_devices()[0])
         return _alm2map_core_multi_gpu(
