@@ -18,16 +18,30 @@ jax.config.update("jax_enable_x64", True)
 import gmaster as nmt
 
 
+def _block(result):
+    """Force every device value in ``result`` to materialise.
+
+    Stage callables return workspace/field objects, not arrays, so a
+    ``hasattr(result, "block_until_ready")`` check skips them entirely and the
+    sample measures only the host-side enqueue. Walking the pytree container is
+    what makes the stage numbers add up to the end-to-end total.
+    """
+    jax.tree.map(
+        lambda leaf: leaf.block_until_ready()
+        if hasattr(leaf, "block_until_ready") else None,
+        result,
+        is_leaf=lambda x: hasattr(x, "block_until_ready"),
+    )
+
+
 def _timed(function, repeats):
     result = function()
-    if hasattr(result, "block_until_ready"):
-        result.block_until_ready()
+    _block(result)
     samples = []
     for _ in range(repeats):
         start = time.perf_counter()
         result = function()
-        if hasattr(result, "block_until_ready"):
-            result.block_until_ready()
+        _block(result)
         samples.append(time.perf_counter() - start)
     return result, float(np.median(samples))
 
