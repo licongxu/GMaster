@@ -16,14 +16,15 @@ that already agrees with NaMaster -- and its transpose reproduces the synthesis
 step to the same accuracy.
 
 So the slice is built once per geometry with a scatter-free ``lax.scan`` and every
-transform afterwards is one memory-bound contraction, ~15x cheaper per call.
+transform afterwards is one memory-bound contraction, 15-25x cheaper per call.
 
 The contraction is diagonal in ``m`` (a batched matvec, not a GEMM), so the slab
-layout decides whether XLA streams it once or materialises a transpose of a
-multi-GiB array: read theta-contiguous it runs at ~760 GB/s, read ell-contiguous
-at ~730 GB/s, and a mismatched pairing drops to ~290 GB/s. One
-``(m, theta, ell)`` buffer plus a fused view for the analysis direction gets both
-directions close to the first number without storing the slab twice.
+layout decides whether XLA streams the buffer once or gathers it: with the
+reduction axis contiguous both directions run at ~700 GB/s, with a strided view
+of the same numbers analysis drops to ~200 GB/s (measured 1.7 ms vs 6.0 ms per
+call at nside 128).  Two materialised copies -- theta-contiguous for analysis,
+ell-contiguous for synthesis -- are therefore worth their 2x memory; a transposed
+view of one buffer is not.
 
 There is no parity shortcut here: unlike the scalar m'=0 band, no signed relation
 reproduces ``d^l_{m,-2}(pi - theta)`` from the same slice (measured ratios span
@@ -38,12 +39,15 @@ from jax import lax
 
 from s2fft.recursions.price_mcewen import generate_precomputes_jax
 
+THETA_CONTIG = "theta_contig"  # (m, ell, theta) -- analysis reduces over theta
+ELL_CONTIG = "ell_contig"  # (m, theta, ell) -- synthesis reduces over ell
+
 _CACHE = {}
 _MAX_GEOMETRIES = 2
-# A slab is (2L-1) * ntheta * L * 8 bytes: 1.1 GiB at nside 128, 9.0 GiB at 256,
-# 77 GiB at 512 (lmax = 3*nside). Above the budget the caller keeps the generic
-# scatter loop rather than swapping.
-_TABLE_BUDGET = 48 * 1024**3
+# A slab pair is 2 * (2L-1) * ntheta * L * 8 bytes: 2.2 GiB at nside 128, 18 GiB
+# at 256, 154 GiB at 512 (lmax = 3*nside).  Above the budget the caller keeps the
+# generic scatter loop rather than trading a slower theta stage for swapping.
+_PAIR_BUDGET = 48 * 1024**3
 
 
 def _march(theta_trig, half_slice, cpi, cp2, vsign_rows, lrenorm, indices, L, which):
@@ -131,8 +135,8 @@ def slice_bytes(nside, L):
     return (2 * L - 1) * (4 * nside - 1) * L * 8
 
 
-def table_budget():
-    return _TABLE_BUDGET
+def pair_bytes(nside, L):
+    return 2 * slice_bytes(nside, L)
 
 
 def _blocked(array):
@@ -143,32 +147,48 @@ def _blocked(array):
     return array
 
 
-def _cached(theta, L, spin, key):
-    cached = _CACHE.get(key)
+def _cached(theta, L, spin, key, layout):
+    cached = _CACHE.get((key, layout))
     if cached is not None:
         return cached
-    table = _blocked(_build(theta, L, spin))
+    table = _build(theta, L, spin)  # (m, theta, ell)
+    if layout == THETA_CONTIG:
+        # `+ 0.0` forces a real theta-contiguous buffer; a bare transpose can
+        # stay a view, which is exactly the layout the contraction punishes.
+        table = table.transpose(0, 2, 1) + 0.0
+    table = _blocked(table)
     if table is None:
         # Inside a transpose/grad trace: nothing concrete to cache, so let the
         # caller fall back to the generic path rather than bake a constant in.
         return None
-    if key not in _CACHE and len(_CACHE) >= _MAX_GEOMETRIES:
+    keys = {k for k, _ in _CACHE}
+    if key not in keys and len(keys) >= _MAX_GEOMETRIES:
         _CACHE.clear()
-    _CACHE[key] = table
+    _CACHE[(key, layout)] = table
     return table
 
 
-def slab_for(theta, *, L, spin, nside):
-    """Wigner-d slab for this geometry, or ``None`` if it would not fit or is traced.
+def slabs_for(theta, *, L, spin, nside):
+    """``(analysis, synthesis)`` slabs for this geometry, or ``(None, None)``.
 
-    One physical buffer in ``(m, theta, ell)`` order serves both directions: the
-    analysis contraction reads it as a ``(theta, m, ell)`` view, which XLA fuses
-    into the reduction instead of materialising a transpose. A second,
-    ell-contiguous copy would have doubled the memory for no measured gain.
+    Two materialised copies of the same numbers, laid out so that each direction
+    reduces over its contiguous axis: ``(m, ell, theta)`` for
+    :func:`forward_latitudinal`, ``(m, theta, ell)`` for
+    :func:`inverse_latitudinal`. Returns ``(None, None)`` when the pair does not
+    fit the memory budget or this is a trace context, in which case the caller
+    keeps the generic scatter loop.
     """
-    if slice_bytes(nside, L) > _TABLE_BUDGET:
-        return None
-    return _cached(jnp.asarray(theta), L, spin, (nside, L, spin))
+    if pair_bytes(nside, L) > _PAIR_BUDGET:
+        return None, None
+    theta = jnp.asarray(theta)
+    key = (nside, L, spin)
+    analysis = _cached(theta, L, spin, key, THETA_CONTIG)
+    if analysis is None:
+        return None, None
+    synthesis = _cached(theta, L, spin, key, ELL_CONTIG)
+    if synthesis is None:
+        return None, None
+    return analysis, synthesis
 
 
 def clear_cache():
@@ -176,16 +196,20 @@ def clear_cache():
 
 
 def forward_latitudinal(ftm, slab, *, L):
-    """flm[ell, L-1+m] = sum_theta slice[theta, ell, m] * ftm[theta, L+m]."""
+    """flm[ell, L-1+m] = sum_theta slice[theta, ell, m] * ftm[theta, L+m].
+
+    ``slab`` is the ``(m, ell, theta)`` copy from :func:`slabs_for`.
+    """
     ftm = jnp.asarray(ftm)[:, 1:]
-    return jnp.einsum("tce,tc->ec", jnp.moveaxis(slab, 1, 0), ftm, optimize=True)
+    return jnp.einsum("cet,tc->ec", slab, ftm, optimize=True)
 
 
 def inverse_latitudinal(flm, slab, *, L):
     """Transpose of :func:`forward_latitudinal`; ftm is padded to 2L columns.
 
-    Diagonal in ``m`` like the forward step: column ``m + L - 1`` of ``flm``
-    feeds column ``m + L`` of the padded ``ftm`` (the same +1 padding offset).
+    ``slab`` is the ``(m, theta, ell)`` copy from :func:`slabs_for`. Diagonal in
+    ``m`` like the forward step: column ``m + L - 1`` of ``flm`` feeds column
+    ``m + L`` of the padded ``ftm`` (the same +1 padding offset).
     """
     contracted = jnp.einsum("cte,ec->tc", slab, jnp.asarray(flm), optimize=True)
     ftm = jnp.zeros((contracted.shape[0], 2 * L), dtype=jnp.complex128)

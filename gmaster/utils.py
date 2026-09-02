@@ -591,15 +591,15 @@ _SPIN_PALLAS_MAX_L = 768
 _MATRIX_BAND_BUDGET = 32 * 1024**3
 
 
-def _spin_slab(L_work, spin, *, nside):
-    """Cached Wigner-d slab for a polarised transform.
+def _spin_slabs(L_work, spin, *, nside):
+    """Cached (analysis, synthesis) Wigner-d slabs for a polarised transform.
 
-    ``None`` means keep the generic s2fft scatter loop: either the calculator
-    asked for it explicitly, or the slab would not fit in device memory.
+    ``(None, None)`` means keep the generic s2fft scatter loop: either the
+    calculator asked for it explicitly, or the pair would not fit in memory.
     """
     if nmt_params.sht_calculator in ("jax-generic", "jax-mgpu"):
-        return None
-    return _spin_slice.slab_for(
+        return None, None
+    return _spin_slice.slabs_for(
         _stable_thetas(L_work, nside), L=L_work, spin=spin, nside=nside
     )
 
@@ -1048,22 +1048,27 @@ def _alm2map_core_slab(alm, *, spin, nside, L, L_work, slab):
 
 
 @partial(jax.jit, static_argnames=("spin", "nside", "L", "L_work"))
-def _map2alm_iteration_slab(alm, maps, ell, order, *, spin, nside, L, L_work, slab):
+def _map2alm_iteration_slab(alm, maps, ell, order, *, spin, nside, L, L_work,
+                            analysis_slab, synthesis_slab):
     residual = (
-        _alm2map_core_slab(alm, spin=spin, nside=nside, L=L, L_work=L_work, slab=slab)
+        _alm2map_core_slab(alm, spin=spin, nside=nside, L=L, L_work=L_work,
+                           slab=synthesis_slab)
         - maps
     )
     return alm - _map2alm_once_slab(
-        residual, ell, order, spin=spin, nside=nside, L=L, L_work=L_work, slab=slab
+        residual, ell, order, spin=spin, nside=nside, L=L, L_work=L_work,
+        slab=analysis_slab,
     )
 
 
-def _map2alm_core_slab(maps, ell, order, *, spin, nside, L, L_work, n_iter, slab):
+def _map2alm_core_slab(maps, ell, order, *, spin, nside, L, L_work, n_iter,
+                       analysis_slab, synthesis_slab):
     alm = _map2alm_once_slab(maps, ell, order, spin=spin, nside=nside, L=L,
-                             L_work=L_work, slab=slab)
+                             L_work=L_work, slab=analysis_slab)
     for _ in range(n_iter):
         alm = _map2alm_iteration_slab(
-            alm, maps, ell, order, spin=spin, nside=nside, L=L, L_work=L_work, slab=slab
+            alm, maps, ell, order, spin=spin, nside=nside, L=L, L_work=L_work,
+            analysis_slab=analysis_slab, synthesis_slab=synthesis_slab,
         )
     return alm
 
@@ -1495,8 +1500,10 @@ def map2alm(map, spin, map_info, alm_info, *, n_iter):
     # Pallas path above already returned with L_work == L.
     L_work = max(L_work, 2 * map_info.nside)
     if spin != 0:
-        slab = _spin_slab(L_work, int(spin), nside=map_info.nside)
-        if slab is not None:
+        analysis_slab, synthesis_slab = _spin_slabs(
+            L_work, int(spin), nside=map_info.nside
+        )
+        if analysis_slab is not None:
             return _map2alm_core_slab(
                 maps,
                 alm_info._ell,
@@ -1506,7 +1513,8 @@ def map2alm(map, spin, map_info, alm_info, *, n_iter):
                 L=L,
                 L_work=L_work,
                 n_iter=int(n_iter),
-                slab=slab,
+                analysis_slab=analysis_slab,
+                synthesis_slab=synthesis_slab,
             )
     if _use_multi_gpu_sht(L_work):
         return _map2alm_core_multi_gpu(
@@ -1555,15 +1563,15 @@ def alm2map(alm, spin, map_info, alm_info):
     # L >= 2*nside; the Pallas path above already returned with L_work == L.
     L_work = max(L_work, 2 * map_info.nside)
     if spin != 0:
-        slab = _spin_slab(L_work, int(spin), nside=map_info.nside)
-        if slab is not None:
+        _, synthesis_slab = _spin_slabs(L_work, int(spin), nside=map_info.nside)
+        if synthesis_slab is not None:
             return _alm2map_core_slab(
                 alm,
                 spin=int(spin),
                 nside=map_info.nside,
                 L=L,
                 L_work=L_work,
-                slab=slab,
+                slab=synthesis_slab,
             )
     if _use_multi_gpu_sht(L_work):
         alm = _copy_to_device(alm, _gpu_devices()[0])
