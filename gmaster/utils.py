@@ -734,6 +734,34 @@ def _ring_czt_constants(L, nside):
     )
 
 
+@lru_cache(maxsize=32)
+def _ring_inverse_layout_numpy(L, nside):
+    """Per-pixel source slot of the (4*nside-1, 4*nside) ring grid, on the host.
+
+    The inverse ring transform used to write the map with an index-add scatter,
+    which needs atomics: the padded slots of every short ring all point at
+    pixel 0. The HEALPix rings partition the map, so the same write is a pure
+    gather of exactly one slot per pixel.
+    """
+    ntheta = 4 * nside - 1
+    npix = 12 * nside**2
+    width = 4 * nside
+    _, _, gather, valid, _ = _ring_czt_constants_numpy(L, nside)
+    slots = np.arange(ntheta * width, dtype=np.int64).reshape(ntheta, width)
+    source = np.zeros(npix, dtype=np.int64)
+    used = np.zeros(npix, dtype=bool)
+    source[gather[valid]] = slots[valid]
+    used[gather[valid]] = True
+    return source, used
+
+
+def _ring_inverse_layout(L, nside):
+    # Built per call, like `_ring_czt_constants`: caching the device arrays here
+    # would keep tracers from whichever trace first asked.
+    source, used = _ring_inverse_layout_numpy(L, nside)
+    return jnp.asarray(source), jnp.asarray(used)
+
+
 def _chirp_angle(index, two_nphi, inverse):
     """exp(+-i*pi*q^2/nphi) angles with exact integer modular reduction."""
     reduced = (index.astype(jnp.int64) ** 2) % two_nphi
@@ -772,7 +800,7 @@ def _forward_ring_fft(map_flat, *, L, nside):
 @partial(jax.jit, static_argnames=("L", "nside"))
 def _inverse_ring_fft(ftm_positive, *, L, nside):
     """Exact HEALPix ring inverse FFT as one batched chirp-Z transform."""
-    nphi, start, gather, valid, width = _ring_czt_constants(L, nside)
+    nphi, _, _, _, width = _ring_czt_constants(L, nside)
     ntheta = 4 * nside - 1
     positive = jnp.asarray(ftm_positive)
     full = jnp.zeros((ntheta, 2 * L), dtype=positive.dtype)
@@ -797,10 +825,9 @@ def _inverse_ring_fft(ftm_positive, *, L, nside):
     wrap_phase = ((L % nphi)[:, None] * p_index[None, :]) % nphi[:, None]
     result *= jnp.exp(-1j * wrap_phase * (2 * jnp.pi / nphi)[:, None])
 
-    pixels = jnp.zeros((12 * nside**2,), dtype=result.real.dtype)
-    contributions = jnp.where(valid, result.real, 0.0)
-    pixels = pixels.at[gather.ravel()].add(contributions.ravel())
-    return pixels
+    source, used = _ring_inverse_layout(L, nside)
+    slots = jnp.reshape(result.real, (-1,))
+    return jnp.where(used, slots[source], 0.0)
 
 
 @partial(jax.jit, static_argnames=("L", "nside"))
@@ -831,7 +858,7 @@ def _forward_ring_fft_full(signal, *, L, nside):
 @partial(jax.jit, static_argnames=("L", "nside"))
 def _inverse_ring_fft_complex(centered, *, L, nside):
     """Complex inverse ring FFT of a centered (ntheta, 2L-1) spectrum."""
-    nphi, start, gather, valid, width = _ring_czt_constants(L, nside)
+    nphi, _, _, _, width = _ring_czt_constants(L, nside)
     grid = jnp.asarray(centered)
     ntheta = grid.shape[0]
     two_nphi = (2 * nphi)[:, None]
@@ -853,10 +880,9 @@ def _inverse_ring_fft_complex(centered, *, L, nside):
     wrap_phase = (((L - 1) % nphi)[:, None] * p_index[None, :]) % nphi[:, None]
     result *= jnp.exp(-1j * wrap_phase * (2 * jnp.pi / nphi)[:, None])
 
-    pixels = jnp.zeros((12 * nside**2,), dtype=result.dtype)
-    contributions = jnp.where(valid, result, 0.0)
-    pixels = pixels.at[gather.ravel()].add(contributions.ravel())
-    return pixels
+    source, used = _ring_inverse_layout(L, nside)
+    slots = jnp.reshape(result, (-1,))
+    return jnp.where(used, slots[source], 0.0)
 
 
 @lru_cache(maxsize=16)
