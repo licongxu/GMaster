@@ -1821,3 +1821,119 @@ the full march (1.74 s) is 8.6x the cost of all seven contractions (7 x 28.9 ms 
 **Do not re-pitch a window or theta stream, a cleverer layout, or PCIe streaming as the
 route to beating NaMaster above 512.** Capacity is the wall, the march is 39x too slow
 to dodge it, and the arithmetic is already at the fp64 floor.
+
+## Session 9 (2026-09-03) — the hand-written kernel measured 3x slower, and the tensor-core lever closed by arithmetic
+
+Session 8 ended with one lever left open: *"closing the remaining distance to the fp64
+floor needs a hand-written kernel."* It has now been written, validated and measured.
+It loses. So does every alternative arithmetic path, and this session ends with the
+first **quantitative** closure of the massive-speedup question rather than an
+appeal to effort.
+
+### The Pallas contraction kernel: correct, and 3x slower than XLA
+
+`.qwen/tmp/cp3.py` (log `cp3b.log`) implements the windowed 4-channel contraction
+directly — one block element loaded once, four register accumulators, tiled over the
+reduce axis — and validates it against the shipped `jnp.sum` form in the same process.
+Sweep: `x_block` 16..128, `y_block` 32..128, `num_warps` 4/8, `num_stages` 2..4.
+
+| shape | plain fp64 sum | shipped 4-channel sum | best Pallas kernel |
+|---|---|---|---|
+| (64, 1536, 2047), 1535 MiB | 1.02 ms / 1572 GB/s | **2.30 ms / 699 GB/s** | 6.74 ms / 239 GB/s = **0.34×**, rel 6.6e-16 |
+| (64, 1536, 343), 257 MiB | 0.21 ms / 1293 GB/s | 0.41 ms / 664 GB/s | 1.17 ms / 230 GB/s = **0.35×**, rel 4.0e-16 |
+
+Every configuration lands in the 180-240 GB/s band. The first version kept a
+`(x_block, y_block, 4)` product tile (64 KB of registers per program) and spilled;
+splitting it into four independent `(x_block,)` accumulators fixed the spill and moved
+the rate by nothing. Triton's fp64 reduction codegen on this card is simply ~3x behind
+XLA's. **The kernel lever is closed: XLA's schedule is the best fp64 form reachable
+here, from either side.**
+
+Probe trap found on the way, worth remembering: a `pl.pallas_call` that is not jitted
+re-traces on every timed call. A trivial read-scale-write kernel measured 8 GB/s
+untraced and 1182 GB/s traced — the first number is host time, not kernel time.
+
+### Alignment is not the limiter, and narrow-N cublas is dead again
+
+The reduce axis is `ntheta = 4·Nside − 1 = 2047` at Nside 512 — odd, so with fp64 only
+the first row of the table is 128 B aligned. Padding the reduce length costs 0.05 % of
+bytes and buys (`align_probe.log`, same contraction, same bytes):
+
+| reduce length | row offset | plain sum | 4-channel sum | `matmul` (N=4) |
+|---|---|---|---|---|
+| 2047 | 120 B | 1521 GB/s | 671.7 GB/s | 222.6 GB/s |
+| 2048 | 0 B | 1549 GB/s | 679.3 GB/s | 219.6 GB/s |
+| 2052 | 32 B | 1564 GB/s | 702.1 GB/s | 219.7 GB/s |
+| 2064 | 0 B | 1570 GB/s | 704.2 GB/s | 222.9 GB/s |
+
+Alignment is worth ≤4.8 % — real but tiny, and it would need the table builder changed
+to hold it. cublas `matmul` sits at 222 GB/s at every N (agrees with the 4-channel sum
+to 3.5e-15), repeating the narrow-N finding in `fp64-roofline-wall.md`.
+
+### Three structural variants, each bit-identical, none of them faster
+
+The shipped forward chains 48 functional `at[...].set(...)` updates over an
+(L, 2L−1) complex array and takes the negative-order half with a negative-stride
+gather per window. Both were rebuilt from the placement algebra (`out[ell, off±m]`,
+`out[th, L±m]`, `m = 0` having no negative column) and measured against the shipped
+function in-process at n512:
+
+| variant | forward | inverse | rel |
+|---|---|---|---|
+| shipped | 42.58 ms | 58.23 ms | — |
+| concatenate + single transpose, no scatter at all | 55.56 (**0.77×**) | 61.90 (**0.94×**) | 1.05e-15 |
+| mirror arrays reversed and signed once per call, every window slice contiguous | 41.85 (**1.00×**) | 55.96 (**1.00×**) | **0.00e+00** |
+| RHS materialised in its own jit (6.65 / 4.84 ms alone), contraction in a second | 41.93 (**1.00×**) | 55.90 (**1.00×**) | **0.00e+00** |
+
+Two of them reproduce the shipped output **bit for bit**, which also confirms the
+placement algebra in `forward_latitudinal`/`inverse_latitudinal` is exactly as derived.
+The scatter chain is already fused into the producers; the gathers and the producer
+fusion cost nothing.
+
+For reference, summing the raw contraction over all 24 windows with the RHS already in
+hand gives 29.99 ms (analysis shapes) and 31.01 ms (synthesis shapes) — **1.03×**, so
+the direction asymmetry seen in situ is not the block shape either
+(`dir_split.log`). What is left between that and the in-situ 42/56 ms is XLA's schedule
+for the fused producer-plus-reduce, and every tool tried on it (kernel, tiling, layout,
+window width, scatter removal, materialisation barrier) now measures flat or worse.
+
+### The massive lever, closed by counting passes instead of by taste
+
+`narrow_tc.log` and `narrow_n4.log` measure the same M=98304, K=2047 operand under
+tensor-core matmuls at the N our contraction actually has (4 channels):
+
+| dtype | N=4 | N=8 | N=16 | N=32 | A+B bandwidth |
+|---|---|---|---|---|---|
+| bf16 | 0.310 ms | 0.300 | 0.301 | 0.301 | ~1.34 TB/s |
+| fp16 | 0.298 ms | 0.295 | 0.300 | 0.304 | ~1.35 TB/s |
+| fp32 | 0.551 ms | 0.546 | 0.550 | 0.551 | ~1.46 TB/s |
+| int8 | 0.408 ms | 0.500 | 0.829 | 1.644 | 493 → 122 GB/s |
+
+bf16/fp16/fp32 time is **flat in N**: at N=4 the tensor cores are not the constraint,
+the operand stream is, and it streams at 1.35 TB/s. int8 is compute-bound at ~7.8 T
+flop/s and *slower* per byte than fp64. That turns the emulation question into a
+pass count with a hard break-even:
+
+- shipped fp64 4-channel contraction of that block: **2.30 ms**;
+- one bf16 pass over it: **0.31 ms** → **break-even = 7.4 limb products**.
+
+Limb counts required for fp64-class accuracy, at 8 bits (bf16) or 7 bits (int8) per
+limb: ~1e-13 needs 44 bits ⇒ 10 bf16 products (4 limbs) or 28 int8 products — **all
+beyond break-even, so all slower than plain fp64**. The only splits that fit inside
+7.4 passes are 2-3 limbs (16-24 bits), which represent the table to 1.5e-5 and 6e-8
+respectively: the first is 2 orders worse than the shipped agreement with NaMaster
+(3.56e-07 at n512), the second reaches it only by consuming the whole budget and still
+lands at 1.24× at best. **A limb scheme at N=4 cannot both beat fp64 and stay accurate
+on this card. "Massively faster" is arithmetic here, not an engineering gap.**
+
+### What that leaves, stated honestly
+
+At Nside ≤ 512 both spins beat NaMaster (1.2-1.7× through 512, n512 spin 2 at 1.33×)
+with the contraction at 83-85 % of the fp64 SIMT FMA ceiling, and no reachable form —
+XLA, Triton, cublas, or tensor-core emulation — improves on it without spending
+accuracy the objective does not allow. Above 512 the wall is capacity: one layout is
+146.96 GiB at 1024 against a 71.2 GiB pool, the march needed to dodge it is 39× off
+bandwidth, PCIe is 60× off it, and 640/768 have no NaMaster reference to beat at all.
+The two things that could still move the scoreboard are outside this box: a second
+free ≥96 GiB card (windows shard, 73.5 GiB per card, ~1.9× projected at 1024), or a
+chirp-Z/factorised-`d` latitudinal rewrite that reduces the FLOP count itself.
