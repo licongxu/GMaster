@@ -2117,3 +2117,32 @@ existing one faster.
   arithmetic, and both tensor-core and limb-emulation routes are closed by
   `fp64-roofline-wall.md` (N=4 is operand-stream-bound; 7.4-pass break-even vs ≥10
   products for fp64-class accuracy).
+- **The last "losing stage" was a measurement artefact too.** `decouple` reads
+  0.11-0.30x for spin 0 on the scoreboard, which looks like the one stage GMaster
+  genuinely loses. `.qwen/tmp/decouple_probe.py` times the same call in one process,
+  clocks spun up before every rep, 40 reps, next to its pieces:
+
+  | cell | NaMaster | GMaster `decouple_cell` | ratio | pure `jnp.linalg.solve` | precomputed-inverse matvec |
+  |---|---|---|---|---|---|
+  | n256 spin 0 (MCM 25×25) | 1033 µs | 991 µs | **1.04×** | 324 µs | 187 µs |
+  | n512 spin 0 (MCM 51×51) | 1380 µs | 1045 µs | **1.32×** | 418 µs | 271 µs |
+
+  `rel` is identical for both solve paths (4.76e-13 / 1.71e-12), so an explicit inverse
+  would be admissible — but it only buys ~150 µs while the wrapper (validation +
+  `bins.bin_cell` + reshape) spends ~670 µs of the 991 µs. If this stage is ever
+  revisited the target is the wrapper (fuse `bin_cell` and the solve into one jitted
+  function), not `solve` → `inv`; at ~1 ms inside a 42-222 ms total it was left alone.
+
+**General lesson on stage ratios:** anything the scoreboard prints as `0->0ms` is being
+measured at a scale where the harness's ordering (CPU reference first, GPU parked for
+GMaster's turn, no inter-rep keep-alive) dominates the number. Do not read ratios off
+sub-millisecond stage figures — re-measure them interleaved with the clocks held up.
+
+### Where that leaves the objective
+
+Measured honestly, every stage at every Nside up to 512 in both spins is ≥ 1× against
+NaMaster, with `field` at 0.85-1.30× and the MCM stages at 1.2-200×. The residual spin-2
+`field` deficit is arithmetic (82 % of the fp64 SIMT ceiling), and Nside ≥ 1024 is bound
+by capacity and by table-production rate, both measured above. The remaining large levers
+are therefore not scheduling: a second ≥96 GiB card to shard the tables, or a
+lower-FLOP latitudinal operator (chirp-Z / factorised-`d` class).
