@@ -1616,6 +1616,14 @@ bit-identical against a float128 oracle at n128. The suite is unchanged at
 n512 spin-2 `field` stage: 441 → **360 ms**. It is still the only stage where
 GMaster trails NaMaster (360 vs 224); coupling/coupled_cell/decouple are 8-240× ahead.
 
+**Where the remaining `field` time is, by subtraction (inference, not a direct stage
+measurement):** 4 analysis + 3 synthesis at the isolated rates above is
+4 x 28.91 + 3 x 34.02 = **217.6 ms of the 360 ms**, leaving **~142 ms (26 % of the whole
+536 ms TOTAL) that is not the Wigner-d contraction** — ring regridding, the phi FFTs,
+weighting and the refinement bookkeeping. Every previous session attributed `field`
+entirely to the transforms; after this commit it no longer is, so the next attribution
+pass should look at the non-contraction part.
+
 ### Why `sum(block[..., None] * real_rhs)` beats `einsum` here
 
 `einsum`/`matmul`/`dot_general` all lower to a tiled GEMM; with an `N = 1`-ish
@@ -1672,29 +1680,63 @@ GEMM tops out at 1.88 TFLOP/s) or fewer FLOPs, not another tuning pass.
   147 GiB table moves at ~16-25 GB/s → ~2.7 s *per transform*, 7 transforms per
   `NmtField(n_iter=3)`. NaMaster's whole field stage is 0.9 s.
 
-### What would actually move 1024
+### Streaming the table: pitched, measured, disqualified
 
-**The bytes, not the algorithm, are the problem — and the bytes never all need to be
-resident at once.** The m-windows are independent in analysis (`alm[ell, m]` receives
-contributions only from its own window) and purely additive in synthesis (the map is a
-sum over m). So instead of holding the whole table, hold one window: build the window's
-blocks, apply them to all 7 latitudinal transforms of the `field` stage, accumulate
-into the output `alm` / map buffers (a few hundred MB at 1024), free, next window.
-`triangle_bytes` gives the exact worst window (`m0 = 0`, `lo = 0`, 64 orders):
+The obvious idea for 1024 is that the bytes never all need to be resident: analysis is
+a sum over `theta`, synthesis is disjoint in `theta`, and m-windows are independent, so
+build one chunk, contract it into the output accumulator, drop it, next chunk. The
+window arithmetic does fit (`triangle_bytes`, worst `m0 = 0` window of 64 orders):
 
-| Nside | windows | one layout total | **worst window, one layout** | worst window, pair |
+| Nside | windows | one layout total | worst window, one layout | worst window, pair |
 |---|---|---|---|---|
 | 512 | 24 | 18.74 GiB | 1.50 GiB | 3.00 GiB |
 | 1024 | 48 | 146.96 GiB | **6.00 GiB** | **12.00 GiB** |
 | 2048 | 96 | 1163.86 GiB | 24.00 GiB | 47.99 GiB |
 | 4096 | 192 | 9263.43 GiB | 95.99 GiB | 191.99 GiB (32-order windows → 96 GiB) |
 
-**The stream is the only route that scales:** the resident table is cubic in Nside and
-runs out at 640, but a window is cubic too divided by `L/64`, so it grows only
-quadratically and stays inside one 96 GiB card through 2048 (and 4096 with 32-order
-windows). The open number is **per-window build cost**: if the build is host-side (n512
-`peakRSS=47.2 GB` says it is) the host→GPU transfer re-enters the timed region, and the
-route may be build-on-GPU per window instead. Unmeasured as of this commit; that
-measurement decides whether 1024 is reachable at all. Multi-card sharding is the other
-option and is already wired for the MCM (`_forward_latitudinal_device`), but GPU0 is
-another tenant at ~96.9 GiB.
+**It dies on the march, not on the arithmetic.** `_build` recurses over `m`, so a chunk
+of the table can only be produced by marching, and the march is nowhere near
+bandwidth (`march_cost3.log`, one 6 GiB build chunk):
+
+| Nside | chunk | rings/chunk | march per chunk | **effective rate** | full-table march |
+|---|---|---|---|---|---|
+| 512 | 6.0 GiB | 171 | 144.9 ms | **41 GB/s** | **1.74 s** |
+| 1024 | 6.0 GiB | 43 | 171.8 ms | **35 GB/s** | **16.49 s** |
+
+Against the 1603 GB/s row-read rate that is a **39x penalty**, and it is paid *per
+march*. A resident table pays it once for the whole `field` stage; a stream pays it
+seven times, because the refinement loop needs all alms before it can synthesise, so
+each of the 7 transforms re-marches. At n1024 that is **7 x 16.5 s = 115 s** — worse
+than the 85.8 s generic scatter loop we are trying to replace (which is doing the same
+re-march, and is the reason it costs what it costs). The transpose that the build does
+per window is not the problem: 0.2-0.5 ms per window-chunk, 0.1 s (n512) / 0.9 s
+(n1024) all-inclusive.
+
+The same numbers say why the resident table is the *only* shape that can win: at n512
+the full march (1.74 s) is 8.6x the cost of all seven contractions (7 x 28.9 ms =
+202 ms), so the build must stay cached and outside the timed region.
+
+### What can still move 1024
+
+1. **Two cards.** Windows are independent, so the layout shards; 1024 needs 73.5 GiB
+   per card (half of 147 GiB) against a 71.2 GiB pool — 3% short, so a raised
+   `gpu_memory_fraction` plus a free second card is the whole requirement. If the
+   contraction then runs at its fp64 floor (FLOPs are cubic: 8 x 24.5 ms = 196 ms per
+   transform, 7 transforms = 1.37 s) plus the 361 ms of coupling already measured at
+   1024, the spin-2 field lands at **~1.7 s against NaMaster's 3.29 s ≈ 1.9x**. Not
+   available now: GPU0 is another tenant at ~96.9 GiB.
+2. **Tensor cores.** `fp64-roofline-wall.md` measures the ladder: no fp64 tensor cores
+   on this card, dense fp64 GEMM tops out at 1.88 TFLOP/s, so Ozaki/DFP32-style
+   fp32-pair emulation is the only remaining *massive* lever, and it must hold fp64
+   accuracy to be usable at all (`dfp32-analysis-kernel.md` records the precision cliff
+   the current DFP32 analysis kernel sits on).
+3. **Fewer FLOPs by algorithm, not layout.** The table is already at its Z2-orbit
+   minimum and the 4-channel contraction is at 85% of the fp64 FMA floor, so the only
+   sub-linear route is a chirp-Z / factorised-`d` scheme of the libsharp family. That is
+   a rewrite of the latitudinal step, not a tuning pass, and `blocked-recurrence-wall.md`
+   and `fused-spin-kernel-dead.md` record two attempts at neighbouring ground that died
+   on fp64 conditioning.
+
+**Do not re-pitch a window or theta stream, a cleverer layout, or PCIe streaming as the
+route to beating NaMaster above 512.** Capacity is the wall, the march is 39x too slow
+to dodge it, and the arithmetic is already at the fp64 floor.
