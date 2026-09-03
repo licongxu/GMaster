@@ -19,6 +19,7 @@ from ._sht_pallas import (
 )
 from ._sht_dfp32 import scalar_forward_latitudinal_dfp32
 from ._theta_matrix import band_bytes as _theta_band_bytes
+from ._theta_matrix import inverse_latitudinal as _theta_matrix_inverse_latitudinal
 from ._theta_matrix import positive_latitudinal as _theta_matrix_latitudinal
 from . import _spin_slice
 
@@ -698,6 +699,28 @@ def _fused_forward_sht(positive, theta, weights, phase, *, L, block_size,
     )
 
 
+def _fused_inverse_sht(positive, theta, phase, *, L, nside, block_size):
+    """Scalar synthesis latitudinal stage, dispatched like `_fused_forward_sht`.
+
+    HEALPix synthesis carries no quadrature weight of its own (the ring
+    transform has it), so both routes get a unit weight vector.  The synthesis
+    band is the analysis band re-laid out so the reduction runs over ell, which
+    doubles the band's device footprint: the budget check has to leave room for
+    both copies.
+    """
+    weights = jnp.ones_like(theta)
+    if (_prefer_theta_band(nside, L, 0)
+            and 2 * _theta_band_bytes(nside, L) <= _MATRIX_BAND_BUDGET):
+        ftm = _theta_matrix_inverse_latitudinal(
+            positive, L=L, nside=nside, weights=weights, phase=phase)
+        if ftm is not None:
+            return ftm
+    return scalar_inverse_latitudinal(
+        positive, theta, weights=weights, phase=phase,
+        L=L, block_size=block_size,
+    )
+
+
 def _next_fast_len_pow2(size):
     return 1 << max(1, int(size) - 1).bit_length()
 
@@ -1194,11 +1217,12 @@ def _alm2map_core_pallas(alm, *, nside, L, L_work, spin=0):
     positive = _positive_alm(alm[0], L=L, L_work=L_work)
     theta = _stable_thetas(L_work, nside)
     phase = healpix_ffts.p2phi_rings_jax(jnp.arange(len(theta)), nside)
-    ftm_positive = scalar_inverse_latitudinal(
+    ftm_positive = _fused_inverse_sht(
         positive,
         theta,
-        phase=phase,
+        phase,
         L=L_work,
+        nside=nside,
         block_size=_pallas_block_size(nside),
     )
     maps = _finish_inverse_pallas(ftm_positive, L=L_work, nside=nside)

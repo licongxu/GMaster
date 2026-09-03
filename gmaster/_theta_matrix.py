@@ -196,3 +196,92 @@ def forward_latitudinal(ftm, *, L, nside, theta, weights, phase):
     """`positive_latitudinal` taking the full FFT map, for the existing probes."""
     return positive_latitudinal(ftm[:, L:], L=L, nside=nside, weights=weights,
                                 phase=phase)
+
+
+_SYNTH_CACHE = {}
+
+
+def _synth_band(geometry):
+    """The band re-laid out for synthesis: reduction over ell, contiguously.
+
+    Same numbers as `_band`, transposed into ``(m_local, j, ell_row)`` blocks.
+    A transposed *view* is what the theta stage punishes (see the module
+    docstring of `_spin_slice`), so each block is materialised; the `+ 0.0` is
+    what forces the copy.
+    """
+    cached = _SYNTH_CACHE.get(geometry)
+    if cached is not None:
+        return cached
+    band = _band(geometry)
+    if band is None:
+        return None
+    if geometry not in _SYNTH_CACHE and len(_SYNTH_CACHE) >= _BAND_MAX_GEOMETRIES:
+        # Same bound as the analysis band's, or the two caches together would
+        # hold twice as many geometries as either alone allows.
+        _SYNTH_CACHE.clear()
+    groups = tuple(
+        tuple((slab.transpose(1, 2, 0) + 0.0) for slab in group) for group in band)
+    for group in groups:
+        for slab in group:
+            slab.block_until_ready()
+    _SYNTH_CACHE[geometry] = groups
+    return groups
+
+
+@partial(jax.jit, static_argnames=("L", "widths"))
+def _inverse(slabs_even, slabs_odd, alm, weights, phase, *, L, widths):
+    north = slabs_even[0].shape[1]
+    m = jnp.arange(L, dtype=jnp.float64)[:, None]
+    sign = 1.0 - 2.0 * jnp.bitwise_and(jnp.arange(L), 1).astype(jnp.float64)
+    # The fused kernel applies each ring's quadrature weight and phi phase to
+    # its own half, so the band has to as well -- the south half with the
+    # *partner* ring's weight and phase, in descending theta.
+    north_factor = weights[:north] * jnp.exp(1j * (m * phase[:north]))
+    south_factor = (
+        jnp.flip(weights)[: north - 1]
+        * jnp.exp(1j * (m * jnp.flip(phase)[: north - 1]))
+    )
+    north_parts, south_parts = [], []
+    for m0, w, even, odd in zip(range(0, L, BLOCK), widths, slabs_even, slabs_odd):
+        # `alm` is (ell, m); a block needs its own m window in the two parity
+        # row-groups the band was split into.
+        rhs_even = alm[m0::2, m0:m0 + w].T
+        rhs_odd = alm[m0 + 1::2, m0:m0 + w].T
+        acc_e = jnp.sum(even * rhs_even[:, None, :], axis=-1)
+        acc_o = jnp.sum(odd * rhs_odd[:, None, :], axis=-1)
+        north_parts.append((acc_e + acc_o) * north_factor[m0:m0 + w])
+        # (-1)^(ell+m) = (-1)^(ell-m0) * (-1)^(m+m0): the parity split makes the
+        # first factor a constant per group, leaving a per-m sign for the south.
+        block_sign = (1.0 if m0 % 2 == 0 else -1.0) * sign[m0:m0 + w]
+        south_parts.append(
+            ((acc_e - acc_o)[:, :north - 1] * block_sign[:, None])
+            * south_factor[m0:m0 + w])
+    north_vals = jnp.concatenate(north_parts, axis=0)   # (L, north)
+    south_vals = jnp.concatenate(south_parts, axis=0)   # (L, north - 1)
+    # ntheta = 4*nside - 1 is odd: row `north - 1` is the equator and is its own
+    # mirror image, where the south sum equals the north one exactly (every
+    # d^l_{m,0}(pi/2) with odd l+m vanishes), so it is the north half's row and
+    # the south contributes only its first north-1 rows.  They follow in
+    # descending theta, which is the order the fused kernel writes them in.
+    return jnp.transpose(jnp.concatenate(
+        [north_vals, jnp.flip(south_vals, axis=1)], axis=1))
+
+
+def inverse_latitudinal(positive_alm, *, L, nside, weights, phase):
+    """Positive-m synthesis theta transform from the cached band.
+
+    `positive_alm` is the (ell, m) positive-m block, the same array
+    `_alm2map_core_pallas` hands to `scalar_inverse_latitudinal`; the result is
+    the centred (ntheta, L) positive-m block that kernel returns, quadrature
+    weight and phi phase included.  Returns None when the band is unavailable so
+    the caller can fall back to the fused kernel.
+    """
+    assert BLOCK % 2 == 0, "the parity split assumes an even m-block"
+    geometry = (nside, L, BLOCK)
+    band = _synth_band(geometry)
+    if band is None:
+        return None
+    slabs_even, slabs_odd = band
+    return _inverse(slabs_even, slabs_odd, jnp.asarray(positive_alm),
+                    weights, phase, L=L,
+                    widths=tuple(min(BLOCK, L - m0) for m0 in range(0, L, BLOCK)))
