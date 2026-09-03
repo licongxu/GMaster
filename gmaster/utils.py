@@ -645,6 +645,11 @@ def _pallas_block_size(nside):
     return min(512, 2 * nside)
 
 
+# Above this working bandlimit the refinement loop runs op-by-op instead of as
+# one traced program; see `_map2alm_core_pallas` for the measured crossover.
+_PALLAS_TRACED_MAX_L = 256
+
+
 def _use_multi_gpu_pallas(L, values):
     if len(_gpu_devices()) < 2 or isinstance(values, jax.core.Tracer):
         return False
@@ -1177,7 +1182,7 @@ def _positive_alm(alm, *, L, L_work):
     return jnp.pad(positive, ((0, L_work - L), (0, L_work - L)))
 
 
-def _alm2map_core_pallas(alm, *, nside, L, L_work, spin=0):
+def _alm2map_core_pallas_eager(alm, *, nside, L, L_work, spin=0):
     if spin != 0:
         # Two-helicity synthesis: a+ = E + iB drives the mp=+s ladder of
         # f+ = Q - iU; a- = E - iB drives the mp=-s ladder of f- = Q + iU.
@@ -1227,6 +1232,18 @@ def _alm2map_core_pallas(alm, *, nside, L, L_work, spin=0):
     )
     maps = _finish_inverse_pallas(ftm_positive, L=L_work, nside=nside)
     return jnp.real(maps)[None, :]
+
+
+_alm2map_core_pallas_traced = jax.jit(
+    _alm2map_core_pallas_eager, static_argnames=("nside", "L", "L_work", "spin")
+)
+
+
+def _alm2map_core_pallas(alm, *, nside, L, L_work, spin=0):
+    """Synthesis, traced whole below `_PALLAS_TRACED_MAX_L` (see `_map2alm_core_pallas`)."""
+    core = (_alm2map_core_pallas_traced if L_work <= _PALLAS_TRACED_MAX_L
+            else _alm2map_core_pallas_eager)
+    return core(alm, nside=nside, L=L, L_work=L_work, spin=spin)
 
 
 @lru_cache(maxsize=32)
@@ -1302,6 +1319,24 @@ def _map2alm_once_pallas(maps, ell, order, *, nside, L_work, spin=0):
 def _map2alm_core_pallas(
     maps, ell, order, *, nside, L, L_work, n_iter, spin=0
 ):
+    """Analytic pseudo-Cl analysis, traced whole or run op-by-op.
+
+    Tracing the refinement loop as one program removes the per-primitive host
+    dispatch, which at small bandlimit is the whole cost (Nside 32-64 are
+    launch-bound: the device idles between kernels).  Above the crossover the
+    monolithic program is the slower of the two: Nside 128 goes 15 -> 18 ms and
+    Nside 256 58 -> 82 ms, because one large program holds every intermediate
+    live at once and loses the allocator's reuse between boundaries.
+    """
+    core = (_map2alm_core_pallas_traced if L_work <= _PALLAS_TRACED_MAX_L
+            else _map2alm_core_pallas_eager)
+    return core(maps, ell, order, nside=nside, L=L, L_work=L_work,
+                n_iter=n_iter, spin=spin)
+
+
+def _map2alm_core_pallas_eager(
+    maps, ell, order, *, nside, L, L_work, n_iter, spin=0
+):
     alm = _map2alm_once_pallas(
         maps, ell, order, nside=nside, L_work=L_work, spin=spin
     )
@@ -1316,6 +1351,12 @@ def _map2alm_core_pallas(
             residual, ell, order, nside=nside, L_work=L_work, spin=spin
         )
     return alm
+
+
+_map2alm_core_pallas_traced = jax.jit(
+    _map2alm_core_pallas_eager,
+    static_argnames=("nside", "L", "L_work", "n_iter", "spin"),
+)
 
 
 @partial(jax.jit, static_argnames=("split",))
