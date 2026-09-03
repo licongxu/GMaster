@@ -1650,10 +1650,17 @@ there is no hidden pool there. Two side findings from the same probes:
   `field 216->358ms`, `TOTAL 536 ms` (`n512_rep7.log`) against `field 360`, `TOTAL 536`
   at repeats 3 — identical. The pipeline's 358 ms reproduces the sum of the separately
   measured pieces (375.8 ms), so the ~130-160 ms distance to the fp64 floor is a stable
-  property of the shipped schedule (candidates: block-page locality under 37.5 GiB of
-  residency, XLA tiling when the blocks arrive as jit arguments rather than constants),
+  property of the shipped schedule (candidate: XLA tiling when the blocks arrive as jit
+  arguments rather than constants — see the next bullet for what is already excluded),
   not measurement noise. That is the biggest remaining win below 1024: field 358 →
   ~220 ms would make n512 spin 2 ~1.9-2.0x overall.
+- **Two explanations for that gap are already ruled out.** It is *not* fp32 inflation in
+  the optimistic probe: `reduce_forms2.py` sets `jax.config.update("jax_enable_x64",
+  True)` before importing `jnp` (line 19), so 28.91 ms was genuine fp64. It is *not*
+  residency either: that probe called `S.slabs_for(...)`, i.e. the same pair-layout path
+  the pipeline uses (the `18.74 GiB` in its header is one layout's byte count, not what
+  was resident). Resolving the difference needs an HLO / profiler look at the two
+  schedules, not another timing probe.
 
 ### Why `sum(block[..., None] * real_rhs)` beats `einsum` here
 
