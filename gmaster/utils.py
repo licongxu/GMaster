@@ -444,7 +444,17 @@ def _stable_thetas(L, nside):
 @partial(jax.jit, static_argnames=("L", "nside", "reality"))
 def _forward_s2fft_ftm(maps, *, L, nside, reality):
     m_start = L - 1 if reality else 0
-    ftm = healpix_ffts.healpix_fft(maps, L, nside, "jax", reality)
+    if reality:
+        ftm = healpix_ffts.healpix_fft(maps, L, nside, "jax", reality)
+    else:
+        # One batched chirp-Z transform instead of s2fft's per-ring unroll: the
+        # latter issues one tiny FFT per ring (1023 of them at Nside 256) and
+        # runs launch-bound at ~4 GB/s.  Matches it to 1.6e-15.
+        centered = _forward_ring_fft_full(maps, L=L, nside=nside)
+        ftm = jnp.concatenate(
+            (jnp.zeros((centered.shape[0], 1), dtype=centered.dtype), centered),
+            axis=1,
+        )
     ftm = jnp.einsum(
         "tm,t->tm",
         ftm,
@@ -535,7 +545,8 @@ def _finish_inverse_s2fft(ftm, *, L, spin, nside, reality):
     ftm *= (-1) ** abs(spin)
     if reality:
         ftm = ftm.at[:, 1:L].set(jnp.flip(jnp.conj(ftm[:, L + 1 :]), axis=-1))
-    return healpix_ffts.healpix_ifft(ftm, L, nside, "jax", reality)
+        return healpix_ffts.healpix_ifft(ftm, L, nside, "jax", reality)
+    return _inverse_ring_fft_complex(ftm[:, 1:], L=L, nside=nside)
 
 
 @partial(jax.jit, static_argnames=("L", "spin", "nside", "reality"))
@@ -802,7 +813,7 @@ def _forward_ring_fft_full(signal, *, L, nside):
     n_index = jnp.arange(width, dtype=jnp.int64)
     embedded = rows * jnp.exp(-1j * _chirp_angle(n_index, two_nphi, False))
     embedded = jnp.pad(embedded, ((0, 0), (0, transform_size - width)))
-    shift = jnp.arange(transform_size, dtype=jnp.int64) - (width - 1)
+    shift = jnp.arange(transform_size, dtype=jnp.int64) - (width - 1) - (L - 1)
     kernel = jnp.exp(1j * _chirp_angle(shift, two_nphi, False))
     convolution = jnp.fft.ifft(
         jnp.fft.fft(embedded, axis=-1) * jnp.fft.fft(kernel, axis=-1), axis=-1
