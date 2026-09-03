@@ -1740,6 +1740,27 @@ during the build even in a fresh process). Nothing ships: a size-dependent width
 buy ~6 ms on the n256 cell while hurting the n512 cell by more. Probes
 `.qwen/tmp/mblock_sweep.py`, logs `mblock_sweep.log`, `mblock_small.log`, `mblock_512.log`.
 
+### Tiling the reduction axis is flat too (and it costs bit-identity)
+
+Session 8's `reduce_forms.log` has `theta-chunked reduce 256/512` recorded as **FAIL**
+(a shape bug), so the idea was never actually measured. Measured now
+(`.qwen/tmp/tile_reduce.py`, n256, shipped call as the in-process control, ratio vs
+shipped for 4 analysis + 3 synthesis):
+
+| tile | analysis | synthesis | 4f+3i |
+|---|---|---|---|
+| — (shipped, one `jnp.sum`) | 8.52 ms | 8.45 ms | 59.4 ms |
+| 64 | 9.14 (0.93×) | 9.08 (0.93×) | 63.8 (0.93×) |
+| 128 | 9.06 (0.94×) | 7.45 (1.13×) | 58.6 (1.01×) |
+| 256 | 9.89 (0.86×) | 7.19 (1.18×) | 61.1 (0.97×) |
+| 512 | 7.39 (1.15×) | 8.91 (0.95×) | 56.3 (1.06×) |
+
+No tile size helps both directions; the best aggregate (512, 1.06×) is inside run-to-run
+spread, and every tiled variant differs from shipped by ~2e-16 because partial sums
+reassociate — i.e. it would cost the bit-identity the shipped form currently has, for
+nothing. **XLA's schedule for the shipped form cannot be beaten by reshaping or tiling
+knobs**; closing the remaining distance to the fp64 floor needs a hand-written kernel.
+
 ### Streaming the table: pitched, measured, disqualified
 
 The obvious idea for 1024 is that the bytes never all need to be resident: analysis is
