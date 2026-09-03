@@ -1340,14 +1340,14 @@ coupled spectrum. **No change this session moved any `rel` value** — spin 0 st
 |---|---|---|---|---|---|
 | 32 | 0 | 3.0-4.5 | 3.7 | 3.5-4.0 | ~1× (noise-bound) |
 | 32 | 2 | 3.7-4.0 | 7.3 | 6.9 | **0.5×** |
-| 64 | 0 | 7.0-7.5 | 7.7 | 6.6 | 1.1× |
+| 64 | 0 | 7.0-8.0 | 7.7 | 6.6-7.0 | 1.0-1.1× |
 | 64 | 2 | 14.0-14.4 | 12.7 | 10.2 | **1.4×** |
 | 128 | 0 | 17.9-23 | 21.1 | 15.4 | **1.2-1.5×** |
 | 128 | 2 | 40-42 | 27.5 | 24 | **1.7×** |
 | 256 | 0 | 61-65 | 59.5 | 47 | **1.3×** |
 | 256 | 2 | 155-163 | 114.6 | 102 | **1.5×** |
-| 512 | 0 | 339-345 | 196 | 288 | **1.2×** |
-| 512 | 2 | 718 | 8500 | ~8700 | **0.08×** |
+| 512 | 0 | 339-345 | 196 | 288-290 | **1.2×** |
+| 512 | 2 | 687-718 | 8500 | ~8700 | **0.08×** |
 
 Nside 32 is host-bound and its noise (±1 ms on a 3-4 ms total) exceeds the
 difference, so both spins there are a tie rather than a measured win or loss —
@@ -1409,49 +1409,43 @@ fails on four parameterisations — the guard is `(m - n) % 2 == 0`.
 - **Always-traced core loops**, m-window blocks of 16 and 128, and a window variant
   that skips both ell ends: all measured worse than what ships.
 
-### Where the time still goes (n256, spin 2, after all four)
+### Where the time still goes (n256, spin 2, after all five)
 
-`field 19` · `map2alm 53` · `alm2map 36` · `coupling 16` · `coupled_cell 3` ·
-`decouple 2` · `synthesize 6`. Both transforms are now pure bandwidth: the spin-2
-latitudinal contraction streams the windowed slab at ~735 GB/s against the ~1578 GB/s
-real-read rate, and the shortfall is the **complex-RHS tax** — every table element is
+`field ~69` · `coupling 10` · `coupled_cell ~0` · transforms ~52 (analysis) + ~36
+(synthesis) of the field stage. Both transforms are now pure bandwidth: the spin-2
+latitudinal contraction streams the windowed slab and the shortfall against the
+~1578 GB/s fp64 read rate is the **complex-RHS tax** — every table element is
 multiplied by a complex weight, and XLA has no way to avoid two real reductions per
 element (see memory `complex-rhs-tax.md`: every XLA-level reformulation tried,
 including einsum variants, `lax.dot_general`, splitting, and batched forms, measured
-at the same 1.00–1.05×). The scalar band contraction runs at 938 GB/s of table bytes
-at n512 and is partly per-block launch-bound (24 block reduces + a pad/concatenate
-assembly chain per transform).
+at the same 1.00–1.05×).
 
-### The n512 spin-2 wall
+### The n512 spin-2 wall, with the last escape route closed
 
 The `_spin_slice` slab pair is `2 × (2L-1) × ntheta × L × 16 B` = **154 GiB** at
-Nside 512 against a 71.2 GiB JAX pool (0.75 × 96 GiB RTX PRO 6000), so
-`slabs_for` rejects it at its `pair_bytes > _PAIR_BUDGET` (48 GiB) gate and the
-transform falls to the generic `lax.fori_loop` scatter path. The benchmark's
-`GPUpeak=20.1GiB` confirms no slab was ever attempted. That path costs
-**8.5 s** for the seven polarised transforms of one field — 38× NaMaster's 224 ms
-field stage and 12× its 718 ms total — because it materialises the full
-`(2L-1, ntheta, L)` `dl` buffer *and* scatters per `m`.
+Nside 512 against a 71.2 GiB JAX pool (0.75 × 96 GiB RTX PRO 6000), so `slabs_for`
+rejects it at its 48 GiB gate and the transform falls to the generic
+`lax.fori_loop` scatter path: **8.7 s** for one field against NaMaster's 0.69 s
+(`GPUpeak=20.2GiB` confirms no slab was attempted). Three ways out were measured and
+all three are shut:
 
-The m-window skip does not change the *allocation*, only the bytes read, so it
-cannot rescue this cell, and neither can windowed allocation: the slab is built
-by a recurrence that marches sequentially over `m`, so the `ell >= |m|` rows
-cannot be produced without their predecessors and `lax.scan` materialises every
-row. Chunking the march over `theta` is legal (the recurrence is independent per
-ring) but compacted storage is still ~45 GiB plus a transient chunk.
+- **Single layout** (77 GiB): synthesis contracted against the theta-contiguous
+  buffer is exact to 2.2e-16 and costs 18.0 ms vs 15.7 ms at Nside 256 — cheap
+  enough — but 77 GiB plus ~14 GiB of `ftm`/`flm` exceeds the 96 GiB *physical*
+  card. Not a budget-setting problem.
+- **Windowed allocation**: the slab marches sequentially over `m`, so the
+  `ell >= |m|` rows cannot be produced without their predecessors and `lax.scan`
+  materialises every row.
+- **Fusing the contraction into the march** (no slab at all): the march costs
+  549 / 466 / 666 ms at Nside 64 / 128 / 256 (`.qwen/tmp/march_cost.py`) — flat in
+  size, i.e. latency-bound, and 10–100× the cost of *reading* the table it builds
+  (8.99 GiB at Nside 256 is a ~6 ms peak-bandwidth read). Paying it seven times per
+  field, as the fused form must, is worse than the generic path it would replace.
 
-Dropping to a **single layout** was measured, not assumed
-(`.qwen/tmp/slab_one_layout.py`, Nside 256): synthesis contracted against the
-*analysis* (theta-contiguous) buffer is exact to 2.2e-16 and costs 18.0 ms
-against 15.7 ms for the dedicated ell-contiguous one — the two copies buy 15% on
-one stage for 2x memory. It is not shipped (memory is not the binding constraint
-below Nside 512 and this is a small slowdown), but it bounds the n512 question:
-one layout is 77 GiB, plus ~14 GiB of `ftm`/`flm` working set, against 96 GiB
-*physical*. **The wall is therefore not a budget setting — n512 spin 2 cannot be
-table-driven on this card at all**, and the only route to beating NaMaster there
-is contracting the Wigner-d recurrence on the fly inside a fused kernel, which
-is also the only known way past the complex-RHS tax that caps every polarised
-transform at ~735 GB/s. Spin 0 at n512 is unaffected (band budget fits) and
-remains the fastest cell in the table.
+The remaining route is a fused Pallas/Triton kernel that runs the recurrence with
+parallel reduction — which memory `blocked-recurrence-wall.md` records as already
+tried and stopped by the fp64 wall at `m ~ L/2`. Spin 0 at n512 is unaffected (band
+budget fits) and remains the fastest cell in the table.
+
 
 
