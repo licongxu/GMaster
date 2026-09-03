@@ -1582,3 +1582,119 @@ further shrinking of a table that is stored at all** — the slice is
 
 Suite state at both commits: **115 passed, 3 skipped**; `flake8 --max-line-length=90`
 clean on `gmaster/_spin_slice.py`.
+
+## Session 8 (2026-09-03) — one contraction over four real channels; the large-Nside wall measured
+
+One commit: `3ff71bc` — *perf(sht): contract each Wigner-d block once over four real
+channels*. Session 7 left the polar latitudinal step doing **two** complex `einsum`
+calls per block (direct + ring-reversed mirror). Both read the *same* block, so the
+block was streamed from HBM twice at 717-745 GB/s. The fix folds the two complex
+contractions and the real/imaginary split into **one** multiply-and-reduce over four
+*real* right-hand sides:
+
+```python
+rhs = jnp.stack([direct.real.T, direct.imag.T, mirror.real.T, mirror.imag.T], -1)
+acc = jnp.sum(block[..., None] * rhs[:, None, :, :], axis=2)   # (m, ell, 4)
+```
+
+Isolated n512 spin 2: analysis **51.9 → 28.9 ms (1.80×)**, synthesis **57.4 → 34.0 ms
+(1.69×)**, `rel = 0.00e+00` — bit-identical to the shipped two-`einsum` form, and
+bit-identical against a float128 oracle at n128. The suite is unchanged at
+**115 passed, 3 skipped**, and `max|dCl|`/`rel` are the same digits at every cell.
+
+### Scoreboard (TOTAL ms, GPU1, `ref->gm`, medians; `real_split_chain.log`)
+
+| Nside | spin | NaMaster | GMaster now | ratio | was (session start) | rel (unchanged) |
+|---|---|---|---|---|---|---|
+| 128 | 0 | 20 | 13 | **1.5×** | 16 | 1.03e-13 |
+| 128 | 2 | 41 | 23 | **1.7×** | 26 | 4.90e-09 |
+| 256 | 0 | 59 | 47 | **1.2×** | 47 | 4.76e-13 |
+| 256 | 2 | 161 | 94 | **1.7×** | 97 | 2.74e-08 |
+| 512 | 0 | 340 | 289 | **1.2×** | 288 | 1.71e-12 |
+| 512 | 2 | 713 | **536** | **1.33×** | 619 (1.14×) | 3.56e-07 |
+
+n512 spin-2 `field` stage: 441 → **360 ms**. It is still the only stage where
+GMaster trails NaMaster (360 vs 224); coupling/coupled_cell/decouple are 8-240× ahead.
+
+### Why `sum(block[..., None] * real_rhs)` beats `einsum` here
+
+`einsum`/`matmul`/`dot_general` all lower to a tiled GEMM; with an `N = 1`-ish
+complex operand XLA picks a tile shape that reads the shared block twice (once per
+complex channel) and lands at **717-745 GB/s**. A real-valued RHS makes the same
+expression a *fused reduction* — a different lowering — so the block is read once and
+multiplied by 4 channels. Reference points on this card: pure fp64 row-read
+**1603 GB/s**, bare `sum(block * rhs)` over the shipped n512 layout **1484 GB/s**,
+shipped complex-RHS `einsum` **717-745 GB/s**.
+
+The spin-0 path in `_theta_matrix.py` already used this real-channel form, which is
+why scalar was never the deficit; only the polarised path was paying the tax.
+
+### Ceiling reached: 85 % of the fp64 FMA floor
+
+For the shipped n512 layout the 4-channel contraction is 1.0e10 FMA; at the measured
+fp64 SIMT ceiling of **0.82 TFLOP/s (0.41 T FMA/s)** the floor is **24.5 ms** against
+28.9 ms measured. **There is no fp64 headroom left in this stage.** Going further
+needs tensor cores / fp32-emulation (this card has no fp64 tensor cores; dense fp64
+GEMM tops out at 1.88 TFLOP/s) or fewer FLOPs, not another tuning pass.
+
+### Things that measured the opposite of expectation
+
+- **"The complex-RHS tax can only be removed by a custom kernel."** Wrong, and the
+  standing memory said so. It was removed with `jnp.sum` on a real RHS.
+- **Complex 2-channel fusion** (one pass, 2 complex channels instead of 4 real):
+  **1.01×** — no read sharing without a real RHS.
+- **Pad-and-concatenate epilogue** instead of the `at[].set` scatter chain: **worse**
+  (35.7 vs 28.9 ms forward, 47.0 vs 34.0 ms inverse). The scatter chain is not the
+  bottleneck.
+
+### The large-Nside wall, measured rather than assumed
+
+- **640 and 768 have no reference cell at all.** `NaMaster/pymaster/utils.py:266-272`
+  (`NmtMapInfo.__init__`) doubles `nside` from 2 until `12*nside*nside == npix` and
+  raises past 65536, so **pymaster accepts only power-of-two Nsides**. The session-7
+  plan item "admit the single 62.42 GiB layout at 768 and benchmark it" is moot: the
+  reference itself dies with `ValueError: Something is wrong with your input arrays`
+  before GMaster is ever called (`n768_try.log`). Nothing to beat at 640/768.
+- **Nside 1024, both spins, one card (`n1024_try.log`):**
+
+  | spin | NaMaster | GMaster | ratio | field `ref->gm` | rel |
+  |---|---|---|---|---|---|
+  | 0 | 1760 | 2962 | **0.60×** | 511 → 1366 ms | 2.20e-12 |
+  | 2 | 3294 | 87658 | **0.04×** | 899 → 85799 ms | 2.97e-06 |
+
+  Accuracy holds at both spins; the loss is purely the transform path. At 1024 the
+  polar table is **146.96 GiB** for one layout (294 GiB for the pair) against a
+  **71.2 GiB** pool, so `slabs_for` declines it and the polarised path drops to the
+  generic s2fft scatter loop — that loop, not the Wigner-d contraction, is what costs
+  85.8 s. Spin 0 falls back to the fused Pallas kernel (`_MATRIX_BAND_BUDGET` is
+  32 GiB vs a 77 GiB band) and lands at 0.6×.
+- **PCIe streaming is not a workaround:** host RAM is 376 GiB (307 available), but a
+  147 GiB table moves at ~16-25 GB/s → ~2.7 s *per transform*, 7 transforms per
+  `NmtField(n_iter=3)`. NaMaster's whole field stage is 0.9 s.
+
+### What would actually move 1024
+
+**The bytes, not the algorithm, are the problem — and the bytes never all need to be
+resident at once.** The m-windows are independent in analysis (`alm[ell, m]` receives
+contributions only from its own window) and purely additive in synthesis (the map is a
+sum over m). So instead of holding the whole table, hold one window: build the window's
+blocks, apply them to all 7 latitudinal transforms of the `field` stage, accumulate
+into the output `alm` / map buffers (a few hundred MB at 1024), free, next window.
+`triangle_bytes` gives the exact worst window (`m0 = 0`, `lo = 0`, 64 orders):
+
+| Nside | windows | one layout total | **worst window, one layout** | worst window, pair |
+|---|---|---|---|---|
+| 512 | 24 | 18.74 GiB | 1.50 GiB | 3.00 GiB |
+| 1024 | 48 | 146.96 GiB | **6.00 GiB** | **12.00 GiB** |
+| 2048 | 96 | 1163.86 GiB | 24.00 GiB | 47.99 GiB |
+| 4096 | 192 | 9263.43 GiB | 95.99 GiB | 191.99 GiB (32-order windows → 96 GiB) |
+
+**The stream is the only route that scales:** the resident table is cubic in Nside and
+runs out at 640, but a window is cubic too divided by `L/64`, so it grows only
+quadratically and stays inside one 96 GiB card through 2048 (and 4096 with 32-order
+windows). The open number is **per-window build cost**: if the build is host-side (n512
+`peakRSS=47.2 GB` says it is) the host→GPU transfer re-enters the timed region, and the
+route may be build-on-GPU per window instead. Unmeasured as of this commit; that
+measurement decides whether 1024 is reachable at all. Multi-card sharding is the other
+option and is already wired for the MCM (`_forward_latitudinal_device`), but GPU0 is
+another tenant at ~96.9 GiB.
