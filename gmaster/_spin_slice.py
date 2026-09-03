@@ -84,17 +84,26 @@ _WINDOW_CACHE = {}
 
 
 def _windows(L):
-    """``(r0, r1, lo)`` per m-block: the first ell nonzero anywhere in the block."""
+    """``(m0, m1, lo)`` per stored window of *non-negative* orders.
+
+    Only orders ``0..L-1`` are stored.  ``T[m, pi-theta, ell] == (-1)**(ell - m') *
+    T[-m, theta, ell]`` -- measured over every row at spin 1 and 2, exact to
+    2.3e-12 relative -- makes the negative rows redundant, and each stored row is
+    then contracted twice in one pass: straight, and against the sky map with its
+    rings reversed (see :func:`forward_latitudinal`).  ``lo = m0`` because within a
+    window of non-negative orders the smallest ``|m|`` is the first one, and
+    ``d^ell_{m,-spin}`` vanishes below ``ell = |m|``.
+    """
     cached = _WINDOW_CACHE.get(L)
     if cached is None:
-        nrows = 2 * L - 1
-        cached = tuple(
-            (r0, min(r0 + _M_BLOCK, nrows),
-             min(abs(r - (L - 1)) for r in range(r0, min(r0 + _M_BLOCK, nrows))))
-            for r0 in range(0, nrows, _M_BLOCK)
-        )
+        cached = tuple((a, min(a + _M_BLOCK, L), a) for a in range(0, L, _M_BLOCK))
         _WINDOW_CACHE[L] = cached
     return cached
+
+
+def _sign(L, spin):
+    """``(-1)**(ell - m')`` with ``m' = -spin``: the theta -> pi-theta sign."""
+    return 1.0 - 2.0 * ((jnp.arange(L) + abs(spin)) % 2).astype(jnp.float64)
 
 
 def _march(theta_trig, half_slice, cpi, cp2, vsign_rows, lrenorm, indices, L, which):
@@ -185,7 +194,7 @@ def _table_bytes(ntheta, L):
 def triangle_bytes(nside, L):
     """Bytes of one windowed layout: one block per m-window holding ``ell >= lo``."""
     ntheta = 4 * nside - 1
-    return sum((r1 - r0) * (L - lo) * ntheta * 8 for r0, r1, lo in _windows(L))
+    return sum((m1 - m0) * (L - lo) * ntheta * 8 for m0, m1, lo in _windows(L))
 
 
 class _BlockSet(tuple):
@@ -196,20 +205,21 @@ class _BlockSet(tuple):
     contraction when a single layout has to serve both directions.
     """
 
-    def __new__(cls, blocks, layout):
+    def __new__(cls, blocks, layout, spin):
         self = super().__new__(cls, blocks)
         self.layout = layout
+        self.spin = spin
         return self
 
 
 # The block set travels through `jax.jit` boundaries as an argument, so it has to
 # be a container of array leaves (like the single slab it replaces) with the layout
-# as aux data.  An unregistered tuple subclass is treated as a non-array leaf and
-# the trace rejects it.
+# and spin as aux data.  An unregistered tuple subclass is treated as a non-array
+# leaf and the trace rejects it.
 jax.tree_util.register_pytree_node(
     _BlockSet,
-    lambda slab: (tuple(slab), slab.layout),
-    lambda layout, children: _BlockSet(children, layout),
+    lambda slab: (tuple(slab), (slab.layout, slab.spin)),
+    lambda aux, children: _BlockSet(children, aux[0], aux[1]),
 )
 
 
@@ -236,6 +246,7 @@ def _build_triangles(theta, L, spin, want_theta, want_ell):
         # Repeat the last ring rather than padding with zero: theta = 0 divides by
         # sin(theta) in the recurrence.  The padded rings are never contracted.
         theta = jnp.concatenate([theta, jnp.repeat(theta[-1:], tail)])
+    off = L - 1
     wins = _windows(L)
     theta_pieces = [[] for _ in wins] if want_theta else None
     ell_pieces = [[] for _ in wins] if want_ell else None
@@ -243,8 +254,9 @@ def _build_triangles(theta, L, spin, want_theta, want_ell):
         table = _build(theta[start:start + per], L, spin)  # (m, theta, ell)
         nvalid = min(per, ntheta - start)  # the padded tail rings are dropped
         pieces = []
-        for i, (r0, r1, lo) in enumerate(wins):
-            sub = table[r0:r1, :nvalid, lo:]  # (m, theta, ell), zero head dropped
+        for i, (m0, m1, lo) in enumerate(wins):
+            # Row off + m holds order m; the negative half is reconstructed from it.
+            sub = table[off + m0:off + m1, :nvalid, lo:]
             if want_theta:
                 out = sub.transpose(0, 2, 1) + 0.0
                 theta_pieces[i].append(out)
@@ -277,9 +289,9 @@ def _build_triangles(theta, L, spin, want_theta, want_ell):
 
     out = {}
     if want_theta:
-        out[THETA_CONTIG] = _BlockSet(join(theta_pieces, 2), THETA_CONTIG)
+        out[THETA_CONTIG] = _BlockSet(join(theta_pieces, 2), THETA_CONTIG, spin)
     if want_ell:
-        out[ELL_CONTIG] = _BlockSet(join(ell_pieces, 1), ELL_CONTIG)
+        out[ELL_CONTIG] = _BlockSet(join(ell_pieces, 1), ELL_CONTIG, spin)
     return out
 
 
@@ -385,25 +397,51 @@ def forward_latitudinal(ftm, slab, *, L):
     """flm[ell, L-1+m] = sum_theta slice[theta, ell, m] * ftm[theta, L+m].
 
     ``slab`` is the ``(m, ell, theta)`` analysis block set from :func:`slabs_for`:
-    one block per entry of :func:`_windows`, each already sliced to its
-    ``ell >= lo`` triangle.  Below that bound the Wigner-d slice vanishes (the
-    triangle condition on ``d^ell_{m,-spin}``), so the skipped output rows keep the
-    zero they already hold and the result is bit-identical to the full slab.
+    one block per entry of :func:`_windows`, non-negative orders only, each already
+    sliced to its ``ell >= lo`` triangle.  Splitting the theta sum at pi/2 and
+    applying ``T[m, pi-theta, ell] = (-1)**(ell - m') T[-m, theta, ell]`` turns the
+    negative orders into a second contraction of the *same* block against the sky
+    map with its rings reversed and its orders negated:
+
+        flm[ell, L-1+m] = sum_theta T[m, theta, ell] * ftm[theta, L+m]
+        flm[ell, L-1-m] = (-1)**(ell - m') * sum_theta T[m, theta, ell]
+                                                    * ftm[pi-theta, L-m]
+
+    Both channels read the same block, so half the table produces all of ``flm``.
+    They are two separate ``einsum`` calls rather than one contraction over a stacked
+    ``h`` axis: the batched spelling is what XLA cannot tile, and measures 2x slower
+    (nside 512 spin 2 field 694 -> 1392 ms).  Order ``m = 0`` is its own mirror and
+    does *not* satisfy the relation (measured), so only the direct channel writes
+    that column.  Below ``ell = |m|`` the slice vanishes, so the skipped output rows
+    keep the zero they already hold.
     """
-    rhs = jnp.asarray(ftm)[:, 1:]
-    out = jnp.zeros((L, 2 * L - 1), dtype=jnp.result_type(slab[0], rhs))
-    for (r0, r1, lo), block in zip(_windows(L), slab):
-        out = out.at[lo:, r0:r1].set(
-            jnp.einsum("cet,tc->ec", block, rhs[:, r0:r1], optimize=True))
+    ftm = jnp.asarray(ftm)
+    off = L - 1
+    rev = ftm[::-1]  # ring i of rev is the ring at pi - theta_i
+    sign = _sign(L, slab.spin)
+    out = jnp.zeros((L, 2 * L - 1), dtype=jnp.result_type(slab[0], ftm))
+    for (m0, m1, lo), block in zip(_windows(L), slab):
+        out = out.at[lo:, off + m0:off + m1].set(
+            jnp.einsum("cet,tc->ec", block, ftm[:, L + m0:L + m1], optimize=True))
+        mirror = jnp.einsum("cet,tc->ec", block,
+                            rev[:, L - m1 + 1:L - m0 + 1][:, ::-1], optimize=True)
+        if m0:
+            out = out.at[lo:, off - m1 + 1:off - m0 + 1].set(
+                sign[lo:, None] * mirror[:, ::-1])
+        else:
+            # Column off belongs to the direct channel alone.
+            out = out.at[lo:, off - m1 + 1:off].set(
+                sign[lo:, None] * mirror[:, 1:][:, ::-1])
     return out
 
 
 def inverse_latitudinal(flm, slab, *, L):
     """Transpose of :func:`forward_latitudinal`; ftm is padded to 2L columns.
 
-    Diagonal in ``m`` like the forward step: column ``m + L - 1`` of ``flm`` feeds
-    column ``m + L`` of the padded ``ftm`` (the same +1 padding offset), and the
-    identically-zero ``ell < |m|`` head is dropped either way.
+    Reading the forward map as a sum of two contractions over one block gives the
+    adjoint directly: the direct channel writes ``ftm[:, L+m]`` and the mirrored
+    channel writes the ring-reversed ``ftm[:, L-m]``.  The two channels touch
+    disjoint columns except at ``m = 0``, which again only the direct one writes.
 
     ``slab`` is the ``(m, theta, ell)`` synthesis block set, or the
     ``(m, ell, theta)`` analysis blocks when a single layout serves both
@@ -411,11 +449,21 @@ def inverse_latitudinal(flm, slab, *, L):
     (19.2 vs 9.3 ms at nside 256).
     """
     alm = jnp.asarray(flm)
+    off = L - 1
     theta_contig = slab.layout == THETA_CONTIG
     ntheta = slab[0].shape[2 if theta_contig else 1]
+    sign = _sign(L, slab.spin)
     out = jnp.zeros((ntheta, 2 * L), dtype=jnp.result_type(slab[0], alm))
     subscripts = "cet,ec->tc" if theta_contig else "cte,ec->tc"
-    for (r0, r1, lo), block in zip(_windows(L), slab):
-        out = out.at[:, r0 + 1:r1 + 1].set(
-            jnp.einsum(subscripts, block, alm[lo:, r0:r1], optimize=True))
+    for (m0, m1, lo), block in zip(_windows(L), slab):
+        out = out.at[:, L + m0:L + m1].set(
+            jnp.einsum(subscripts, block, alm[lo:, off + m0:off + m1], optimize=True))
+        alm_mirror = sign[lo:, None] * alm[lo:, off - m1 + 1:off - m0 + 1][:, ::-1]
+        mirror = jnp.einsum(subscripts, block, alm_mirror, optimize=True)
+        # The mirrored channel reads ftm ring-reversed, so its adjoint writes back
+        # ring-reversed as well.
+        if m0:
+            out = out.at[:, L - m1 + 1:L - m0 + 1].set(mirror[::-1][:, ::-1])
+        else:
+            out = out.at[:, L - m1 + 1:L].set(mirror[::-1][:, 1:][:, ::-1])
     return out
