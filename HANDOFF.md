@@ -2138,6 +2138,12 @@ measured at a scale where the harness's ordering (CPU reference first, GPU parke
 GMaster's turn, no inter-rep keep-alive) dominates the number. Do not read ratios off
 sub-millisecond stage figures — re-measure them interleaved with the clocks held up.
 
+(Probe caveat: `decouple_probe.py` rebuilds the binned RHS as `bins.bin_cell(cl).T.reshape(-1)`,
+which matches `decouple_cell` only for `ncls == 1`. At n512 spin 2 (ncls=4) its `A`/`B`
+rows therefore come out at rel 0.98 — a probe bug, not a library defect; the library call
+itself is correct there (rel 3.56e-07, 1.08x vs NaMaster). The spin-0 rows are sound:
+their `A`/`B` relative errors match the library's to the printed digit.)
+
 ### Where that leaves the objective
 
 Measured honestly, every stage at every Nside up to 512 in both spins is ≥ 1× against
