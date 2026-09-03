@@ -422,12 +422,20 @@ def forward_latitudinal(ftm, slab, *, L):
                                                     * ftm[pi-theta, L-m]
 
     Both channels read the same block, so half the table produces all of ``flm``.
-    They are two separate ``einsum`` calls rather than one contraction over a stacked
-    ``h`` axis: the batched spelling is what XLA cannot tile, and measures 2x slower
-    (nside 512 spin 2 field 694 -> 1392 ms).  Order ``m = 0`` is its own mirror and
-    does *not* satisfy the relation (measured), so only the direct channel writes
-    that column.  Below ``ell = |m|`` the slice vanishes, so the skipped output rows
-    keep the zero they already hold.
+    Order ``m = 0`` is its own mirror and does *not* satisfy the relation (measured),
+    so only the direct channel writes that column.  Below ``ell = |m|`` the slice
+    vanishes, so the skipped output rows keep the zero they already hold.
+
+    The contraction is a multiply-and-reduce over four *real* right-hand sides
+    (direct re, direct im, mirror re, mirror im) rather than an ``einsum`` over the
+    complex map.  ``einsum`` lowers the per-window batched matvec to 717 GB/s here,
+    and every alternative spelling of it -- one call over a stacked ``h`` axis
+    (nside 512 field 694 -> 1392 ms), the same two calls without the scatter chain
+    -- measured no better or worse.  Split into real channels one pass over the
+    block suffices, and one pass costs 28.9 ms against the 24.5 ms floor set by
+    this card's fp64 FMA rate where the two complex ``einsum`` calls took 51.9.
+    It is also bit-for-bit the same answer (``|new - einsum| = 0.0`` at nside 128
+    against the full slab and at 512 against shipped).
     """
     ftm = jnp.asarray(ftm)
     off = L - 1
@@ -435,17 +443,19 @@ def forward_latitudinal(ftm, slab, *, L):
     sign = _sign(L, slab.spin)
     out = jnp.zeros((L, 2 * L - 1), dtype=jnp.result_type(slab[0], ftm))
     for (m0, m1, lo), block in zip(_windows(L), slab):
+        direct = ftm[:, L + m0:L + m1]
+        mirror = rev[:, L - m1 + 1:L - m0 + 1][:, ::-1]
+        rhs = jnp.stack([direct.real.T, direct.imag.T,
+                         mirror.real.T, mirror.imag.T], axis=-1)  # (m, theta, 4)
+        acc = jnp.sum(block[..., None] * rhs[:, None, :, :], axis=2)  # (m, ell, 4)
         out = out.at[lo:, off + m0:off + m1].set(
-            jnp.einsum("cet,tc->ec", block, ftm[:, L + m0:L + m1], optimize=True))
-        mirror = jnp.einsum("cet,tc->ec", block,
-                            rev[:, L - m1 + 1:L - m0 + 1][:, ::-1], optimize=True)
+            (acc[..., 0] + 1j * acc[..., 1]).T)
+        mir = sign[lo:, None] * (acc[..., 2] + 1j * acc[..., 3]).T
         if m0:
-            out = out.at[lo:, off - m1 + 1:off - m0 + 1].set(
-                sign[lo:, None] * mirror[:, ::-1])
+            out = out.at[lo:, off - m1 + 1:off - m0 + 1].set(mir[:, ::-1])
         else:
             # Column off belongs to the direct channel alone.
-            out = out.at[lo:, off - m1 + 1:off].set(
-                sign[lo:, None] * mirror[:, 1:][:, ::-1])
+            out = out.at[lo:, off - m1 + 1:off].set(mir[:, 1:][:, ::-1])
     return out
 
 
@@ -458,9 +468,11 @@ def inverse_latitudinal(flm, slab, *, L):
     disjoint columns except at ``m = 0``, which again only the direct one writes.
 
     ``slab`` is the ``(m, theta, ell)`` synthesis block set, or the
-    ``(m, ell, theta)`` analysis blocks when a single layout serves both
+    ``(m, ell, theta)`` analysis blocks when a single layout has to serve both
     directions -- there the reduction runs over a strided axis and costs 2.1x
-    (19.2 vs 9.3 ms at nside 256).
+    (19.2 vs 9.3 ms at nside 256).  Spelled as one multiply-and-reduce over four
+    real right-hand sides for the same reason as :func:`forward_latitudinal`
+    (57.4 -> 34.0 ms at nside 512, identical output).
     """
     alm = jnp.asarray(flm)
     off = L - 1
@@ -468,16 +480,22 @@ def inverse_latitudinal(flm, slab, *, L):
     ntheta = slab[0].shape[2 if theta_contig else 1]
     sign = _sign(L, slab.spin)
     out = jnp.zeros((ntheta, 2 * L), dtype=jnp.result_type(slab[0], alm))
-    subscripts = "cet,ec->tc" if theta_contig else "cte,ec->tc"
     for (m0, m1, lo), block in zip(_windows(L), slab):
-        out = out.at[:, L + m0:L + m1].set(
-            jnp.einsum(subscripts, block, alm[lo:, off + m0:off + m1], optimize=True))
-        alm_mirror = sign[lo:, None] * alm[lo:, off - m1 + 1:off - m0 + 1][:, ::-1]
-        mirror = jnp.einsum(subscripts, block, alm_mirror, optimize=True)
+        direct = alm[lo:, off + m0:off + m1]
+        mirror = sign[lo:, None] * alm[lo:, off - m1 + 1:off - m0 + 1][:, ::-1]
+        rhs = jnp.stack([direct.real, direct.imag,
+                         mirror.real, mirror.imag], axis=-1)
+        rhs = rhs.transpose(1, 0, 2)  # (m, ell, 4)
+        if theta_contig:  # block (m, ell, theta): reduce over the strided axis
+            acc = jnp.sum(block[..., None] * rhs[:, :, None, :], axis=1)
+        else:  # block (m, theta, ell)
+            acc = jnp.sum(block[..., None] * rhs[:, None, :, :], axis=2)
+        out = out.at[:, L + m0:L + m1].set((acc[..., 0] + 1j * acc[..., 1]).T)
+        mir = (acc[..., 2] + 1j * acc[..., 3]).T
         # The mirrored channel reads ftm ring-reversed, so its adjoint writes back
         # ring-reversed as well.
         if m0:
-            out = out.at[:, L - m1 + 1:L - m0 + 1].set(mirror[::-1][:, ::-1])
+            out = out.at[:, L - m1 + 1:L - m0 + 1].set(mir[::-1][:, ::-1])
         else:
-            out = out.at[:, L - m1 + 1:L].set(mirror[::-1][:, 1:][:, ::-1])
+            out = out.at[:, L - m1 + 1:L].set(mir[::-1][:, 1:][:, ::-1])
     return out
