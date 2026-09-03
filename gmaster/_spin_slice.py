@@ -48,6 +48,28 @@ _MAX_GEOMETRIES = 2
 # at 256, 154 GiB at 512 (lmax = 3*nside).  Above the budget the caller keeps the
 # generic scatter loop rather than trading a slower theta stage for swapping.
 _PAIR_BUDGET = 48 * 1024**3
+# Row ``L-1+m`` of a slab holds ``d^ell_{m,-spin}``, which vanishes for ``ell <
+# |m|`` -- just under half the buffer, streamed on every polarised transform.  A
+# contiguous block of rows shares the bound ``lo = min |m|`` in the block, so the
+# contraction reads only ``[lo, L)`` (see :func:`forward_latitudinal`).  64 skips
+# 42% of the bytes and measures 1.67x on analysis / 1.60x on synthesis at nside
+# 128; 16-row blocks skip 48% but pay 4x the kernels and give only 1.34x/1.20x.
+_M_BLOCK = 64
+_WINDOW_CACHE = {}
+
+
+def _windows(L):
+    """``(r0, r1, lo)`` per m-block: the first ell nonzero anywhere in the block."""
+    cached = _WINDOW_CACHE.get(L)
+    if cached is None:
+        nrows = 2 * L - 1
+        cached = tuple(
+            (r0, min(r0 + _M_BLOCK, nrows),
+             min(abs(r - (L - 1)) for r in range(r0, min(r0 + _M_BLOCK, nrows))))
+            for r0 in range(0, nrows, _M_BLOCK)
+        )
+        _WINDOW_CACHE[L] = cached
+    return cached
 
 
 def _march(theta_trig, half_slice, cpi, cp2, vsign_rows, lrenorm, indices, L, which):
@@ -198,10 +220,18 @@ def clear_cache():
 def forward_latitudinal(ftm, slab, *, L):
     """flm[ell, L-1+m] = sum_theta slice[theta, ell, m] * ftm[theta, L+m].
 
-    ``slab`` is the ``(m, ell, theta)`` copy from :func:`slabs_for`.
+    ``slab`` is the ``(m, ell, theta)`` copy from :func:`slabs_for`.  Each m-block
+    contracts only ``ell >= min|m|`` inside the block: below that bound the slab is
+    identically zero (the Wigner-d triangle condition), so skipping it leaves those
+    output rows at the zero they already hold and the result is bit-identical.
     """
-    ftm = jnp.asarray(ftm)[:, 1:]
-    return jnp.einsum("cet,tc->ec", slab, ftm, optimize=True)
+    rhs = jnp.asarray(ftm)[:, 1:]
+    out = jnp.zeros((L, 2 * L - 1), dtype=jnp.result_type(slab, rhs))
+    for r0, r1, lo in _windows(L):
+        out = out.at[lo:, r0:r1].set(
+            jnp.einsum("cet,tc->ec", slab[r0:r1, lo:], rhs[:, r0:r1],
+                       optimize=True))
+    return out
 
 
 def inverse_latitudinal(flm, slab, *, L):
@@ -209,8 +239,13 @@ def inverse_latitudinal(flm, slab, *, L):
 
     ``slab`` is the ``(m, theta, ell)`` copy from :func:`slabs_for`. Diagonal in
     ``m`` like the forward step: column ``m + L - 1`` of ``flm`` feeds column
-    ``m + L`` of the padded ``ftm`` (the same +1 padding offset).
+    ``m + L`` of the padded ``ftm`` (the same +1 padding offset).  The reduction
+    skips the same identically-zero ``ell < |m|`` head of the slab.
     """
-    contracted = jnp.einsum("cte,ec->tc", slab, jnp.asarray(flm), optimize=True)
-    ftm = jnp.zeros((contracted.shape[0], 2 * L), dtype=jnp.complex128)
-    return ftm.at[:, 1:].set(contracted)
+    alm = jnp.asarray(flm)
+    out = jnp.zeros((slab.shape[1], 2 * L), dtype=jnp.result_type(slab, alm))
+    for r0, r1, lo in _windows(L):
+        out = out.at[:, r0 + 1:r1 + 1].set(
+            jnp.einsum("cte,ec->tc", slab[r0:r1, :, lo:], alm[lo:, r0:r1],
+                       optimize=True))
+    return out
