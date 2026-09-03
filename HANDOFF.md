@@ -1449,3 +1449,136 @@ budget fits) and remains the fastest cell in the table.
 
 
 
+---
+
+## Session 7 (2026-09-03) — the polar table halves twice; Nside 512 spin 2 beats NaMaster
+
+Two commits, both on the polarised latitudinal step:
+
+| commit | what | n512 spin-2 TOTAL |
+|---|---|---|
+| `5f08924` | `ell >= |m|` windowed triangles + two pipeline bug fixes | 8700 → 873 ms |
+| `f139526` | non-negative orders only (`pi - theta` / m-flip identity) | 873 → **619 ms** |
+
+### Scoreboard (TOTAL ms, GPU1, `ref->gm`, medians)
+
+| Nside | spin | NaMaster | GMaster now | ratio | rel | session start |
+|---|---|---|---|---|---|---|
+| 128 | 0 | 19 | 16 | **1.2×** | 1.03e-13 | 15.4 |
+| 128 | 2 | 38 | 26 | **1.5×** | 4.90e-09 | 24 |
+| 256 | 0 | 60 | 47 | **1.3×** | 4.76e-13 | 47 |
+| 256 | 2 | 166 | 97 | **1.7×** | 2.74e-08 | 102 |
+| 512 | 0 | 333 | 288 | **1.2×** | 1.71e-12 | 288-290 |
+| 512 | 2 | 706 | **619** | **1.14×** | 3.56e-07 | ~8700 |
+
+`rel` is bit-identical to the pre-session values at every cell (`3.56e-07`,
+`2.74e-08`, `4.90e-09`, `1.71e-12`), so none of the speed was bought with accuracy.
+Nside 128 spin 0/2 is a few ms off its session-6 best (16 vs 15.4, 26 vs 24) — host
+launch bound, inside the run-to-run spread of these cells.
+
+Stage split at n512 spin 2 (`chain3.log`): field 225 → 441 ms, coupling 375 → 50 ms,
+coupled_cell 19 → 0 ms, decouple 0 → 1 ms. **`field` is now the only stage where
+GMaster is behind NaMaster** (441 vs 225 ms); the MCM side is 7-200× ahead.
+
+### Win 1 — `ell >= |m|` windowed triangles (`5f08924`)
+
+A window of 64 contiguous rows shares the bound `lo = min |m|`, so it stores only
+`[lo, L)`. Analysis stays bit-identical, synthesis is 1.8e-16 against a window-free
+oracle, speed is unchanged (0.95-1.01×), bytes fall 1.85×. Two bugs hid it inside the
+pipeline:
+
+- `slabs_for` ran the pool-headroom gate **before** the cache lookup. A pool holding a
+  37 GiB layout is by definition short of 37 GiB, so every call after the first
+  declined to the generic scatter loop (`n512_calls.py` printed
+  `slabs_for #2: DECLINED in 0.0 ms`). Cache lookup now comes first.
+- the block sets were arguments of the outer pipeline `jax.jit`, so XLA counted both
+  layouts against the pool and refused the executable
+  (`byte size of input/output arguments (80583709680) exceeds the base limit
+  (76461096960)` — the "base limit" is the 71.2 GiB pool). Only the latitudinal
+  contraction is jitted now (`_forward_latitudinal_slab` / `_inverse_latitudinal_slab`);
+  every s2fft stage around it was already jitted individually.
+
+After both: `.qwen/tmp/n512_calls.py` → `BUILD #1: 16.0 s ok`, `field #1 in 23.9 s`
+(includes the one-time trace), `field #2 in 0.7 s`, `declined: 0`. Before: 12.1 s per
+field on the generic path, 29.7 s with the broken slab path.
+
+### Win 2 — the `pi - theta` / m-flip identity (`f139526`)
+
+Measured on the built slice (`theta_sym3.py`), for **every row with `m != 0`**, spin 1
+and 2:
+
+```
+T[m, pi - theta, ell] = (-1)**(ell - m') * T[-m, theta, ell],   m' = -spin
+```
+
+worst per-row relative residue **2.3e-12**; the sign is constant along theta inside
+each ell column and equals `(-1)**(ell - m')` on every entry with `|ratio| > 0.5`
+(0 violations of ~48k per sampled row). The HEALPix ring grid is symmetric about
+pi/2 to **4.0e-15**, so `theta -> pi - theta` is exactly the ring reversal
+`i -> ntheta-1-i`.
+
+**`m = 0` is the exception**: that row is its own mirror and violates the relation
+across the whole theta range (residue 1.33 at spin 2, 2.00 at spin 1) — 1 bad row of
+191. That single row is why an earlier whole-table absolute-residue test recorded "no
+theta-halving of the polarised slab"; that verdict was wrong, and
+`memory/project/wigner-d-symmetries.md` now points here.
+
+Implementation: the block sets store orders `0..L-1`; each stored row is contracted
+twice, once straight against `ftm[:, L+m]` and once against the ring-reversed
+`ftm[:, L-m]` with the sign applied on output, order 0 taking the direct channel only.
+
+Validation (`.qwen/tmp/half_ok.py`, oracle = full slab evaluated by definition):
+analysis 5.08e-12 / synthesis 1.32e-11 / **adjoint 1.02e-15** at n128 spin 1; spin 2 is
+better (2.67e-14 / 1.07e-13 at n64). Against a **float128** oracle
+(`.qwen/tmp/half_precision.py`, n128 spin 1) the shipped full-slab path is
+7.95e-16 / 1.01e-15 and this path is **1.46e-12 / 1.21e-11** — the reconstructed
+negative orders inherit s2fft's march-to-march inconsistency rather than being wrong.
+Four orders below the pipeline's accepted `rel`, and invisible in it, but it is a real
+difference: do not describe this path as bit-identical.
+
+### Two things that measured the opposite of expectation
+
+- **Fusing the two channels into one einsum is 2x slower.** `einsum("cet,cth->ech")`
+  over a stacked channel axis (one pass over the block, two FMAs per element) gave
+  n512 spin-2 field 694 → **1392 ms**; two plain `einsum("cet,tc->ec")` calls give 441.
+  XLA tiles the N=1 GEMV shape well and the N=2 batched shape badly. Shipped form: two
+  calls (`chain.log` vs `chain3.log`).
+- **Nside 640 cannot be benchmarked**: the NaMaster reference itself raises
+  `ValueError: Something is wrong with your input arrays` in `pymaster/utils.py:272`
+  from this harness, so there is no reference cell for 640 — GMaster-side numbers at
+  640 would be unbenchmarked.
+
+### Memory law now (exact, from `triangle_bytes`)
+
+| Nside | one layout | pair | fits (56 GiB budget, 71.2 GiB pool) |
+|---|---|---|---|
+| 256 | 2.44 GiB | 4.87 | both layouts |
+| 384 | 8.01 | 16.02 | both |
+| 512 | 18.74 | 37.48 | **both** (was: one 37.46, pair impossible) |
+| 640 | 36.31 | 72.63 | one layout (was: declined at 72.59) |
+| 768 | 62.42 | 124.83 | declined — 62.4 + 16 GiB build reserve > pool |
+| 1024 | 146.96 | 293.93 | **impossible on one card** |
+| 2048 | 1163.9 | 2327.7 | impossible |
+| 4096 | 9263.4 | 18526.9 | impossible |
+
+The table is cubic in Nside and the halving extends the reachable range by only
+`2^(1/3) = 1.26x`. **Nside 1024 and above cannot be made memory-fittable by any
+further shrinking of a table that is stored at all** — the slice is
+`(2L-1) x ntheta x L` and even one row per `(m, theta, ell)` triple is ~147 GiB at
+1024. What would actually be needed, in the order I would try it:
+
+1. **768 on one card**: admit the single 62.42 GiB layout by lowering `_BUILD_RESERVE`
+   and re-chunking the build (the 6 GiB chunk target exists because smaller chunks
+   fragment the pool — see the `_BUILD_CHUNK_TARGET` comment). Untested; synthesis
+   would pay the 2.1x strided-axis penalty.
+2. **1024 without a table**: a fused Wigner-d kernel that recomputes the slice per
+   block (no resident table at any Nside). `memory/fused-spin-kernel-dead.md` records
+   the Pallas attempt as disqualified on accuracy, and
+   `memory/blocked-recurrence-wall.md` the blocked-recurrence restart problem — the
+   gap is a *correct* fused kernel, not another tuning pass.
+3. **1024+ with sharding**: the m-windows are independent, so the block sets shard
+   across cards cleanly; two 96 GiB cards would put 1024 (147 GiB pair-split) within
+   reach. Multi-GPU is already wired for the MCM (`_forward_latitudinal_device`).
+
+Suite state at both commits: **115 passed, 3 skipped**; `flake8 --max-line-length=90`
+clean on `gmaster/_spin_slice.py`.
