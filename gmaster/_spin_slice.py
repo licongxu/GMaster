@@ -26,19 +26,33 @@ over ``theta``, synthesis over ``ell``, and making both directions reduce over a
 contiguous axis costs memory, not time (1.7 ms vs 6.0 ms per call at nside 128 for
 the strided spelling).
 
-Storing only the ``ell >= |m|`` triangle of each layout -- the head below it is
-identically zero -- is where the memory comes back: the same contraction runs at
-the same speed (12.1 vs 11.5 ms on analysis, 9.3 vs 9.3 ms on synthesis at nside
-256) for 1.85x fewer bytes, 9.7 GiB of block sets against 18 GiB of full slabs, and
-37 GiB rather than 72 GiB at nside 512, which is what puts 512 inside a 96 GiB card
-at all.  When even two triangles will not fit, one theta-contiguous triangle serves
-both directions and synthesis pays 2.1x reducing over a strided axis (19.2 vs
-9.3 ms at nside 256) -- still ~10x cheaper than the scatter loop it replaces.  See
-:func:`slabs_for`.
+Two independent shrinkages make the table fit.  Storing only the ``ell >= |m|``
+triangle of each layout -- the head below it is identically zero -- costs nothing in
+speed (12.1 vs 11.5 ms on analysis, 9.3 vs 9.3 ms on synthesis at nside 256) and saves
+1.85x of the bytes.  Storing only *non-negative orders* then halves what is left:
+for every order except ``m = 0``,
 
-There is no parity shortcut here: unlike the scalar m'=0 band, no signed relation
-reproduces ``d^l_{m,-2}(pi - theta)`` from the same slice (measured ratios span
-0.34-2.98), so the full theta range must be stored.
+    d^l_{m,-spin}(pi - theta) = (-1)**(l + spin) * d^l_{-m,-spin}(theta)
+
+measured on the built slice over every row at spin 1 and 2 (worst per-row relative
+residue 2.3e-12).  The HEALPix ring grid is symmetric about pi/2 to 4e-15, so
+``theta -> pi - theta`` is exactly the ring reversal ``i -> ntheta-1-i``, and one
+stored row serves both ``+m`` and ``-m`` -- see :func:`forward_latitudinal`.
+``m = 0`` is its own mirror and does *not* satisfy the relation (residue 1.33 at spin
+2, 2.00 at spin 1), which is why an earlier whole-table residue test recorded this
+shortcut as absent.  The reconstruction is not free internally: against a float128
+oracle the full slab is 8e-16 / 1e-15 (analysis / synthesis) and the reconstructed
+path 1.5e-12 / 1.2e-11, because the two halves of the s2fft march agree only to
+~1e-13.  End to end it is invisible -- the pipeline's ``rel`` against NaMaster is
+identical either way.
+
+Net at nside 512 (lmax = 3*nside): a layout pair is 37.48 GiB instead of the 143.9 GiB
+two full slabs need, and at nside 256 it is 4.87 GiB instead of 18.  Both layouts still
+fit through 512; 640 gets one layout (36.31 GiB); 768 (62.42) and 1024 (146.96) are
+declined, so those sizes keep the generic scatter loop -- the table is cubic in nside
+and no further shrinking reaches 1024 on one card.  When only one layout fits, synthesis
+pays 2.1x reducing over a strided axis (19.2 vs 9.3 ms at nside 256) -- still ~10x
+cheaper than the scatter loop it replaces.  See :func:`slabs_for`.
 """
 
 import gc
