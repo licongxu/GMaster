@@ -279,28 +279,16 @@ def _wigner_d_table(beta, *, m, n, lmax):
     return table.at[:, minimum:].set(values.T)
 
 
-@partial(
-    jax.jit,
-    static_argnames=("s1", "s2", "n1", "n2", "lmax", "lmax_mask"),
-)
+@partial(jax.jit, static_argnames=("lmax", "lmax_mask"))
 def _general_coupling_matrix_quadrature(
     mask_cls,
-    nodes,
     weights,
+    tables,
     *,
-    s1,
-    s2,
-    n1,
-    n2,
     lmax,
     lmax_mask,
 ):
-    beta = jnp.arccos(nodes)
-    first = _wigner_d_table(beta, m=n1, n=n2, lmax=lmax)
-    second = _wigner_d_table(beta, m=-s1, n=-s2, lmax=lmax)
-    mask = _wigner_d_table(
-        beta, m=s1 - n1, n=s2 - n2, lmax=lmax_mask
-    )
+    first, second, mask = tables
     mask_ell = jnp.arange(lmax_mask + 1)
     coefficients = (
         (2 * mask_ell + 1) * mask_cls[: lmax_mask + 1] / (4 * jnp.pi)
@@ -325,19 +313,61 @@ def _general_coupling_matrix_quadrature(
     return jnp.stack(((total + signed) / 2, (total - signed) / 2))
 
 
+_WD_TRIPLE_CACHE = {}
+
+
+def _wigner_d_shared(beta, m, n, order):
+    """``_wigner_d_table`` with the ``(-m, -n)`` redundancy folded away.
+
+    ``d^l_{-m,-n}(beta) == d^l_{m,n}(beta)`` when ``m - n`` is even (checked
+    bit-for-bit against the builder); when ``m - n`` is odd the identity carries
+    a minus sign, so those tables are left alone rather than shared with the
+    wrong sign.  Even differences are exactly what the temperature and
+    polarised couplings ask for -- ``(0,2)``, ``(2,2)``, ``(0,0)``.  Each table
+    is a *sequential* scan over degree, which is what the polarised coupling
+    build spends its time on -- at lmax 95 it costs the same 5 ms as at lmax
+    767 -- so handing the same array back twice is a latency win, not just a
+    memory one.  The key carries the node count rather than the nodes: only
+    :func:`_general_coupling_matrix` asks for tables, and it always passes the
+    Gauss-Legendre nodes of that order.
+    """
+    if (m - n) % 2 == 0 and (m < 0 or (m == 0 and n < 0)):
+        m, n = -m, -n
+    key = (m, n, order, len(beta))
+    table = _WD_TRIPLE_CACHE.get(key)
+    if table is None:
+        table = _wigner_d_table(beta, m=m, n=n, lmax=order)
+        if getattr(table, "is_fully_addressable", True):
+            if len(_WD_TRIPLE_CACHE) > 24:
+                _WD_TRIPLE_CACHE.clear()
+            _WD_TRIPLE_CACHE[key] = table
+    return table
+
+
+def _wigner_d_triple(beta, *, s1, s2, n1, n2, lmax, lmax_mask):
+    """The three Wigner-d tables one quadrature call integrates against."""
+    return (
+        _wigner_d_shared(beta, n1, n2, lmax),
+        _wigner_d_shared(beta, -s1, -s2, lmax),
+        _wigner_d_shared(beta, s1 - n1, s2 - n2, lmax_mask),
+    )
+
+
 def _general_coupling_matrix(
-    mask_cls, *, s1, s2, n1, n2, lmax, lmax_mask
+    mask_cls, *, s1, s2, n1, n2, lmax, lmax_mask, tables=None
 ):
     order = (2 * lmax + lmax_mask) // 2 + 1
     nodes, weights = _gauss_legendre(order)
+    nodes = jnp.asarray(nodes)
+    if tables is None:
+        tables = _wigner_d_triple(
+            jnp.arccos(nodes), s1=s1, s2=s2, n1=n1, n2=n2, lmax=lmax,
+            lmax_mask=lmax_mask,
+        )
     return _general_coupling_matrix_quadrature(
         mask_cls,
-        jnp.asarray(nodes),
         jnp.asarray(weights),
-        s1=s1,
-        s2=s2,
-        n1=n1,
-        n2=n2,
+        tables,
         lmax=lmax,
         lmax_mask=lmax_mask,
     )
