@@ -1721,6 +1721,25 @@ has no fp64 tensor cores, dense fp64 GEMM tops out at 1.88 TFLOP/s) or fewer FLO
   147 GiB table moves at ~16-25 GB/s → ~2.7 s *per transform*, 7 transforms per
   `NmtField(n_iter=3)`. NaMaster's whole field stage is 0.9 s.
 
+### `_M_BLOCK` (the m-window width) is not a lever — swept
+
+`_M_BLOCK = 64` has never been swept for the polar path: HANDOFF line 841 chose `mb=64`
+for the **spin-0 band**, and the polar path inherited the constant. Swept it per Nside in
+one process (matched clocks; every variant bit-identical to the `mb=64` control to
+≤9.5e-17), timing 4 analysis + 3 synthesis contractions of one `field` stage:
+
+| Nside | mb=32 | mb=64 | mb=128 | mb=256 |
+|---|---|---|---|---|
+| 256 | **52.2 ms** | 58.8 | 58.9 | 64.4 |
+| 384 | 162.4 | **160.6** | 162.5 | 175.4 |
+| 512 | 349.0 | **334.0 / 336.6** | build declined | build declined |
+
+Narrower wins 11 % at 256, ties at 384, and **loses at 512**; wider is flat-to-worse and
+costs bytes (mb=256 is +23 % bytes at n256, and `mb ≥ 128` at n512 exhausts the pool
+during the build even in a fresh process). Nothing ships: a size-dependent width would
+buy ~6 ms on the n256 cell while hurting the n512 cell by more. Probes
+`.qwen/tmp/mblock_sweep.py`, logs `mblock_sweep.log`, `mblock_small.log`, `mblock_512.log`.
+
 ### Streaming the table: pitched, measured, disqualified
 
 The obvious idea for 1024 is that the bytes never all need to be resident: analysis is
