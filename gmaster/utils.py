@@ -1104,14 +1104,33 @@ def _map2alm_iteration(alm, maps, ell, order, *, spin, nside, L, L_work):
     )
 
 
-@partial(jax.jit, static_argnames=("spin", "nside", "L", "L_work"))
+@partial(jax.jit, static_argnames=("L",))
+def _forward_latitudinal_slab(ftm, slab, *, L):
+    """The slice contraction on its own: see :func:`_inverse_latitudinal_slab`."""
+    return _spin_slice.forward_latitudinal(ftm, slab, L=L)
+
+
+@partial(jax.jit, static_argnames=("L",))
+def _inverse_latitudinal_slab(flm, slab, *, L):
+    """The slice contraction, and nothing else.
+
+    A block set is tens of GiB from Nside 512 up, and a ``jax.jit`` boundary whose
+    argument list carries both layouts makes XLA count them twice against the pool
+    (``The byte size of input/output arguments ... exceeds the base limit``) and
+    schedule multi-gibibyte copies of them on every call.  So only the latitudinal
+    step is jitted here; the s2fft stages around it are each already jitted
+    individually and never see the table.
+    """
+    return _spin_slice.inverse_latitudinal(flm, slab, L=L)
+
+
 def _map2alm_once_slab(maps, ell, order, *, spin, nside, L, L_work, slab):
     """Polarised analysis with the latitudinal step replaced by a slab contraction."""
     ftm = _forward_s2fft_ftm(
         maps[0] + 1j * maps[1], L=L_work, nside=nside, reality=False
     )
     plus = _finish_forward_s2fft(
-        _spin_slice.forward_latitudinal(ftm, slab, L=L_work),
+        _forward_latitudinal_slab(ftm, slab, L=L_work),
         L=L_work,
         spin=spin,
         reality=False,
@@ -1121,17 +1140,15 @@ def _map2alm_once_slab(maps, ell, order, *, spin, nside, L, L_work, slab):
     return jnp.stack([-(plus_m + minus_m) / 2, 0.5j * (plus_m - minus_m)])
 
 
-@partial(jax.jit, static_argnames=("spin", "nside", "L", "L_work"))
 def _alm2map_core_slab(alm, *, spin, nside, L, L_work, slab):
     flm = _prepare_inverse_s2fft(_unpack_spin(alm, L, L_work), L=L_work)
-    ftm = _spin_slice.inverse_latitudinal(flm, slab, L=L_work)
+    ftm = _inverse_latitudinal_slab(flm, slab, L=L_work)
     maps = _finish_inverse_s2fft(
         ftm, L=L_work, spin=spin, nside=nside, reality=False
     )
     return jnp.stack([jnp.real(maps), jnp.imag(maps)])
 
 
-@partial(jax.jit, static_argnames=("spin", "nside", "L", "L_work"))
 def _map2alm_iteration_slab(alm, maps, ell, order, *, spin, nside, L, L_work,
                             analysis_slab, synthesis_slab):
     residual = (

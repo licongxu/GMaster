@@ -132,6 +132,18 @@ def _band(geometry):
     return groups
 
 
+def release():
+    """Drop the cached Legendre bands; they rebuild on the next scalar transform.
+
+    The polar Wigner-d block sets and these bands are the two large resident
+    tables in GMaster, and at Nside 512 they do not both fit.  The caller that
+    needs room calls this rather than failing, because the transform each one
+    enables differs by an order of magnitude in cost.
+    """
+    _BAND_CACHE.clear()
+    _SYNTH_CACHE.clear()
+
+
 def band_bytes(nside, L, block=BLOCK):
     """Device bytes the band occupies, for the fit check before dispatching."""
     north = (4 * nside - 1 + 1) // 2
