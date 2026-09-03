@@ -1937,3 +1937,127 @@ bandwidth, PCIe is 60× off it, and 640/768 have no NaMaster reference to beat a
 The two things that could still move the scoreboard are outside this box: a second
 free ≥96 GiB card (windows shard, 73.5 GiB per card, ~1.9× projected at 1024), or a
 chirp-Z/factorised-`d` latitudinal rewrite that reduces the FLOP count itself.
+
+## Session 10 (2026-09-03) — the channel axis of the reduce was the defect all along
+
+Session 9 closed the polar contraction as "at 83-85 % of the fp64 FMA floor, six forms
+tried, all flat or worse". It had tried six forms of the *right-hand side* and of the
+scatter epilogue. It never changed the shape of the **reduce** itself, and that is where
+the loss was. Everywhere in the theta path the contraction was written as
+
+```python
+jnp.sum(block[..., None] * rhs[:, None, :, :], axis=2)   # channels AFTER the reduced axis
+```
+
+Leaving the output channels in a dimension behind the axis being reduced makes XLA
+materialise the whole product instead of folding the multiply into the reduction, so the
+stage pays a write plus a read of its own product on top of the table read. The fix is
+one `lax.reduce` over a tuple of accumulators — the table is read once and nothing wide
+is ever materialised:
+
+```python
+re, im = lax.reduce((slab * chan[..., 0], slab * chan[..., 1]), (0.0, 0.0),
+                    lambda a, b: (a[0] + b[0], a[1] + b[1]), (2,))
+```
+
+### The three wins, each measured inside the shipped program
+
+| site | shipped | one-pass | gain | rel | log |
+|---|---|---|---|---|---|
+| `_theta_matrix._transform` (scalar analysis) | 12.16 ms / 823 GB/s | 8.11 ms / 1238 GB/s | **1.50×** | 2.5e-16 | `lat_var.log` |
+| `_theta_matrix._inverse` (scalar synthesis) | 22.55 ms / 446 GB/s | 16.78 ms / 600 GB/s | **1.34×** | 3.1e-16 | `synth_ab.log` |
+| `_spin_slice.forward_latitudinal` + `inverse_latitudinal` (4 channels) | field 64.9 ms | field 47.7 ms @ n256 | **1.36×** | 5.4e-16 | `spin_ab256.log` |
+
+All three are interleaved-rounds medians with an honest `jax.random.normal` bandwidth
+control beside every line (1389-1459 GB/s). Landed as `_contract_theta` /
+`_contract_ell` (`8880401`) and `_spin_slice._reduce_channels`.
+
+### Scoreboard (GPU1, `ref->gm` ms, clocks provably up)
+
+`.qwen/tmp/score_after.log` is the scalar half alone (`8880401`); `.qwen/tmp/score_spin.log`
+is both halves shipped (`c80263b`). `field` is the stage both fixes act on.
+
+| cell | session-9 baseline | scalar half | both halves | `field` trajectory |
+|---|---|---|---|---|
+| n128 spin 0 | 1.25× (19→15) | 1.41× (21→15) | 1.18× (21→18) | 7→6→9 ms (±3 ms host noise) |
+| n128 spin 2 | 2.26× (50→22) | 2.13× (46→21) | 1.87× (43→23) | 14→13→12 ms |
+| n256 spin 0 | 1.27× (61→48) | **1.53×** (65→43) | **1.54×** (64→42) | 0.95× → **1.30×/1.18×** (20→17 ms) |
+| n256 spin 2 | 1.83× (172→94) | 1.87× (175→94) | **2.26×** (168→74) | 0.68× → 0.67× → **0.92×** (66→48 ms) |
+| n512 spin 0 | 1.20× (351→291) | **1.54×** (343→222) | **1.56×** (347→222) | 0.92× → **1.24×/1.28×** (118→92 ms) |
+| n512 spin 2 | 1.35× (722→537) | 1.45× (730→504) | **1.75×** (742→424) | 0.64× → 0.67× → **0.85×** (239→281 ms) |
+
+The n128 rows move by 3 ms between processes on a 15-22 ms total, which is host-side
+compile/launch noise, not a regression: the two spin-0 n128 runs bracket 15/18 ms with
+identical code and both controls at ~1400 GB/s. Everything from n256 up is stable to
+±1 ms across runs.
+
+`rel` vs NaMaster is byte-identical to the session-8/9 values at every cell
+(1.03e-13 / 4.90e-09 / 4.76e-13 / 2.74e-08 / 1.71e-12 / 3.56e-07) and the suite is
+**115 passed, 3 skipped** on both commits.
+
+**Session-9 conclusions this revises:** "no reachable form — XLA, Triton, cublas, or
+tensor-core emulation — improves on [the polar contraction]" (end of session 9) and the
+memory note "the remaining 15 % is not recoverable — measured six ways". Six ways were
+tried against the RHS producers and the scatter epilogue; the reduce's own channel axis
+was never tried and was worth 1.36×. Session 9's *measurements* all stand — the listed
+forms really are flat or worse — only the universality of the conclusion was wrong.
+
+### The trap that hid it: an A/B of a patched function needs the jit cache dropped
+
+`utils._forward_latitudinal_slab` is itself `jax.jit` and resolves
+`_spin_slice.forward_latitudinal` from module globals at *trace* time, so swapping the
+module attribute leaves its cache key untouched — the second form times the first form's
+compiled HLO and the A/B reports 1.00×. `.qwen/tmp/spin_ab.py` calls
+`_forward_latitudinal_slab.clear_cache()` / `_inverse_latitudinal_slab.clear_cache()` on
+every swap and prints a trace counter (2 traces per form, which is also the proof the
+patch is on the path).
+
+### Probe hygiene, three more ways to be wrong
+
+- **Unit bug that manufactured a fake defect:** `band_rate.py::measure` returned
+  `np.median(ts) * 1e3` where `ts` was already ms, printing "the band runs at 1.6 GB/s"
+  for what is really 3.50 ms / 1577 GB/s. An entire detour into a nonexistent
+  memory-path pathology. Convert to ms exactly once, at the print.
+- **Ranking is program-dependent:** a per-block `jax.jit` says
+  `einsum("emj,mjc->emc")` is 4× *faster* than the broadcast product (882 vs 205 GB/s);
+  inside the shipped whole-band program the same einsum is 4× *slower* (203 vs 817),
+  and patching it in scores 0.5× end to end (`lat_pipe.log`). Isolated probes generate
+  hypotheses; only in-situ A/Bs rank.
+- **The stock harness parks the GPU:** `benchmarks/benchmark_pipeline.py` runs the CPU
+  reference first and GMaster second, and this card idles at 180 MHz needing ~0.5 s of
+  continuous load. The error is one-sided against GMaster (same code: `field` 51 ms in a
+  fresh process, 364 ms inside a sweep). `.qwen/tmp/scoreboard.py` wraps the same
+  `_run_pipeline` with a spin-up and a bandwidth control before/after each GMaster run —
+  use it for any number that will be quoted.
+
+### What the win does *not* buy
+
+The synthesis band still runs at 600 GB/s against a 1420 GB/s control, so the transposed
+`(m_local, j, ell_row)` layout is still leaving ~2.4× on the table. And the capacity wall
+is unchanged: the scalar band is 77 GiB at Nside 1024 against a 71.2 GiB pool, and the
+polar table is 146.96 GiB per layout, so neither is storable there regardless of how fast
+the contraction is. Faster contraction changes the *value* of solving the capacity
+problem, not the capacity itself.
+
+### Two hypotheses tested and closed in the same session
+
+- **The recurring `bfc_allocator ran out of memory ... 1.19 GiB` warning at n512 spin 2
+  is not costing time.** It appears in every multi-cell run, and the obvious theory was
+  that the spin-0 cells' scalar band + synth copy (18.7 GiB) were still resident while
+  the polar slab pair was being built, forcing eviction traffic inside the `field`
+  stage. `.qwen/tmp/score_one.py` runs a single `(nside, spin)` cell in a fresh process
+  that cached nothing: **n512 spin 2 gives 1.72× / field 279 ms fresh vs 1.75× / field
+  281 ms in the multi-cell run.** No effect — do not add a `_theta_matrix.release()`
+  call to the polar path for performance reasons; the warning is benign.
+- **The polar contraction is now provably at the fp64 SIMT floor, so the `field` stage
+  cannot go faster in fp64.** After `c80263b` the stage decomposes as 4 analysis + 3
+  synthesis passes; scaling session 9's in-situ times by the measured 1.36× gives
+  ~30.7 ms analysis and ~41 ms synthesis, i.e. ~252 ms of the measured 279 ms is the
+  contraction. One analysis pass reads the 18.74 GiB layout = 2.5e9 elements × 4 FMAs in
+  30.7 ms = **335 G FMA/s against the card's measured 410 G FMA/s fp64 SIMT ceiling
+  (82 %)**. Session 9's floor arithmetic was right; only its claim that nothing could
+  reach it was wrong. Getting below needs fewer FMAs per element (the `pi - theta`
+  identity is already spent, the other symmetries measured unavailable) or faster
+  arithmetic, and both tensor-core and limb-emulation routes are closed by
+  `fp64-roofline-wall.md` (N=4 is operand-stream-bound; 7.4-pass break-even vs ≥10
+  products for fp64-class accuracy).
