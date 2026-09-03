@@ -1646,6 +1646,14 @@ there is no hidden pool there. Two side findings from the same probes:
   quotable; the "85 % of the fp64 FMA floor" figure above is the *best observed* case,
   and in situ the contraction sits nearer 58 % of that floor — which is the one place
   left on this card where n512 spin 2 could still get faster.
+- **The in-situ gap is not clock ramp.** `--repeats 7` under sustained load gives
+  `field 216->358ms`, `TOTAL 536 ms` (`n512_rep7.log`) against `field 360`, `TOTAL 536`
+  at repeats 3 — identical. The pipeline's 358 ms reproduces the sum of the separately
+  measured pieces (375.8 ms), so the ~130-160 ms distance to the fp64 floor is a stable
+  property of the shipped schedule (candidates: block-page locality under 37.5 GiB of
+  residency, XLA tiling when the blocks arrive as jit arguments rather than constants),
+  not measurement noise. That is the biggest remaining win below 1024: field 358 →
+  ~220 ms would make n512 spin 2 ~1.9-2.0x overall.
 
 ### Why `sum(block[..., None] * real_rhs)` beats `einsum` here
 
