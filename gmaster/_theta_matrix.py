@@ -150,6 +150,27 @@ def band_bytes(nside, L, block=BLOCK):
     return sum(min(block, L - m0) * (L - m0) * north * 8 for m0 in range(0, L, block))
 
 
+def _contract_theta(slab, chan):
+    """``acc[e, m, c] = sum_j slab[e, m, j] * chan[m, j, c]`` in one sweep.
+
+    Both channels must be reduced together.  Spelling it
+    ``sum(slab[..., None] * chan[None], axis=2)`` leaves the two channels in a
+    trailing dimension *after* the reduction axis, and XLA then materialises the
+    (rows, mb, north, 2) product rather than folding it into the reduce: 12.16 ms
+    for the Nside 512 band against 8.14 ms here (823 vs 1238 GB/s of slab read,
+    control 1400 GB/s, three interleaved rounds, values agree to 2.5e-16).  A
+    tuple reduce carries both accumulators in a single pass.
+
+    A dot is not the answer either: ``einsum("emj,mjc->emc")`` measures 4x
+    *slower* inside this program (203 GB/s) while measuring 4x faster when each
+    block is compiled on its own.  Only the whole-band program is what ships.
+    """
+    re, im = lax.reduce(
+        (slab * chan[None, :, :, 0], slab * chan[None, :, :, 1]), (0.0, 0.0),
+        lambda a, b: (a[0] + b[0], a[1] + b[1]), (2,))
+    return jnp.stack([re, im], axis=-1)
+
+
 @partial(jax.jit, static_argnames=("L", "widths"))
 def _transform(slabs_even, slabs_odd, ftm_pos, weights, phase, *, L, widths):
     ntheta = weights.shape[0]
@@ -169,7 +190,7 @@ def _transform(slabs_even, slabs_odd, ftm_pos, weights, phase, *, L, widths):
     for group, rhs in ((slabs_even, north_rhs + sign[:, None] * south_rhs),
                        (slabs_odd, north_rhs - sign[:, None] * south_rhs)):
         rhs2 = jnp.stack([rhs.real, rhs.imag], axis=-1)
-        accs.append([jnp.sum(slab[:, :, :, None] * rhs2[m0:m0 + w][None], axis=2)
+        accs.append([_contract_theta(slab, rhs2[m0:m0 + w])
                      for m0, w, slab in zip(range(0, L, BLOCK), widths, group)])
     even_accs, odd_accs = accs
     blocks = []
@@ -240,6 +261,22 @@ def _synth_band(geometry):
     return groups
 
 
+def _contract_ell(slab, rhs):
+    """``acc[m, j] = sum_e slab[m, j, e] * rhs[m, e]``, reducing the ell axis.
+
+    The synthesis twin of `_contract_theta`.  Spelled as a single complex product,
+    ``sum(slab * rhs[:, None, :], axis=-1)``, the operand that has to be
+    materialised before the reduce is complex — twice the slab — and the reduce
+    sits behind that materialisation instead of absorbing it: 22.55 ms for the
+    Nside 512 synth band against 16.78 ms here (446 vs 600 GB/s of slab read,
+    control 1420 GB/s, three interleaved rounds, values agree to 3.1e-16).
+    """
+    re, im = lax.reduce(
+        (slab * rhs.real[:, None, :], slab * rhs.imag[:, None, :]), (0.0, 0.0),
+        lambda a, b: (a[0] + b[0], a[1] + b[1]), (2,))
+    return re + 1j * im
+
+
 @partial(jax.jit, static_argnames=("L", "widths"))
 def _inverse(slabs_even, slabs_odd, alm, weights, phase, *, L, widths):
     north = slabs_even[0].shape[1]
@@ -259,8 +296,8 @@ def _inverse(slabs_even, slabs_odd, alm, weights, phase, *, L, widths):
         # row-groups the band was split into.
         rhs_even = alm[m0::2, m0:m0 + w].T
         rhs_odd = alm[m0 + 1::2, m0:m0 + w].T
-        acc_e = jnp.sum(even * rhs_even[:, None, :], axis=-1)
-        acc_o = jnp.sum(odd * rhs_odd[:, None, :], axis=-1)
+        acc_e = _contract_ell(even, rhs_even)
+        acc_o = _contract_ell(odd, rhs_odd)
         north_parts.append((acc_e + acc_o) * north_factor[m0:m0 + w])
         # (-1)^(ell+m) = (-1)^(ell-m0) * (-1)^(m+m0): the parity split makes the
         # first factor a constant per group, leaving a per-m sign for the south.
