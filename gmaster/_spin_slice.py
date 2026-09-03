@@ -407,6 +407,27 @@ def clear_cache():
     _CACHE.clear()
 
 
+def _reduce_channels(prod, axis):
+    """Sum a list of same-shaped products along ``axis``, one accumulator each.
+
+    Spelling the channel contraction as ``sum(block[..., None] * rhs[:, None, :, :],
+    axis=2)`` leaves the channels in a dimension *after* the axis being reduced, and
+    XLA then materialises the whole ``(m, ell, theta, 4)`` product instead of folding
+    the multiply into the reduce -- a write and a read of the product on top of the
+    block read.  One ``lax.reduce`` over a tuple of accumulators reads the block once
+    and nothing wide is ever materialised: the Nside 256 spin-2 ``field`` stage goes
+    64.9 -> 47.7 ms (1.36x, three interleaved rounds inside the production stage,
+    control 1430 GB/s, alms agree to 5.4e-16).  This is the polar twin of
+    ``_theta_matrix._contract_theta``, which wins 1.50x on the scalar band.
+
+    ``einsum`` is not the answer: it lowers this batched matvec to 717 GB/s (HANDOFF
+    session 8), and it loses to both of the forms above.
+    """
+    return jnp.stack(lax.reduce(tuple(prod), (0.0,) * len(prod),
+                                lambda a, b: tuple(x + y for x, y in zip(a, b)),
+                                (axis,)), axis=-1)
+
+
 def forward_latitudinal(ftm, slab, *, L):
     """flm[ell, L-1+m] = sum_theta slice[theta, ell, m] * ftm[theta, L+m].
 
@@ -431,11 +452,12 @@ def forward_latitudinal(ftm, slab, *, L):
     complex map.  ``einsum`` lowers the per-window batched matvec to 717 GB/s here,
     and every alternative spelling of it -- one call over a stacked ``h`` axis
     (nside 512 field 694 -> 1392 ms), the same two calls without the scatter chain
-    -- measured no better or worse.  Split into real channels one pass over the
-    block suffices, and one pass costs 28.9 ms against the 24.5 ms floor set by
-    this card's fp64 FMA rate where the two complex ``einsum`` calls took 51.9.
-    It is also bit-for-bit the same answer (``|new - einsum| = 0.0`` at nside 128
-    against the full slab and at 512 against shipped).
+    -- measured no better or worse.  The four real channels then have to be reduced
+    through ``_reduce_channels``, not a stacked broadcast: that second choice is
+    worth 1.36x on the ``field`` stage at nside 256 (64.9 -> 47.7 ms) at 5.4e-16.
+    The channel split itself is bit-for-bit the same answer as ``einsum``
+    (``|new - einsum| = 0.0`` at nside 128 against the full slab and at 512 against
+    shipped).
     """
     ftm = jnp.asarray(ftm)
     off = L - 1
@@ -447,7 +469,7 @@ def forward_latitudinal(ftm, slab, *, L):
         mirror = rev[:, L - m1 + 1:L - m0 + 1][:, ::-1]
         rhs = jnp.stack([direct.real.T, direct.imag.T,
                          mirror.real.T, mirror.imag.T], axis=-1)  # (m, theta, 4)
-        acc = jnp.sum(block[..., None] * rhs[:, None, :, :], axis=2)  # (m, ell, 4)
+        acc = _reduce_channels([block * rhs[:, None, :, c] for c in range(4)], 2)
         out = out.at[lo:, off + m0:off + m1].set(
             (acc[..., 0] + 1j * acc[..., 1]).T)
         mir = sign[lo:, None] * (acc[..., 2] + 1j * acc[..., 3]).T
@@ -487,9 +509,9 @@ def inverse_latitudinal(flm, slab, *, L):
                          mirror.real, mirror.imag], axis=-1)
         rhs = rhs.transpose(1, 0, 2)  # (m, ell, 4)
         if theta_contig:  # block (m, ell, theta): reduce over the strided axis
-            acc = jnp.sum(block[..., None] * rhs[:, :, None, :], axis=1)
+            acc = _reduce_channels([block * rhs[:, :, c, None] for c in range(4)], 1)
         else:  # block (m, theta, ell)
-            acc = jnp.sum(block[..., None] * rhs[:, None, :, :], axis=2)
+            acc = _reduce_channels([block * rhs[:, None, :, c] for c in range(4)], 2)
         out = out.at[:, L + m0:L + m1].set((acc[..., 0] + 1j * acc[..., 1]).T)
         mir = (acc[..., 2] + 1j * acc[..., 3]).T
         # The mirrored channel reads ftm ring-reversed, so its adjoint writes back
