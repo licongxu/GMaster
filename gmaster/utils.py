@@ -616,12 +616,14 @@ def _spin_slabs(L_work, spin, *, nside):
 
 
 def _use_pallas_sht(L, spin):
-    if (
-        nmt_params.sht_calculator
-        not in ("jax", "jax-single", "jax-mgpu", "jax-dfp32", "jax-matrix")
-        or L < 128
+    if nmt_params.sht_calculator not in (
+        "jax", "jax-single", "jax-mgpu", "jax-dfp32", "jax-matrix"
     ):
         return False
+    # No lower bound on L: interleaved against the generic s2fft path with the
+    # clocks forced up, the fused scalar path is 1.8x faster at Nside 16 and
+    # 4.5x at Nside 32, because the generic latitudinal step is a scatter loop
+    # whose cost barely falls with map size. Alms agree to 2.9e-13.
     # Fused spin-weighted kernels remain experimental: their closed-form
     # Wigner-d seeds lose relative precision through catastrophic cancellation
     # once |m| approaches l. Spin transforms use the generic path until the
