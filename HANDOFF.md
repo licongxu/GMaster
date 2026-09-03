@@ -1289,7 +1289,7 @@ close to its ceiling.
 
 ---
 
-## Session 6 (2026-09-03) — four landed wins; scoreboard by Nside
+## Session 6 (2026-09-03) — five landed wins; scoreboard by Nside
 
 Everything below is measured on GPU1 with `CUDA_VISIBLE_DEVICES=1`, `repeats=5`,
 `total` computed as `field + coupling + coupled_cell + decouple_cell` (never the
@@ -1334,26 +1334,40 @@ coupled spectrum. **No change this session moved any `rel` value** — spin 0 st
    The spin-2 matrix builder already used matmuls and needed nothing (16 ms vs
    NaMaster's 83 ms).
 
-### Scoreboard (TOTAL ms, GPU1, repeats=5)
+### Scoreboard (TOTAL ms, GPU1, repeats=5, `8ca2304`)
 
-| Nside | spin | NaMaster | GMaster before | GMaster now | NaMaster / now |
+| Nside | spin | NaMaster | GMaster at session start | GMaster now | NaMaster / now |
 |---|---|---|---|---|---|
-| 32 | 0 | 4.5 | 3.7 | 4.0 | 1.1× |
-| 32 | 2 | 3.7 | 7.3 | 7.1 | **0.5×** |
-| 64 | 0 | 7.5 | 7.7 | 6.8 | 1.1× |
-| 64 | 2 | 14.4 | 12.7 | 13.2 | 1.1× |
-| 128 | 0 | 17.9 | 21.1 | 16.1 | 1.1× |
-| 128 | 2 | 41.5 | 27.5 | 26.2 | **1.6×** |
-| 256 | 0 | 61.2 | 59.5 | 47.2 | **1.3×** |
-| 256 | 2 | 162.7 | 114.6 | 108.6 | **1.5×** |
-| 512 | 0 | ~300 | 196 | (see below) | — |
-| 512 | 2 | — | 8500 | (see below) | — |
+| 32 | 0 | 3.0-4.5 | 3.7 | 3.5-4.0 | ~1× (noise-bound) |
+| 32 | 2 | 3.7-4.0 | 7.3 | 6.9 | **0.5×** |
+| 64 | 0 | 7.0-7.5 | 7.7 | 6.6 | 1.1× |
+| 64 | 2 | 14.0-14.4 | 12.7 | 10.2 | **1.4×** |
+| 128 | 0 | 17.9-23 | 21.1 | 15.4 | **1.2-1.5×** |
+| 128 | 2 | 40-42 | 27.5 | 24 | **1.7×** |
+| 256 | 0 | 61-65 | 59.5 | 47 | **1.3×** |
+| 256 | 2 | 155-163 | 114.6 | 102 | **1.5×** |
+| 512 | 0 | 339-345 | 196 | 288 | **1.2×** |
+| 512 | 2 | 718 | 8500 | ~8700 | **0.08×** |
 
-Nside 32 is host-bound and its ±0.5 ms noise exceeds the difference; both codes are
-"one launch budget" there. Nside 32 spin 2 is the one cell where GMaster is genuinely
-slower than NaMaster: NaMaster's spin-2 cost at tiny Nside is dominated by small
-matrix work it does in optimized BLAS, while GMaster's pipeline has ~3× the kernel
-count and its spin-2 `field` stage cannot amortise it.
+Nside 32 is host-bound and its noise (±1 ms on a 3-4 ms total) exceeds the
+difference, so both spins there are a tie rather than a measured win or loss —
+except spin 2, where GMaster's extra launches still cost it ~3 ms.
+
+### Fifth win (`8ca2304`) — one Wigner-d table per geometry
+
+`_coupling_matrices_spin2` asked for **six** Wigner-d tables, built inside two
+separate jit calls, so XLA could not merge them: the `(0,0)` table at
+`lmax_mask` twice literally, and — because `d^l_{-m,-n} == d^l_{m,n}` when `m - n`
+is even, verified bit-for-bit against this builder — each call's `first`/`second`
+pair is really one table. They are sequential scans over degree, which is why the
+stage cost barely depended on `lmax` (~5 ms at lmax 95 vs 16 ms at 767). Building
+them outside the quadrature call and passing them in collapses six to three:
+coupling **77 → 10 ms** at Nside 256, **17 → 6 ms** at 128, taking those cells to
+1.5× and 1.7× NaMaster. `rel` values are bit-identical before and after.
+Applying the identity to *odd* `m - n` pairs is wrong (there it carries a minus
+sign) and `tests/test_workspaces.py::test_arbitrary_spin_workspaces_match_namaster`
+fails on four parameterisations — the guard is `(m - n) % 2 == 0`.
+
 
 ### Two measurement traps that cost hours (now in memory)
 
@@ -1383,9 +1397,15 @@ count and its spin-2 `field` stage cannot amortise it.
 - **Per-window slab rebuild** to bound memory at n512: the slab takes ~15 s to build
   against a ~0.2 s transform, so rebuilding it per window costs more time than the
   windowing saves.
-- **Splitting the band's complex reduce** into two real reduces: 1543 vs 1412 GB/s in
-  a matched synthetic test (and the two forms differ by 1.6e-15 because of summation
-  order). XLA already fuses the 4-D product; do not pay an accuracy change for 9%.
+- **Splitting the band's complex reduce** into two real reduces: *untested, do not
+  cite*. `.qwen/tmp/band_forms.py` compares the shipped stacked reduce against an
+  einsum-against-complex form and a two-real-reduce form on the real cached band, but
+  it dies on ragged m-block shapes (`np.stack` of unequal blocks), and the "1412 vs
+  1543 GB/s" pair quoted at the end of the previous session was never read from a
+  log. The measured facts are only these: the band contraction moves table bytes at
+  783/609 GB/s (analysis/synthesis) at Nside 256 and 769/639 at 512, against a
+  ~1578 GB/s fp64 read rate. Fix the probe's comparison before concluding anything
+  about the reduce form.
 - **Always-traced core loops**, m-window blocks of 16 and 128, and a window variant
   that skips both ell ends: all measured worse than what ships.
 
@@ -1405,14 +1425,33 @@ assembly chain per transform).
 ### The n512 spin-2 wall
 
 The `_spin_slice` slab pair is `2 × (2L-1) × ntheta × L × 16 B` = **154 GiB** at
-Nside 512 against a 71.2 GiB JAX pool (0.75 × 96 GiB RTX PRO 6000). Even a *single*
-layout (77 GiB) does not fit, so spin 2 at n512 falls through to the generic s2fft
-path (measured 8.5 s, i.e. ~0.03× NaMaster). The m-window skip does not change the
-*allocation*, only the bytes read. Options, none free: (a) split the slab along `m`
-with a per-window transform — rebuild cost exceeds the win (above); (b) contract the
-Wigner-d recurrence on the fly inside a Pallas kernel — the real fix, and the only
-route past the complex-RHS tax at any Nside; (c) keep n512 spin 2 on the generic path
-and say so. Spin 0 at n512 is unaffected (band budget fits) and remains the fastest
-cell in the table.
+Nside 512 against a 71.2 GiB JAX pool (0.75 × 96 GiB RTX PRO 6000), so
+`slabs_for` rejects it at its `pair_bytes > _PAIR_BUDGET` (48 GiB) gate and the
+transform falls to the generic `lax.fori_loop` scatter path. The benchmark's
+`GPUpeak=20.1GiB` confirms no slab was ever attempted. That path costs
+**8.5 s** for the seven polarised transforms of one field — 38× NaMaster's 224 ms
+field stage and 12× its 718 ms total — because it materialises the full
+`(2L-1, ntheta, L)` `dl` buffer *and* scatters per `m`.
+
+The m-window skip does not change the *allocation*, only the bytes read, so it
+cannot rescue this cell, and neither can windowed allocation: the slab is built
+by a recurrence that marches sequentially over `m`, so the `ell >= |m|` rows
+cannot be produced without their predecessors and `lax.scan` materialises every
+row. Chunking the march over `theta` is legal (the recurrence is independent per
+ring) but compacted storage is still ~45 GiB plus a transient chunk.
+
+Dropping to a **single layout** was measured, not assumed
+(`.qwen/tmp/slab_one_layout.py`, Nside 256): synthesis contracted against the
+*analysis* (theta-contiguous) buffer is exact to 2.2e-16 and costs 18.0 ms
+against 15.7 ms for the dedicated ell-contiguous one — the two copies buy 15% on
+one stage for 2x memory. It is not shipped (memory is not the binding constraint
+below Nside 512 and this is a small slowdown), but it bounds the n512 question:
+one layout is 77 GiB, plus ~14 GiB of `ftm`/`flm` working set, against 96 GiB
+*physical*. **The wall is therefore not a budget setting — n512 spin 2 cannot be
+table-driven on this card at all**, and the only route to beating NaMaster there
+is contracting the Wigner-d recurrence on the fly inside a fused kernel, which
+is also the only known way past the complex-RHS tax that caps every polarised
+transform at ~735 GB/s. Spin 0 at n512 is unaffected (band budget fits) and
+remains the fastest cell in the table.
 
 
