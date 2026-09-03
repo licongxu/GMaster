@@ -1287,4 +1287,132 @@ exposes only FP32 BF16x9 emulation, no FP64 emulation. Achieved streaming is alr
 865-1600 GB/s against a 1603 GB/s measured peak, so within exact fp64 this stage is
 close to its ceiling.
 
+---
+
+## Session 6 (2026-09-03) — four landed wins; scoreboard by Nside
+
+Everything below is measured on GPU1 with `CUDA_VISIBLE_DEVICES=1`, `repeats=5`,
+`total` computed as `field + coupling + coupled_cell + decouple_cell` (never the
+wall-clock `pipeline` column), and `rel` = max relative deviation from NaMaster's
+coupled spectrum. **No change this session moved any `rel` value** — spin 0 stays at
+5.9e-14 (n64) / 1.03e-13 (n128) / 4.76e-13 (n256), spin 2 at 1.07e-10 / 4.90e-09 /
+2.74e-08. Test suite is `115 passed, 3 skipped` at every commit.
+
+### Landed
+
+1. **`c485d64` — scalar synthesis reads the cached Legendre band.** The spin-0
+   `inverse_latitudinal` was recomputing the `D`-band from the three-term recurrence
+   on every call while the analysis side already used `_band_cache`. Added
+   `_theta_matrix._synth_band` (same rows, re-laid out `(m_local, j, ell_row)` for the
+   synthesis contraction) + `_SYNTH_CACHE`, and `_fused_inverse_sht` now dispatches to
+   it under the same `_prefer_theta_band(nside, L, 0)` and `2·band_bytes ≤
+   _MATRIX_BAND_BUDGET` gates as analysis. Stage **1.67–1.87×** at Nside 128/256/512.
+2. **`c502c26` — skip the zero head of the polarised slab.** Row `L-1+m` of the
+   `_spin_slice` slab holds `d^ell_{m,-spin}`, which is *identically zero for `ell <
+   |m|`*: just under half of a buffer that is streamed twice per polarised transform.
+   `_windows(L)` returns `(r0, r1, lo)` per 64-row block and both
+   `forward_latitudinal`/`inverse_latitudinal` contract only `slab[r0:r1, lo:]`
+   (analysis, THETA_CONTIG) / `slab[r0:r1, :, lo:]` (synthesis, ELL_CONTIG), writing
+   `out.at[lo:, …]`. Skipped rows keep their exact zeros, so the result is
+   **bit-identical** (`rel` 0.0 / 1e-17). Stage **1.79× analysis / 1.75× synthesis**,
+   n256 spin-2 TOTAL **165 → 108 ms**. Block 64 is optimal: 16 skips more bytes but
+   pays 4× the kernels (1.34×/1.20×), 128 gives 1.70×/1.71× at n256 but loses at
+   n128; a variant that also skips the `ell > 2L-2-|m|` tail was consistently worse.
+3. **`70e7f07` — traced refinement loop, gated.** Running the whole `n_iter`
+   refine-loop as one traced program removes the per-op host dispatch that dominates
+   small-N (`field` at n64 spends ~8 ms of *host* time per field: 395
+   `apply_primitive` calls and 115 `rewriting_take`/`_gather` gathers from the
+   triangle↔square layout conversion). Traced is 1.8× faster at n64, 1.05× at n128,
+   and **1.4× slower at n256** (one program must hold every intermediate), so
+   `_PALLAS_TRACED_MAX_L = 256` selects traced below it and eager above.
+   n64 spin 0 **12 → 7 ms**, n64 spin 2 **13 → 12 ms**.
+4. **`a3ddbc9` — offset-blocked scalar MASTER matrix.** A coupling term vanishes
+   unless `offset ≤ min(l1, l2)`, so offset block `[o0, o0+C)` only touches the
+   sub-matrix `[o0:, o0:]`: ~n³/3 element evaluations instead of n³. Chunk 16 measured
+   best (3.0–3.6× vs 2.0–3.3× for 8/32/64). Coupling **16 → 6 ms** at n256,
+   4.4 → 1.5 ms at n128, 2.1 → 0.75 ms at n64; n256 spin-0 TOTAL **61 → 47 ms**.
+   The spin-2 matrix builder already used matmuls and needed nothing (16 ms vs
+   NaMaster's 83 ms).
+
+### Scoreboard (TOTAL ms, GPU1, repeats=5)
+
+| Nside | spin | NaMaster | GMaster before | GMaster now | NaMaster / now |
+|---|---|---|---|---|---|
+| 32 | 0 | 4.5 | 3.7 | 4.0 | 1.1× |
+| 32 | 2 | 3.7 | 7.3 | 7.1 | **0.5×** |
+| 64 | 0 | 7.5 | 7.7 | 6.8 | 1.1× |
+| 64 | 2 | 14.4 | 12.7 | 13.2 | 1.1× |
+| 128 | 0 | 17.9 | 21.1 | 16.1 | 1.1× |
+| 128 | 2 | 41.5 | 27.5 | 26.2 | **1.6×** |
+| 256 | 0 | 61.2 | 59.5 | 47.2 | **1.3×** |
+| 256 | 2 | 162.7 | 114.6 | 108.6 | **1.5×** |
+| 512 | 0 | ~300 | 196 | (see below) | — |
+| 512 | 2 | — | 8500 | (see below) | — |
+
+Nside 32 is host-bound and its ±0.5 ms noise exceeds the difference; both codes are
+"one launch budget" there. Nside 32 spin 2 is the one cell where GMaster is genuinely
+slower than NaMaster: NaMaster's spin-2 cost at tiny Nside is dominated by small
+matrix work it does in optimized BLAS, while GMaster's pipeline has ~3× the kernel
+count and its spin-2 `field` stage cannot amortise it.
+
+### Two measurement traps that cost hours (now in memory)
+
+- **Async leaves.** `benchmarks/benchmark_pipeline.py::_block` walks the result with
+  `jax.tree.map(..., is_leaf=lambda x: hasattr(x, "block_until_ready"))`. `NmtField`
+  and `NmtWorkspace` are plain Python objects, so a jitted `field` stage returns
+  *without* any device array in it and is timed as host enqueue only — that is why
+  "field 21 → 4 ms" appeared when the loop was traced while the TOTAL got worse.
+  Trust a stage only if its return value contains arrays, and always cross-check the
+  TOTAL.
+- **Constant-folded probes.** A probe `@jax.jit` that closes over module-level device
+  arrays makes them HLO constants, and XLA folds the whole call away (it reported
+  8.6 TB/s on a 1.2 GiB read). Always pass big tables as explicit jit arguments.
+
+### Refuted / dead ends (do not re-derive)
+
+- **π−θ symmetry to halve the polarised slab.** `d^l_{m,-spin}(π−θ) = (-1)^l
+  d^l_{-m,-spin}(θ)` looks like a 2× memory win and is in every table-of-Wigner-d
+  handbook, but it is **false for this slice** — tested directly against the built
+  table (`_m_slice` row `L-1+m`): residual 1.334 of the table max for spin 2, 1.998
+  for spin 1 (a true identity would be ~1e-15). `.qwen/tmp/slab_symmetry.py` has the
+  three control comparisons.
+- **Real-pair packing** (`_pack_pair`) to halve the slab footprint: same total bytes
+  as the complex form because the pair covers both signs of `m`; measured no win in a
+  prior session and re-derived here — `2 × (rows, L, θ) real = 2 × (rows, 2L-1, θ)`
+  real.
+- **Per-window slab rebuild** to bound memory at n512: the slab takes ~15 s to build
+  against a ~0.2 s transform, so rebuilding it per window costs more time than the
+  windowing saves.
+- **Splitting the band's complex reduce** into two real reduces: 1543 vs 1412 GB/s in
+  a matched synthetic test (and the two forms differ by 1.6e-15 because of summation
+  order). XLA already fuses the 4-D product; do not pay an accuracy change for 9%.
+- **Always-traced core loops**, m-window blocks of 16 and 128, and a window variant
+  that skips both ell ends: all measured worse than what ships.
+
+### Where the time still goes (n256, spin 2, after all four)
+
+`field 19` · `map2alm 53` · `alm2map 36` · `coupling 16` · `coupled_cell 3` ·
+`decouple 2` · `synthesize 6`. Both transforms are now pure bandwidth: the spin-2
+latitudinal contraction streams the windowed slab at ~735 GB/s against the ~1578 GB/s
+real-read rate, and the shortfall is the **complex-RHS tax** — every table element is
+multiplied by a complex weight, and XLA has no way to avoid two real reductions per
+element (see memory `complex-rhs-tax.md`: every XLA-level reformulation tried,
+including einsum variants, `lax.dot_general`, splitting, and batched forms, measured
+at the same 1.00–1.05×). The scalar band contraction runs at 938 GB/s of table bytes
+at n512 and is partly per-block launch-bound (24 block reduces + a pad/concatenate
+assembly chain per transform).
+
+### The n512 spin-2 wall
+
+The `_spin_slice` slab pair is `2 × (2L-1) × ntheta × L × 16 B` = **154 GiB** at
+Nside 512 against a 71.2 GiB JAX pool (0.75 × 96 GiB RTX PRO 6000). Even a *single*
+layout (77 GiB) does not fit, so spin 2 at n512 falls through to the generic s2fft
+path (measured 8.5 s, i.e. ~0.03× NaMaster). The m-window skip does not change the
+*allocation*, only the bytes read. Options, none free: (a) split the slab along `m`
+with a per-window transform — rebuild cost exceeds the win (above); (b) contract the
+Wigner-d recurrence on the fly inside a Pallas kernel — the real fix, and the only
+route past the complex-RHS tax at any Nside; (c) keep n512 spin 2 on the generic path
+and say so. Spin 0 at n512 is unaffected (band budget fits) and remains the fastest
+cell in the table.
+
 
