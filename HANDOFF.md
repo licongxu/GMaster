@@ -1616,13 +1616,35 @@ bit-identical against a float128 oracle at n128. The suite is unchanged at
 n512 spin-2 `field` stage: 441 → **360 ms**. It is still the only stage where
 GMaster trails NaMaster (360 vs 224); coupling/coupled_cell/decouple are 8-240× ahead.
 
-**Where the remaining `field` time is, by subtraction (inference, not a direct stage
-measurement):** 4 analysis + 3 synthesis at the isolated rates above is
-4 x 28.91 + 3 x 34.02 = **217.6 ms of the 360 ms**, leaving **~142 ms (26 % of the whole
-536 ms TOTAL) that is not the Wigner-d contraction** — ring regridding, the phi FFTs,
-weighting and the refinement bookkeeping. Every previous session attributed `field`
-entirely to the transforms; after this commit it no longer is, so the next attribution
-pass should look at the non-contraction part.
+**The `field` stage measured piece by piece (`field_split.log`, n512 spin 2).** An
+earlier reading of this session claimed the two contractions only accounted for
+217.6 ms of the 360 ms and that ~142 ms was somewhere else. **That was wrong** — it
+used the best-case isolated contraction rates. Measured in situ:
+
+| piece | per call | calls | total |
+|---|---|---|---|
+| analysis: ring transform + quadrature + phase shifts | 10.45 ms | 4 | 41.8 ms |
+| analysis: **contraction** | 35.82 ms | 4 | 143.3 ms |
+| analysis: finish (`sqrt((2l+1)/4pi)`, spin zeroing) | 0.09 ms | 4 | 0.4 ms |
+| synthesis: prepare | 4.69 ms | 3 | 14.1 ms |
+| synthesis: **contraction** | 51.45 ms | 3 | 154.4 ms |
+| synthesis: inverse ring transform | 7.32 ms | 3 | 22.0 ms |
+| **sum** | | | **375.8 ms** vs 360 ms benchmarked |
+
+So `field` *is* the transforms (94 %); the ring/FFT/factor work is 23 ms (6 %), and
+there is no hidden pool there. Two side findings from the same probes:
+
+- **The `(m, theta, ell)` synthesis layout is still worth its memory**: synthesis on
+  the theta-contiguous layout costs **83.91 ms** against **51.45 ms** on
+  ell-contiguous (`layout_ab.log`), so `want_ell` stays. `forward_latitudinal` accepts
+  only the theta-contiguous layout (ell-contiguous raises a broadcast shape error), so
+  a one-layout world is not available without a second forward form.
+- **Probe variance on this operation is large and it is the cold-clock trap again**: the
+  same forward contraction measured **28.91 ms** (session-8 probe, warm), **35.82 ms**
+  in situ, **42.47 ms** in a cold single-purpose probe. Only end-to-end medians are
+  quotable; the "85 % of the fp64 FMA floor" figure above is the *best observed* case,
+  and in situ the contraction sits nearer 58 % of that floor — which is the one place
+  left on this card where n512 spin 2 could still get faster.
 
 ### Why `sum(block[..., None] * real_rhs)` beats `einsum` here
 
@@ -1637,13 +1659,16 @@ shipped complex-RHS `einsum` **717-745 GB/s**.
 The spin-0 path in `_theta_matrix.py` already used this real-channel form, which is
 why scalar was never the deficit; only the polarised path was paying the tax.
 
-### Ceiling reached: 85 % of the fp64 FMA floor
+### Where the fp64 ceiling is, and the gap to it
 
 For the shipped n512 layout the 4-channel contraction is 1.0e10 FMA; at the measured
-fp64 SIMT ceiling of **0.82 TFLOP/s (0.41 T FMA/s)** the floor is **24.5 ms** against
-28.9 ms measured. **There is no fp64 headroom left in this stage.** Going further
-needs tensor cores / fp32-emulation (this card has no fp64 tensor cores; dense fp64
-GEMM tops out at 1.88 TFLOP/s) or fewer FLOPs, not another tuning pass.
+fp64 SIMT ceiling of **0.82 TFLOP/s (0.41 T FMA/s)** the floor is **24.5 ms** per
+transform. The best isolated measurement reaches 28.9 ms (**85 % of the floor**), but
+in situ the same calls run at 35.8 ms (analysis) and 51.5 ms (synthesis), i.e.
+**~58 % of the floor**, and that gap — 126 ms of the 360 ms `field` stage — is the one
+remaining place n512 spin 2 could get faster on this card. Whatever closes it must not
+trade accuracy; going *past* the floor needs tensor cores / fp32-emulation (this card
+has no fp64 tensor cores, dense fp64 GEMM tops out at 1.88 TFLOP/s) or fewer FLOPs.
 
 ### Things that measured the opposite of expectation
 
