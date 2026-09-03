@@ -2032,12 +2032,68 @@ patch is on the path).
 
 ### What the win does *not* buy
 
-The synthesis band still runs at 600 GB/s against a 1420 GB/s control, so the transposed
-`(m_local, j, ell_row)` layout is still leaving ~2.4× on the table. And the capacity wall
-is unchanged: the scalar band is 77 GiB at Nside 1024 against a 71.2 GiB pool, and the
-polar table is 146.96 GiB per layout, so neither is storable there regardless of how fast
-the contraction is. Faster contraction changes the *value* of solving the capacity
-problem, not the capacity itself.
+The capacity wall is unchanged: the scalar band is 77 GiB at Nside 1024 against a
+71.2 GiB pool, and the polar table is 146.96 GiB per layout, so neither is storable
+there regardless of how fast the contraction is. Faster contraction changes the *value*
+of solving the capacity problem, not the capacity itself.
+
+Measured live at this HEAD (`.qwen/tmp/score_one_1024s0.log`, fresh process, repeats 1):
+**n1024 spin 0 = 0.61× (1806 → 2976 ms), `field` 512 → 1372 ms (0.37×), rel 2.20e-12** —
+indistinguishable from session 8's 0.60× / 511 → 1366 ms, as expected: at 1024 the band
+is declined (77 GiB > 32 GiB budget) and the fused Pallas kernel runs, which neither
+commit touches. No regression, no gain. The arithmetic for what a resident band *would*
+buy there: 7 passes over 77 GiB at the now-measured 1238 GB/s ≈ 455 ms of `field`
+against NaMaster's 512 ms — so even solving the capacity problem only reaches ~1.1× at
+1024, not a massive win.
+
+(Careful with the 600 GB/s figure for the synthesis band quoted above: it comes from
+dividing the *whole* `alm2map` stage — FFTs, mask algebra, residual included — by the
+band's byte count, so it is a floor on the contraction's rate, not a measurement of it.
+The clean contraction numbers in this session's table are 1238 GB/s analysis and the
+16.78 ms synthesis stage.)
+
+### The number that governs every large-Nside plan: tables are produced 54x slower than they are read
+
+`.qwen/tmp/slab_build_rate.py` measures how fast `_spin_slice.slabs_for` can *make* a
+Wigner-d slab set (clocks spun up, bandwidth control printed beside every line):
+
+| Nside | pair bytes | cold build (incl. compile) | warm rebuild (cached compiles) |
+|---|---|---|---|
+| 128 | 0.65 GiB | 1463 ms (0.5 GB/s) | 29 ms → **24.1 GB/s** |
+| 256 | 4.87 GiB | 3917 ms (1.3 GB/s) | 228 ms → **22.9 GB/s** |
+| 512 | 37.48 GiB | 10834 ms (3.7 GB/s) | (probe bug, see below) |
+
+The warm production rate is ~23 GB/s and size-independent, while this session measured
+the *consumption* rate of the same bytes at 1238 GB/s. **A produced table therefore has
+to be read ~54 times to pay for itself.** A `NmtField(..., n_iter=3)` reads it 7 times.
+That single ratio is why:
+
+- **n1024 spin 2 cannot be rescued by streaming.** Producing the 146.96 GiB analysis
+  layout takes ~6.4 s at 23 GB/s; build-a-chunk/contract/free would pay that per
+  transform (7x), i.e. ~45 s, against the 85.8 s the generic scatter loop costs today —
+  the same order, which is exactly what the observed 85.8 s is (7 x ~12 s of production).
+- **The scalar band at 1024 cannot be streamed either.** Its build rate is ~90 GB/s
+  (session 8: 97-166 ms for 9.38 GiB), so a chunk costs ~0.86 s to build against 65 ms
+  to contract — build dominates by 13x. Full residency is the only form that wins, and
+  77 GiB does not fit a 71.2 GiB pool.
+- **The march itself is ~40x off the arithmetic floor** (23 GB/s / 8 B = 2.9 G elem/s at
+  a few FMAs each ≈ 10 GFLOP/s against 0.41 T FMA/s), so it is structure/latency-bound.
+  Making the march faster is a legitimate target, but even 10x only reaches ~1 GFLOP-
+  class parity, and the operator's O(L^2 * ntheta) flop count is what caps n1024 anyway.
+
+Probe bug worth noting: the script's `rebuild` leg calls `SS.clear_cache()` and then
+`slabs_for` again while the first pair is still bound, so at n512 the cache decline
+kicks in and `pair` comes back `None`. Delete the pair (and let the pool settle) before
+timing a rebuild.
+
+**Consequence for the standing objective.** Up to Nside 512 both spins now beat NaMaster
+by 1.5-2.3x and the dominant stages are at the fp64 SIMT floor. At Nside >= 1024 the
+binding constraints are capacity (77 GiB band / 147 GiB polar layout vs a 71.2 GiB pool),
+production rate (23-90 GB/s vs 1238 GB/s consumption) and — for anything "massive" — the
+operator's O(L^2 * ntheta) flop count, which is the same order NaMaster spends. Beating
+NaMaster by a large factor there needs a different operator (chirp-Z / factorised-Wigner-d
+class), or a second large card to shard the tables; it is not reachable by scheduling the
+existing one faster.
 
 ### Two hypotheses tested and closed in the same session
 
