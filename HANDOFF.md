@@ -1634,11 +1634,12 @@ used the best-case isolated contraction rates. Measured in situ:
 So `field` *is* the transforms (94 %); the ring/FFT/factor work is 23 ms (6 %), and
 there is no hidden pool there. Two side findings from the same probes:
 
-- **The `(m, theta, ell)` synthesis layout is still worth its memory**: synthesis on
-  the theta-contiguous layout costs **83.91 ms** against **51.45 ms** on
-  ell-contiguous (`layout_ab.log`), so `want_ell` stays. `forward_latitudinal` accepts
-  only the theta-contiguous layout (ell-contiguous raises a broadcast shape error), so
-  a one-layout world is not available without a second forward form.
+- **The `(m, theta, ell)` synthesis layout is still worth its memory.** Matched-clock
+  A/B in one process (`layout_ab2.log`): synthesis **56.06 ms** on ell-contiguous
+  against **83.99 ms** on theta-contiguous = **1.50x**, i.e. ~84 ms off a `field` stage
+  for 18.74 GiB, so `want_ell` stays. `forward_latitudinal` accepts only the
+  theta-contiguous layout (ell-contiguous raises a broadcast shape error), so a
+  one-layout world is not available without writing a second forward form.
 - **Probe variance on this operation is large and it is the cold-clock trap again**: the
   same forward contraction measured **28.91 ms** (session-8 probe, warm), **35.82 ms**
   in situ, **42.47 ms** in a cold single-purpose probe. Only end-to-end medians are
