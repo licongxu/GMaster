@@ -2311,3 +2311,147 @@ every `.qwen/tmp/*.log` row for Nside 1024 spin 2 returns only 0.02-0.04x
 (87 420-87 532 ms, and one 142 456 ms). The comment now states the measured refusals. If a
 future session sees a claim about a fast Nside 1024 spin-2 pipeline, it is wrong until a log
 row proves it.
+
+## Session 13 (2026-09-04) — the isolated SHT against the DUCC C code: the table route is at the bandwidth floor, the chirp-Z was transforming a mirror image
+
+**The question this session existed to answer.** Every previous scoreboard is the *whole*
+MASTER pipeline, which mixes the transform with the coupling matrix and the deprojection and
+therefore cannot answer "is our SHT faster than the ducc0 C code NaMaster calls".
+`.qwen/tmp/sht_vs_ducc.py` times one `map2alm` and one `alm2map` on each side — ducc driven
+through NaMaster's own helper (`pymaster.utils._map2alm_ducc0` / `_alm2map_ducc0` with
+`_ducc_kwargs` = `theta/nphi/phi0/ringstart/lmax/mmax/mstart/nthreads: 0`, ducc0 0.39.1 on all
+192 cores), GMaster through `utils.map2alm(..., n_iter=0)` / `utils.alm2map`, `L = 3·nside−1`,
+clocks spun up before every round and a `jnp.sum` bandwidth control printed on every line
+(1330-1440 GB/s in these runs).
+
+**Stage split (`.qwen/tmp/sht_stage_split.py`) is the finding that redirected the session.**
+Timing the latitudinal contraction alone against a pure `jnp.sum` over the same table slab:
+
+| | nside 512 | nside 1024 |
+|---|---|---|
+| band read floor (`sum` over one slab) | 1488 GB/s | 1488 GB/s |
+| theta analysis | 3.67 ms (1369 GB/s) | 26.18 ms (**1506 GB/s**) |
+| theta synthesis | 4.19 ms (1200 GB/s) | 28.60 ms (1379 GB/s) |
+| everything else (azimuthal ring CZT + ring↔pixel scatter) | 3.5 / 7.4 ms | 15.1 / 27.9 ms |
+
+The precomputed-Legendre contraction is **already streaming at the card's floor** — 1506 GB/s
+against a 1488 GB/s `sum`. There is nothing left to win in the table route, which retires the
+"effective bandwidth of the whole call is only 939 GB/s, close it for 1.4x" reading from
+Session 11-12: the missing time is in the *azimuthal* stage, not in the table.
+
+**Win 1 — the synthesis chirp-Z was transforming an array it already knew.**
+`_inverse_ring_fft` mirrored the positive-m block into a centred `2L`-wide window and
+chirp-Z-transformed the whole thing, so its convolution bound was `N ≥ 2L−1+width` = 8192 at
+Nside 512 and **16384** at 1024, twice the analysis side's 4096/8192. The mirror is exact by
+construction, so with `P(p) = Σ_{m<L} F_m e^{2πipm/nphi}`,
+
+    Σ_m full[m] e^{2πipm/nphi} = 2 P(p) − F_0        (real part)
+
+which needs only the bound `L + width − 1` — 4096 at 512, 8192 at 1024. `utils._inverse_ring_fft_herm`
+implements that and also drops `wrap_phase` entirely (the centred form's bookkeeping for the
+`L`-sample index shift disappears because the new form extracts the window at `L−1+p` instead
+of `2L−1+p`). Measured **2.07x on the stage at Nside 512** and identical to the old form to
+**1.3e-15** (`tests/test_sht.py::test_ring_synthesis_from_positive_half_matches_centred_window`,
+Nside 32/64); the transform size halves at every size (1024→512, 2048→1024, 4096→2048,
+8192→4096). `_inverse_ring_fft` is kept as the equivalence baseline — nothing in the shipped
+path calls it.
+
+**Win 2 — the analysis side built a Hermitian window and immediately threw half of it away.**
+`_map2alm_once_pallas` called the filling ring FFT and sliced `[:, L:]` straight back off it.
+`utils._forward_ring_fft_positive` returns that block directly and `_forward_ring_fft` is now
+that call plus the fill. Stage speedup is small (**1.02 / 1.03 / 1.05x** at 256 / 512 / 1024,
+`.qwen/tmp/ring_forward_ab.log`, sliced-vs-block difference exactly 0.0) and the pipeline does
+not move — it is worth landing for the 100 MB (Nside 512) / 400 MB (Nside 1024) of complex
+buffer it stops materialising, not for the clock.
+
+**Isolated SHT scoreboard, fp32 tables, both ring fixes in.** GPU1, `CUDA_VISIBLE_DEVICES=1`,
+one Nside per process, min over 3-7 reps. The ducc columns are the **45 clean baseline runs**
+of `.qwen/tmp/ducc_only.py` (5 processes × 9 reps per size, **no JAX and no CUDA context on the
+box**): best-of-45 first, then the median-of-process-medians in brackets.
+
+| nside | dir | ducc best (median) ms | GMaster ms | ratio vs best | ratio vs median |
+|---|---|---|---|---|---|
+| 256 | map2alm | 2.12 (2.28) | 1.5 | **1.41x** | **1.52x** |
+| 256 | alm2map | 1.41 (1.62) | 1.8 | 0.78x | 0.90x |
+| 512 | map2alm | 14.97 (16.23) | 7.0 | **2.14x** | **2.32x** |
+| 512 | alm2map | 10.50 (12.03) | 7.6 | **1.38x** | **1.58x** |
+| 1024 | map2alm | 60.81 (64.08) | 40.4 | **1.51x** | **1.59x** |
+| 1024 | alm2map | 53.62 (57.44) | 43.0 | **1.25x** | **1.34x** |
+
+So with fp32 tables the GPU beats the ducc0 C code in **five of six spin-0 cells** even when
+ducc is given its fastest observed time; the sixth is the sub-2 ms Nside 256 synthesis cell
+where both sides are launch-dominated. In fp64 tables the same cells are 0.32-0.53x for
+synthesis and 0.41x for Nside 1024 analysis (the fp64 band is 73.5 GiB and is declined by the
+40 GiB budget).
+
+**Never take a ducc number from the comparison probe at Nside 512.** One run
+(`.qwen/tmp/sht_vs_ducc_s14.log`) read 11.0 / 6.8 ms there; three other runs of the identical
+script read 15.3-16.0 / 12.2-12.6 ms, and the 45 clean GPU-free processes read 14.97-17.35 /
+10.50-13.41 ms. The s14 line is an outlier, and it is the line that made the Nside 512
+synthesis cell look like 0.86x rather than 1.38x. Baselines come from `ducc_only.py` across
+several processes; the comparison probe is for the GPU side only.
+
+**Pipeline re-scored after both fixes** (`score_one.py`, fresh process per cell, control
+1351-1400 GB/s): Nside 512 spin-0 fp32 **346→136 ms (2.54x)** rel 7.17e-09; Nside 512 spin-0
+fp64 **340→199 ms (1.71x)** rel 1.71e-12; Nside 1024 spin-0 fp32 **1790→809 ms (2.21x)** rel
+5.48e-08; Nside 512 spin-2 fp32 **734→401 ms (1.83x)** rel 3.55e-07. Before this session the
+same cells read 157.2 / 222.2 / 900.6 / 401 ms.
+
+**Rejected, with the measurement.** Five-smooth FFT lengths to shorten the ring transforms:
+on this card pow2 wins — 2047 rows, length 3600 → 0.56 ms vs 4096 → 0.49 ms; 4095 rows, 7200 →
+2.51 ms vs 8192 → 2.02 ms (`.qwen/tmp/fft_len.log`, FFT-only 2065-2159 GFLOP/s at pow2).
+`--xla_gpu_cufft_autotune=true` is not a flag in this XLA build (`Unknown flag in XLA_FLAGS`).
+Do not re-derive either.
+
+**Two measurement traps that cost time this session** (both in memory):
+1. *One Nside per process.* A combined fp32 sweep read Nside 1024 analysis as 148.2 ms (0.42x,
+   identical to the fp64 fused kernel) because the process still held the 256/512 tables, the
+   1024 band build hit `Allocator (GPU_0_bfc) ran out of memory trying to allocate 400.00MiB`,
+   and the negative build cache silently routed the transform through the generic path.
+2. *`XLA_PYTHON_CLIENT_MEM_FRACTION=0.95` silently downgrades the route.* With the pool
+   preallocated to 0.95, the band build raised `RESOURCE_EXHAUSTED` and the transform fell
+   back: 41.3 ms at the default pool became 147.4 ms. A bigger pool is not a bigger budget
+   when the build needs headroom to assemble.
+
+**Verification.** `pytest tests/ -q` → **126 passed, 3 skipped in 291.57 s**
+(`.qwen/tmp/pytest_s16.log`); the three skips are the two-GPU tests. The suite already asserts
+`alm2map`/`map2alm` against `pymaster` at atol 1e-12-1e-13, so both rewirings are guarded
+end to end, plus the new exact-equivalence test for the ring synthesis.
+
+**Known asymmetry, deliberately not touched**: `_map2alm_once_pallas_multi_gpu` still uses the
+filling `_forward_healpix_fft` + `[:, L_work:]`. It cannot be exercised on this single-GPU box
+(its tests skip), so it was left alone rather than changed blind. Pre-existing dead code also
+left alone: `_SPIN_PALLAS_MAX_L = 768`.
+
+**Where the azimuthal stage still sits, and the lever.** At Nside 1024 the analysis ring stage
+costs 13.6 ms while a raw batched complex128 FFT *pair* on 4095 rows of 8192 measures **4.73 ms**
+— so ~9 ms is the pad/chirp/slice/scatter around the transforms, and structurally the CZT
+spends **two** 8192-point transforms per ring where ducc0 spends **one** FFT of each ring's own
+length (`nphi` runs 4…4·nside, average ~2048). Bluestein only pays when the requested m-range
+is a small slice of the input grid; at the HEALPix band limit `L = 3n−1 = 0.75·nphi`, so it is
+the wrong tool there. The open question is whether one padded transform per ring group
+(s2fft's `healpix_ffts` modes) reproduces our exact ring values and how many distinct FFT
+shapes a jit-friendly grouping needs — HEALPix RING gives each `nphi = 4j` exactly two rings,
+so a naive per-length grouping is `nside` tiny batches, which is presumably why everybody
+pads. Fixing this stage is worth ~1.4x on analysis at 1024 (40.4 → ~31 ms, i.e. ~1.9x vs ducc)
+and similar on synthesis.
+
+**No fp32 accuracy cliff — that reading was a normalisation bug in the probe.** The isolated
+probe's `rel alm` column reported 2.8e-2 at Nside 512 and 1.1e-1 at 1024 with
+`set_table_precision("fp32")` against 1.2e-7 with fp64, which reads as fp32 tables destroying
+the analysis. It is not an accuracy measurement: ducc0's alms differ from ours by a convention
+factor `|s| ≈ 2.5e5` (the quadrature scale) and the probe fitted `s` but divided the residual
+by `||ref||` instead of `||s·ref||`, inflating every number by exactly `|s|`. Two independent
+corrected measurements agree: with the residual normalised by the fitted magnitude
+(`.qwen/tmp/fp32_accuracy.py`, now also printing `|s|`) and a *same-implementation* comparison
+that has no convention factor at all (`.qwen/tmp/fp32_ell_breakdown.py`, our alms at fp32
+tables vs our alms at fp64 tables, both resident in one process, fp32 built first), the analysis
+error is **4.8e-13 (fp64) → 1.1e-07 (fp32)**, and it is **flat in ell** (8.0e-08 for ell < 192,
+1.4e-07, 1.9e-07, 2.0e-07, 2.2e-07, 2.2e-07, 2.2e-07, 1.9e-07 across the eight equal ell bins
+to 1535). Synthesis is 5.08e-13 (fp64) → 1.14e-07 (fp32), with `|s| ≈ 1` so that direction was
+never inflated. The 1.1e-7 is the cost of the *storage-width reduce* in
+`_theta_matrix._contract_theta` (its docstring already says 1.28e-07), not of the table build.
+So the fp32 win at Nside 1024 is not borrowed against a hidden accuracy loss, and the
+fp32-route numbers above stand as scientific results. Habits: print `|s|` next to every fitted
+residual, and settle any precision claim with an ours-vs-ours comparison instead of a
+cross-implementation one.
