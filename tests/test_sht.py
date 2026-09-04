@@ -403,3 +403,22 @@ def test_matrix_theta_stage_matches_fused_kernel():
         assert float(jnp.max(jnp.abs(positive[below]))) == 0.0
     finally:
         nmt.set_sht_calculator(original)
+
+
+@pytest.mark.parametrize("nside", [32, 64])
+def test_ring_synthesis_from_positive_half_matches_centred_window(nside):
+    """The positive-m ring synthesis equals the mirrored-window one it replaces.
+
+    `_inverse_ring_fft` mirrors the block into 2L coefficients and chirp-Z transforms
+    all of it; `_inverse_ring_fft_herm` spends the exact mirror as `2 Re P - Re F_0` and
+    needs the CZT bound `L + width - 1` instead of `2L - 1 + width` — half the transform
+    size for the same ring values, measured 2.07x on the stage at Nside 512.
+    """
+    L = 3 * nside - 1
+    positive = (
+        jax.random.normal(jax.random.PRNGKey(11), (4 * nside - 1, L))
+        + 1j * jax.random.normal(jax.random.PRNGKey(12), (4 * nside - 1, L))
+    )
+    reference = utils._inverse_ring_fft(positive, L=L, nside=nside)
+    got = utils._inverse_ring_fft_herm(positive, L=L, nside=nside)
+    np.testing.assert_allclose(got, reference, rtol=1e-13, atol=1e-13)

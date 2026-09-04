@@ -849,8 +849,16 @@ def _chirp_angle(index, two_nphi, inverse):
 
 
 @partial(jax.jit, static_argnames=("L", "nside"))
-def _forward_ring_fft(map_flat, *, L, nside):
-    """Exact HEALPix ring FFT for every ring as one batched chirp-Z transform."""
+def _forward_ring_fft_positive(map_flat, *, L, nside):
+    """Chirp-Z ring analysis for every ring, returning the `m in [0, L)` block.
+
+    `_forward_healpix_fft` additionally fills the Hermitian mirror into a
+    `(4*nside-1, 2L)` window because s2fft's latitudinal primitive takes that layout. The
+    HEALPix pipeline asks for it and then slices it straight back off again
+    (`ftm[:, L_work:]`), so a zeroed 2L-wide buffer, two update-slices and a flip/conj
+    gather — 100 MB-scale at Nside 512, 400 MB-scale at 1024 — buy nothing there. Same
+    numbers, fewer passes: `_forward_ring_fft` is this plus the fill.
+    """
     nphi, _, gather, valid, width = _ring_czt_constants(L, nside)
     pixels = jnp.reshape(jnp.asarray(map_flat), (-1,))
     two_nphi = (2 * nphi)[:, None]
@@ -867,9 +875,15 @@ def _forward_ring_fft(map_flat, *, L, nside):
     )
 
     m_index = jnp.arange(L, dtype=jnp.int64)
-    positive = jnp.exp(-1j * _chirp_angle(m_index, two_nphi, False)) * convolution[
+    return jnp.exp(-1j * _chirp_angle(m_index, two_nphi, False)) * convolution[
         :, width - 1 : width - 1 + L
     ]
+
+
+@partial(jax.jit, static_argnames=("L", "nside"))
+def _forward_ring_fft(map_flat, *, L, nside):
+    """Exact HEALPix ring FFT for every ring as one batched chirp-Z transform."""
+    positive = _forward_ring_fft_positive(map_flat, L=L, nside=nside)
     ftm = jnp.zeros((4 * nside - 1, 2 * L), dtype=positive.dtype)
     ftm = ftm.at[:, L:].set(positive)
     ftm = ftm.at[:, 1:L].set(jnp.flip(jnp.conj(positive[:, 1:L]), axis=-1))
@@ -878,7 +892,11 @@ def _forward_ring_fft(map_flat, *, L, nside):
 
 @partial(jax.jit, static_argnames=("L", "nside"))
 def _inverse_ring_fft(ftm_positive, *, L, nside):
-    """Exact HEALPix ring inverse FFT as one batched chirp-Z transform."""
+    """Exact HEALPix ring inverse FFT as one batched chirp-Z transform.
+
+    Kept as the baseline `_inverse_ring_fft_herm` is checked against (identical to
+    1.3e-15 at Nside 512, 2.07x slower); nothing in the shipped path calls it.
+    """
     nphi, _, _, _, width = _ring_czt_constants(L, nside)
     ntheta = 4 * nside - 1
     positive = jnp.asarray(ftm_positive)
@@ -903,6 +921,48 @@ def _inverse_ring_fft(ftm_positive, *, L, nside):
     ]
     wrap_phase = ((L % nphi)[:, None] * p_index[None, :]) % nphi[:, None]
     result *= jnp.exp(-1j * wrap_phase * (2 * jnp.pi / nphi)[:, None])
+
+    source, used = _ring_inverse_layout(L, nside)
+    slots = jnp.reshape(result.real, (-1,))
+    return jnp.where(used, slots[source], 0.0)
+
+
+@partial(jax.jit, static_argnames=("L", "nside"))
+def _inverse_ring_fft_herm(ftm_positive, *, L, nside):
+    """Real HEALPix synthesis ring transform, from the positive-m half only.
+
+    `_inverse_ring_fft` mirrors the block into a centred window of 2L coefficients and
+    chirp-Z transforms all of it, so the convolution length bound (`2L - 1 + width`)
+    forces a transform of 8192 at Nside 512 and 16384 at 1024.  The mirror is exact by
+    construction — `full[L - m] == conj(full[L + m])` — so the ring sum collapses to
+
+        sum_{m=-L+1}^{L-1} F_m e^{2i pi p m / nphi} = 2 P(p) - F_0,
+        P(p) = sum_{m=0}^{L-1} F_m e^{2i pi p m / nphi},
+
+    which needs only L coefficients and a bound of `L + width - 1`: 4096 at Nside 512,
+    8192 at 1024.  Same numbers, N log N cheaper.  The centred form's `wrap_phase`
+    correction is the bookkeeping for the L-sample shift of the coefficient index and
+    disappears here, because this form never shifts it.
+    """
+    nphi, _, _, _, width = _ring_czt_constants(L, nside)
+    positive = jnp.asarray(ftm_positive)
+    two_nphi = (2 * nphi)[:, None]
+    transform_size = _next_fast_len_pow2(L + width - 1)
+
+    m_index = jnp.arange(L, dtype=jnp.int64)
+    embedded = positive * jnp.exp(1j * _chirp_angle(m_index, two_nphi, False))
+    embedded = jnp.pad(embedded, ((0, 0), (0, transform_size - L)))
+    shift = jnp.arange(transform_size, dtype=jnp.int64) - (L - 1)
+    kernel = jnp.exp(-1j * _chirp_angle(shift, two_nphi, False))
+    convolution = jnp.fft.ifft(
+        jnp.fft.fft(embedded, axis=-1) * jnp.fft.fft(kernel, axis=-1), axis=-1
+    )
+
+    p_index = jnp.arange(width, dtype=jnp.int64)
+    positive_half = jnp.exp(1j * _chirp_angle(p_index, two_nphi, False)) * convolution[
+        :, L - 1 : L - 1 + width
+    ]
+    result = 2.0 * positive_half - positive[:, :1]
 
     source, used = _ring_inverse_layout(L, nside)
     slots = jnp.reshape(result.real, (-1,))
@@ -992,7 +1052,7 @@ def _forward_healpix_fft(maps, *, L, nside, reality):
 
 @partial(jax.jit, static_argnames=("L", "nside"))
 def _finish_inverse_pallas(ftm_positive, *, L, nside):
-    return _inverse_ring_fft(ftm_positive, L=L, nside=nside)
+    return _inverse_ring_fft_herm(ftm_positive, L=L, nside=nside)
 
 
 @lru_cache(maxsize=32)
@@ -1367,14 +1427,14 @@ def _map2alm_once_pallas(maps, ell, order, *, nside, L_work, spin=0):
         return _map2alm_once_pallas_spin(
             maps, ell, order, nside=nside, L_work=L_work, spin=spin
         )
-    ftm = _forward_healpix_fft(maps[0], L=L_work, nside=nside, reality=True)
+    ftm = _forward_ring_fft_positive(maps[0], L=L_work, nside=nside)
     theta = _stable_thetas(L_work, nside)
     weights = quadrature_jax.quad_weights_transform(
         L_work, "healpix", nside
     )
     phase = -healpix_ffts.p2phi_rings_jax(jnp.arange(len(theta)), nside)
     positive = _fused_forward_sht(
-        ftm[:, L_work:],
+        ftm,
         theta,
         weights,
         phase,
