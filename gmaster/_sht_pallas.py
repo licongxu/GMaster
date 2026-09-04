@@ -10,6 +10,12 @@ import jax.numpy as jnp
 import numpy as np
 
 
+# Thread-block width for the fused latitudinal kernels.  The hot loop keeps about
+# ten float64 vectors live per theta lane, so `block_size / (32 * num_warps)`
+# doubles per thread is what decides whether they sit in registers or spill.
+_NUM_WARPS = 2
+
+
 @lru_cache(maxsize=16)
 def _diagonal_normalization(L):
     values = np.empty(L)
@@ -121,21 +127,27 @@ def _analysis_kernel(
     def add_coefficient(
         ell,
         values,
-        north_real,
-        north_imag,
-        south_real,
-        south_imag,
+        combined_real,
+        combined_imag,
+        mask=None,
     ):
-        parity = 1.0 - 2.0 * jnp.bitwise_and(ell + m, 1).astype(jnp.float64)
-        real = jnp.sum(values * (north_real + parity * south_real))
-        imag = jnp.sum(values * (north_imag + parity * south_imag))
+        real = jnp.sum(values * combined_real)
+        imag = jnp.sum(values * combined_imag)
+        if mask is None:
+            previous_real = plt.load(out_real_ref.at[local_m, ell])
+            previous_imag = plt.load(out_imag_ref.at[local_m, ell])
+        else:
+            previous_real = plt.load(
+                out_real_ref.at[local_m, ell], mask=mask, other=0.0
+            )
+            previous_imag = plt.load(
+                out_imag_ref.at[local_m, ell], mask=mask, other=0.0
+            )
         plt.store(
-            out_real_ref.at[local_m, ell],
-            plt.load(out_real_ref.at[local_m, ell]) + real,
+            out_real_ref.at[local_m, ell], previous_real + real, mask=mask
         )
         plt.store(
-            out_imag_ref.at[local_m, ell],
-            plt.load(out_imag_ref.at[local_m, ell]) + imag,
+            out_imag_ref.at[local_m, ell], previous_imag + imag, mask=mask
         )
 
     def latitude_chunk(chunk, _):
@@ -173,50 +185,65 @@ def _analysis_kernel(
         qmm = jnp.where(
             diagonal < 0, -jnp.ones_like(sine), jnp.ones_like(sine)
         ) * jnp.exp2(log2_scale - scale_exponent)
-        add_coefficient(
-            m,
-            qmm * scale_factor,
-            north_real,
-            north_imag,
-            south_real,
-            south_imag,
-        )
+        # d^ell_{m0}(pi - theta) = (-1)^(ell+m) d^ell_{m0}(theta), so the southern
+        # half of the ring sum collapses onto the northern one with a sign that
+        # alternates in ell.  Within the degree loop that sign is fixed every
+        # other step, so the two combinations are formed once per theta chunk and
+        # the loop multiplies by a fixed vector instead of recomputing
+        # `north + parity * south` at every degree.
+        plus_real = north_real + south_real
+        plus_imag = north_imag + south_imag
+        minus_real = north_real - south_real
+        minus_imag = north_imag - south_imag
+        add_coefficient(m, qmm * scale_factor, plus_real, plus_imag)
 
         qm1 = jnp.sqrt(2.0 * m_float + 3.0) * cosine * qmm
 
         @pl.when(m + 1 < L)
         def add_first_off_diagonal():
-            add_coefficient(
-                m + 1,
-                qm1 * scale_factor,
-                north_real,
-                north_imag,
-                south_real,
-                south_imag,
-            )
+            add_coefficient(m + 1, qm1 * scale_factor, minus_real, minus_imag)
 
-        def degree_step(ell, state):
+        def degree_pair(step, state):
             qm2, qm1, scale_exponent, scale_factor = state
+            ell = m + 2 + 2 * step
             coefficient_1 = plt.load(coefficient_1_ref.at[local_m, ell])
             coefficient_2 = plt.load(coefficient_2_ref.at[local_m, ell])
             current = coefficient_1 * cosine * qm1 - coefficient_2 * qm2
-            add_coefficient(
-                ell,
-                current * scale_factor,
-                north_real,
-                north_imag,
-                south_real,
-                south_imag,
-            )
+            add_coefficient(ell, current * scale_factor, plus_real, plus_imag)
             qm1, current, scale_exponent, scale_factor = (
                 _renormalize_periodically(
                     qm1, current, scale_exponent, scale_factor, ell, m
                 )
             )
-            return qm1, current, scale_exponent, scale_factor
+            # An odd offset from m is never a renormalization point, so the pair
+            # needs the tracked rescale only at its first degree.
+            partner = ell + 1
+            partner_valid = partner < L
+            coefficient_1 = plt.load(
+                coefficient_1_ref.at[local_m, partner],
+                mask=partner_valid,
+                other=0.0,
+            )
+            coefficient_2 = plt.load(
+                coefficient_2_ref.at[local_m, partner],
+                mask=partner_valid,
+                other=0.0,
+            )
+            paired = coefficient_1 * cosine * current - coefficient_2 * qm1
+            add_coefficient(
+                partner,
+                paired * scale_factor,
+                minus_real,
+                minus_imag,
+                mask=partner_valid,
+            )
+            return current, paired, scale_exponent, scale_factor
 
         lax.fori_loop(
-            m + 2, L, degree_step, (qmm, qm1, scale_exponent, scale_factor)
+            0,
+            (L - m - 1) // 2,
+            degree_pair,
+            (qmm, qm1, scale_exponent, scale_factor),
         )
 
     lax.fori_loop(0, pl.cdiv(north_count, block_size), latitude_chunk, None)
@@ -415,7 +442,7 @@ def _scalar_forward_latitudinal_impl(
         out_shape=(shape, shape),
         grid=(m_count,),
         input_output_aliases={9: 0, 10: 1},
-        compiler_params=plt.CompilerParams(num_warps=2),
+        compiler_params=plt.CompilerParams(num_warps=_NUM_WARPS),
         name="gmaster_scalar_analysis",
     )(
         jnp.real(transposed_input),
@@ -457,7 +484,7 @@ def _scalar_inverse_latitudinal_impl(
         out_shape=(shape, shape),
         grid=(m_count, pl.cdiv((len(theta) + 1) // 2, block_size)),
         input_output_aliases={9: 0, 10: 1},
-        compiler_params=plt.CompilerParams(num_warps=2),
+        compiler_params=plt.CompilerParams(num_warps=_NUM_WARPS),
         name="gmaster_scalar_synthesis",
     )(
         jnp.real(transposed),
@@ -931,7 +958,7 @@ def _spin_forward_latitudinal(weighted_ftm, theta, *, L, spin, block_size):
         out_shape=(shape, shape),
         grid=(orders, pl.cdiv(ntheta, block_size)),
         input_output_aliases={20: 0, 21: 1},
-        compiler_params=plt.CompilerParams(num_warps=2),
+        compiler_params=plt.CompilerParams(num_warps=_NUM_WARPS),
         name="gmaster_spin_analysis",
     )(
         jnp.real(weighted_ftm),
@@ -968,7 +995,7 @@ def _scalar_spin_synthesis_latitudinal(
         out_shape=(shape, shape),
         grid=(orders, pl.cdiv(ntheta, block_size)),
         input_output_aliases={20: 0, 21: 1},
-        compiler_params=plt.CompilerParams(num_warps=2),
+        compiler_params=plt.CompilerParams(num_warps=_NUM_WARPS),
         name="gmaster_spin_synthesis",
     )(
         jnp.real(positive_alm),

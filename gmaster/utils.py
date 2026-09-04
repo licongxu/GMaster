@@ -30,9 +30,50 @@ class NmtParams:
         self.n_iter_default = 3
         self.n_iter_mask_default = 3
         self.tol_pinv_default = 1e-10
+        # Storage precision of the precomputed transform tables.  Every
+        # contraction accumulates in float64 whatever this is.
+        self.table_dtype = "fp64"
 
 
 nmt_params = NmtParams()
+
+_TABLE_DTYPES = {"fp64": jnp.float64, "fp32": jnp.float32}
+
+
+def table_dtype():
+    """jnp dtype the precomputed transform tables are stored in."""
+    return _TABLE_DTYPES[nmt_params.table_dtype]
+
+
+def set_table_precision(name):
+    """Choose the device storage precision of the precomputed tables.
+
+    `"fp64"` (default) is what every published GMaster number used: the tables
+    hold exactly the values the fused kernel recomputes, so a table transform and
+    a kernel transform agree to ~1e-16.
+
+    `"fp32"` halves the device bytes of those tables.  The largest geometries are
+    dispatched by a fit test, not by speed, so what this buys is *engagement*:
+    a geometry that declined the tables and took the recurrence-bound fused
+    kernel can take the memory-bound contraction instead.  The recurrence that
+    generates the values stays float64 and every contraction still accumulates in
+    float64; the price is the table's own representation error (~1e-7 relative on
+    the coupling matrix), which is why it is opt-in and never inferred.
+
+    Cached tables are keyed by dtype, and the caches are process-global, so
+    switching clears them rather than handing a caller the other precision's
+    bytes.
+    """
+    if name not in _TABLE_DTYPES:
+        raise KeyError("GMaster table precision must be 'fp64' or 'fp32'")
+    if name == nmt_params.table_dtype:
+        return
+    nmt_params.table_dtype = name
+    from . import _spin_slice
+    from . import _theta_matrix
+
+    _theta_matrix.release()
+    _spin_slice.clear_cache()
 
 
 def set_sht_calculator(calc_name):
@@ -597,10 +638,18 @@ def _use_multi_gpu_sht(L):
 
 _SPIN_PALLAS_MAX_L = 768
 
-# The precomputed Legendre band is O(L^2 * nside): 1.3 GB at Nside 256, 10 GB
-# at 512, 77 GB at 1024. Anything above this falls back to the fused kernel
-# rather than trading a 2.6x theta stage for an OOM.
-_MATRIX_BAND_BUDGET = 32 * 1024**3
+# The precomputed Legendre band is O(L^2 * nside) in the *storage* precision:
+# 9.4 GiB at Nside 512 and 73.5 GiB at 1024 in float64, half that with
+# `set_table_precision("fp32")` (36.7 GiB at Nside 1024). Anything above this falls
+# back to the fused kernel rather than trading a faster theta stage for an OOM.
+# Synthesis prefers a second, re-laid-out copy and takes it only while the pool has
+# room (`_theta_matrix._synth_band`); with one resident band it reduces the analysis
+# layout strided, so this single number gates both directions.
+# 40 GiB is what makes the float32 Nside 1024 analysis band engage on this box's
+# 71.2 GiB pool; the float64 Nside 1024 band (73.5 GiB) and both Nside 2048 sizes
+# still decline. This gate only decides whether a build is attempted — the builders
+# also decline on `RESOURCE_EXHAUSTED`, and `_spin_slice` checks live pool headroom.
+_MATRIX_BAND_BUDGET = 40 * 1024**3
 
 
 def _spin_slabs(L_work, spin, *, nside):
@@ -672,7 +721,7 @@ def _prefer_theta_band(nside, L, m_start):
         return False
     if nmt_params.sht_calculator not in ("jax", "jax-matrix"):
         return False
-    return _theta_band_bytes(nside, L) <= _MATRIX_BAND_BUDGET
+    return _theta_band_bytes(nside, L, dtype=table_dtype()) <= _MATRIX_BAND_BUDGET
 
 
 def _fused_forward_sht(positive, theta, weights, phase, *, L, block_size,
@@ -709,13 +758,15 @@ def _fused_inverse_sht(positive, theta, phase, *, L, nside, block_size):
 
     HEALPix synthesis carries no quadrature weight of its own (the ring
     transform has it), so both routes get a unit weight vector.  The synthesis
-    band is the analysis band re-laid out so the reduction runs over ell, which
-    doubles the band's device footprint: the budget check has to leave room for
-    both copies.
+    band prefers a copy re-laid out so the reduction runs over a contiguous axis,
+    and `_theta_matrix._synth_band` makes that copy only while the pool has room
+    for it; with one band resident it reduces the analysis layout strided instead.
+    So the gate here is the same single-band test as the analysis path, and the
+    doubling that used to be written here is what silently handed Nside 1024
+    synthesis back to the fused kernel.
     """
     weights = jnp.ones_like(theta)
-    if (_prefer_theta_band(nside, L, 0)
-            and 2 * _theta_band_bytes(nside, L) <= _MATRIX_BAND_BUDGET):
+    if _prefer_theta_band(nside, L, 0):
         ftm = _theta_matrix_inverse_latitudinal(
             positive, L=L, nside=nside, weights=weights, phase=phase)
         if ftm is not None:
