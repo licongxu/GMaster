@@ -98,6 +98,22 @@ nmt.set_sht_calculator("jax-mgpu")    # request two devices
 nmt.set_sht_calculator("jax-generic") # force generic S2FFT reference path
 ```
 
+The precomputed transform tables (the scalar Legendre band and the polarised
+Wigner-d triangles) are dispatched by a fit test, so their storage precision
+selects the route as well as the bytes:
+
+```python
+nmt.set_table_precision("fp64")  # default
+nmt.set_table_precision("fp32")  # half the table bytes
+```
+
+The recurrence that generates the table values and every contraction over them
+stay in float64 either way, so the only cost is the table's own representation
+error: `6.5e-9` relative on the decoupled `Cl` at `Nside=512` spin 0 and
+`6.3e-8` at `Nside=1024`, against `1.7e-12` with float64 tables. Halving the
+bytes is what lets `Nside=1024` build its band at all and take the
+memory-bound contraction instead of the recurrence kernel.
+
 On two RTX PRO 6000 Blackwell GPUs, warmed scalar analysis at `Nside=512`
 improves from 0.7057 s on one GPU to 0.3255 s on two (2.17x), while synthesis
 improves from 0.6517 s to 0.3750 s (1.74x). At `Nside=1024`, analysis improves
@@ -194,9 +210,15 @@ without a GPU-to-host-to-GPU round trip. The memory estimates remain planning
 aids rather than substitutes for telemetry, especially for spin-2 and
 Jacobi-refined runs that have not yet been executed at full resolution. The
 fused scalar and generic spin S2FFT transforms are correctness-tested against
-NaMaster, but an end-to-end SHT runtime speedup over DUCC has not been
-demonstrated; coupling-matrix acceleration is the currently measured NaMaster
-speedup.
+NaMaster. Measured end to end on one GPU against `pymaster` (same process, clocks
+forced up, `NmtField(n_iter=3)` + coupling matrix + decoupled cell), the full MASTER
+pipeline is **1.57x** at `Nside=512` spin 0 with float64 tables and **2.20x** with
+`set_table_precision("fp32")`; at `Nside=1024` spin 0 the band only fits in float32 and
+delivers **1.99x** (900.6 ms vs 1791.1 ms). Spin 2 takes 425.8 ms against 657.1 ms at
+`Nside=512` (**1.54x**; the same 426 ms measured against a 708 ms reference run is 1.68x — the
+CPU reference varies ~8% run to run) and still loses badly at `Nside=1024`, where the precomputed Wigner-d
+layout that would replace the generic transform is 73.5 GiB in float32 and the build
+cannot assemble it inside the pool.
 
 Run the parity suite on CPU with:
 

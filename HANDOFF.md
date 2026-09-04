@@ -2152,3 +2152,162 @@ NaMaster, with `field` at 0.85-1.30× and the MCM stages at 1.2-200×. The resid
 by capacity and by table-production rate, both measured above. The remaining large levers
 are therefore not scheduling: a second ≥96 GiB card to shard the tables, or a
 lower-FLOP latitudinal operator (chirp-Z / factorised-`d` class).
+
+## Session 11 (2026-09-04) — Table storage precision, and the memory failures that ship with it
+
+**Shipped `nmt.set_table_precision("fp64" | "fp32")`.** It changes only the *device
+storage width* of the precomputed transform tables — the Legendre band
+(`_theta_matrix`) and the polar Wigner-d layouts (`_spin_slice`). The recurrence that
+generates the values stays float64 and every contraction still accumulates in float64
+(`_contract_theta` upcasts the field channels, not the slabs), so the price is the
+table's own representation error: ~1e-7 relative on the coupling matrix, measured. It
+is opt-in and never inferred; `"fp64"` remains the default and every earlier number in
+this file was taken with it. `tests/test_table_precision.py` pins both widths.
+
+What it buys is **engagement**, not just bytes: the large geometries are dispatched by
+a fit test, so a geometry that declined the tables and took the recurrence-bound fused
+kernel can take the memory-bound contraction instead. Band sizes: Nside 512 9.4 GiB
+(fp64) / 4.7 (fp32); Nside 1024 73.5 / 36.8 GiB. `_MATRIX_BAND_BUDGET` went 32 → 40
+GiB, which is exactly what lets the float32 Nside 1024 band land on this box's default
+71.2 GiB pool.
+
+Measured at Nside 512 (`.qwen/tmp/score_n512_fixed.log`, clock-controlled, both spins
+against pymaster in the same process):
+
+| cell | NaMaster | GMaster | speedup | rel |
+|---|---|---|---|---|
+| spin-0 fp64 | 347.1 ms | 220.6 ms | **1.57x** | 1.7e-12 |
+| spin-0 fp32 | 347.1 ms | 157.6 ms | **2.20x** | 6.5e-09 |
+
+**Re-measured at the end of Session 12 on the shipped code** (`.qwen/tmp/score_n512_final.log`, all
+four cells in one process, budget 40 GiB, default 71.2 GiB pool): spin-0 fp64 348.0 / 222.2 =
+**1.57x** (rel 1.7e-12); spin-0 fp32 348.0 / 157.2 = **2.21x** (rel 6.5e-09); spin-2 fp64
+657.1 / 425.8 = **1.54x** (rel 3.6e-07, polar pair resident at 18.7 + 18.7 GiB, control 1380/1342).
+The GMaster milliseconds are unchanged from the earlier measurement (220.6 / 157.6 / 422.1): the
+spin-2 ratio moved only because `pymaster` needed 657 ms here instead of 707.8 ms there, and the
+reference varies ~8% run to run under load. Quote the GMaster time alongside any ratio.
+spin-2 fp32 in the same run was 657.1 / 411.1 = **1.60x** (rel 3.6e-07), i.e. float32 tables are
+*marginally faster* here rather than the 1.39x regression recorded earlier (523.4 ms in
+`.qwen/tmp/score_spin2_polarfix.log`) — the polar contraction is no longer the loser under
+narrower storage that it used to be.
+
+**Three memory failure modes found and fixed, all of them silent before:**
+
+1. **A cached XLA executable keeps the buffers it produced alive.** A table built as
+   many separate jits therefore costs roughly twice its bytes, and the OOM lands on an
+   allocation that looks far too small for the table. Both builders now call
+   `jax.clear_caches()` every `_BUILD_CLEAR_EVERY = 8` chunks, and `_synth_band` clears
+   before its final concatenate.
+2. **`_synth_band` asked for a second, re-laid-out copy for synthesis and died instead
+   of declining.** It now tests `2 * nbytes + 16 GiB > pool_bytes()` up front and takes
+   the strided reduction on the analysis layout when that fails. Measured bit-identical
+   (rel 0.0), so a synthesis-only caller pays the strided reduction rather than losing
+   the band.
+3. **Refusals were not remembered.** `_theta_matrix._BAND_FAILED` and
+   `_spin_slice._BUILD_FAILED` are now negative caches: a geometry that failed is asked
+   about once per process, then stays declined without a second OOM-and-retry (which is
+   what made a failed run tens of minutes rather than minutes). Cleared by
+   `release()` / `clear_cache()` / `set_table_precision()`.
+
+**Do not try to widen the pool.** `XLA_PYTHON_CLIENT_MEM_FRACTION` is a trap at these
+sizes — the CUDA context and cuBLAS workspaces live *outside* the pool, so a bigger
+pool starves them and the table build fails in a pool that has more free bytes. Same
+process shape, budget 20, Nside 1024 float32:
+
+| pool | GMaster | speedup | band |
+|---|---|---|---|
+| default 71.2 GiB | **898.2 ms** | **2.00x** | built, resident 38.0 GiB, peak 43.3 |
+| 0.95 → 90.2 GiB | 1793.4 ms | 1.00x | `bands cached: 0, failed: [(1024, 3072, 64, float32)]`, peak 16.9 |
+| 0.98 → 93.0 GiB | 1794.1 ms | 0.02x (other cells) | same refusal, peak 14.0 |
+
+The headline of the session, then, is **Nside 1024 spin-0 fp32 = 1.99–2.00x against
+NaMaster CPU with no environment variable at all**: `.qwen/tmp/score_n1024_fp32_defaultpool.log`
+is a fresh process with only `CUDA_VISIBLE_DEVICES=1`, `nmt.set_table_precision("fp32")`,
+NaMaster 1791.1 ms / GMaster 900.6 ms, rel 6.3e-08, control 1354/1429 GB/s, one band
+cached, `synth layouts: {}` (the second copy declined, so the strided reduction runs),
+warm-up including the build 389.4 s.
+
+## Session 12 (2026-09-04) — Nside 1024 spin-2: one route, 73.5 GiB, and the pool cannot assemble it
+
+**Attribution first (`.qwen/tmp/stage_n1024_spin2.log`).** Of GMaster's end-to-end time
+at Nside 1024 spin-2, 99.6% is the field stage: 964.4 ms (NaMaster) vs 85 504.9 ms
+(0.01x), while the coupling matrix is 4.96x and the coupled cell 220.5x faster than the
+reference. There is nothing else to optimize — the deficit *is* the latitudinal spin-2
+transform running without a table, i.e. s2fft's generic scatter loop.
+
+The only route to a fast spin-2 latitudinal step in this codebase is the precomputed
+Wigner-d layout, and at Nside 1024 that layout is `(mmax+1, ntheta, L)` = **73.48 GiB in
+float32**. The gate is `tri > _SLAB_BUDGET`, then `tri + _BUILD_RESERVE <= live pool
+headroom`. Every way of moving those numbers was tried and measured; every one ends in
+a single `RESOURCE_EXHAUSTED` of ~2.7 GiB — exactly one joined window block — with the
+peak at 86–87 GiB of a 90.2 GiB pool and `largest_free_block_bytes: 0`:
+
+- `XLA_PYTHON_CLIENT_MEM_FRACTION=0.95` and `0.98`; `POLAR_RESERVE_GIB=16, 10, 6`.
+- `TF_GPU_ALLOCATOR=cuda_malloc_async` — 0.04x, same refusal (so it is not fragmentation).
+- `PREALLOCATE=false` — same refusal.
+
+What *was* shipped is correct on its own merits and makes the build strictly cheaper:
+`_spin_slice._build` marched the Wigner-d recurrence over **both** m-halves and returned
+`(2L-1, ntheta, L)`, of which the `L-1` negative-order rows were never read —
+`_build_triangles` slices `[:, :, L-1:]` and the pi-theta identity
+(`T[m, pi-theta, l] = (-1)**(l-spin) T[-m, theta, l]`, m=0 excepted) is why only m >= 0
+is kept at all. It now returns `(L, ntheta, L)`: half the march work and a chunk table
+of 3.02 GiB instead of 6.05 at this size. The float32 cast is fused into the transpose
+(one copy per window instead of two). `tests/test_sht.py`: 13 passed, 3 skipped.
+
+**Verdict.** The assembled layout would fit a 90 GiB pool; assembling it does not,
+because the per-chunk pieces and the join output have to exist at the same time and the
+build peak lands ~13 GiB above the layout. Nside 1024 spin-2 needs either a fused kernel
+that passes the accuracy test (the existing one loses precision through catastrophic
+cancellation as |m| -> l, which is why `spin != 0` returns False in `_use_pallas_sht`)
+or a layout that is structurally smaller. Budget, reserve, allocator and prealloc knobs
+are exhausted — do not spend another session on them.
+
+Measured spin-2 state on this code: **Nside 512 fp64 1.68x**
+(`.qwen/tmp/final_score_512_folded.log`), **Nside 512 fp32 1.39x**
+(`.qwen/tmp/score_spin2_polarfix.log`), Nside 1024 0.04x with no resident table. The
+current scoreboard at Nside 1024 is therefore spin-0 **1.99–2.00x** (fp32) and spin-2
+**not beating NaMaster**; there is no measured Nside 1024 spin-2 win, and there is no
+measured Nside 2048 win of any kind (both table sizes decline there, and `pymaster`
+itself needs 40 min for 50 ms of work at Nside 4096).
+measured Nside 2048 win of any kind (both table sizes decline there, and `pymaster`
+itself needs 40 min for 50 ms of work at Nside 4096).
+
+**The one route that is still open for Nside 1024 spin-2, with the arithmetic done.**
+Every in-process way to make room has failed because *building* the layout costs ~13 GiB
+more than *holding* it. So build it out-of-process and load it:
+
+1. A separate process marches the triangles chunk by chunk and writes each finished
+   window block as raw float32 to a cache file (`.gmaster-cache/<nside>-<L>-<spin>-<dtype>.bin`).
+   Peak there is one chunk (3.02 GiB) plus one window block — the same shape that already
+   fits at Nside 512 — and `/scratch` has 745 GB free against the 73.5 GiB file.
+2. The serving process memory-maps (or `read`s) the file into **one** contiguous device
+   buffer and installs it in `_spin_slice._CACHE` directly, bypassing `_build_triangles`
+   entirely. A single 73.5 GiB host->device copy needs no join and no cuBLAS workspace, so
+   the `XLA_PYTHON_CLIENT_MEM_FRACTION` breakage that kills the *build* does not apply to
+   a *loader*; the pool at 0.95 is 90.2 GiB and the layout is 73.48 GiB.
+3. Expected payoff, scaled from the measured Nside 512 spin-2 field stage (281 ms for
+   seven polar passes, `.qwen/tmp/final_score_512_folded.log`) by the cubic in Nside:
+   ~2.25 s against NaMaster's 3.41 s total, i.e. **~1.4x**, with the coupling matrix and
+   coupled cell already 5x and 220x ahead. That is the honest ceiling of this route — the
+   fp32 polar contraction is *not* faster than fp64 (n512 spin-2 went 1.68x -> 1.39x with
+   fp32 tables), so do not expect the 2x that the scalar band got.
+Costs to weigh before starting: ~3-4 min one-off build, ~40 s load per process, a 73.5 GiB
+file per geometry, and a cache-invalidation key (nside, L, spin, dtype *and* the revision
+of `_spin_slice._build`).
+file per geometry, and a cache-invalidation key (nside, L, spin, dtype *and* the revision
+of `_spin_slice._build`).
+
+**Verification of everything shipped in Sessions 11-12** (GPU1, `CUDA_VISIBLE_DEVICES=1`):
+full suite **124 passed, 3 skipped in 304.46 s** (`.qwen/tmp/suite_final.log`) — the three
+skips are the two-GPU tests at `tests/test_sht.py:301,326`, and the run includes the six new
+tests in `tests/test_table_precision.py`, including `test_float32_tables_keep_the_coupling_matrix`
+at spin 0 and spin 2. No test-count change from the pre-session baseline.
+
+**One comment-level fabrication was found and removed while reviewing the diff for the
+commit message**: the `_BUILD_RESERVE` comment claimed the 73.5 GiB layout "builds in a
+90.2 GiB pool and runs the pipeline in 2.2 s". No log contains such a cell — `grep` over
+every `.qwen/tmp/*.log` row for Nside 1024 spin 2 returns only 0.02-0.04x
+(87 420-87 532 ms, and one 142 456 ms). The comment now states the measured refusals. If a
+future session sees a claim about a fast Nside 1024 spin-2 pipeline, it is wrong until a log
+row proves it.
