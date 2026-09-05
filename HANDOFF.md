@@ -2599,3 +2599,147 @@ the ring stage is now ~12 % of the Nside 1024 analysis call and the table route 
 the remaining levers are the polar cap size classes (measured exact, above), spin-2's ring
 twins, and nothing at all inside the theta contraction.
 
+---
+
+## Session 15 (2026-09-05) — the ring stage stops being double precision, and the polarised ring gets the belt
+
+Three changes, one of which was built, measured, and **reverted**. Every number below is read
+from a log in `.qwen/tmp/`; controls (a pure `sum` over a 384 MiB array) printed 1317-1462
+GB/s on every line, so the cards were at clock.
+
+### 1. The azimuthal transforms follow the table precision (`ring_dtype()`)
+
+The ring stage was the last part of the transform still running in double precision even when
+`set_table_precision("fp32")` had already moved the Legendre band and the Wigner slices down:
+its constants were built with x64 on, so every cap row was a pair of complex128 FFTs and every
+belt row a complex128 `4*nside` one. `ring_dtype()` now returns `complex64` in fp32 mode, the
+table builders cast to it, and the stages cast their *input* to the tables' type (so the
+element type is decided by the tables rather than by promotion). Measured on the shipped
+functions (`.qwen/tmp/ring_stage_prec.log`, one process, both precisions, jit specializing on
+the argument types):
+
+| nside | spin | stage | fp64 ms | fp32 ms | speedup | ring-value difference |
+|---|---|---|---|---|---|---|
+| 256 | 0 | analysis | 0.22 | 0.08 | 2.8x | 3.61e-07 |
+| 256 | 0 | synthesis | 0.24 | 0.08 | 3.0x | 4.05e-07 |
+| 256 | 2 | analysis | 0.40 | 0.09 | 4.4x | 3.77e-07 |
+| 256 | 2 | synthesis | 0.44 | 0.13 | 3.4x | 4.29e-07 |
+| 512 | 0 | analysis | 0.83 | 0.16 | 5.2x | 3.55e-07 |
+| 512 | 0 | synthesis | 0.86 | 0.18 | 4.8x | 4.21e-07 |
+| 512 | 2 | analysis | 2.06 | 0.32 | 6.4x | 3.44e-07 |
+| 512 | 2 | synthesis | 2.06 | 0.41 | 5.0x | 4.23e-07 |
+| 1024 | 0 | analysis | 4.27 | 1.31 | 3.3x | 3.48e-07 |
+| 1024 | 0 | synthesis | 4.36 | 1.28 | 3.4x | 4.09e-07 |
+| 1024 | 2 | analysis | 7.95 | 2.50 | 3.2x | 4.17e-07 |
+| 1024 | 2 | synthesis | 8.15 | 2.71 | 3.0x | 4.47e-07 |
+
+This is the `fp64-roofline-wall` result showing up in an FFT: on this card a double-precision
+transform runs near the fp64 arithmetic rate and the fp32 one is a different class of machine.
+Shortening the same transform (change 3 below) bought nothing comparable.
+
+### 2. The polarised ring stage gets the belt (`_forward_ring_fft_full`, `_inverse_ring_fft_complex`)
+
+The spin-2 twins of the spin-0 ring stage had none of session 14's treatment: all
+`4*nside-1` rings went through a chirp-Z pair at `next_pow2(width + 2L)` (8192 at Nside 512,
+16384 at 1024) with the ramps and kernel rebuilt inside every trace. The residue identity that
+served the spin-0 belt works here too — `F_m` is periodic in `m` with period `nphi` and
+`F_-m = F_(nphi-m)` — so on the belt the *centred* window `m in [-(L-1), L)` is
+`concat(F[4n-L+1 : 4n], F[0 : L])`: two contiguous slices of one length-`4*nside` FFT, no
+chirp, no pad, no kernel. The inverse runs it backwards by adding coefficients that share a
+residue into one slot and transforming once; `L > 2*nside` makes the two slot ranges overlap,
+so placement is the sum of two padded arrays rather than a concatenation (still slice
+arithmetic — no scatter, per `xla-scatter-and-clock-ramp`). The polar rows keep the chirp-Z,
+with its constants hoisted into `_spin_ring_analysis_tables` / `_spin_ring_synthesis_tables`
+and threaded through the eight call sites as arguments, which is the pattern
+`_forward_healpix_fft` already documents (fetch outside the trace, never bake).
+
+Stage measurement against the committed bodies, both arms at complex64
+(`.qwen/tmp/spin2_stage_ab.log`):
+
+| nside | stage | committed ms | now ms | speedup |
+|---|---|---|---|---|
+| 256 | analysis | 1.47 | 0.10 | 14.4x |
+| 256 | synthesis | 1.53 | 0.13 | 12.0x |
+| 512 | analysis | 6.54 | 0.34 | 19.1x |
+| 512 | synthesis | 6.73 | 0.41 | 16.4x |
+| 1024 | analysis | 26.29 | 2.52 | 10.5x |
+| 1024 | synthesis | 27.23 | 2.73 | 10.0x |
+
+Correctness: at fp64 on CPU the new bodies match the committed ones to 5.6e-16 / 5.8e-16
+(Nside 8), 4.4e-16 / 5.9e-16 (16), 6.5e-16 / 7.2e-16 (32), forward / synthesis; and a new test
+(`test_spin_ring_window_matches_direct_dft_both_ways`, 8 geometries) pins both directions
+against an explicit `sum_p x_p exp(-2i pi p m / nphi)` on cap, boundary and belt rings,
+including the `L = 2*nside` touch point, the `L = 3*nside` overlap and the declined
+`L = 4*nside + 7`.
+
+One trap worth recording: the spin-2 input is the helicity combination `Q -/+ iU`, so casting
+it to the tables' *real* type (what the spin-0 stage does, correctly, with a real map) silently
+drops the imaginary part and produces a 0.7 relative error in the forward direction while
+leaving the inverse exact. `_forward_ring_fft_full` takes `chirp_in.dtype`, not
+`chirp_in.real.dtype`.
+
+### 3. Polar-cap size classes: built, exact, and reverted
+
+Grouping the polar rings by `next_pow2(L + nphi)` so each group pays its own transform length
+models out at 0.865 of the cap FFT work at the band limit (two classes at Nside 1024: 4096 for
+`rings[0:256]`, 8192 for `rings[256:1023]`). It is exact — 16/16 end-to-end cells bit-identical
+with the route on and off (`.qwen/tmp/class_e2e_control.log`,
+`.qwen/tmp/class_e2e_classes.log`), and the GPU stage agrees with the committed single-width
+bodies to 5.5e-16 … 1.3e-15 across the six cells below. Measured on the GPU
+(`.qwen/tmp/cap_stage_ab.log`) it is a **loss**:
+
+| nside | stage | single-width ms | classes ms | speedup |
+|---|---|---|---|---|
+| 256 | analysis | 0.21 | 0.34 | 0.62x |
+| 256 | synthesis | 0.23 | 0.34 | 0.67x |
+| 512 | analysis | 0.85 | 0.90 | 0.94x |
+| 512 | synthesis | 0.85 | 0.93 | 0.92x |
+| 1024 | analysis | 4.28 | 4.06 | 1.05x |
+| 1024 | synthesis | 4.36 | 4.08 | 1.07x |
+
+Extra kernel boundaries and a longer graph cost more than a shorter transform, and only at the
+largest geometry does the trade even break even. The class code is reverted; the modelled FLOP
+saving is not the quantity XLA optimises. Recorded in `ring-belt-plain-fft` so nobody re-pays
+for it.
+
+### Where the transform stands against the ducc0 C code
+
+Isolated one-pass `map2alm`/`alm2map`, fp32 tables, `L = 3*nside-1`, ducc0 0.39.1 on all 192
+cores (`.qwen/tmp/sht_vs_ducc_s25_{256,512,1024}_0.log`):
+
+| nside | dir | ducc ms | GMaster ms | ratio | session-14 ratio |
+|---|---|---|---|---|---|
+| 256 | map2alm | 2.3 | 1.3 | 1.85x | 1.95x |
+| 256 | alm2map | 1.7 | 1.3 | 1.34x | 1.08x |
+| 512 | map2alm | 14.8 | 4.7 | 3.18x | 3.30x |
+| 512 | alm2map | 11.6 | 4.9 | 2.37x | 2.22x |
+| 1024 | map2alm | 57.4 | 28.5 | **2.02x** | 1.82x |
+| 1024 | alm2map | 51.1 | 30.9 | **1.65x** | 1.51x |
+
+Pipeline against pymaster (`n_iter=3`, `.qwen/tmp/score_s25.log`): Nside 512 spin-0 fp32
+**321→93 ms (3.45x)**, Nside 1024 spin-0 fp32 **1697→635 ms (2.67x)**, Nside 512 spin-2 fp32
+**674→332 ms (2.03x)** — the spin-2 pipeline cell crosses 2x for the first time, and its
+`field` cell moves from 0.73x to 0.83x.
+
+**The accuracy price, stated plainly.** With the complex64 ring the coupling-matrix `rel`
+against pymaster at Nside 512 spin-0 goes **7.17e-09 → 1.45e-07** (Nside 1024:
+5.48e-08 → 1.32e-07; Nside 512 spin-2: 3.55e-07 → 3.04e-07) for 11 % and 6 % on those two
+cells. It is inside what `set_table_precision("fp32")` promises (~1e-7 representation error),
+but it is a real degradation of what fp32 mode was actually delivering, and it is now the
+dominant error term in fp32 runs. The spin-0 `rel alm` in the isolated probe likewise moved
+from 1.4e-07 to 3.7e-07 at Nside 512. If that is the wrong trade, the fix is one line: make
+`ring_dtype()` ignore the table precision (or give it its own switch) — the ring stage then
+returns to the fp64 column above and everything else in this session is unaffected.
+
+**Spin 2 still loses per-pass, and it is no longer the ring's fault.**
+`.qwen/tmp/sht_vs_ducc_s25_{256,512}_2.log`: 4.9 vs 5.9 ms (0.83x) and 2.9 vs 5.5 ms (0.52x)
+at 256, 26.0 vs 34.2 ms (0.76x) and 22.2 vs 37.6 ms (0.59x) at 512. The ring stage is now
+0.34 ms of that 34.2 ms call — the polarised latitudinal contraction (`_spin_slice`) owns the
+rest, and its synthesis layout at Nside 512 is the one `_spin_slice.slabs_for` documents as
+paying 2.1x for a strided-axis reduction. That, not the azimuth, is the next thing to attack.
+
+**Verification.** `pytest tests/ -q` on GPU → **141 passed, 3 skipped in 336.38 s**
+(`.qwen/tmp/pytest_s25b.log`) with all three changes in, including the new
+`test_spin_ring_window_matches_direct_dft_both_ways` across 8 geometries. The earlier
+`pytest_s25.log` (133 passed) predates that test.
+
