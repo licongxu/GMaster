@@ -51,12 +51,30 @@ def _normalized_coefficients_numpy(L, m_start, m_count):
 
 
 def _initial_factor(exponent):
-    """Exact power-of-two scale factor; zero below the double range."""
-    return jnp.where(
-        exponent >= -1022,
-        lax.exp2(exponent.astype(jnp.float64)),
-        0.0,
-    )
+    """``2.0 ** exponent`` for an integer exponent, assembled bit by bit.
+
+    Writing the biased exponent into the exponent field is exact for every normal
+    double, which is the property the rescale exists to have: a power of two must
+    not touch a mantissa bit.
+
+    ``lax.exp2`` - the previous body - does not have it.  Over all 2046 integer
+    exponents in [-1022, 1023] it returns the exact power for only 23 of them and
+    drifts by up to 8.0e-14 relative (``.qwen/tmp/exp2_exactness.py``), so every
+    value this fed was contaminated at that level.  The two forms differ by ~3e-15
+    relative in the rescaled march, with this one the accurate side.  It is also
+    1.17-1.21x faster on the device, where fp64 ``exp2`` has no unit and lowers to
+    a software sequence; on CPU it is the slower of the two, so never validate that
+    claim off-device.
+
+    Shared with the precomputed band, which calls it on a whole tile at every
+    degree because `jnp.where` evaluates both of its arms
+    (`_theta_matrix._build_slab`); here `_renormalize_periodically` gates it with
+    `lax.cond` every sixteenth degree instead.
+    """
+    biased = jnp.clip(exponent.astype(jnp.int64) + 1023, 1, 2046)
+    bits = lax.bitcast_convert_type(biased << 52, jnp.float64)
+    return jnp.where(exponent >= -1022,
+                     jnp.where(exponent <= 1023, bits, jnp.inf), 0.0)
 
 
 def _renormalize_with_factor(previous, current, exponent, factor):

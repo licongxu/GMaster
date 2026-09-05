@@ -33,34 +33,11 @@ from jax import lax
 
 from gmaster._sht_pallas import (
     _diagonal_normalization,
+    _initial_factor,
     _normalized_coefficients_numpy,
 )
 
 BLOCK = 64
-
-
-def _initial_factor(exponent):
-    """``2.0 ** exponent`` for an integer exponent, assembled bit by bit.
-
-    `degree` below masks its rescale with `jnp.where`, which evaluates both sides,
-    so this runs on a whole ``(mb, north)`` tile at *every* degree of the scan -
-    thousands of times per block.  Writing the biased exponent into the exponent
-    field is exact for every normal double, which is the property the rescale
-    exists to have: a power of two must not touch a mantissa bit.
-
-    ``lax.exp2`` - the previous body - does not have it.  Over all 2046 integer
-    exponents in [-1022, 1023] it returns the exact power for only 23 of them and
-    drifts by up to 8.0e-14 relative (``.qwen/tmp/exp2_exactness.py``), so the
-    shipped march was contaminating every renormalised value it emitted.  The two
-    forms therefore differ by ~3e-15 relative in the slab, with this one the
-    accurate side.  It is also 1.17-1.21x faster on the device, where fp64
-    ``exp2`` has no unit and lowers to a software sequence; on CPU it is the
-    slower of the two, so never validate that claim off-device.
-    """
-    biased = jnp.clip(exponent.astype(jnp.int64) + 1023, 1, 2046)
-    bits = lax.bitcast_convert_type(biased << 52, jnp.float64)
-    return jnp.where(exponent >= -1022,
-                     jnp.where(exponent <= 1023, bits, jnp.inf), 0.0)
 
 
 def _build_slab(theta, L, diag, c1, c2, m0, mb, store_name="float64"):
@@ -72,6 +49,16 @@ def _build_slab(theta, L, diag, c1, c2, m0, mb, store_name="float64"):
     built at all: the scan's output is the band's dominant allocation, so emitting
     it in float32 halves the peak instead of leaving a full-precision twin next
     to the storage copy.
+
+    The recurrence coefficients are passed to the scan as rows, not gathered out
+    of `c1`/`c2` by `ell` inside the body.  With those tables shaped (m, ell),
+    `c1[m0:m0+mb, ell]` is a column gather -- `mb` strided loads, once per degree,
+    3071 times for a single slab at Nside 1024 -- and it is the only access in the
+    body that is neither contiguous nor loop invariant.  They do not depend on the
+    recurrence state, so slicing and transposing once outside the scan hands each
+    step the same (mb,) vector the gather produced: bit-for-bit the same slab
+    (checked at Nside 512 and 1024, both storages, `.qwen/tmp/builder_nogather.py`)
+    for 1.09-1.20x at 512 and parity at 1024.
     """
     north = (len(theta) + 1) // 2
     store = jnp.dtype(store_name)
@@ -83,17 +70,19 @@ def _build_slab(theta, L, diag, c1, c2, m0, mb, store_name="float64"):
     log2_scale = jnp.log2(jnp.abs(d))[:, None] + mf * jnp.log2(sine)[None, :]
     exponent = jnp.floor(log2_scale).astype(jnp.int32)
     seed = jnp.where(d < 0, -1.0, 1.0)[:, None] * jnp.exp2(log2_scale - exponent)
+    # (rows, mb): step i is the vector the gather at `ell = m0 + i` produced.
+    k1 = c1[m0:m0 + mb, m0:L].T
+    k2 = c2[m0:m0 + mb, m0:L].T
 
-    def degree(state, ell):
+    def degree(state, coeffs):
         qm2, qm1, exponent, factor = state
-        started = ell >= mi
+        ell, a, b = coeffs
         current = jnp.where(
             ell == mi,
             seed,
-            c1[m0:m0 + mb, ell][:, None] * cosine[None, :] * qm1
-            - c2[m0:m0 + mb, ell][:, None] * qm2,
+            a[:, None] * cosine[None, :] * qm1 - b[:, None] * qm2,
         )
-        value = jnp.where(started, current * factor, 0.0).astype(store)
+        value = jnp.where(ell >= mi, current * factor, 0.0).astype(store)
         do = (ell >= mi + 2) & (jnp.bitwise_and(ell - mi, 15) == 0)
         largest = jnp.maximum(jnp.abs(qm1), jnp.abs(current))
         large = do & (largest > 2.0**100)
@@ -107,7 +96,7 @@ def _build_slab(theta, L, diag, c1, c2, m0, mb, store_name="float64"):
     _, vals = lax.scan(
         degree,
         (jnp.zeros((mb, north)), jnp.zeros((mb, north)), e0, _initial_factor(e0)),
-        jnp.arange(m0, L),
+        (jnp.arange(m0, L), k1, k2),
     )
     return vals
 
