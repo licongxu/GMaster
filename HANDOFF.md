@@ -2874,3 +2874,155 @@ Nside 4096 is not attempted.
 (`.qwen/tmp/queue_s26.sh` -> `score_s26_2048_0`, `score_s26_2048_2`, `score_s26_4096_0`). No
 number from those has been quoted here.
 
+## Session 17 (2026-09-05) — the big-Nside pipeline is measured, and the rescale is not exact
+
+### 1. End-to-end MASTER pipeline at Nside 2048 and 4096, spin 0, fp32 tables
+
+`score_one.py` prints `ref->gm ms (ref/gm x)`, so **>1.00x is a GMaster win**. One cell per
+process, `repeats=1`, clocks spun up, control reduce 1336–1413 GB/s in every run:
+
+```
+FRESH n2048 spin=0: TOTAL 10464->18255ms (0.57x) | field 2423->8312ms (0.29x)
+    coupling 5633->1527ms (3.69x)  coupled_cell 139->0ms (306.96x)  decouple 0->1ms (0.40x)
+    rel=7.23e-08
+FRESH n4096 spin=0: TOTAL 72884->146433ms (0.50x) | field 14973->66675ms (0.22x)
+    coupling 43383->12734ms (3.41x)  coupled_cell 535->2ms (328.39x)  decouple 1->2ms (0.78x)
+    rel=1.16e-07
+```
+
+Two facts, pulling in opposite directions:
+
+- **The NaMaster stages that are matrix work we win, at every size.**
+  `compute_coupling_matrix` is **3.69x** at 2048 and **3.41x** at 4096; `compute_coupled_cell`
+  is 307x and 328x. Those run once per mask/bandlimit pair in a real analysis and they are not
+  marginal.
+- **The whole pipeline still loses: 0.57x and 0.50x.** The `NmtField` stage is the entire
+  deficit (8312 ms against 2423; 66675 against 14973), and that stage is latitudinal transforms
+  repeated for the smoothing iterations — the same fused-kernel call session 16 measured at
+  0.29x per pass, because at these sizes the fp32 band is 291 GiB and the 40 GiB budget
+  declines it.
+
+So "does GMaster beat NaMaster at Nside ≥ 2048?" now has a measured answer instead of an
+extrapolation: **no — 0.50–0.57x end to end, and the loss is one stage, not a diffuse tax.**
+Correctness holds there (`rel` 7.23e-08 and 1.16e-07). Spin 2 at 2048 remains the isolated
+0.01x cell (110 s per transform); a pipeline cell there is ~13 min per repetition and would
+only re-confirm it, so it was deliberately not queued.
+
+The size of the prize is set by the same table: were `field` merely at ducc's cost, the 2048
+total would be 2423+1527+0+1 = 3951 ms against the CPU's 10464 — **2.65x**. Everything else in
+the pipeline is already faster than the CPU.
+
+### 2. Negative result: the fused kernel's thread-block shape is not the limiter
+
+`_sht_pallas.py` documents that "about ten float64 vectors live per theta lane, so
+`block_size / (32 * num_warps)` doubles per thread is what decides whether they sit in
+registers or spill". `_pallas_block_size` already cites measurements behind the 512 choice
+("the synthesis kernel degrades ~1.5-1.6x at 1024 and cliffs hard at 2048"), but `num_warps`
+has always been the fixed constant `_NUM_WARPS = 2`, and no combination had been swept for
+either direction at the sizes where the fused kernel is the *only* route. It now has
+(`.qwen/tmp/block_sweep.py`, which monkeypatches both; totals are map2alm + alm2map, ms):
+
+| block / warps | 512/1 | **512/2 (shipped)** | 512/4 | 256/1 | 256/2 | 128/1 | 128/4 | 64/1 |
+|---|---|---|---|---|---|---|---|---|
+| Nside 1024 fp64 | 448 | **312** | 336 | 319 | 330 | 335 | 476 | 371 |
+| Nside 2048 fp32 | 3312 | **2408** | 2612 | 2403 | 2560 | 2536 | 3633 | 2808 |
+
+The shipped configuration wins at both sizes (256/1 ties it at 2048 to within 0.2%), every
+other shape is worse, and `rel alm` against the shipped config is ≤ 8e-16 everywhere — only
+reduction order moves. **Register pressure is not what caps the fused kernel; the default is
+already at its optimum and should not be "tuned" again.** Nside 4096 agrees: totals there are
+`512/2` 19 237 ms (shipped) and `256/1` 19 086 ms — a 0.8% tie — against 20 937 (`512/4`),
+20 466 (`256/2`) and 62 093 (`512/1`, where synthesis blows up to 54.3 s); the 128/64 shapes
+were still running against the cell's 40-minute timeout when this was written.
+
+### 3. The band builder is 7x off the fused kernel's arithmetic rate
+
+From the builder probe — which itself never ran, because `timed(fn)` called `fn()` and dropped
+the batched theta argument, so every vmap row printed `ValueError: vmap wrapped function must
+be passed at least one argument containing batched arrays` — the *shipped* builder's own
+numbers are the useful part:
+
+| geometry | one m-block output | time | GiB/s out | implied fp64 rate |
+|---|---|---|---|---|
+| Nside 1024, fp64, m0=0 | 3.00 GiB | 38.0 ms | 78.9 | ~32 GFMA/s |
+| Nside 2048, fp64, m0=0 | 12.00 GiB | 126.3 ms | 95.0 | ~32 GFMA/s |
+
+The fused kernel does the *same recurrence* at ~221 GFMA/s (session 16's 1048 ms cell), so the
+builder runs at **~14% of the fused kernel's efficiency**, ~3% of the card's 940 GFMA/s, and
+~30x under the 2939 GB/s the contraction gets out of the same bytes. That gap — not the 291
+GiB — is what "the build is the wall" actually means.
+
+### 4. The rescale is not computing an exact power of two
+
+`_initial_factor(exponent)` must return exactly `2.0 ** exponent`; the entire point of the
+exp2-rescale schedule is that it changes no mantissa bit. The shipped body is
+
+```python
+jnp.where(exponent >= -1022, lax.exp2(exponent.astype(jnp.float64)), 0.0)
+```
+
+and **`lax.exp2` is not exact on integer arguments** (`.qwen/tmp/exp2_exactness.py`, CPU
+backend, all 2046 exponents in [−1022, 1023] compared against `decimal.Decimal(2)**k`):
+
+```
+backend=cpu  exponents=2046  values differing: 2023
+worst relative error vs exact 2**k:  lax.exp2=7.971e-14 (at k=994)  exponent-field assembly=4.715e-60
+exactly representable: lax.exp2=23/2046  assembly=2046/2046
+```
+
+Only **23 of 2046** powers of two leave `exp2` unchanged. Because `degree` masks its rescale
+with `jnp.where`, which evaluates both arms, this is paid on the whole `(mb, north)` tile at
+*every* degree of the scan, not at the 16th degree where the rescale can actually fire.
+Writing the biased exponent into the exponent field instead (`bitcast(biased << 52)`, both
+range guards preserved) is exact by construction and is a handful of integer ops; it is now
+`_theta_matrix._initial_factor`.
+
+Two things had to be measured before this could be shipped, and both are now on disk.
+(a) **Accuracy:** the effect on any current score is invisible — ~1e-14 relative on a table
+whose accepted `rel` against NaMaster is 3.6e-07 — so this is a correctness fix, not a win,
+and it is reported as one. (b) **Speed is backend-dependent**, so neither backend's number
+could stand in for the other's. On the CPU the assembly is *slower* than `exp2`
+(0.59–0.73x, `.qwen/tmp/renorm_smoke.py`), where `exp2` is close to a hardware instruction;
+on the GPU the same A/B against `git show HEAD:gmaster/_theta_matrix.py`, in one process,
+clocks spun up, is a win (`.qwen/tmp/renorm_ab.log`):
+
+```
+nside    store    m0          builder        ms  x HEAD  GiB/s out              vs HEAD
+   512  float64     0             HEAD      14.3    1.00       52.5                    -
+   512  float64     0          bitcast      12.2    1.17       61.3        DIFF 3.29e-15
+   512  float64  1471             HEAD       0.6    1.00       52.4                    -
+   512  float64  1471          bitcast       0.5    1.21       63.3        DIFF 3.31e-15
+```
+
+**1.17x on the leading m-block and 1.21x on the tail block, with a 3.3e-15 relative
+difference from HEAD exactly as predicted** (HEAD's `exp2` drifting, the assembly not). That
+is a real but modest builder gain; *if* it carries to the sizes that matter it turns the 5.5 s
+Nside 2048 build into ~4.7 s, which does not by itself open the band route at 2048 — and the
+first run died before its fp32 cells on a `NameError: rel_err` left behind by an edit in the
+probe itself, so the fp32/fp64 1024 cells are being re-measured
+(`queue_s26g.sh` -> `.qwen/tmp/renorm_ab_full.log`) together with the corrected theta-chunk
+vmap candidate. Quote those, not the extrapolation, when they land.
+
+### 5. The same inexactness is still in the fused kernel, deliberately untouched
+
+`_sht_pallas._initial_factor` is a second copy of the same body, used for the kernel's
+per-(m, theta-chunk) seed scale and inside `_renormalize_with_factor` every 16 degrees. It
+contaminates the *fused* path's alms the same way, so it is the same fix. It was deliberately
+**not** changed here: three measurement queues were already running against the working tree,
+and that copy lives inside a Pallas kernel where `bitcast_convert_type` has to lower through
+Triton — a compile risk that must be settled by a GPU test run, not by editing underneath
+measurements that are in flight. Next session: apply it, run `tests/test_sht.py` on GPU, and
+only then commit.
+
+### 6. Where that leaves the design
+
+The suite with this change in place: **141 passed, 3 skipped in 336 s** on GPU1
+(`.qwen/tmp/pytest_s26.log`, `exit=0`).
+
+The 0.22–0.29x `field` stage is the only thing between us and a big-Nside pipeline win, and
+section 2 shows shape tuning cannot close a 3.4x gap it has already been measured not to
+control. The two shapes from session 16 §5 remain the only routes — a builder fast enough to
+sweep once per geometry, and a multi-RHS recurrence shared across the passes that today each
+re-derive the same values — and section 3 says which half of the first one is broken.
+
+
