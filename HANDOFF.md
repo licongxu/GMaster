@@ -3397,5 +3397,74 @@ today no way to hand GMaster two maps that could share one band read.
    a Pallas band fill *without* first clearing the store-rate bar (previous attempt: 33x slower).
    Every one of those has a measurement attached.
 
+### 9. Measured after section 8 was written: the store gate passed and the emitter exists
+
+Both probes below ran after the text above, and they change what item 1 means.
+
+**The store gate** (`.qwen/tmp/pallas_fill_gate.py`, `pallas_fill_gate.log`, GPU1, one process): a
+Pallas kernel that writes the band's own slab layout `(mb, ncol, north)` fp32 with cheap index
+arithmetic and no recurrence at all.
+
+```
+Pallas chunk=  1 warps=2 (64, 512, 2048): 0.64 ms   393.6 GiB/s  105.7 G values/s  x builder 3.39
+Pallas chunk=  8 warps=2 (64, 512, 2048): 0.27 ms   936.4 GiB/s  251.4 G values/s  x builder 8.07
+Pallas chunk= 64 warps=2 (64, 512, 2048): 0.22 ms  1121.7 GiB/s  301.1 G values/s  x builder 9.67
+XLA fill (same buffer)                    : 33.46 ms   7.5 GiB/s    2.0 G values/s  x builder 0.06
+```
+
+**9.7x the builder's marginal emission rate on the store side alone.** The `XLA fill` row is *not* an
+XLA store ceiling — the broadcast three-way add did not fuse into a store loop — so do not quote it;
+the comparison that matters is against the builder's measured 116 GB/s. It also means the old
+"A Pallas band-fill kernel is 33x slower" line (memory: *Alternatives landscape*) cannot be a property
+of Pallas stores: store granularity alone moves this probe by 3x, and the number has the signature of
+the untraced-`pallas_call` artefact recorded in section 5 of the session-15 notes.
+
+**The emitter exists and reproduces the shipped slab.** `.qwen/tmp/pallas_band_emitter.py` carries the
+`_build_slab` recurrence in registers — one program per (m-lane, theta chunk), `lax.fori_loop` over
+`ell`, storing every degree — and it wins wherever it has been measured:
+
+```
+Nside 256, m0=0, fp32 (`pallas_band_emitter7.log`)
+  XLA builder     : 5.36 ms   17.5 GiB/s   4.7 G values/s
+  Pallas chunk=128: 0.35 ms  268.6 GiB/s  72.1 G values/s   x this XLA 15.4   rel 1.5e-08
+Nside 1024, m0=0, fp32 (`pallas_band_emitter_n1024.log`)
+  XLA builder     : 26.25 ms  57.1 GiB/s   15.3 G values/s
+  Pallas chunk=128:  3.15 ms 476.2 GiB/s  127.8 G values/s   x this XLA  8.34  rel 5.1e-09
+  Pallas chunk=256:  3.27 ms 459.3 GiB/s  123.3 G values/s   x this XLA  8.04  rel 5.1e-09
+  Pallas chunk=512:  4.50 ms 333.4 GiB/s   89.5 G values/s   x this XLA  5.84  rel 5.1e-09
+```
+
+The `rel` figures are the float32 storage quantum, and the Nside 256 diff map has **0 of 25,133,056
+entries** above 1e-4 relative (max absolute 1.49e-08 on a value of 1.905312e-01,
+`.qwen/tmp/emitter_diffmap.py`). It is the same table, emitted **8.3x faster** at the size that
+matters, at **127.8 G values/s** against the **37 G values/s** section 6 says the streamed Nside 2048
+shape needs. If that rate holds across a whole band, the 2048 build is ~0.6 s rather than 2.6-6 s, the
+streamed `field` stage is 0.6 + 8 x 0.22 = 2.4 s against the fused kernel's 8.3 s, and the session-17
+pipeline arithmetic (2423 -> 8312 ms today, ref 2423 ms) moves to roughly parity or better for the
+first time above 1024.
+
+Two Triton-lowering facts, each worth an hour, that any future kernel here must respect:
+
+* `jnp.where(pred, -1.0, 1.0)` with a **scalar** `pred` whose result feeds a vector multiply does not
+  lower at all: `AssertionError: ('tensor<128xi1>', 'tensor<128xf64>')` — XLA canonicalises the
+  select into an i1×float multiply. The shipped kernel's
+  `jnp.where(diagonal < 0, -jnp.ones_like(sine), jnp.ones_like(sine))` is therefore load-bearing
+  style, not decoration. Bisect: `.qwen/tmp/pallas_emitter_bisect.py` — `fori_store_only`,
+  `fori_scalar_load` and `vecwhere_only` all lower; the scalar-armed `where` variants all fail.
+* `lax.cond` inside `lax.fori_loop` works, but **both branches must advance the recurrence**. A
+  "do nothing" branch that returns the incoming carry freezes the march on 15 degrees out of 16: that
+  is the whole of the `rel` 2.2e+00 first result (22.7M of 25.1M entries wrong, first divergence at
+  `ell = m + 3`), and no error message accompanies it.
+* `pl.range` does not exist in jax 0.10 (`pl.loop` does); the codebase idiom is `lax.fori_loop`.
+
+What is *not* claimed yet: nothing is wired in. The next three steps, in order — (a) build a **whole**
+band through the emitter and compare against the shipped 340 s at Nside 1024
+(`block_band_check.log`), since the per-block win has to survive 48 launches, the parity split
+(`_build_pair` returns `vals[0::2], vals[1::2]`, which the emitter currently does not do) and the
+`_BUILD_CLEAR_EVERY` cache churn; (b) the isolated `sht_vs_ducc` cells at 512/1024 with the emitter
+inside `_band`, which also needs the GPU suite green; (c) the streamed shape at 2048, where the
+emitter's 127.8 G values/s is the first measurement to clear the 37 G values/s bar. Nothing about the
+`field` stage score is measured yet — 0.29x at 2048 is still the shipped number until (c) runs.
+
 
 
