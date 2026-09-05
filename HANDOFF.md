@@ -3017,12 +3017,111 @@ only then commit.
 ### 6. Where that leaves the design
 
 The suite with this change in place: **141 passed, 3 skipped in 336 s** on GPU1
-(`.qwen/tmp/pytest_s26.log`, `exit=0`).
+(`.qwen/tmp/pytest_s26.log`, `exit=0`). The isolated scores re-run after the fix are the same
+within noise, and the accuracy is bit-for-bit the same story as before the fix — `rel alm`
+3.7e-07 at 512 and 3.6e-07 at 1024, `rel alm` 3.3e-07 at 256 spin 2:
+
+```
+512  0  map2alm  15.5 ->  4.2 ms (3.69x)   alm2map  12.8 ->  4.5 ms (2.87x)
+1024 0  map2alm  62.3 -> 28.3 ms (2.20x)   alm2map  54.7 -> 30.4 ms (1.80x)
+256  2  map2alm   4.7 ->  5.8 ms (0.82x)   alm2map   2.9 ->  5.3 ms (0.54x)
+```
+
+Do **not** read 3.69x/2.20x as an effect of the fix: the runtime contraction never calls
+`_initial_factor` (only the build does, and the build sits outside the timed loop), the ducc
+reference itself moved by a similar 5-10%, and `rel alm` is unchanged. These are the same
+cells as session 25 with a different clock roll.
 
 The 0.22–0.29x `field` stage is the only thing between us and a big-Nside pipeline win, and
 section 2 shows shape tuning cannot close a 3.4x gap it has already been measured not to
 control. The two shapes from session 16 §5 remain the only routes — a builder fast enough to
 sweep once per geometry, and a multi-RHS recurrence shared across the passes that today each
 re-derive the same values — and section 3 says which half of the first one is broken.
+
+### 7. Spin 2 at Nside >= 1024: the 110 s is the scatter loop, not a failed build
+
+Spin 2 is the worst thing on the board (0.82x/0.54x at 256, 0.76x/0.59x at 512, 0.04x in the
+n1024 pipeline, 0.01x = 110 096 ms per transform at 2048), and a 100x loss looks pathological
+rather than merely uncompetitive. The obvious suspect was that `map2alm` pays for a huge polar
+build before it declines to "the generic s2fft scatter loop". **It does not**
+(`.qwen/tmp/spin2_stage_split.py` at n2048):
+
+```
+        1. _spin_slabs request         first     0.3 ms  min      0.2 ms  [1.0 GiB / 71.2 limit]
+   -> returned NONE (generic scatter loop)
+        2. _map2alm_core (no slab arg) first 131171.8 ms min 113680.9 ms  [3.2 GiB / 71.2 limit]
+        3. map2alm (public, n_iter=0)  first 126107.7 ms min 110147.1 ms  [5.5 GiB / 71.2 limit]
+        4. alm2map (public)            first 127067.8 ms min 111774.1 ms  [7.7 GiB / 71.2 limit]
+```
+
+The request is 0.2 ms and the pool never moves off 1.0 GiB, so `_spin_slice` declines on its
+headroom check without ever trying — nothing is built and thrown away. Step 3's 110.1 s equals
+the isolated score's 110.1 s and repeats agree to 0.01 %, so the probe measures the production
+call. **The entire 110 s is the generic loop, running at a 7.7 GiB working set.** Against ducc0's
+605.7 ms at Nside 2048 that is 182x, where spin 0 at the same Nside is 2x: spin 2 is not losing an
+arithmetic race, it is running a different (scatter-based) algorithm — and 7.7 GiB is nowhere near
+the memory limit, which is a different situation from the table route's.
+
+The tempting next idea is to ask for less of the polar table, and the arithmetic kills it. A
+**single** fp32 polar layout at Nside 1024 is 73.5 GiB (the pair is 147 GiB), against a
+71.2 GiB pool — one layout is already bigger than the whole pool, so "build the analysis
+layout alone" cannot fit at 1024 either, and the scalar band's 36.8 GiB engagement at that
+size is not a template for it: the polar slice spans m in [-(L-1), L), exactly twice the
+scalar triangle. That is also why spin 2 works at 512 (pair 18.74 GiB in fp64, 9.37 in fp32 →
+the table route runs, 0.76x/0.59x) and stops working at 1024. Four capacity routes were
+already tried there in session 12 — `_BUILD_RESERVE` 16/10/6, memory fraction 0.95/0.98,
+`cuda_malloc_async`, `PREALLOCATE=false` — and spin 2 stayed at 0.04x.
+
+So spin 2 at Nside >= 1024 is blocked on the same wall as the scalar band, only one octave
+sooner, and the Z2 (pi-theta / m-flip) minimum is already shipped: there is no layout trick
+left. What remains is the same two things as for spin 0 — a recurrence shared across passes
+instead of re-derived per call, or leaving fp64 for tensor cores — plus keeping the generic
+scatter loop from being the fallback at all, since it is 100x off rather than 2x off and is
+therefore the single largest mispriced thing in the library.
+
+### 8. The builder A/B re-run compares the patch with itself, and the vmap candidate is dead
+
+`queue_s26g.sh` re-ran `.qwen/tmp/renorm_ab.py` after `4e2a179` landed, which quietly made its
+own control useless: the script builds its baseline from `git show HEAD:gmaster/_theta_matrix.py`,
+and HEAD *is* now the patched file. Every `bitcast` row in `.qwen/tmp/renorm_ab_full.log` is
+therefore a self-comparison — it reports `IDENTICAL` and 1.00–1.05x, and says nothing about the
+fix. **The fix's numbers stay the ones in section 4** (1.17x/1.21x with DIFF 3.3e-15, taken from
+`renorm_ab.log`, which ran against the pre-fix HEAD). If that script is ever run again, pin the
+baseline to `4e2a179^:` explicitly.
+
+The rows that *are* new are the theta-chunk vmap candidates, and they close that idea:
+
+```
+nside    store    m0          builder        ms  x HEAD  GiB/s out              vs HEAD
+   512  float64     0             HEAD      12.4    1.00       60.6                    -
+   512  float64     0        vmap-1024      11.0    1.10       34.0        DIFF 3.56e-13
+   512  float64     0         vmap-512      12.1    1.00       30.9        DIFF 3.56e-13
+   512  float64     0          vmap-32      12.2    0.99       30.8        DIFF 3.56e-13
+  1024  float64     0             HEAD      31.7    1.00       94.7                    -
+  1024  float64     0        vmap-1024      31.7    1.00       47.4        DIFF 3.52e-12
+  1024  float64     0          vmap-32      31.7    1.00       47.4        DIFF 3.52e-12
+  1024  float32     0             HEAD      28.4    1.00       52.7                    -
+  1024  float32     0        vmap-1024      28.5    1.00       26.3        DIFF 5.96e-08
+```
+
+Two cautions before reading it. The `GiB/s out` column in the vmap block is computed from the
+*parity-sliced* reference, so it undercounts by 2x by construction — only the **ms** and
+**x HEAD** columns are comparable across the two blocks. And `_slab_subset` (defined inside the
+probe) seeds both parities from one value at `ell = m`, while production `_build_slab` takes a
+separate `_parity_seed`; that is the whole 3.5e-13/6.0e-08 `DIFF`, not a rounding mystery, and it
+means the vmap arm is the *cheaper* recurrence.
+
+So the honest reading is: shortening the per-program carry from `(64, north)` to `(64, chunk)` by
+vmap-ing over theta is worth **nothing at Nside 1024** (1.00x at every chunk size, in both
+precisions) and at most 1.10x at 512, doing less arithmetic per call than the production form.
+Declined.
+
+What that leaves is a clean diagnosis. A slab build at 1024 runs at 94.8 GiB/s out, about 6 % of
+the 1513 GB/s this card sustains, and neither the cheapest rescale op nor any amount of theta
+batching moves the wall time. The builder is neither FMA-bound nor bandwidth-bound: it is bound by
+the length of the sequential degree chain in `_build_slab`, which is exactly the thing
+`blocked-recurrence-wall` says cannot be shortened in fp64 and `complex-rhs-tax`/`contraction-layout-tax`
+say cannot be hidden in the contraction. Only the two shapes in section 6 remain — build once per
+geometry, or share one chain across several right-hand sides.
 
 
