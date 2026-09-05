@@ -420,5 +420,38 @@ def test_ring_synthesis_from_positive_half_matches_centred_window(nside):
         + 1j * jax.random.normal(jax.random.PRNGKey(12), (4 * nside - 1, L))
     )
     reference = utils._inverse_ring_fft(positive, L=L, nside=nside)
-    got = utils._inverse_ring_fft_herm(positive, L=L, nside=nside)
+    got = utils._inverse_ring_fft_herm(
+        positive, utils._ring_synthesis_tables(L, nside), L=L, nside=nside
+    )
     np.testing.assert_allclose(got, reference, rtol=1e-13, atol=1e-13)
+
+
+@pytest.mark.parametrize("nside, L", [(16, 47), (32, 95), (16, 64), (16, 71)])
+def test_ring_analysis_matches_direct_dft_ring_by_ring(nside, L):
+    """Every ring's m block equals an explicit `sum_p x_p exp(-2i pi p m / nphi)`.
+
+    The azimuthal stage now takes two routes: the equatorial belt (`nphi = 4*nside`, a
+    power of two wider than the band) is one plain FFT of a contiguous reshape, the polar
+    rings keep the Bluestein chirp-Z. Both are checked here against the definition, on
+    cap rings, on the two boundary rings and on belt rings. `L = 64` is the gate boundary
+    `L == 4*nside`; `L = 71 > 4*nside` is an overset band, for which the belt shortcut is
+    declined and every ring goes back through the chirp-Z.
+    """
+    nphi, start, _, _, _ = utils._ring_czt_constants_numpy(L, nside)
+    map_flat = jnp.asarray(
+        np.random.default_rng(4).normal(size=12 * nside ** 2)
+    )
+    got = np.asarray(
+        utils._forward_ring_fft_positive(
+            map_flat, utils._ring_analysis_tables(L, nside), L=L, nside=nside
+        )
+    )
+    ntheta = 4 * nside - 1
+    m_index = np.arange(L)
+    for ring in {0, nside // 2, nside - 2, nside - 1, nside,
+                 2 * nside, 3 * nside - 1, 3 * nside, ntheta - 1}:
+        period = nphi[ring]
+        direct = (np.exp(-2j * np.pi * np.outer(m_index, np.arange(period)) / period)
+                  @ map_flat[start[ring]:start[ring] + period])
+        scale = float(np.max(np.abs(direct)))
+        np.testing.assert_allclose(got[ring], direct, rtol=0.0, atol=1e-12 * scale)
