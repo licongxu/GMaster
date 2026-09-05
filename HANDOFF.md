@@ -2455,3 +2455,147 @@ So the fp32 win at Nside 1024 is not borrowed against a hidden accuracy loss, an
 fp32-route numbers above stand as scientific results. Habits: print `|s|` next to every fitted
 residual, and settle any precision claim with an ours-vs-ours comparison instead of a
 cross-implementation one.
+
+## Session 14 (2026-09-05) — the ring stage was recomputing its own constants, and two thirds of the rings never needed a chirp-Z
+
+Two changes to the azimuthal stage, both found by decomposing the stage into passes
+(`.qwen/tmp/ring_passes.py`) instead of guessing, both measured against the committed
+bodies copied verbatim from `HEAD` into the probe (`.qwen/tmp/ring_hoist_ab.py`,
+`.qwen/tmp/ring_split_ab.log`), clocks spun up, bandwidth control 1382-1433 GB/s:
+
+| nside | analysis ring stage | synthesis ring stage | max\|new − old\| / max\|old\| |
+|---|---|---|---|
+| 256 | 0.77 → **0.21 ms** (3.66x) | 0.75 → **0.22 ms** (3.41x) | 9.6e-16 |
+| 512 | 3.28 → **0.82 ms** (4.01x) | 3.21 → **0.86 ms** (3.75x) | 1.2e-15 |
+| 1024 | 13.60 → **4.29 ms** (3.17x) | 13.21 → **4.32 ms** (3.06x) | 1.3e-15 |
+
+**1. XLA does not fold the ring constants; a jit that computes only constants still runs
+every call.** The convolution kernel and both chirp ramps are functions of (L, nside) only,
+but they were written inline inside the jitted transform, and the assumption "closed over →
+HLO literal → folded away" is false here. Measured with a jit whose body is *only* the
+constant subexpression (a folded program launches nothing and times ~0):
+
+| constant-only jit at Nside 1024 | ms |
+|---|---|
+| `fft(exp(i·chirp_angle(shift, two_nphi)))` — the kernel spectrum | **2.03** |
+| the same including its own `exp` | **5.02** |
+| `exp(-i·chirp_angle(p_index, two_nphi))` — one chirp ramp | 1.65 (163 GB/s) |
+
+against a 13.57 ms ring stage. The operands are `(4n-1, N)` arrays, not vectors, because
+`_chirp_angle` broadcasts against `two_nphi` of shape `(ntheta, 1)` — so it is a real batched
+FFT of a real 2-D constant. The fix is `_ring_analysis_tables` / `_ring_synthesis_tables`
+(`@lru_cache(maxsize=2)`, keyed on `(L, nside, device)`), whose three arrays are passed as
+**jit arguments**; closing over the built arrays would only move them into the jaxpr as
+literals. Measured alone (before change 2) this was **bit-identical** — error exactly
+`0.00e+00` at all three Nsides — at 2.35 / 2.01 / 1.96x on the analysis stage and
+2.39 / 2.01 / 1.94x on synthesis.
+
+Two traps in the wiring, both now documented in the docstrings:
+* `lru_cache` + tracing leaks tracers. The small-`L` cores jit the whole transform
+  (`_PALLAS_TRACED_MAX_L = 256`), so a builder running inside that trace would cache tracers
+  and poison the next one. The builders run inside
+  `with jax.ensure_compile_time_eval(), jax.default_device(device):` and `device_put` the
+  result, so cached values are always concrete and committed to the device of the map.
+* the fetch must live **outside** the jit. `_forward_healpix_fft` and `_finish_inverse_pallas`
+  are now plain Python wrappers that fetch the tables and call the jitted implementation.
+  Keeping them jitted would put the tables back inside the trace, and the multi-GPU path runs
+  the ring stage on a non-default device — hence the `device` parameter, taken from
+  `getattr(arr, "device", None)` at the three call sites.
+
+Retained bytes: the tables are ~1.0 GB (analysis) + 0.7 GB (synthesis) at Nside 1024 when they
+cover every ring; change 2 halves them. `maxsize=2` bounds the cache at two geometries.
+
+**2. The equatorial belt does not need a chirp-Z at all.** `_ring_czt_constants` pads every
+ring to the same transform length `next_fast_len(L + 4n)`, which is why all `4n-1` rings pay
+two 8192-point transforms at Nside 1024. But rings `nside-1 … 3·nside-1` all have
+`nphi = 4·nside` — a power of two, and wider than `L = 3n-1` — and in RING order their pixels
+are **one contiguous run** (checked: `start` advances by exactly `4n`, belt = 66.7 % of the
+map, verified for 64/256/1024). So for those `2n+1` rings
+
+    F_m = Σ_{p<nphi} x_p e^{-2iπpm/nphi} = fft(x)[m],   m < L,
+
+one unnormalised forward FFT of a reshape: no input chirp, no zero-pad, no kernel multiply,
+no second transform. Synthesis is the mirror statement — zero-pad the m block to `4n` and take
+`width · ifft(·)` — again one transform. Only the `2(n-1)` polar rings keep Bluestein, so the
+tables are now **cap-only**. The split is `_ring_split_numpy(L, nside)`, and because caps are a
+prefix and a suffix while the belt is the middle, reassembly is
+`concatenate([cap[:n-1], belt, cap[n-1:]])` — contiguous slices, no indexed scatter (which
+this project has measured to be catastrophic in XLA).
+
+*Gate.* The shortcut needs `L ≤ 4n`: a length-`4n` transform returns exactly the band
+`m < 4n`. Beyond that the ring sums repeat with period `nphi`, so an overset band would have to
+be tiled back in; `L > 4n` declines the belt and puts every ring through the chirp-Z (belt
+empty, tables full width). Verified on both sides of the gate: `L = 4n` and `L = 4n+7` at
+nside 16 give 0.00e+00 (analysis, vs the pre-split path) and 7e-16 / 5e-16 (synthesis, vs
+`_inverse_ring_fft`).
+
+**Both routes now checked against the definition, not just against each other.**
+`tests/test_sht.py::test_ring_analysis_matches_direct_dft_ring_by_ring` builds
+`Σ_p x_p exp(-2iπpm/nphi)` explicitly in NumPy for nine rings per Nside — cap, the two
+boundary rings, belt — at (16, 47), (32, 95), (16, 64), (16, 71), and asserts
+`atol = 1e-12 · max|direct|`. Standalone the same check reads 6.8e-15 / 1.8e-14 / 3.3e-14 at
+nside 8/16/32, which is the direct DFT's own rounding, not the library's.
+
+**The m-periodicity that makes the next lever available, measured.** `F_m` is periodic in `m`
+with period `nphi` (the kernel gains `exp(-2iπp) = 1`), so only `min(L, nphi)` values are
+distinct and a ring's transform bound could drop from `L + nphi - 1` to `2·nphi - 1`.
+`.qwen/tmp/ring_alias_check.py` measures `max|F_m − F_{m mod nphi}| / max|F|` =
+**2.7e-16 / 3.3e-16 / 3.5e-16** at nside 32/64/128 for every ring with `nphi < L`. That makes
+a per-size-class decomposition of the *polar* caps exact: at Nside 1024 most cap rings would
+transform at 4096 or less instead of 8192, with their m block tiled back out by a gather. Not
+implemented — the belt captured the cheap half. The same probe also validates the synthesis
+half of that plan (aliased-sum into `nphi` slots, then one plain inverse FFT, then the
+`2P - F_0` mirror): **8.1e-16** against the shipped chirp-Z (`ring_alias_check2.log`), so cap
+grouping is exact in both directions, not just in analysis.
+
+**Isolated SHT scoreboard after both changes** (fp32 tables, one Nside per process,
+`sht_vs_ducc_s23_{256,512,1024}.log`, control 1337-1447 GB/s; ducc column is the recorded
+best/median of the 45 GPU-free `ducc_only.py` processes, never the in-process number):
+
+| nside | dir | ducc best (median) ms | before session | after both | ratio vs best | vs median |
+|---|---|---|---|---|---|---|
+| 256 | map2alm | 2.12 (2.28) | 1.5 | **1.1** | **1.93x** | 2.07x |
+| 256 | alm2map | 1.41 (1.62) | 1.8 | **1.3** | **1.08x** | 1.25x |
+| 512 | map2alm | 14.97 (16.23) | 7.0 | **4.6** | **3.26x** | 3.53x |
+| 512 | alm2map | 10.50 (12.03) | 7.6 | **5.3** | **1.98x** | 2.27x |
+| 1024 | map2alm | 60.81 (64.08) | 40.4 | **31.4** | **1.94x** | 2.04x |
+| 1024 | alm2map | 53.62 (57.44) | 43.0 | **34.3** | **1.56x** | 1.67x |
+
+**All six spin-0 cells now go to the GPU, against ducc's fastest observed time**, including the
+Nside 256 synthesis cell that it held all along (0.78x → 1.08x). Session 13's "five of six" is
+superseded. The `rel alm` column now prints `|s|` beside it (probe fixed the same way
+`fp32_accuracy.py` was) and reads 9.9e-08 / 1.4e-07 / 1.3e-07 at 256/512/1024 with fp32 tables
+— the storage-width reduce, as expected, not a cliff.
+
+**Pipeline re-scored** (`score_one.py`, fresh process per cell): Nside 512 spin-0 fp32
+**332→102 ms (3.26x)**, Nside 1024 spin-0 fp32 **1713→678 ms (2.53x)**; after change 1 alone
+they were 113 ms and 717 ms, and before the session 136 ms and 809 ms. `rel` unchanged in every
+cell (7.17e-09 at 512, 5.48e-08 at 1024). Nside 512 fp64 spin-0 after change 1: **323→176 ms
+(1.84x)**, rel 1.71e-12. Nside 512 spin-2 fp32 after change 1: **719→389 ms (1.85x)**, rel
+3.55e-07 — spin-2 goes through `_forward_ring_fft_full` / `_inverse_ring_fft_complex`, which
+take neither change (their ring spectra are genuinely complex, and at `2L-1 > 4n` the belt
+shortcut needs the tiling the caps still owe); its `field` cell is still 0.73x and remains the
+worst cell on the board.
+
+**Verification.** `pytest tests/ -q` → **126 passed, 3 skipped in 305.62 s**
+(`.qwen/tmp/pytest_s23.log`) with the belt split in; the 3 skips are the two-GPU tests. The new
+`test_ring_analysis_matches_direct_dft_ring_by_ring` (4 parametrised geometries, 9 rings each,
+both routes and the overset gate) passes, as does the pre-existing
+`test_ring_synthesis_from_positive_half_matches_centred_window`, which now checks the split
+synthesis against the independent centred chirp-Z at 1e-13.
+
+**Unrelated bug spotted, not fixed (CPU-only path).** `_spin_slice._pool_headroom` guards only
+`memory_stats()` with `try/except`, then calls `stats.get(...)` outside it; on a CPU backend
+`memory_stats()` returns `None` rather than raising, so two spin tests die with
+`AttributeError: 'NoneType' object has no attribute 'get'` when the suite is run with
+`CUDA_VISIBLE_DEVICES=`. Harmless on GPU (where the suite is run), but the docstring promise
+"+inf when the device won't say" is not honoured.
+
+**What the ring stage still costs, and what is left.** After both changes it is
+0.21 / 0.82 / 4.29 ms at Nside 256/512/1024 against a latitudinal (theta) contraction that is
+at the card's streaming floor (26.18 ms at 1024, 1506 GB/s against a 1488 GB/s pure-`sum`
+control, north/south already folded by the `(-1)^(ell+m)` parity split in `_theta_matrix`). So
+the ring stage is now ~12 % of the Nside 1024 analysis call and the table route owns the rest:
+the remaining levers are the polar cap size classes (measured exact, above), spin-2's ring
+twins, and nothing at all inside the theta contraction.
+
