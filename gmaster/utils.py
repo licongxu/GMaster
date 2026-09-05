@@ -45,6 +45,20 @@ def table_dtype():
     return _TABLE_DTYPES[nmt_params.table_dtype]
 
 
+def ring_dtype():
+    """Element type of the azimuthal (ring) transforms, following the table precision.
+
+    The ring stage is a batched FFT, and on this card a double-precision FFT is
+    compute-bound at roughly the fp64 FMA rate while the fp32 one runs on the tensor-core
+    path: the same length transform is ~4.5x cheaper in `complex64` (`.qwen/tmp/ring_fp32_ab.py`:
+    0.91 -> 0.21 ms at Nside 512, 4.08 -> 0.83 ms at 1024).  Its representation error is
+    ~4e-7 relative on the ring sums, the same order as the fp32 table error that
+    `set_table_precision("fp32")` already buys, and the theta contraction downstream of it
+    accumulates in float64 either way.
+    """
+    return jnp.complex64 if table_dtype() == jnp.float32 else jnp.complex128
+
+
 def set_table_precision(name):
     """Choose the device storage precision of the precomputed tables.
 
@@ -74,6 +88,10 @@ def set_table_precision(name):
 
     _theta_matrix.release()
     _spin_slice.clear_cache()
+    _ring_analysis_tables.cache_clear()
+    _ring_synthesis_tables.cache_clear()
+    _spin_ring_analysis_tables.cache_clear()
+    _spin_ring_synthesis_tables.cache_clear()
 
 
 def set_sht_calculator(calc_name):
@@ -484,15 +502,15 @@ def _stable_thetas(L, nside):
 
 
 @partial(jax.jit, static_argnames=("L", "nside", "reality"))
-def _forward_s2fft_ftm(maps, *, L, nside, reality):
+def _forward_s2fft_ftm(maps, tables, *, L, nside, reality):
     m_start = L - 1 if reality else 0
     if reality:
         ftm = healpix_ffts.healpix_fft(maps, L, nside, "jax", reality)
     else:
-        # One batched chirp-Z transform instead of s2fft's per-ring unroll: the
+        # One batched transform instead of s2fft's per-ring unroll: the
         # latter issues one tiny FFT per ring (1023 of them at Nside 256) and
         # runs launch-bound at ~4 GB/s.  Matches it to 1.6e-15.
-        centered = _forward_ring_fft_full(maps, L=L, nside=nside)
+        centered = _forward_ring_fft_full(maps, tables, L=L, nside=nside)
         ftm = jnp.concatenate(
             (jnp.zeros((centered.shape[0], 1), dtype=centered.dtype), centered),
             axis=1,
@@ -544,9 +562,19 @@ def _finish_forward_s2fft(flm, *, L, spin, reality):
     return flm * (-1) ** abs(spin)
 
 
-@partial(jax.jit, static_argnames=("L", "spin", "nside", "reality"))
 def _forward_s2fft(maps, *, L, spin, nside, reality):
-    ftm = _forward_s2fft_ftm(maps, L=L, nside=nside, reality=reality)
+    """Not a jit boundary: the ring constants cross to the trace as arguments."""
+    return _forward_s2fft_impl(
+        maps,
+        () if reality else _spin_ring_analysis_tables(
+            L, nside, getattr(maps, "device", None)),
+        L=L, spin=spin, nside=nside, reality=reality,
+    )
+
+
+@partial(jax.jit, static_argnames=("L", "spin", "nside", "reality"))
+def _forward_s2fft_impl(maps, tables, *, L, spin, nside, reality):
+    ftm = _forward_s2fft_ftm(maps, tables, L=L, nside=nside, reality=reality)
     flm = _forward_latitudinal(
         ftm, L=L, spin=spin, nside=nside, reality=reality, L_lower=0
     )
@@ -579,7 +607,7 @@ def _inverse_latitudinal(flm, theta, *, L, spin, nside, reality):
 
 
 @partial(jax.jit, static_argnames=("L", "spin", "nside", "reality"))
-def _finish_inverse_s2fft(ftm, *, L, spin, nside, reality):
+def _finish_inverse_s2fft(ftm, tables, *, L, spin, nside, reality):
     m_start = L - 1 if reality else 0
     ftm = ftm.at[:, m_start + 1 :].multiply(
         healpix_ffts.ring_phase_shifts_hp_jax(L, nside, False, reality)
@@ -588,11 +616,21 @@ def _finish_inverse_s2fft(ftm, *, L, spin, nside, reality):
     if reality:
         ftm = ftm.at[:, 1:L].set(jnp.flip(jnp.conj(ftm[:, L + 1 :]), axis=-1))
         return healpix_ffts.healpix_ifft(ftm, L, nside, "jax", reality)
-    return _inverse_ring_fft_complex(ftm[:, 1:], L=L, nside=nside)
+    return _inverse_ring_fft_complex(ftm[:, 1:], tables, L=L, nside=nside)
+
+
+def _inverse_s2fft(flm, *, L, spin, nside, reality):
+    """Not a jit boundary: the ring constants cross to the trace as arguments."""
+    return _inverse_s2fft_impl(
+        flm,
+        () if reality else _spin_ring_synthesis_tables(
+            L, nside, getattr(flm, "device", None)),
+        L=L, spin=spin, nside=nside, reality=reality,
+    )
 
 
 @partial(jax.jit, static_argnames=("L", "spin", "nside", "reality"))
-def _inverse_s2fft(flm, *, L, spin, nside, reality):
+def _inverse_s2fft_impl(flm, tables, *, L, spin, nside, reality):
     flm = _prepare_inverse_s2fft(flm, L=L)
     ftm = _inverse_latitudinal(
         flm,
@@ -603,7 +641,7 @@ def _inverse_s2fft(flm, *, L, spin, nside, reality):
         reality=reality,
     )
     return _finish_inverse_s2fft(
-        ftm, L=L, spin=spin, nside=nside, reality=reality
+        ftm, tables, L=L, spin=spin, nside=nside, reality=reality
     )
 
 
@@ -911,6 +949,8 @@ def _ring_analysis_tables(L, nside, device=None):
             jnp.fft.fft(jnp.exp(1j * _chirp_angle(shift, two_nphi, False)), axis=-1),
             jnp.exp(-1j * _chirp_angle(m_index, two_nphi, False)),
         )
+        cplx = ring_dtype()
+        tables = tuple(t.astype(cplx) for t in tables)
     return tables if device is None else tuple(
         jax.device_put(t, device) for t in tables
     )
@@ -936,7 +976,7 @@ def _forward_ring_fft_positive(map_flat, tables, *, L, nside):
     chirp_in, kernel_spec, chirp_out = tables
     belt_lo, belt_hi, belt_start, caps = _ring_split_numpy(L, nside)
     width = 4 * nside
-    pixels = jnp.reshape(jnp.asarray(map_flat), (-1,))
+    pixels = jnp.reshape(jnp.asarray(map_flat), (-1,)).astype(chirp_in.real.dtype)
 
     cap_out = None
     if caps.size:
@@ -1028,6 +1068,8 @@ def _ring_synthesis_tables(L, nside, device=None):
             jnp.fft.fft(jnp.exp(-1j * _chirp_angle(shift, two_nphi, False)), axis=-1),
             jnp.exp(1j * _chirp_angle(p_index, two_nphi, False)),
         )
+        cplx = ring_dtype()
+        tables = tuple(t.astype(cplx) for t in tables)
     return tables if device is None else tuple(
         jax.device_put(t, device) for t in tables
     )
@@ -1057,7 +1099,7 @@ def _inverse_ring_fft_herm(ftm_positive, tables, *, L, nside):
     chirp_m, kernel_spec, chirp_p = tables
     belt_lo, belt_hi, _, caps = _ring_split_numpy(L, nside)
     width = 4 * nside
-    positive = jnp.asarray(ftm_positive)
+    positive = jnp.asarray(ftm_positive).astype(chirp_m.dtype)
 
     cap_res = None
     if caps.size:
@@ -1085,55 +1127,156 @@ def _inverse_ring_fft_herm(ftm_positive, tables, *, L, nside):
     return jnp.where(used, slots[source], 0.0)
 
 
-@partial(jax.jit, static_argnames=("L", "nside"))
-def _forward_ring_fft_full(signal, *, L, nside):
-    """Complex ring FFT returning the full centered window m in [-(L-1), L)."""
-    nphi, _, gather, valid, width = _ring_czt_constants(L, nside)
-    pixels = jnp.reshape(jnp.asarray(signal), (-1,))
-    two_nphi = (2 * nphi)[:, None]
-    rows = jnp.where(valid, pixels[gather], 0.0)
-    transform_size = _next_fast_len_pow2(width + 2 * L)
+@lru_cache(maxsize=2)
+def _spin_ring_analysis_tables(L, nside, device=None):
+    """Constant factors of the polarised analysis ring chirp-Z.
 
-    n_index = jnp.arange(width, dtype=jnp.int64)
-    embedded = rows * jnp.exp(-1j * _chirp_angle(n_index, two_nphi, False))
-    embedded = jnp.pad(embedded, ((0, 0), (0, transform_size - width)))
-    shift = jnp.arange(transform_size, dtype=jnp.int64) - (width - 1) - (L - 1)
-    kernel = jnp.exp(1j * _chirp_angle(shift, two_nphi, False))
-    convolution = jnp.fft.ifft(
-        jnp.fft.fft(embedded, axis=-1) * jnp.fft.fft(kernel, axis=-1), axis=-1
+    Polar rows only, like `_ring_analysis_tables`: the equatorial belt is served by one plain
+    FFT (see `_forward_ring_fft_full`).  The centred window is `m in [-(L-1), L)`, so the
+    kernel is shifted by `(width-1) + (L-1)` to bring order `m = -(L-1)` under the output
+    window and the convolution bound is `width + 2L - 1`.
+    """
+    with jax.ensure_compile_time_eval(), jax.default_device(device):
+        nphi, _, _, _, width = _ring_czt_constants(L, nside)
+        caps = _ring_split_numpy(L, nside)[-1]
+        two_nphi = (2 * nphi[caps])[:, None] if caps.size else (2 * nphi[:1])[:, None]
+        transform_size = _next_fast_len_pow2(width + 2 * L)
+        n_index = jnp.arange(width, dtype=jnp.int64)
+        m_index = jnp.arange(-(L - 1), L, dtype=jnp.int64)
+        shift = jnp.arange(transform_size, dtype=jnp.int64) - (width - 1) - (L - 1)
+        tables = (
+            jnp.exp(-1j * _chirp_angle(n_index, two_nphi, False)),
+            jnp.fft.fft(jnp.exp(1j * _chirp_angle(shift, two_nphi, False)), axis=-1),
+            jnp.exp(-1j * _chirp_angle(m_index, two_nphi, False)),
+        )
+        cplx = ring_dtype()
+        tables = tuple(t.astype(cplx) for t in tables)
+    return tables if device is None else tuple(
+        jax.device_put(t, device) for t in tables
     )
 
-    m_index = jnp.arange(-(L - 1), L, dtype=jnp.int64)
-    positive = jnp.exp(-1j * _chirp_angle(m_index, two_nphi, False)) * (
-        convolution[:, width - 1 : width - 1 + m_index.shape[0]]
+
+@partial(jax.jit, static_argnames=("L", "nside"))
+def _forward_ring_fft_full(signal, tables, *, L, nside):
+    """Complex ring FFT returning the full centered window m in [-(L-1), L).
+
+    The ring sums are periodic in the order with period `nphi`, and a negative order is just
+    a residue: `F_-m = F_(nphi-m)`.  On the equatorial belt `nphi = 4*nside`, so one plain
+    FFT of the contiguous reshape holds the whole centred window and it comes out as two
+    contiguous slices of that result — `F[4n-L+1 : 4n]` for `m < 0`, `F[0 : L]` for
+    `m >= 0`.  That replaces a `next_pow2(width + 2L)` transform pair (8192 at Nside 512,
+    16384 at 1024) with one length-`4*nside` transform on `2*nside+1` of the `4*nside-1`
+    rings, with no chirp, pad or kernel multiply there at all.  It agrees with the chirp-Z
+    form to 4e-16 relative for `L` up to the `4*nside` gate (`.qwen/tmp/spin2_ring_ab.py`).
+
+    The polar rows keep the chirp-Z; `tables` is `_spin_ring_analysis_tables(L, nside)` so
+    its ramps and kernel are built once per geometry instead of inside every trace.
+    """
+    chirp_in, kernel_spec, chirp_out = tables
+    belt_lo, belt_hi, belt_start, caps = _ring_split_numpy(L, nside)
+    width = 4 * nside
+    # The signal here is a helicity combination `Q -/+ iU`, so it takes the tables'
+    # *complex* type: casting to their real type would silently drop the imaginary part.
+    pixels = jnp.reshape(jnp.asarray(signal), (-1,)).astype(chirp_in.dtype)
+
+    cap_out = None
+    if caps.size:
+        _, _, gather, valid, _ = _ring_czt_constants(L, nside)
+        rows = jnp.asarray(caps)
+        cap_pixels = jnp.where(jnp.asarray(valid)[rows],
+                               pixels[jnp.asarray(gather)[rows]], 0.0)
+        transform_size = _next_fast_len_pow2(width + 2 * L)
+        embedded = jnp.pad(cap_pixels * chirp_in, ((0, 0), (0, transform_size - width)))
+        convolution = jnp.fft.ifft(
+            jnp.fft.fft(embedded, axis=-1) * kernel_spec, axis=-1
+        )
+        cap_out = chirp_out * convolution[:, width - 1 : width - 1 + 2 * L - 1]
+
+    belt_rows = belt_hi - belt_lo
+    if belt_rows == 0:
+        return cap_out
+    belt = jnp.reshape(pixels[belt_start : belt_start + belt_rows * width],
+                       (belt_rows, width))
+    full = jnp.fft.fft(belt, axis=-1)
+    belt_out = jnp.concatenate((full[:, width - L + 1 :], full[:, :L]), axis=1)
+    if cap_out is None:
+        return belt_out
+    return jnp.concatenate((cap_out[:belt_lo], belt_out, cap_out[belt_lo:]), axis=0)
+
+
+@lru_cache(maxsize=2)
+def _spin_ring_synthesis_tables(L, nside, device=None):
+    """Constant factors of the polarised synthesis ring chirp-Z; polar rows only."""
+    with jax.ensure_compile_time_eval(), jax.default_device(device):
+        nphi, _, _, _, width = _ring_czt_constants(L, nside)
+        caps = _ring_split_numpy(L, nside)[-1]
+        two_nphi = (2 * nphi[caps])[:, None] if caps.size else (2 * nphi[:1])[:, None]
+        transform_size = _next_fast_len_pow2(2 * L - 1 + width)
+        c_index = jnp.arange(2 * L - 1, dtype=jnp.int64)
+        p_index = jnp.arange(width, dtype=jnp.int64)
+        shift = jnp.arange(transform_size, dtype=jnp.int64) - (2 * L - 2)
+        tables = (
+            jnp.exp(1j * _chirp_angle(c_index, two_nphi, False)),
+            jnp.fft.fft(jnp.exp(-1j * _chirp_angle(shift, two_nphi, False)), axis=-1),
+            jnp.exp(1j * _chirp_angle(p_index, two_nphi, False)),
+        )
+        cplx = ring_dtype()
+        tables = tuple(t.astype(cplx) for t in tables)
+    return tables if device is None else tuple(
+        jax.device_put(t, device) for t in tables
     )
-    return positive
 
 
 @partial(jax.jit, static_argnames=("L", "nside"))
-def _inverse_ring_fft_complex(centered, *, L, nside):
-    """Complex inverse ring FFT of a centered (ntheta, 2L-1) spectrum."""
+def _inverse_ring_fft_complex(centered, tables, *, L, nside):
+    """Complex inverse ring FFT of a centered (ntheta, 2L-1) spectrum.
+
+    The residue identity that serves the forward direction has a reverse: summing
+    `F_m e^{2 pi i p m / nphi}` over a window wider than one period `nphi` only requires
+    adding the coefficients that share a residue and transforming once.  On the belt that
+    means placing `m in [0, L)` in slots `[0, L)` and `m in [-(L-1), 0)` in slots
+    `[4n-L+1, 4n)` and doing one length-`4*nside` inverse transform instead of the chirp-Z
+    pair at `next_pow2(2L-1 + width)`.  For `L > 2*nside` the two slot ranges overlap, so
+    placement is the *sum* of two padded arrays rather than a concatenation — still slice
+    arithmetic, no scatter.  Checked against the chirp-Z form at 8e-16 relative, including
+    the overlapping `L = 3*nside` case.
+
+    The polar rows keep the chirp-Z with `tables` = `_spin_ring_synthesis_tables(L, nside)`
+    and the `wrap_phase` correction that accounts for the shift of their coefficient index.
+    """
+    chirp_c, kernel_spec, chirp_p = tables
+    belt_lo, belt_hi, _, caps = _ring_split_numpy(L, nside)
     nphi, _, _, _, width = _ring_czt_constants(L, nside)
-    grid = jnp.asarray(centered)
-    ntheta = grid.shape[0]
-    two_nphi = (2 * nphi)[:, None]
-    transform_size = _next_fast_len_pow2(2 * L - 1 + width)
+    grid = jnp.asarray(centered).astype(chirp_c.dtype)
 
-    c_index = jnp.arange(2 * L - 1, dtype=jnp.int64)
-    embedded = grid * jnp.exp(1j * _chirp_angle(c_index, two_nphi, False))
-    embedded = jnp.pad(embedded, ((0, 0), (0, transform_size - (2 * L - 1))))
-    shift = jnp.arange(transform_size, dtype=jnp.int64) - (2 * L - 2)
-    kernel = jnp.exp(-1j * _chirp_angle(shift, two_nphi, False))
-    convolution = jnp.fft.ifft(
-        jnp.fft.fft(embedded, axis=-1) * jnp.fft.fft(kernel, axis=-1), axis=-1
-    )
+    cap_res = None
+    if caps.size:
+        cap_grid = grid[jnp.asarray(caps)]
+        transform_size = _next_fast_len_pow2(2 * L - 1 + width)
+        embedded = jnp.pad(cap_grid * chirp_c,
+                           ((0, 0), (0, transform_size - (2 * L - 1))))
+        convolution = jnp.fft.ifft(
+            jnp.fft.fft(embedded, axis=-1) * kernel_spec, axis=-1
+        )
+        p_index = jnp.arange(width, dtype=jnp.int64)
+        cap_res = chirp_p * convolution[:, 2 * L - 2 : 2 * L - 2 + width]
+        rows_nphi = nphi[jnp.asarray(caps)][:, None]
+        wrap_phase = ((L - 1) % rows_nphi) * p_index[None, :] % rows_nphi
+        cap_res *= jnp.exp(-1j * wrap_phase * (2 * jnp.pi / rows_nphi))
 
-    p_index = jnp.arange(width, dtype=jnp.int64)
-    result = jnp.exp(1j * _chirp_angle(p_index, two_nphi, False)) * convolution[
-        :, 2 * L - 2 : 2 * L - 2 + width
-    ]
-    wrap_phase = (((L - 1) % nphi)[:, None] * p_index[None, :]) % nphi[:, None]
-    result *= jnp.exp(-1j * wrap_phase * (2 * jnp.pi / nphi)[:, None])
+    belt_rows = belt_hi - belt_lo
+    if belt_rows == 0:
+        result = cap_res
+    else:
+        belt_grid = grid[belt_lo:belt_hi]
+        zeros_left = jnp.zeros((belt_rows, width - L + 1), dtype=grid.dtype)
+        zeros_right = jnp.zeros((belt_rows, width - L), dtype=grid.dtype)
+        slot = (jnp.concatenate((belt_grid[:, L - 1 :], zeros_right), axis=1)
+                + jnp.concatenate((zeros_left, belt_grid[:, :L - 1]), axis=1))
+        belt_res = jnp.fft.ifft(slot, axis=-1) * width
+        result = belt_res if cap_res is None else jnp.concatenate(
+            (cap_res[:belt_lo], belt_res, cap_res[belt_lo:]), axis=0
+        )
 
     source, used = _ring_inverse_layout(L, nside)
     slots = jnp.reshape(result, (-1,))
@@ -1215,7 +1358,11 @@ def _inverse_latitudinal_device(L, spin, nside, reality, half, device_index):
 def _forward_s2fft_multi_gpu(maps, *, L, spin, nside, reality):
     primary, secondary = _gpu_devices()[:2]
     maps = _copy_to_device(maps, primary)
-    ftm = _forward_s2fft_ftm(maps, L=L, nside=nside, reality=reality)
+    ftm = _forward_s2fft_ftm(
+        maps,
+        () if reality else _spin_ring_analysis_tables(L, nside, primary),
+        L=L, nside=nside, reality=reality,
+    )
     split = max(abs(spin) + 1, 2 * L // 3)
     if split >= L:
         return _forward_s2fft(maps, L=L, spin=spin, nside=nside, reality=reality)
@@ -1250,7 +1397,9 @@ def _inverse_s2fft_multi_gpu(flm, *, L, spin, nside, reality):
     south = _copy_to_device(south, primary)
     ftm = jnp.concatenate((north, south))
     return _finish_inverse_s2fft(
-        ftm, L=L, spin=spin, nside=nside, reality=reality
+        ftm,
+        () if reality else _spin_ring_synthesis_tables(L, nside, primary),
+        L=L, spin=spin, nside=nside, reality=reality,
     )
 
 
@@ -1362,7 +1511,11 @@ def _inverse_latitudinal_slab(flm, slab, *, L):
 def _map2alm_once_slab(maps, ell, order, *, spin, nside, L, L_work, slab):
     """Polarised analysis with the latitudinal step replaced by a slab contraction."""
     ftm = _forward_s2fft_ftm(
-        maps[0] + 1j * maps[1], L=L_work, nside=nside, reality=False
+        maps[0] + 1j * maps[1],
+        _spin_ring_analysis_tables(
+            L_work, nside,
+            getattr(maps, "device", None) or getattr(maps[0], "device", None)),
+        L=L_work, nside=nside, reality=False,
     )
     plus = _finish_forward_s2fft(
         _forward_latitudinal_slab(ftm, slab, L=L_work),
@@ -1379,7 +1532,9 @@ def _alm2map_core_slab(alm, *, spin, nside, L, L_work, slab):
     flm = _prepare_inverse_s2fft(_unpack_spin(alm, L, L_work), L=L_work)
     ftm = _inverse_latitudinal_slab(flm, slab, L=L_work)
     maps = _finish_inverse_s2fft(
-        ftm, L=L_work, spin=spin, nside=nside, reality=False
+        ftm,
+        _spin_ring_synthesis_tables(L_work, nside, getattr(ftm, "device", None)),
+        L=L_work, spin=spin, nside=nside, reality=False,
     )
     return jnp.stack([jnp.real(maps), jnp.imag(maps)])
 
@@ -1461,13 +1616,17 @@ def _alm2map_core_pallas_eager(alm, *, nside, L, L_work, spin=0):
             jnp.asarray(a_minus).T, theta, L=L_work, spin=-int(spin), block_size=block
         )
         shifts = healpix_ffts.ring_phase_shifts_hp_jax(L_work, nside, False, False)
+        synth_tables = _spin_ring_synthesis_tables(
+            L_work, nside, getattr(f_plus, "device", None))
+
         def to_map(centered):
             full = jnp.concatenate(
                 (jnp.zeros((centered.shape[0], 1), dtype=centered.dtype), centered),
                 axis=1,
             )
             full = full.at[:, 1:].multiply(shifts)
-            return _inverse_ring_fft_complex(full[:, 1:], L=L_work, nside=nside)
+            return _inverse_ring_fft_complex(full[:, 1:], synth_tables,
+                                             L=L_work, nside=nside)
         q_map = 0.5 * (to_map(f_plus) + jnp.conj(to_map(f_minus)))
         u_map = -0.5j * (to_map(f_plus) - jnp.conj(to_map(f_minus)))
         return jnp.stack([q_map, u_map])[None, :]
@@ -1525,8 +1684,13 @@ def _map2alm_once_pallas_spin(maps, ell, order, *, nside, L_work, spin):
 
     signal_plus = maps[0] - 1j * maps[1]   # helicity +s
     signal_minus = maps[0] + 1j * maps[1]  # helicity -s
-    rings_p = _forward_ring_fft_full(signal_plus, L=L_work, nside=nside)
-    rings_m = _forward_ring_fft_full(signal_minus, L=L_work, nside=nside)
+    analysis_tables = _spin_ring_analysis_tables(
+        L_work, nside,
+        getattr(maps, "device", None) or getattr(signal_plus, "device", None))
+    rings_p = _forward_ring_fft_full(signal_plus, analysis_tables,
+                                     L=L_work, nside=nside)
+    rings_m = _forward_ring_fft_full(signal_minus, analysis_tables,
+                                     L=L_work, nside=nside)
 
     a_plus_grid = _spin_forward_latitudinal(
         rings_p * window, theta, L=L_work, spin=int(spin), block_size=block

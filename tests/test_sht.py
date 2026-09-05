@@ -405,16 +405,18 @@ def test_matrix_theta_stage_matches_fused_kernel():
         nmt.set_sht_calculator(original)
 
 
-@pytest.mark.parametrize("nside", [32, 64])
-def test_ring_synthesis_from_positive_half_matches_centred_window(nside):
+@pytest.mark.parametrize("nside, L", [(32, 95), (64, 191), (32, 40), (16, 71)])
+def test_ring_synthesis_from_positive_half_matches_centred_window(nside, L):
     """The positive-m ring synthesis equals the mirrored-window one it replaces.
 
     `_inverse_ring_fft` mirrors the block into 2L coefficients and chirp-Z transforms
     all of it; `_inverse_ring_fft_herm` spends the exact mirror as `2 Re P - Re F_0` and
-    needs the CZT bound `L + width - 1` instead of `2L - 1 + width` — half the transform
-    size for the same ring values, measured 2.07x on the stage at Nside 512.
+    needs the CZT bound `L + width - 1` instead of `2L - 1 + width`: half the transform
+    size for the same ring values, measured 2.07x on the stage at Nside 512. The polar
+    rows are read out of a concatenated slot buffer, the belt of one plain inverse FFT.
+    `L = 40` at Nside 32 is a band wider than the polar rings' own `nphi`, so the cap
+    chirp-Z has to alias there; `L = 71 > 4*nside` declines the belt and must still match.
     """
-    L = 3 * nside - 1
     positive = (
         jax.random.normal(jax.random.PRNGKey(11), (4 * nside - 1, L))
         + 1j * jax.random.normal(jax.random.PRNGKey(12), (4 * nside - 1, L))
@@ -426,16 +428,18 @@ def test_ring_synthesis_from_positive_half_matches_centred_window(nside):
     np.testing.assert_allclose(got, reference, rtol=1e-13, atol=1e-13)
 
 
-@pytest.mark.parametrize("nside, L", [(16, 47), (32, 95), (16, 64), (16, 71)])
+@pytest.mark.parametrize("nside, L", [(16, 47), (32, 95), (16, 64), (16, 71), (32, 40)])
 def test_ring_analysis_matches_direct_dft_ring_by_ring(nside, L):
     """Every ring's m block equals an explicit `sum_p x_p exp(-2i pi p m / nphi)`.
 
     The azimuthal stage now takes two routes: the equatorial belt (`nphi = 4*nside`, a
     power of two wider than the band) is one plain FFT of a contiguous reshape, the polar
-    rings keep the Bluestein chirp-Z. Both are checked here against the definition, on
-    cap rings, on the two boundary rings and on belt rings. `L = 64` is the gate boundary
-    `L == 4*nside`; `L = 71 > 4*nside` is an overset band, for which the belt shortcut is
-    declined and every ring goes back through the chirp-Z.
+    rings keep the Bluestein chirp-Z at the map-wide width. Both routes are checked here
+    against the definition, on cap rings, on the two boundary rings and on belt rings.
+    `L = 64` is the gate boundary `L == 4*nside`; `L = 71 > 4*nside` is an overset band,
+    for which the belt shortcut is declined and every ring goes back through the
+    single-width chirp-Z. `L = 40` at Nside 32 is wider than the polar rings' own `nphi`,
+    so their chirp-Z has to alias.
     """
     nphi, start, _, _, _ = utils._ring_czt_constants_numpy(L, nside)
     map_flat = jnp.asarray(
@@ -455,3 +459,53 @@ def test_ring_analysis_matches_direct_dft_ring_by_ring(nside, L):
                   @ map_flat[start[ring]:start[ring] + period])
         scale = float(np.max(np.abs(direct)))
         np.testing.assert_allclose(got[ring], direct, rtol=0.0, atol=1e-12 * scale)
+
+
+@pytest.mark.parametrize("nside, L", [(8, 16), (8, 23), (8, 24), (8, 32), (8, 39),
+                                      (16, 32), (16, 47), (16, 71)])
+def test_spin_ring_window_matches_direct_dft_both_ways(nside, L):
+    """The polarised ring stage's centred window and its inverse are the ring DFT.
+
+    `_forward_ring_fft_full` returns the centred window `m in [-(L-1), L)`. On the
+    equatorial belt that window is wider than the band but narrower than one period of the
+    ring sum (`nphi = 4*nside >= L`), so it is two contiguous slices of a single plain FFT:
+    orders `m < 0` are the residues `F_-m = F_(nphi-m)` at the top of the transform, orders
+    `m >= 0` at the bottom. `_inverse_ring_fft_complex` runs the same identity backwards by
+    adding coefficients that share a residue into one slot and transforming once; when
+    `L > 2*nside` the positive and negative halves land in overlapping slots and must be
+    summed rather than concatenated. Cap rings keep the chirp-Z in both directions.
+
+    Every case is checked against the definition on cap, boundary and belt rings, forward
+    and back. `L = 2*nside` is the boundary where the two slot ranges just touch,
+    `L = 3*nside`/`3*nside-1` overlap them, and `L = 4*nside+7` declines the belt entirely.
+    """
+    nphi, start, _, _, _ = utils._ring_czt_constants_numpy(L, nside)
+    npix = 12 * nside ** 2
+    ntheta = 4 * nside - 1
+    rng = np.random.default_rng(7)
+    signal = np.asarray(rng.normal(size=npix) + 1j * rng.normal(size=npix))
+    centered = (jax.random.normal(jax.random.PRNGKey(3), (ntheta, 2 * L - 1))
+                + 1j * jax.random.normal(jax.random.PRNGKey(4), (ntheta, 2 * L - 1)))
+
+    forward = np.asarray(utils._forward_ring_fft_full(
+        jnp.asarray(signal), utils._spin_ring_analysis_tables(L, nside),
+        L=L, nside=nside))
+    backward = np.asarray(utils._inverse_ring_fft_complex(
+        centered, utils._spin_ring_synthesis_tables(L, nside), L=L, nside=nside))
+
+    m_index = np.arange(-(L - 1), L)
+    for ring in {0, nside // 2, nside - 2, nside - 1, nside,
+                 2 * nside, 3 * nside - 1, 3 * nside, ntheta - 1}:
+        period = nphi[ring]
+        row = signal[start[ring]:start[ring] + period]
+        direct = (np.exp(-2j * np.pi * np.outer(m_index, np.arange(period)) / period)
+                  @ row)
+        scale = float(np.max(np.abs(direct)))
+        np.testing.assert_allclose(forward[ring], direct, rtol=0.0, atol=1e-12 * scale)
+
+        coefficients = np.asarray(centered[ring])
+        synth = (np.exp(2j * np.pi * np.outer(np.arange(period), m_index) / period)
+                 @ coefficients)
+        scale = float(np.max(np.abs(synth)))
+        np.testing.assert_allclose(backward[start[ring]:start[ring] + period], synth,
+                                   rtol=0.0, atol=1e-12 * scale)
