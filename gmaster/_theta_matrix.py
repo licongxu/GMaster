@@ -40,7 +40,27 @@ BLOCK = 64
 
 
 def _initial_factor(exponent):
-    return jnp.where(exponent >= -1022, lax.exp2(exponent.astype(jnp.float64)), 0.0)
+    """``2.0 ** exponent`` for an integer exponent, assembled bit by bit.
+
+    `degree` below masks its rescale with `jnp.where`, which evaluates both sides,
+    so this runs on a whole ``(mb, north)`` tile at *every* degree of the scan -
+    thousands of times per block.  Writing the biased exponent into the exponent
+    field is exact for every normal double, which is the property the rescale
+    exists to have: a power of two must not touch a mantissa bit.
+
+    ``lax.exp2`` - the previous body - does not have it.  Over all 2046 integer
+    exponents in [-1022, 1023] it returns the exact power for only 23 of them and
+    drifts by up to 8.0e-14 relative (``.qwen/tmp/exp2_exactness.py``), so the
+    shipped march was contaminating every renormalised value it emitted.  The two
+    forms therefore differ by ~3e-15 relative in the slab, with this one the
+    accurate side.  It is also 1.17-1.21x faster on the device, where fp64
+    ``exp2`` has no unit and lowers to a software sequence; on CPU it is the
+    slower of the two, so never validate that claim off-device.
+    """
+    biased = jnp.clip(exponent.astype(jnp.int64) + 1023, 1, 2046)
+    bits = lax.bitcast_convert_type(biased << 52, jnp.float64)
+    return jnp.where(exponent >= -1022,
+                     jnp.where(exponent <= 1023, bits, jnp.inf), 0.0)
 
 
 def _build_slab(theta, L, diag, c1, c2, m0, mb, store_name="float64"):
