@@ -3047,15 +3047,17 @@ build before it declines to "the generic s2fft scatter loop". **It does not**
 (`.qwen/tmp/spin2_stage_split.py` at n2048):
 
 ```
-        1. _spin_slabs request         first     0.3 ms  min      0.2 ms  [1.0 GiB / 71.2 limit]
+nside=2048 L=6143 L_work=6143 prec=fp32 reps=2
+pool before: 1.0 GiB in use / 71.2 limit
+                1. _spin_slabs request first      25.5 ms  min       0.3 ms  [1.0 GiB / 71.2]
    -> returned NONE (generic scatter loop)
-        2. _map2alm_core (no slab arg) first 131171.8 ms min 113680.9 ms  [3.2 GiB / 71.2 limit]
-        3. map2alm (public, n_iter=0)  first 126107.7 ms min 110147.1 ms  [5.5 GiB / 71.2 limit]
-        4. alm2map (public)            first 127067.8 ms min 111774.1 ms  [7.7 GiB / 71.2 limit]
+        2. _map2alm_core (no slab arg) first  131171.8 ms  min  113680.9 ms  [3.2 GiB / 71.2]
+         3. map2alm (public, n_iter=0)  first  126107.7 ms  min  110147.1 ms  [5.5 GiB / 71.2]
+                   4. alm2map (public)  first  127067.8 ms  min  111774.1 ms  [7.7 GiB / 71.2]
 ```
 
-The request is 0.2 ms and the pool never moves off 1.0 GiB, so `_spin_slice` declines on its
-headroom check without ever trying — nothing is built and thrown away. Step 3's 110.1 s equals
+The request settles at 0.3 ms and the pool never moves off 1.0 GiB, so `_spin_slice` declines on
+its headroom check without ever trying — nothing is built and thrown away. Step 3's 110.1 s equals
 the isolated score's 110.1 s and repeats agree to 0.01 %, so the probe measures the production
 call. **The entire 110 s is the generic loop, running at a 7.7 GiB working set.** Against ducc0's
 605.7 ms at Nside 2048 that is 182x, where spin 0 at the same Nside is 2x: spin 2 is not losing an
@@ -3123,5 +3125,277 @@ the length of the sequential degree chain in `_build_slab`, which is exactly the
 `blocked-recurrence-wall` says cannot be shortened in fp64 and `complex-rhs-tax`/`contraction-layout-tax`
 say cannot be hidden in the contraction. Only the two shapes in section 6 remain — build once per
 geometry, or share one chain across several right-hand sides.
+
+## Session 18 (2026-09-05) — the rescale guard is live, three builder ideas die, and the block size is a capacity knob
+
+Nothing shipped. Four probes, one of which found a bug in an idea I had already reported as a win,
+and a measurement that finally says what `_build_slab` is bound by.
+
+### 1. The exp2-rescale guard is not a vestige: it fires millions of times and its carry blows the trip point by 2**37
+
+`.qwen/tmp/renorm_firing.py` walks the shipped march and reduces it to guard statistics — firing
+count, and the extreme |carry| over *every* degree rather than only the checked ones (CPU, all
+m-blocks):
+
+```
+nside    m0  block   fires      log2 pmax     log2 pmin    slack
+  256      0    64    3062         108.7        -4.8     -8.7
+  256    448    64   60565         137.0        -2.6    -37.0
+  256    704    63    7858         136.6        -1.5    -36.6
+# nside 256: L=767 blocks=12 total fires=468827 worst slack=-37.0 decades
+# nside 512: L=1535 blocks=24 total fires=4352493 worst slack=-38.1 decades
+```
+
+The trip point is `2**100`; the carry runs to `2**137`, and one m-block at Nside 512 takes
+221,590 rescales. So the guard is doing constant work, and the "value-preserving" claim in the
+docstring is load-bearing rather than decorative — which is also why the session-17 discovery that
+`lax.exp2` was not exact mattered at all. Any "make the guard cheap" idea has to preserve it
+exactly, not approximately.
+
+### 2. Grouping the degrees so the check runs 1/16 as often: declined, and it is slower on the GPU
+
+`.qwen/tmp/builder_grouped.py` nests the scan — inner body is the bare recurrence, outer body
+checks and rescales once per 16 degrees. On the CPU at small sizes it looks excellent (1.30-2.80x
+at Nside 64, 1.33-1.70x at 128) and then stops: 0.92x at 256 fp64 (`builder_grouped_cpu2.log`),
+and on the GPU (`builder_grouped_gpu.log`, clocks spun up, one process on GPU1):
+
+```
+nside store    m0      shipped     grouped      x   GiB/s out  identical
+  512  float64     0       12.31       12.78   0.96       58.6           YES
+  512  float32     0       11.68       11.91   0.98       31.5           YES
+ 1024  float64     0       28.52       35.75   0.80       83.9           YES
+ 1024  float32     0       26.29       31.72   0.83       47.3           YES
+ 1024  float64  3007       0.59        0.68   0.87       91.8   NO rel 2.15e-265
+```
+
+0.80-0.83x at the leading block — the block that dominates a build — in both storages. XLA
+compiles the nested scan worse than the flat one, by more than 25 guard ops per degree are worth.
+The scan stays flat; do not restructure it again.
+
+### 3. Making the guard's rescale cheap: the idea was wrong, and the GPU could not have told me
+
+The shipped body recomputes the scale from the exponent,
+`factor = where(large | small, _initial_factor(exponent), factor)`, which is ~10 ops (int64 cast,
+add, clip, shift, bitcast, two compares, two selects, one select). `exponent` only ever moves by
+exactly ±100 there, so multiplying the existing `factor` by the reciprocal of the carry's `mult`
+should give the same power of two, and would take `exponent` out of the loop carry.
+
+The first version multiplied by `mult` instead of its reciprocal. It is wrong by O(1) —
+`rel` 7.03e-01 at Nside 64, 1.00e+00 at Nside 128 — and on the GPU it measured
+
+```
+  512  float64     0      11.90    1.28       61.0  fires 0  IDENTICAL
+ 1024  float64     0      25.28    1.14      118.8  fires 0  IDENTICAL
+```
+
+**`fires 0` and `IDENTICAL` because the leading m-block is one of the few places the guard never
+wakes up** (section 1: at 1024 the block at m0=3007 fires 51,921 times, m0=0 fires 13,433). A
+GPU-only A/B on the leading block would have shipped a 1.14x "win" that zeroes half the Legendre
+table. The CPU sweep at `m0 = L//4` is what caught it.
+
+The corrected version (`builder_cheapguard_cpu2.log`, `builder_cheapguard_gpu2.log`; `gate+inv`
+keeps the shipped every-16th-degree phase, `gate+exp2` is the shipped semantics as a control):
+
+```
+nside store   m0   arm          shipped      cheap      x  GiB/s out  fires  identical
+  512  float64     0 gate+inv       10.67     11.18   0.95       67.0     6480         YES
+  512  float64  1471 gate+inv        0.51      0.38   1.34       82.7    21393  NO rel 1.32e-250
+ 1024  float64     0 gate+inv       27.24     27.26   1.00      110.0    13433         YES
+ 1024  float64  3007 gate+inv        0.60      0.60   0.99      103.4    51921  NO rel 6.24e-247
+ 1024  float32     0 gate+inv       26.27     26.29   1.00       57.0    13433         YES
+```
+
+**1.00x at Nside 1024 in both storages** — the geometry where a build is actually paid — and
+1.26-1.38x only on 0.5 ms tail blocks. The control arm is 1.00x as it should be. On the CPU the
+same change is worth 1.10-2.13x, which is the third time this week the two backends have disagreed
+about an op-count change on this recurrence.
+
+And it is not bit-identical. `.qwen/tmp/cheapguard_diffmap.py` says why, and the reason is a
+correctness argument rather than a rounding argument:
+
+```
+   m0  n_diff   rel vs max      |a| at worst   |b| at worst   zero-one-side
+    0   23663   6.80e-231      -2.803e-230       -0.000e+00          23663
+  256    8744   1.25e-241       1.653e-241        0.000e+00           8744
+```
+
+Every differing entry is exactly zero on the reciprocal side. A `factor` accumulated by
+multiplication stays zero once a step has underflowed it; `_initial_factor(exponent)` re-derives
+`2**exponent` from the exponent and recovers on the next degree. The differing entries here are
+~1e-230 relative to the slab maximum and physically meaningless, but the failure mode is not
+bounded — a lane whose factor passes through the underflow range emits zeros for the rest of its
+march. **`factor` must be derived from `exponent`, not accumulated alongside it.** Declined, and
+the shipped form is right for a reason that was not written down before today.
+
+### 4. `BLOCK` is a capacity knob, and 64 is not arbitrary
+
+The tile sweep below says a wider m-block should build faster per emitted value, so `_theta_matrix.BLOCK`
+(64, with no rationale comment) was set to 256 and the isolated fp32 score re-run
+(`sht_block256_fp32.log`, same script as `sht_s26k_fp32.log`):
+
+| Nside | BLOCK=64 (shipped) | BLOCK=256 |
+|---|---|---|
+| 512 map2alm / alm2map | 15.5 -> **4.4 ms (3.53x / 2.56x)** | 14.9 -> 4.6 / 5.1 ms (3.21x / 2.40x) |
+| 1024 map2alm / alm2map | 58.0 -> **28.1 ms (2.06x / 1.79x)** | 60.3 -> 124.8 / 162.8 ms (**0.48x / 0.33x**) |
+
+`rel alm` is unchanged (3.7e-07 / 3.5e-07) — the band values do not depend on the block boundary,
+as they should not — but at Nside 1024 the score collapses by 4.4x, and 124.8 ms is exactly the
+fused-kernel cell measured in session 17 (125.6 ms). `.qwen/tmp/block_band_check.py` reproduces it
+independently and prints the mechanism (`block_band_check.log`):
+
+```
+=== BLOCK=256   band_bytes block=BLOCK(256): 38.97 GiB   block=default: 36.73 GiB   budget=40 GiB
+                _prefer_theta_band=True
+map2alm first=282984.8 ms best=125.0 ms
+_band calls: [((1024,3072,256,float32),'NONE',277747 ms), then four more 'NONE' at 0 ms]
+_BAND_CACHE keys=[] _BAND_FAILED=[(1024, 3072, 256, <class 'jax.numpy.float32'>)]
+=== BLOCK=64    band_bytes block=BLOCK(64): 36.73 GiB   block=default: 36.73 GiB   budget=40 GiB
+                _prefer_theta_band=True
+map2alm first=346306.8 ms best=28.1 ms
+_band calls: [((1024,3072,64,float32),'built',340522 ms), then four more 'built' at 0 ms]
+_BAND_CACHE keys=[(1024, 3072, 64, <class 'jax.numpy.float32'>)] _BAND_FAILED=[]
+```
+
+So the gate **approved** and the *build* failed: `_band` caught `RESOURCE_EXHAUSTED`, negative-cached
+the geometry, returned None, and the transform took the fused kernel. Two things follow that are not
+obvious from the score alone:
+
+* **The fit test does not see the block size.** `_prefer_theta_band` (utils.py:762) calls
+  `band_bytes(nside, L, dtype=...)`, and `band_bytes`'s `block` parameter has `BLOCK` as a *default
+  argument*, bound at import. Setting `tm.BLOCK = 256` therefore changes what gets allocated
+  (38.97 GiB) but not what gets gated (36.73 GiB). With `BLOCK = 64` in the shipped code the two
+  agree, so nothing is wrong today — but any BLOCK change silently bypasses the budget test, and the
+  real footprint is what the pool votes on.
+* **A failed build is expensive.** The 256-wide attempt ran **277.7 s** before it raised; the score
+  script's `first` call paid it. The negative cache then correctly keeps the other ~7 passes from
+  retrying, which is why the steady-state 125.0 ms looks like an ordinary fused-kernel cell.
+
+The peak is what breaks, not the resident size: with 12 blocks instead of 48, `_BUILD_CLEAR_EVERY = 8`
+fires once instead of six times, so more executables are alive pinning their outputs
+(`executables-pin-their-outputs`) on top of a table that is itself 2.2 GiB larger. The wide build is
+also slower per block — 277.7 s for 12 blocks (23 s/block) against 340.5 s for 48 (7.1 s/block) —
+because each program now emits a 256-lane march rather than a 64-lane one, so even the attempt that
+succeeded in the control leg pays a third more warm-up time for a band that serves the same 3072
+degrees.
+
+So `BLOCK` trades build shape against *route availability*, and at 1024 the route is worth far more
+than the build. **64 stays. Anyone widening it must pass the block size to `band_bytes` in
+`_prefer_theta_band` and re-check the budget at every Nside that currently engages.** Reverted;
+`git diff` is clean for `gmaster/`.
+
+### 5. What `_build_slab` is actually bound by: a ~5 us floor per degree
+
+`.qwen/tmp/builder_tile_scaling.py` holds the degree count fixed (3071, Nside 1024) and scales the
+lanes per degree, so a fixed cost shows as a flat line and real work as a slope:
+
+```
+nside store  rows   mb  north    lanes/deg    ms  us/deg  xlanes    xms   exp
+ 1024 float32  3071   16   512        8192    15.31     4.98    1.00    1.00   nan
+ 1024 float32  3071   32   512       16384    14.96     4.87    2.00    0.98  -0.03
+ 1024 float32  3071   64   512       32768    23.16     7.54    4.00    1.51   0.30
+ 1024 float32  3071  256   512      131072    25.80     8.40   16.00    1.69   0.19
+ 1024 float32  3071  256  2048      524288    67.06    21.84   16.00    3.20   0.42
+```
+
+The exponent is **0.16-0.42**: 64x the lanes costs 4.4x the time. Reading it as
+`time = 15.3 ms + lanes x 3.4e-8 ms` gives a **fixed ~5 us per degree** and a marginal rate of
+~29-34 G emitted values/s. That marginal rate writes ~116 GB/s (8 % of the 1400 GB/s the
+contraction gets from the same bytes) and does ~3 FMA per value at ~10 % of the 940 GFMA/s fp64
+peak — so the scan is **neither bandwidth-bound nor op-bound**, and the numbers now say why every
+attempt to speed it up failed:
+
+| lever | op count | emitted bytes | source |
+|---|---|---|---|
+| coefficients as scan rows | down | same | session 18 (shipped: 1.09-1.20x at 512, 1.00x at 1024) |
+| `_initial_factor` exponent-field | down | same | session 17 §4 (1.17x at 512) |
+| rescale guard ~25 -> ~10 ops | down 40 % | same | this session: **1.00x at 1024** |
+| check 1/16 as often | down | same | this session: **0.80x at 1024** |
+| fp32 storage | same | **halved** | 27.24 -> 26.27 ms (0.97x) |
+| vmap over theta chunks | same | same | session 17 §8: 1.00x |
+
+The bound is the scan itself: a `(mb, north)` fp64 carry (1 MB per tile at BLOCK=64, four arrays)
+that XLA shuttles through memory once per degree, one dependent chain, ~5 us per step. The only
+march on this card that does not pay that is the **Pallas fused kernel** (221 GFMA/s, carry in
+registers). So "make the build fast" is not an XLA problem at all — it means writing the band
+emitter as a Pallas kernel, which is the same march `_sht_pallas._analysis_kernel` already runs,
+with a store in place of the block reduction. Section 8 puts the cheap test that has to come first:
+one negative measurement of exactly that shape already exists.
+
+### 6. What that is worth: the streamed-band budget, recomputed with measured numbers
+
+At Nside 2048 the fp32 scalar band is ~288 GiB against a 97.9 GiB card (97887 MiB, `nvidia-smi`),
+so the band route cannot be resident and the fused kernel runs: **0.32x / 0.23x** isolated
+(`sht_s26k_fp32_2048.log`: ducc 303.3 -> GM 953.2 map2alm, 287.2 -> 1264.0 alm2map, `rel` 3.7e-07)
+and 0.22x / 0.17x at 4096 (`block_sweep_4096_0_fp32.log` shipped shape 8352.78 / 10884.38 ms
+against `ducc_only_4096_0.log` 1840.97 / 1865.26 ms). The streamed shape — build one m-block,
+contract every pass against it, free it — needs no memory it cannot get:
+
+* build the whole band once: 7.5e10 emitted values at the measured marginal rate ≈ **2.6 s**, and
+  ~6 s if extrapolated from the measured 2048 leading block (126.3 ms, `builder_nogather.log`)
+* contraction per pass: 288 GiB at the measured 1400-1474 GiB/s ≈ **0.22 s**
+* fused kernel per pass: **1.04 s** (8312 ms / 8 passes at 2048, session 17 §1)
+
+Break-even is therefore k ≈ 4 passes today, and for the 8 passes of the real `field` stage a
+streamed band is 6 + 1.8 = 7.8 s against 7.6 s fused — **a wash**. With the builder 4x faster
+(a Pallas emitter at the fused kernel's own rate, ~1.5 s) the same stage becomes 3.3 s, the whole
+2048 pipeline 3.3 + 1.53 = 4.8 s against the CPU's 10.46 s, i.e. **~2.2x end to end where it is
+0.57x today**. This is the one remaining shape, and section 5 says precisely which piece of it is
+missing: not capacity, not the contraction, not the guard — the emitter.
+
+### 7. Multi-RHS: the measured verdict, and why it converts bandwidth rather than arithmetic
+
+`.qwen/tmp/multi_rhs_contract.py` (GPU1, one process, `multi_rhs_contract.log`) extends
+`_contract_theta`'s tuple reduce from 2 accumulators to 2k over one slab:
+
+```
+nside store   k        ms  x k=1  GiB/s slab   x stacked
+ 1024  float32   1      1.02   1.00     1474.5      1.02
+ 1024  float32   2      1.04   0.98     1441.0      1.00
+ 1024  float32   4      1.07   0.95     1400.0      0.97
+ 1024  float32   8      1.75   0.58      856.1      0.60
+ 1024  float64   1      2.06   1.00     1458.8      1.00
+ 1024  float64   4      4.61   0.45      650.2      1.00
+ 1024  float64   8      9.39   0.22      319.4      0.97
+```
+
+In the fp32 storage that production uses, **4 right-hand sides cost +5 %, 8 cost +72 %**; in fp64
+it is dead linear. Read against the machine roofline (balance 0.58 FMA/byte, so a 2-FMA-per-element
+scalar band tops out at 378 GFMA/s) the contraction is already at 1400-1474 GiB/s of the 1633 GB/s
+read peak — **it is at its bandwidth ceiling, which is exactly why extra channels are almost
+free**: they add arithmetic the card has spare, not bytes it has to fetch. The k=8 fp32 break and
+the fp64 linearity are the accumulator count capping the reduce, not bandwidth.
+
+Design consequence: batch ~4 channels per contraction program (two programs if 7 passes are
+simultaneous), keep the tuple-reduce spelling — the stacked form is the 0.97-1.02x column above
+and the 12.16-vs-8.14 ms trap in `_contract_theta`'s docstring — and the pipeline's repeated
+transforms against one band cost roughly the price of one.
+
+What is *not* batchable, checked rather than assumed: the `n_iter` loop in
+`_map2alm_core_pallas` (utils.py:1760-1775) is a recurrence — each iteration's analysis consumes
+the previous iteration's synthesis — so those passes cannot share a read. The batchable set is
+independent fields: the mask-power transforms inside `compute_coupling_matrix`, and several maps at
+the API level. The API is the blocker: `map2alm` accepts exactly `(1, npix)` for spin 0 and
+`(2, npix)` for spin 2 (utils.py:1976-1981) and `_map2alm_once` reads `maps[0]`, so there is
+today no way to hand GMaster two maps that could share one band read.
+
+### 8. Next work, in the order the measurements now support
+
+1. **Pallas band emitter** (section 5/6): the march from `_analysis_kernel` with a store instead of
+   the reduction, one m-block resident at a time, contraction in the existing
+   `_contract_theta`. **Prior art is negative, so gate it on the cheapest possible test first:** a
+   Pallas band-fill kernel has already been measured once — correct to 3.96e-14 and **33x slower**
+   than the XLA builder (196 ms vs 5.8 ms for a 0.19 GiB block). Before any march work, write the
+   store-only fill (known values in, slab out) and check it reaches XLA's ~30 G values/s; if it does
+   not, the emitter idea dies there rather than after a week.
+   Gate the whole shape on: build the 2048 band in under ~2 s, then re-measure the 2048 `field`
+   stage end to end. Nothing else on the board turns 0.5x into >1x.
+2. **Batched multi-RHS contraction** (section 7): 2k accumulators, k <= 4, plus the API change that
+   lets independent maps arrive together. This one pays at <= 1024, where the band route already
+   wins 1.79-3.53x, and it is the cheapest big number on the board.
+3. Do **not** revisit: scan restructuring (0.80x), guard op counting (1.00x), fp32-as-a-speed-lever
+   (0.97x), theta vmap (1.00x), thread-block shapes (session 17 §2), `BLOCK` widening (section 4),
+   a Pallas band fill *without* first clearing the store-rate bar (previous attempt: 33x slower).
+   Every one of those has a measurement attached.
+
 
 
