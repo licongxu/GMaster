@@ -24,8 +24,11 @@ Row values are identical to `_sht_pallas._analysis_kernel`'s: same normalised
 exp2-rescale-every-16 schedule (value-preserving), same equator-counted-once rule.
 """
 
+import contextlib
 import gc
-from functools import partial
+import os
+import warnings
+from functools import lru_cache, partial
 
 import jax
 import jax.numpy as jnp
@@ -38,6 +41,32 @@ from gmaster._sht_pallas import (
 )
 
 BLOCK = 64
+
+# Which builder fills the band.  The scan is the reference and stays the default in tests;
+# the Pallas emitter is the same march with one Triton program per m-block, which is what
+# makes a large band cheap to produce (see `gmaster/_band_pallas.py`).
+_BAND_BUILDER = os.environ.get("GMASTER_BAND_BUILDER", "pallas").strip().lower()
+
+
+def set_band_builder(name):
+    """Choose the band builder at runtime: `"pallas"` (default) or `"scan"`."""
+    global _BAND_BUILDER
+    name = name.strip().lower()
+    if name not in ("pallas", "scan"):
+        raise ValueError(f"unknown band builder: {name!r}")
+    _BAND_BUILDER = name
+
+
+def band_builder():
+    return _BAND_BUILDER
+
+
+@lru_cache(maxsize=1)
+def _has_nvidia_gpu():
+    return any(
+        device.platform == "gpu" and "NVIDIA" in device.device_kind.upper()
+        for device in jax.devices()
+    )
 
 
 def _build_slab(theta, L, diag, c1, c2, m0, mb, store_name="float64"):
@@ -152,19 +181,61 @@ def _band(geometry):
         _BAND_CACHE.clear()
     theta = utils._stable_thetas(L, nside)
     diag = jnp.asarray(_diagonal_normalization(L))
-    c1, c2 = (jnp.asarray(t) for t in _normalized_coefficients_numpy(L, 0, L))
-    builder = jax.jit(partial(_build_pair, theta, L, diag, c1, c2),
-                      static_argnames=("m0", "mb", "store_name"))
+    c1_np, c2_np = _normalized_coefficients_numpy(L, 0, L)
+
+    def scan_builder():
+        # Built on demand: the coefficient tables ride the jit as constants, and
+        # the emitter route should not pay to stage them.
+        return jax.jit(partial(_build_pair, theta, L, diag,
+                               jnp.asarray(c1_np), jnp.asarray(c2_np)),
+                       static_argnames=("m0", "mb", "store_name"))
+
+    emitter = _BAND_BUILDER == "pallas" and _has_nvidia_gpu()
+    if emitter:
+        # One Triton program per m-block: the march in registers, storing straight
+        # into the parity halves.  Chosen because the scan route pays an XLA
+        # compile per block, which is 99% of a build (340 s for 36.73 GiB at
+        # Nside 1024, against 5.14 s for the same band here).
+        from gmaster import _band_pallas
+
+        builder = partial(_band_pallas.build_pair, theta, L, diag, c1_np, c2_np)
+    else:
+        builder = scan_builder()
+    # `ensure_compile_time_eval` is what lets the scan fold into the caller as a
+    # compile-time constant.  It works by making `jax.jit` evaluate eagerly, and a
+    # `pallas_call` has no eager rule -- `pl.program_id` raises
+    # `NotImplementedError: Evaluation rule for 'program_id' not implemented`,
+    # which is exactly what the emitter did the first time it was wired in here.
+    # So the emitter route skips the fold and relies on the concrete-buffer check
+    # below to reject a build performed inside a trace, which is the same
+    # outcome the fold produced for gradients: the caller takes the fused kernel.
+    fold = contextlib.nullcontext() if emitter else jax.ensure_compile_time_eval()
     even, odd = [], []
     try:
-        with jax.ensure_compile_time_eval():
+        with fold:
             for i, m0 in enumerate(range(0, L, block)):
                 # The recurrence is fp64 and stays fp64; only the *storage* may be
                 # fp32, and the cast is part of the block's kernel so the fp64
                 # original is dead before the next block is built.  Casting the
                 # finished band would need both precisions resident at once, which
                 # is exactly the budget the fp32 option exists to avoid.
-                pair = builder(m0, min(block, L - m0), store.name)
+                mb = min(block, L - m0)
+                try:
+                    pair = builder(m0, mb, store.name)
+                except Exception as exc:
+                    # RESOURCE_EXHAUSTED is the pool's verdict on the geometry and
+                    # belongs to the handler below.  Anything else is the emitter
+                    # declining a shape it cannot compile, which is worth one
+                    # rebuilt block rather than losing the band's transform.
+                    if not emitter or isinstance(exc, jax.errors.JaxRuntimeError):
+                        raise
+                    emitter = False
+                    builder = scan_builder()
+                    warnings.warn(
+                        f"GMaster band emitter declined m0={m0} "
+                        f"({type(exc).__name__}: {str(exc)[:200]}); this band is "
+                        "being built with the scan builder instead", stacklevel=2)
+                    pair = builder(m0, mb, store.name)
                 even.append(pair[0])
                 odd.append(pair[1])
                 # A cached executable pins a copy of the buffers it produced, so a
