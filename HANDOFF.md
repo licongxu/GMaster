@@ -2743,3 +2743,134 @@ paying 2.1x for a strided-axis reduction. That, not the azimuth, is the next thi
 `test_spin_ring_window_matches_direct_dft_both_ways` across 8 geometries. The earlier
 `pytest_s25.log` (133 passed) predates that test.
 
+---
+
+## Session 16 (2026-09-05) — Nside 2048/4096: where the wall actually is, measured
+
+The demand is the transform at Nside 2048 and 4096 on one card, all spins, winning like 256-1024
+do. This session measured the wall instead of guessing at it. No library change shipped: one
+optimisation was implemented and **reverted** (below), and one probe was built whose own numbers
+came with a caveat.
+
+Machine, for the record (`nvidia-smi`, `free`): 2x RTX PRO 6000 Blackwell, **97.9 GiB each**,
+PCIe **gen5 x8**, no NVLink between them; 376 GiB host RAM. Host staging of a table is therefore
+~50 GB/s against ~1.5-2.9 TB/s on the card — a streamed band cannot live in host RAM and be read
+once per pass.
+
+### 1. The current state at Nside 2048: we lose by 3-5x
+
+Isolated one-pass transform, fp32 tables, `L = 3*nside-1` (`.qwen/tmp/sht_vs_ducc_s26_2048_0.log`,
+controls 1336/1334 GB/s):
+
+| dir | ducc ms (in-process) | GMaster ms | ratio |
+|---|---|---|---|
+| map2alm | 301.5 | 1048.1 | 0.29x |
+| alm2map | 287.3 | 1356.6 | 0.21x |
+
+`rel alm 3.7e-07`, so the result is correct — it is just slow. The Legendre band is declined
+(40 GiB gate) and the fused fp64 Pallas kernel carries the call. Clean GPU-free ducc baselines
+(`.qwen/tmp/ducc_only_2048_0.log`, `_2.log`, 192 cores, reps=3) are a bit slower than the
+in-process column, as they always are: spin 0 map2alm min/med/max **369.51/384.51/574.03** ms,
+alm2map **373.05/477.58/491.03** ms; spin 2 map2alm **732.08/903.86/1001.08** ms, alm2map
+**609.54/612.15/613.55** ms. And at Nside 4096 (`_4096_0.log`, reps=2, `OMP_NUM_THREADS=96`):
+map2alm **1840.97/1842.75/1844.52** ms, alm2map **1865.26/1865.32/1865.37** ms.
+
+### 2. The contraction is not the problem — the table's existence is
+
+Cost model for building and contracting the band one m-block at a time
+(`.qwen/tmp/block_cost.py`, fp32, Nside 2048, `BLOCK = 64`):
+
+| m0 | rows | slab GiB | build ms | contract ms | contract GB/s |
+|---|---|---|---|---|---|
+| 0 | 6143 | 6.00 | 113.6 | 2.04 | 2939 |
+| 767 | 5376 | 5.25 | 99.4 | 1.79 | 2941 |
+| 1535 | 4608 | 4.50 | 85.3 | 1.55 | 2907 |
+| 3071 | 3072 | 3.00 | 57.1 | 1.04 | 2887 |
+| 4607 | 1536 | 1.50 | 28.6 | 0.54 | 2785 |
+| 6079 | 64 | 0.06 | 1.3 | 0.08 | 831 |
+
+fp64 `sum` control on the same process: 1395 GB/s. Integrating over the block index:
+
+* whole fp32 band at Nside 2048: **290.9 GiB** (4096: ~2.3 TiB) — can never be resident;
+* one latitudinal pass from it: **105 ms**, at 2939 GB/s of fp32 slab reads, i.e. **at the
+  card's streaming rate** and **2.9-3.5x faster than ducc's whole map2alm** (301-370 ms);
+* building it: **5.5 s**.
+
+So at Nside >= 2048 every number is right except one: the table costs 5.5 s to make and 291 GiB
+to hold, while ducc needs 0.3 s and no table at all. Rebuilding per pass (5.5 s) is 17x worse
+than ducc; the *same* 5.5 s spent once and contracted seven times costs 5.5 + 7x0.105 = 6.2 s
+against ducc's 7x301 = 2.1 s, which is still a loss. **The build is the wall, not the
+transform.**
+
+### 3. Making the builder faster: one probe, one caveat, no win shipped
+
+`.qwen/tmp/build_speed.py` times one m-block of `_theta_matrix._build_slab` at Nside 1024
+(m0 = 0, 1.50 GiB of fp32 output): shipped body **32.1 ms** (~150 GFLOP/s), `unroll=4` 34.7 ms,
+`unroll=8` 32.5 ms, rescale-machinery removed 26.2 ms, that plus `unroll=4` 14.3 ms, fp32-carried
+recurrence 21.6 ms.
+
+**Caveat that has to travel with those numbers: every non-base variant printed NaN in the
+agreement column**, so none of them is a usable candidate — the probe never produced a
+value-correct faster body, and the only conclusion that survives regardless of NaN is that
+**scan unrolling alone buys nothing** (32.1 -> 32.5 ms), which says the builder is not
+limited by loop overhead. An earlier draft of this section quoted a "3.5x bit-identical"
+result from this probe before it had been run; that was wrong and is removed. What the numbers
+do support is the diagnosis: the recurrence is carried as two `(mb, north)` tiles through
+`lax.scan`, and at ~150 GFLOP/s it is nowhere near the card's fp64 arithmetic rate — the carry
+is being written and read back, not kept.
+
+The fp32 escape hatch is closed independently: `dfp32-analysis-kernel` records that an
+fp32-carried recurrence has a precision cliff (8.8e-8 at L = 224, **2.3e-3** at L = 1024, from
+cancellation at |m| > ~0.85L), and this card's fp64 matmul rate is 1.88 TFLOP/s against ~120
+TFLOP/s fp32 (`fp64-roofline-wall`). The recurrence has to stay fp64; only storage may be fp32.
+
+### 4. A spin-2 idea that is algebraically exact and numerically a regression
+
+`_spin_slice._march` rebuilds, on every m-step, a full `(ntheta, L)` fp64 tile
+
+```
+lamb = ((el+1)(1-c) + (m-L+el+1)c - half) / s
+```
+
+whose difference from the seed tile `lamb0` is exactly `(m-1)·c/s` — a rank-1 update, no divide.
+Verified in numpy over m at L = 1344: worst relative difference **6.04e-16**. Implemented and
+checked against HEAD on CPU: Nside 16 agrees to 1.58e-14, Nside 64 to 8.66e-14, and **Nside 32
+gains 5 NaN entries** at rows m = 0..2, theta rings 87 and 95, ell 3-4, where HEAD holds ordinary
+values (max 2.449 and 2.530 there; the table's largest finite value is 1.663e+02). Reverted;
+working tree is clean.
+
+The mechanism is that the march is not mask-safe: `bigi = 1/|dl_entry|` and the carry updates
+`jnp.where(index, bigi*dl_cur, dl_prev)` evaluate the divide everywhere, so a 1e-14 change in
+`lamb` flips a masked entry through inf and into the emitted rows. That is worth remembering as a
+latent fragility in `_spin_slice`, not just as a blocked optimisation: **any** restructuring of
+the march body can hit it. Before the rank-1 update (or anything else that perturbs rounding
+there) can land, the carry must be made inf-safe and a zero-NaN assertion added to the spin tests
+— there is none today, which is why this was found by hand rather than by the suite.
+
+### 5. What this implies for the design, stated as arithmetic
+
+At Nside >= 2048 nothing about ducc changes: it is fp64-recurrence-bound on a CPU with 4.14
+TFLOP/s against the card's 1.88. Our wins have always come from bandwidth and fp32, and at these
+sizes the fp32 object is 291 GiB. Two shapes can exploit the card without holding that:
+
+1. **A fast builder + one sweep per geometry.** If the builder reached even 10x (0.55 s, and the
+   physical floor for writing 291 GiB at ~1.5 TB/s is ~0.2 s), then building once and contracting
+   every pass against it costs 0.55 + 7x0.105 = 1.3 s against ducc's 2.1 s — a win, and every
+   additional pass is nearly free.
+2. **Multi-RHS fused recurrence.** The MASTER pipeline runs the *same* Legendre recursion seven
+   times per workspace build (field, then the coupling terms), each pass re-deriving values the
+   others already needed. Sharing one recurrence across a few RHS tiles amortises exactly the cost
+   that is blocking 2048, at a memory footprint of the RHS tiles rather than the band — and it is
+   the same trick for the spin-2 slices. The measured caution is `dfp32-analysis-kernel`'s
+   register-spill finding: adding four loop-carried fp64 FMAs per lane-degree cost +161% there, so
+   the RHS group size must be small (2-3) and measured, not assumed.
+
+Both are "compute the recursion once, spend it many times", which is the one thing ducc's
+per-call structure cannot do. That is the next build target; until then, Nside 2048 is 0.29x and
+Nside 4096 is not attempted.
+
+**Still running when this was written:** the spin-2 Nside 2048 isolated cell
+(`.qwen/tmp/sht_vs_ducc_s26_2048_2.log`) and the queued pipeline scores
+(`.qwen/tmp/queue_s26.sh` -> `score_s26_2048_0`, `score_s26_2048_2`, `score_s26_4096_0`). No
+number from those has been quoted here.
+
