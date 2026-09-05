@@ -3466,5 +3466,95 @@ inside `_band`, which also needs the GPU suite green; (c) the streamed shape at 
 emitter's 127.8 G values/s is the first measurement to clear the 37 G values/s bar. Nothing about the
 `field` stage score is measured yet — 0.29x at 2048 is still the shipped number until (c) runs.
 
+### 10. The emitter is shipped, and it turns out the band build was compile-bound all along
+
+`282ca21 perf(sht): emit the Legendre band with one Triton program per m-block` —
+`gmaster/_band_pallas.py`, selected by `_theta_matrix._band` (default; `GMASTER_BAND_BUILDER=scan`
+or `tm.set_band_builder("scan")` gets the old builder back).
+
+The whole band, parity split included, `.qwen/tmp/pallas_band_fullbuild2.log`:
+
+```
+nside  256  cold   1.35 s | warm 0.005 s   0.61 GiB out   34.6 G values/s   diff vs scan 8.9e-16
+nside  512  cold   2.65 s | warm 0.014 s   4.68 GiB out   90.3 G values/s   diff vs scan 2.3e-10
+nside 1024  cold   5.14 s | warm 0.080 s  36.73 GiB out  117.3 G values/s   diff vs scan 6.0e-08
+          (eager `_build_pair` over the same blocks: 3.46 / 7.72 / 28.67 s -> x733 / x555 / x341)
+```
+
+**The parity split costs nothing**: at Nside 256 m0 = 0 one unmasked store per degree is
+37.8 G values/s and the two masked stores per degree that do `vals[0::2]` / `vals[1::2]` inline are
+37.4 (`.qwen/tmp/fullbuild_probe.log`), so there is no separate pass and no transpose. What the
+first whole-band run read as "0.4 GiB/s warm" was a measurement artefact — an intervening
+`jax.clear_caches()` evicted the Triton programs, so the "warm" pass was recompiling all 12 kernels.
+
+Correctness, `.qwen/tmp/band_equivalence.py`, every entry of every block, both storages:
+
+```
+fp32 nside   64 (north 128, exact tile)  max abs 0.000e+00   padding violations 0
+fp32 nside  100 (north 200, MASKED tile) max abs 0.000e+00   padding violations 0
+fp64 nside   64 / 100                    rel   1.9e-14 / 2.1e-14
+```
+
+Bit-identical in float32, and the float64 difference is the march-order floor. `nside 100` is the
+geometry that makes `north = 200` not a multiple of the 128-lane theta tile, so the masked path is
+covered rather than assumed. Padding rows (`ell < m`) are written zero explicitly — a pallas output
+buffer is not zeroed, and the scan writes `0.0` there through `where(ell >= mi, …)`.
+
+**Why the win is 60x and not 8x.** The scan builder is not store-bound and, at build scale, barely
+march-bound: `block` m-blocks with a static `m0` is `block` XLA programs, so a band build pays a full
+compile per block and each program pins a copy of what it produced. That is what the 340 s was
+(`block_band_check.log`), against well under a second of device work. Triton compiles the same 48
+blocks in 5.1 s. Section 8's "the builder is latency-bound" was true of the *march* and is now moot:
+the march runs in registers at 117 G values/s and the compile is what was left.
+
+The number that matters is the cold pipeline, `.qwen/tmp/band_route_score.py`,
+`GM_PREC=fp32`, one geometry per process:
+
+```
+nside  512  route=band  cold map2alm first=  6224 ms  best=  4.7 ms | alm2map first= 5558 ms best=  4.8 ms
+nside 1024  route=band  cold map2alm first= 11594 ms  best= 28.1 ms | alm2map first= 5777 ms best= 31.0 ms
+          build alone, Nside 1024: 6.11 s = 36.75 GiB at 6.0 GiB/s (48 blocks, 48 emitter compiles)
+```
+
+and the same-process ducc cells, `.qwen/tmp/score_emit_fp32.log`:
+
+```
+   512  0  map2alm   15.3 ms  ->   4.6 ms   3.29x    rel 3.7e-07
+   512  0  alm2map   12.1 ms  ->   4.8 ms   2.51x
+  1024  0  map2alm   56.3 ms  ->  28.3 ms   1.99x    rel 3.6e-07
+  1024  0  alm2map   53.6 ms  ->  31.0 ms   1.73x
+```
+
+A first `map2alm` at Nside 1024 float32 used to be dominated by 346 s of table build
+(`block_band_check.log`: `first=346306.8 ms best=28.1 ms`). It is now **11.6 s** including the build,
+and the warm transform is unchanged at 28.1 ms. The band route stops being something you can only
+afford in a benchmark that throws away its first call.
+
+Three traps, each of which produced a plausible-looking wrong answer:
+
+* `jax.ensure_compile_time_eval()` — which `_band` used so the scan folds into the caller as a
+  compile-time constant — makes `jit` evaluate eagerly, and a `pallas_call` has no eager rule:
+  `NotImplementedError: Evaluation rule for 'program_id' not implemented`. `jax.disable_jit(False)`
+  nested inside does not undo it (the fold is a trace-time flag, not the jit setting). The emitter
+  route runs in a `contextlib.nullcontext()` and relies on the concrete-buffer check that already
+  rejected a build inside a trace, so gradients still take the fused kernel exactly as before.
+* A "fall back to the scan if the emitter raises" wrapper made the first `pytest tests/ -q` after
+  the wiring report **141 passed** while every band in it came from the old builder. The route is
+  now asserted, not assumed: `.qwen/tmp/band_route_engaged.py` counts emitter compiles against
+  block count (`6 blocks, emitter compiles 6`) and checks the transform against ducc0
+  (rel 2.7e-07 at 128, 3.3e-07 at 256). Suite after the fix: **141 passed, 3 skipped in 308.35 s**
+  (`pytest_s18emit.log`).
+* A probe that builds `band_geometry(nside, 3*nside-1)` by hand is not the pipeline's geometry — the
+  pipeline wants `(nside, 3*nside, BLOCK, dtype)`. Two geometries means two 36.7 GiB tables on a
+  71 GiB pool, the second build dies, and `map2alm` answers **122 ms** (fused kernel) instead of
+  28 ms. `band_route_score.py` reads the cache keys back instead of guessing them.
+
+What this does *not* change: the band is `d^l_{m,0}`, so spin 2 still uses the Wigner-d tables and is
+untouched; Nside 2048 float32 needs 147 GiB and cannot be resident at any builder speed, so there the
+`field` stage stays at its shipped number until the streamed shape runs. The streamed band is now
+the only remaining use for a table this big, and 117 G values/s is 3x the 37 G values/s bar
+section 6 set for it — but note the arithmetic in section 11 before spending time there.
+
+
 
 
