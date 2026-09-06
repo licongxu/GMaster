@@ -3750,11 +3750,62 @@ brings K=8 to ~24 GiB. The fused kernel would then read a table that *fits* the 
 Nside 1024 spin-2 sitting at **13.27 s/pass** in the generic per-window loop and a real shot at ducc0's
 **107 ms**.
 
-**Not built: the kernel.** Next is a `lax.scan` oracle of the actual block — march `ell` inside a
-`(m-window, theta-tile)` block, contract `nxt·w·f` into the 4 real channels, per-`(m, tile)` partials
-and a cheap reduce, K=8 anchor reads, rows `m < spin` routed through the swap
-`d^l_{m'm} = (-1)^(m-m') d^l_{mm'}` — scored against this gate's float64 march, then ported to Pallas
-behind a default-off env gate, with the speed number and the `rel alm` number required in the same log.
+**The law holds at the target geometry.** `.qwen/tmp/spin2_anchor_gate2_1024.log` and
+`spin2_anchor_gate2_1024_w512.log` (L=3072, ntheta=4095, the fp64 march as its own oracle — the
+table cannot be built here at all):
+
+```text
+window m [0,64)        pure         K=8          K=16         K=32          anchors/window
+                     1.08e-03     5.16e-07     1.08e-06     2.79e-06      1.50 / 0.75 / 0.37 GiB
+                     median 1.61e-05  1.44e-08   3.93e-08     1.15e-07
+window m [512,576)    9.40e-05     9.71e-07     2.09e-06     5.92e-06      (same bytes)
+                                    6.51e-08    1.46e-07     3.28e-07
+```
+
+K=8 at Nside 1024 gives **5.16e-07 / 9.71e-07**, i.e. the same number it gave at L=768 and L=1536 —
+the L-independence is confirmed at the geometry that matters, and it brackets the shipped route's
+7.12e-07…1.15e-06 with medians 1.4e-08…6.5e-08 (~20x better). The scan's own 15 s arm time is XLA
+per-degree dispatch inside `lax.scan`, not a kernel rate.
+
+**And the real block shape holds too.** `.qwen/tmp/spin2_fused_block.py` is the kernel's actual
+shape rather than the gate's single-RHS form: theta split into tiles (the march state must live in
+registers), each tile producing a partial per `ell` that is summed in float64 across tiles — the
+shipped `_RED_CHUNK` discipline — and the contraction taken against **4 real polarised channels**
+(Q,U x direct,mirror) at storage width with float64 only for the tile partial. The padded theta tail
+is dead in every sense: zero RHS, zeroed `nxt`, and its exponent pinned at −1e6 so it can never win
+`emax` and shift the real lanes out of float32's reach. Nside 256, window m<64, 8 tiles of 128:
+
+```text
+  fp64 block (oracle): 382 ms   partial buffer 12 MiB
+  fp64 self-check:            all 0.00e+00   median 0.00e+00
+  fp32 march + anchors K=8:   all 4.10e-07   median 1.33e-08   anchors 0.09 GiB/window
+```
+
+4.10e-07 is *better* than the single-RHS gate's 6.41e-07 at the same K, because each fp32 partial sum
+now runs over 128 lanes instead of 1023 — tiling buys accuracy as well as register residence. Pure
+arithmetic for this block is 0.017 ms/window of fp32 FFMA (1.13e10 FLOP/window at Nside 1024 = 0.27 ms
+there), so the whole polarised pass is budgeted ~5-7 ms of arithmetic + ~24 GiB of anchor reads +
+~25 GiB of RHS reads ≈ **40 ms/pass against ducc0's 107 ms and the generic loop's 13.27 s**.
+
+**That 40 ms is a budget, not a measurement, and there is one measured generator rate that argues
+against it.** The fused kernel is the first *generator* we have never timed. The only measured
+value-producing kernel in this repo is the spin-0 band emitter at **117.3 G values/s** (session 19),
+which on the same value count (1.93e10 at Nside 1024) would be **165 ms/pass** — i.e. slower than
+ducc0. The emitter's floor is its 77 GiB of writes (53 ms at the measured 1444 GB/s) plus the
+per-degree scan-latency pathology recorded in `project/builder-scan-latency.md`, neither of which the
+fused kernel has (it writes only ~2 MiB of partials per window), but the gap between 41.4 TFLOP/s of
+FFMA capacity and 117 G values/s is 35x and it is exactly the gap that has eaten every previous
+"the flops are cheap" estimate here. **The kernel's rate is therefore unmeasured and is the only open
+question; the accuracy question is closed.** Do not quote 40 ms in a comparison until it is in a log
+next to a `rel alm`.
+
+**Not built: the Pallas kernel.** The `lax.scan` oracle of the real block now exists and passes
+(`spin2_fused_block.py`, numbers above), so the remaining work is the port: one program per
+`(m-window, theta-tile)` with `(prev, cur, ex)` in registers, the K=8 anchor gather, the 4-channel
+`nxt*w*R` partial in fp32 with a float64 accumulator, and rows `m < spin` routed through the swap
+`d^l_{m'm} = (-1)^(m-m') d^l_{mm'}`. It goes behind a default-off env gate (the session 18/19 pattern,
+`GMASTER_POLAR_CONTRACT=xla` style) and the first log must contain the kernel's ms/window *and* the
+pipeline's `rel alm`, because a generator route that is only fast is not a win.
 
 **DFT / brute-force note (`record-brute`), recorded as a cost model, not a measurement.** The probe
 script and its log for the no-FFT direct DFT are no longer in `.qwen/tmp` (checked: `ls .qwen/tmp/*brute*`
