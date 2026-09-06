@@ -326,21 +326,75 @@ def forward_latitudinal(ftm, *, L, spin, nside):
 
 
 # ------------------------------------------------------------------- synthesis: the same row, summed
-def _kern_synth(manr, ex0r, xr, xlr, c1r, c0r, cbr, c1lr, c0lr, cblr, lexr,
-                chr_, clr, cih, cil, m0_ref, out_ref, *, L, ntheta, chunk):
-    """One (m-window row, theta tile): march the row and accumulate ``d^l_(m,-s) c_l`` per lane.
+_ST = int(os.environ.get("GMASTER_SPIN2_MARCH_SYNTH_TILE", "512"))
+_SW = int(os.environ.get("GMASTER_SPIN2_MARCH_SYNTH_WARPS", "4"))
 
-    The analysis kernel reduces the theta axis at every degree; the synthesis contraction is the
-    transpose of that sum, so it keeps a per-lane accumulator and walks `ell`.  Terms span ~2^2800
-    at Nside 1024, so the accumulator carries its own per-lane exponent and meets each term through
-    the exact power ``2**(tex - aex)``: `tex` is the march exponent plus the integer part of the
-    factorial ratio, whose fractional part and the ``(-1)**m`` sign ride in the coefficient.  That
-    way no ``2**+-1400`` is ever formed, and the alignment stays exact.
 
-    The accumulator is a second float32 (value, limb) pair, not a float64 one.  This GPU does
-    float64 at 1/64 rate, and the dozen float64 ops per degree the first version ran cost more than
-    the entire march: 793.9 ms for the synthesis step against 111.6 ms for the analysis step at
-    Nside 1024 (`.qwen/tmp/sht_vs_ducc_s29_ab2_1024_2.log`).
+def _add_pair(hh, lo, ph, pl):
+    """(hh, lo) += (ph, pl) for two compensated float32 pairs, result renormalised."""
+    sh, se = _two_sum(hh, ph)
+    sl = lo + (pl + se)
+    nh = sh + sl
+    return nh, sl - (nh - sh)
+
+
+def _accumulate(nd, ndl, tex, aex, at0, rh, rl, ih, il, a_r, a_l, b_r, b_l):
+    """Add one degree's term to a per-lane (value, limb) accumulator pair; return the new state.
+
+    `tex` is the term's exponent and `aex` the accumulator's, and they meet through the exact power
+    `2**(tex - aex)`: no `2**+-1400` is ever formed, and the alignment costs one multiply on the
+    value and one on its limb.
+
+    The invariant is `value * 2**aex`, so a block that moves has to carry the stored value with it.
+    A term that dwarfs the accumulator lifts the block and flushes the residue; a term it dwarfs
+    simply underflows in -- the block never moves down, because that would grow the stored value
+    toward overflow.  Clamping the drift in both directions without rescaling, as the first version
+    did, silently multiplies whatever had accumulated by `2**drift`.  That is what put the synthesis
+    step at 7.08e-04 against the shipped route at Nside 1024 while the identical march gives
+    1.46e-07 in analysis (`.qwen/tmp/march_knob_1024.log`): analysis reduces over theta, so a lane
+    whose residue got relabelled is diluted, while synthesis emits that lane as a pixel.
+    """
+    aex = jnp.where(at0, tex, aex)
+    lift = jnp.maximum(tex - aex - 90, 0).astype(jnp.int32)
+    aex = aex + lift
+    res = _pow2(-lift)
+    a_r, a_l, b_r, b_l = a_r * res, a_l * res, b_r * res, b_l * res
+    ds = _pow2((tex - aex).astype(jnp.int32))
+    nd, ndl = nd * ds, ndl * ds
+    pr, pl = _two_prod(nd, rh)
+    pl = _fma(nd, rl, pl)
+    pl = _fma(ndl, rh, pl)
+    pi, pli = _two_prod(nd, ih)
+    pli = _fma(nd, il, pli)
+    pli = _fma(ndl, ih, pli)
+    a_r, a_l = _add_pair(a_r, a_l, pr, pl)
+    b_r, b_l = _add_pair(b_r, b_l, pi, pli)
+    amax = jnp.maximum(jnp.abs(a_r), jnp.abs(b_r))
+    abig = amax > BHI
+    asmall = (amax < BLO) & (amax > 0)
+    amult = jnp.where(abig, jnp.float32(2.0 ** -JUMP),
+                      jnp.where(asmall, jnp.float32(2.0 ** JUMP), jnp.float32(1.0)))
+    aex = aex + jnp.where(abig, JUMP, jnp.where(asmall, -JUMP, 0)).astype(jnp.int32)
+    return a_r * amult, a_l * amult, b_r * amult, b_l * amult, aex
+
+
+def _kern_synth(manr, ex0r, xr, xlr, c1r, c0r, cbr, c1lr, c0lr, cblr,
+                lexdr, drh, drl, dih, dil, lexmr, mrh, mrl, mih, mil,
+                m0_ref, out_ref, *, L, ntheta, chunk):
+    """One (m-window row, theta tile): march the row once, sum it against both order signs.
+
+    The synthesis contraction is the transpose of the analysis sum, so it keeps a per-lane
+    accumulator over `ell` rather than reducing theta at every degree.  Positive and negative
+    orders need the *same* row: the negative side is ``R_m(pi - theta)``, and because the HEALPix
+    theta grid is symmetric (``theta[ntheta-1-i] == pi - theta[i]``) that is the same marched lane
+    read at the mirrored ring.  So one march feeds both accumulators and only the store index
+    differs -- before this the negative orders ran a second, identical march on a `-cos` geometry,
+    which is why synthesis cost 197.7 ms against analysis' 111.6 at Nside 1024.
+
+    Both accumulators are float32 (value, limb) pairs, not float64 ones: this GPU runs float64 at
+    1/64 rate, and an fp64 accumulator alone cost 793.9 ms for this step
+    (`.qwen/tmp/sht_vs_ducc_s29_ab2_1024_2.log`).  Output channel 0/1 is the direct (positive m)
+    sum, 2/3 the mirror (negative m) sum, which the caller stores at the reversed theta axis.
     """
     row = pl.program_id(0)
     tile = pl.program_id(1)
@@ -359,15 +413,8 @@ def _kern_synth(manr, ex0r, xr, xlr, c1r, c0r, cbr, c1lr, c0lr, cblr, lexr,
     beta = jnp.abs(mf - jnp.float32(SPIN))
     p1f = ((alpha + beta + 2.0) / 2.0) * xv + ((alpha - beta) / 2.0)
 
-    def add_pair(hh, lo, ph, pl):
-        """(hh, lo) += (ph, pl) for two compensated float32 pairs, result renormalised."""
-        sh, se = _two_sum(hh, ph)
-        sl = lo + (pl + se)
-        nh = sh + sl
-        return nh, sl - (nh - sh)
-
     def degree(ell, st):
-        ph, pl_, ch, cl, ex, ah_r, al_r, ah_i, al_i, aex = st
+        (ph, pl_, ch, cl, ex, adr, adl, adi, adli, aexd, amr, aml, ami, amli, aexm) = st
         c1 = jnp.broadcast_to(plt.load(c1r.at[row, ell]).astype(jnp.float32), xv.shape)
         c0 = jnp.broadcast_to(plt.load(c0r.at[row, ell]).astype(jnp.float32), xv.shape)
         cb = jnp.broadcast_to(plt.load(cbr.at[row, ell]).astype(jnp.float32), xv.shape)
@@ -402,53 +449,56 @@ def _kern_synth(manr, ex0r, xr, xlr, c1r, c0r, cbr, c1lr, c0lr, cblr, lexr,
         nxt = nxt * dmult
         nxtl = nxtl * dmult
 
-        # Bring the degree's value into the accumulator's block: the alignment is a power of two,
-        # so both the value and its limb scale exactly.
-        lex = jnp.broadcast_to(plt.load(lexr.at[row, ell]), xv.shape)
-        tex = jnp.where(valid, ex + lex, aex)
-        drift = tex - aex
-        aex = jnp.where(at0, tex,
-                        aex + jnp.where(drift > 90, drift - 90,
-                                        jnp.where(drift < -90, drift + 90, 0)))
-        ds = _pow2((tex - aex).astype(jnp.int32))
-        nd, ndl = nxt * ds, nxtl * ds
-        pr, pl = _two_prod(nd, jnp.broadcast_to(plt.load(chr_.at[row, ell]), xv.shape))
-        pl = _fma(nd, jnp.broadcast_to(plt.load(clr.at[row, ell]), xv.shape), pl)
-        pl = _fma(ndl, jnp.broadcast_to(plt.load(chr_.at[row, ell]), xv.shape), pl)
-        pi, pli = _two_prod(nd, jnp.broadcast_to(plt.load(cih.at[row, ell]), xv.shape))
-        pli = _fma(nd, jnp.broadcast_to(plt.load(cil.at[row, ell]), xv.shape), pli)
-        pli = _fma(ndl, jnp.broadcast_to(plt.load(cih.at[row, ell]), xv.shape), pli)
-        ah_r, al_r = add_pair(ah_r, al_r, pr, pl)
-        ah_i, al_i = add_pair(ah_i, al_i, pi, pli)
-        amax = jnp.maximum(jnp.abs(ah_r), jnp.abs(ah_i))
-        abig = amax > BHI
-        asmall = (amax < BLO) & (amax > 0)
-        amult = jnp.where(abig, jnp.float32(2.0 ** -JUMP),
-                          jnp.where(asmall, jnp.float32(2.0 ** JUMP), jnp.float32(1.0)))
-        aex = aex + jnp.where(abig, JUMP, jnp.where(asmall, -JUMP, 0)).astype(jnp.int32)
-        ah_r, al_r, ah_i, al_i = (ah_r * amult, al_r * amult, ah_i * amult, al_i * amult)
+        # Both sums consume the same marched value; only the coefficient set and the block
+        # exponent differ.  Pad lanes track their own accumulator so `EX_PAD` cannot poison it.
+        lex = jnp.broadcast_to(plt.load(lexdr.at[row, ell]), xv.shape)
+        tex = jnp.where(valid, ex + lex, aexd)
+        adr, adl, adi, adli, aexd = _accumulate(
+            nxt, nxtl, tex, aexd, at0,
+            jnp.broadcast_to(plt.load(drh.at[row, ell]), xv.shape),
+            jnp.broadcast_to(plt.load(drl.at[row, ell]), xv.shape),
+            jnp.broadcast_to(plt.load(dih.at[row, ell]), xv.shape),
+            jnp.broadcast_to(plt.load(dil.at[row, ell]), xv.shape),
+            adr, adl, adi, adli)
+        lexm = jnp.broadcast_to(plt.load(lexmr.at[row, ell]), xv.shape)
+        texm = jnp.where(valid, ex + lexm, aexm)
+        amr, aml, ami, amli, aexm = _accumulate(
+            nxt, nxtl, texm, aexm, at0,
+            jnp.broadcast_to(plt.load(mrh.at[row, ell]), xv.shape),
+            jnp.broadcast_to(plt.load(mrl.at[row, ell]), xv.shape),
+            jnp.broadcast_to(plt.load(mih.at[row, ell]), xv.shape),
+            jnp.broadcast_to(plt.load(mil.at[row, ell]), xv.shape),
+            amr, aml, ami, amli)
         return (jnp.where(valid, ch * dmult, jnp.float32(0.0)),
                 jnp.where(valid, cl * dmult, jnp.float32(0.0)), nxt, nxtl, ex,
-                ah_r, al_r, ah_i, al_i, aex)
+                adr, adl, adi, adli, aexd, amr, aml, ami, amli, aexm)
 
     zb = jnp.zeros_like(man)
-    (_, _, _, _, _, ah_r, al_r, ah_i, al_i, aex) = lax.fori_loop(
-        nstart, L, degree, (zb, zb, man, zb, ex, zb, zb, zb, zb, jnp.zeros(xv.shape, jnp.int32)))
-    sc = _pow2_f64(aex)
+    zi = jnp.zeros(xv.shape, jnp.int32)
+    (_, _, _, _, _, adr, adl, adi, adli, aexd,
+     amr, aml, ami, amli, aexm) = lax.fori_loop(
+        nstart, L, degree, (zb, zb, man, zb, ex, zb, zb, zb, zb, zi,
+                            zb, zb, zb, zb, zi))
+    sd = _pow2_f64(aexd)
+    sm_ = _pow2_f64(aexm)
+    # Two stores, not one 4-channel `stack`: Pallas lowers concatenate only in arity 2.
     plt.store(out_ref.at[row, tile, slice(0, chunk), slice(0, 2)],
-              jnp.stack([(ah_r.astype(jnp.float64) + al_r.astype(jnp.float64)) * sc,
-                         (ah_i.astype(jnp.float64) + al_i.astype(jnp.float64)) * sc], axis=-1))
+              jnp.stack([(adr.astype(jnp.float64) + adl.astype(jnp.float64)) * sd,
+                         (adi.astype(jnp.float64) + adli.astype(jnp.float64)) * sd], axis=-1))
+    plt.store(out_ref.at[row, tile, slice(0, chunk), slice(2, 4)],
+              jnp.stack([(amr.astype(jnp.float64) + aml.astype(jnp.float64)) * sm_,
+                         (ami.astype(jnp.float64) + amli.astype(jnp.float64)) * sm_], axis=-1))
 
 
 def _call_synth(L, ntheta, ntile, mb):
-    key = ("synth", int(L), int(ntheta), int(ntile), int(mb), _TILE, _WARPS)
+    key = ("synth", int(L), int(ntheta), int(ntile), int(mb), _ST, _SW)
     call = _CALLS.get(key)
     if call is None:
         call = jax.jit(pl.pallas_call(
-            partial(_kern_synth, L=L, ntheta=ntheta, chunk=_TILE),
-            out_shape=jax.ShapeDtypeStruct((mb, ntile, _TILE, 2), jnp.float64),
+            partial(_kern_synth, L=L, ntheta=ntheta, chunk=_ST),
+            out_shape=jax.ShapeDtypeStruct((mb, ntile, _ST, 4), jnp.float64),
             grid=(mb, ntile),
-            compiler_params=plt.CompilerParams(num_warps=_WARPS),
+            compiler_params=plt.CompilerParams(num_warps=_SW),
             name="gmaster_spin2_synth"))
         _CALLS[key] = call
     return call
@@ -462,6 +512,11 @@ def _synth_coeff(flm, m0, mb, L, *, mirror):
     half carries the slice's own ``(-1)**(ell + |spin|)``, which the delta probe
     (``.qwen/tmp/spin2_synth_negm_64.log``) shows is exactly the ``theta -> pi - theta`` factor the
     shipped synthesis applies to negative orders.
+
+    Split into a float32 high part plus limb: the contraction inside the kernel is float32
+    (float64 is 1/64-rate here), so the coefficient keeps its precision only as a pair -- a
+    float32 coefficient alone is re-spent at every degree of the same lane and its error grows
+    like L * 2**-24 (measured 5.9e-06 at Nside 32).
     """
     from gmaster import _spin_slice as ss
 
@@ -473,17 +528,13 @@ def _synth_coeff(flm, m0, mb, L, *, mirror):
     lgs = _log2_norm(m0, mb, L)                        # (mb, L) float64
     lex = jnp.floor(lgs)
     sc = jnp.exp2(lgs - lex) * ((-1.0) ** ms)[:, None]
-    # Split the float64 coefficient into a float32 high part plus limb.  The contraction inside the
-    # kernel is float32 (float64 is 1/64-rate here), so the coefficient keeps its precision only if
-    # it arrives as a pair -- a float32 coefficient alone is re-spent at every degree of the same
-    # lane and its error grows like L * 2**-24 (measured 5.9e-06 at Nside 32).
     out = []
     for part in (c.real.T * sc, c.imag.T * sc):
         hi = part.astype(jnp.float32)
         out.append(hi)
         out.append((part - hi.astype(jnp.float64)).astype(jnp.float32))
-    crh, clr, cih, cil = out
-    return crh, clr, cih, cil, lex.astype(jnp.int32)
+    drh, drl, dih, dil = out
+    return lex.astype(jnp.int32), drh, drl, dih, dil
 
 
 @partial(jax.jit, static_argnames=("L", "spin", "nside"))
@@ -494,32 +545,32 @@ def _inverse_impl(flm, *, L, spin, nside):
     theta = (jnp.asarray(s2_samples.thetas(L, "healpix", nside), dtype=jnp.float64)
              + 8 * jnp.finfo(jnp.float64).eps)
     ntheta = theta.shape[0]
-    ntile = -(-ntheta // _TILE)
-    npad = ntile * _TILE
+    ntile = -(-ntheta // _ST)
+    npad = ntile * _ST
     x = jnp.cos(theta)
     sh, ch = jnp.sin(theta / 2.0), jnp.cos(theta / 2.0)
     out = jnp.zeros((ntheta, 2 * L), dtype=jnp.complex128)
     for (m0, m1, lo) in ss._windows(L):
         mb = m1 - m0
         g = _window_geometry(m0, mb, x, sh, ch, L, npad)
-        crh, clr, cih, cil, lex = _synth_coeff(flm, m0, mb, L, mirror=False)
-        v = _call_synth(L, ntheta, ntile, mb)(
-            *g[:10], lex, crh, clr, cih, cil, jnp.asarray([m0], jnp.int32))
-        v = v.reshape(mb, npad, 2)[:, :ntheta]
+        dc = _synth_coeff(flm, m0, mb, L, mirror=False)
+        mc = _synth_coeff(flm, m0, mb, L, mirror=True)
+        if m0 == 0:
+            # m = 0 is its own mirror and has no negative column, so its mirror accumulator is
+            # simply never fed; every other row of this window is a genuine negative order.
+            keep = (jnp.arange(mb) != 0)[:, None]
+            mc = tuple(jnp.where(keep, a, jnp.zeros_like(a)) for a in mc)
+        v = _call_synth(L, ntheta, ntile, mb)(*g[:10], *dc, *mc,
+                                              jnp.asarray([m0], jnp.int32))
+        v = v.reshape(mb, npad, 4)[:, :ntheta]
         out = out.at[:, L + m0:L + m1].set(v[:, :, 0].T + 1j * v[:, :, 1].T)
-        # Negative orders ride the same row on the pi - theta grid, which is the same geometry with
-        # cos -> -cos and the half-angle sines and cosines swapped.  m = 0 has no separate negative
-        # column: it is its own mirror and lands on `L` alone.
+        # `R_m(pi - theta_i)` is the marched lane at the mirrored ring, so the mirror accumulator
+        # lands at the reversed theta axis; its rows are descending orders by the column layout.
         n0 = max(int(m0), 1)
         if n0 < m1:
-            nb = m1 - n0
-            gm = _window_geometry(n0, nb, -x, ch, sh, L, npad)
-            crh, clr, cih, cil, lexm = _synth_coeff(flm, n0, nb, L, mirror=True)
-            vm = _call_synth(L, ntheta, ntile, nb)(
-                *gm[:10], lexm, crh, clr, cih, cil, jnp.asarray([n0], jnp.int32))
-            vm = vm.reshape(nb, npad, 2)[:, :ntheta]
-            val = (vm[:, :, 0].T + 1j * vm[:, :, 1].T)[:, ::-1]   # ascending column = descending m
-            out = out.at[:, L - m1 + 1:L - n0 + 1].set(val)
+            re = v[n0 - m0:, :, 2][::-1, ::-1].T
+            im = v[n0 - m0:, :, 3][::-1, ::-1].T
+            out = out.at[:, L - m1 + 1:L - n0 + 1].set(re + 1j * im)
     return out
 
 
