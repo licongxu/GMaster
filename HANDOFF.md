@@ -4099,6 +4099,168 @@ Pallas gotchas this window, each of which cost a run:
   read as "timed out" and one as "the compensated kernel takes 5 min to compile" before `grep
   "f32ds +[0-9]"` showed they had all run fine. Match on the value, not the padded label.
 
+## Session 22 (2026-09-06): the march becomes a default, and the polar lane survives every arithmetic fix
+
+**The shipped change (`92e97e0`).** `march_requested` used to be an env-var test with no geometry, so
+the table-free march was reachable *only* when someone typed `GMASTER_SPIN2_MARCH=1`, and the shipped
+default at every Nside whose Wigner-d slice is declined fell through to the generic scatter loop. It
+now takes `L` and `nside` and, with no flag set, picks the march exactly where `slice_declined` says
+no slice can exist — the test is on the cheapest layout that can ever exist, a float32 single-layout
+triangle, which is 2.44 GiB at Nside 256, 18.74 GiB at 512, **146.96 GiB at 1024** and 1163.86 GiB at
+2048 against `_SLAB_BUDGET` = 56 GiB. One cell moves: spin-2 `map2alm` at Nside ≥ 1024 goes
+**13 255.1 ms → 108.0 ms**, i.e. **0.01x → 1.00x** against ducc0's 107.8 ms, with `rel alm`
+3.7e-05 instead of the scatter loop's 4.0e-07. `GMASTER_SPIN2_MARCH=0` restores the exact route at
+any size.
+
+**Why the flag was not simply turned on everywhere:** where a slice *does* exist the table route is
+~2.5x faster than the march — Nside 512 spin-2 `map2alm` is 9.4 ms on tables against 24.0 ms marched
+(`.qwen/tmp/twosum_check.log` section 4). The default is therefore "march only where there is nothing
+else", not "march everywhere".
+
+**The default-route matrix, one geometry per process, nothing set in the environment**
+(`.qwen/tmp/score_matrix_fresh.log`, `GM_PREC=fp32`, GPU1, ducc0 0.39.1 on the same box, controls
+1279–1446 GB/s, driver `.qwen/tmp/score_matrix.sh`):
+
+```text
+ nside spin      dir    DUCC ms  GMaster ms GPU speedup    rel alm
+    64    0  map2alm        0.4         0.3       1.64x 2.1e-07
+    64    0  alm2map        0.3         0.2       1.44x
+    64    2  map2alm        0.6         2.1       0.26x 2.7e-07
+    64    2  alm2map        0.8         0.4       1.73x
+   128    0  map2alm        0.8         1.2       0.67x 2.8e-07
+   128    0  alm2map        0.7         0.7       0.94x
+   128    2  map2alm        1.3         2.3       0.57x 3.5e-07
+   128    2  alm2map        1.0         0.6       1.61x
+   256    0  map2alm        2.3         1.1       2.00x 2.7e-07
+   256    0  alm2map        1.6         1.3       1.20x
+   256    2  map2alm        4.7         2.2       2.10x 3.2e-07
+   256    2  alm2map        3.1         1.6       1.95x
+   512    0  map2alm       15.5         4.5       3.48x 3.7e-07
+   512    0  alm2map       11.9         5.1       2.36x
+   512    2  map2alm       27.4         9.1       3.02x 3.2e-07
+   512    2  alm2map       22.8         8.4       2.71x
+  1024    0  map2alm       57.6        28.2       2.04x 3.6e-07
+  1024    0  alm2map       51.6        30.8       1.67x
+  1024    2  map2alm      107.8       108.0       1.00x 3.7e-05
+  1024    2  alm2map       96.5     13207.5       0.01x
+```
+
+Two new holes this is the first log to put side by side: **Nside 64–128 loses on analysis** (0.26x,
+0.57x for spin 2; 0.67x for spin 0 at 128) where a ~2 ms fixed cost meets a 0.6 ms ducc0 call, and
+**Nside 1024 spin-2 synthesis is the last sub-1x cell above the launch floor**. Everything from 256
+up wins except that one cell.
+
+**The exact 2Sum is right and buys nothing measurable (`779ae1b`).** The march took the residual of
+`th - uh` from the fast form `(th - nxt) - uh`. Over 8192 lanes on the GPU that form is off from the
+exact difference by max rel **5.845e-08 with |b| < |a|** — where its precondition *is* satisfied — and
+**5.956e-08 / rms 2.043e-08 with |b| > |a|**, while the branch-free six-operation `_two_sum` returns
+**0.000e+00** in both orderings (`.qwen/tmp/twosum_order_probe.log`). Same mechanism the module
+already documents for products: `a - b - c` is contractible by the compiler, `s - bb` is not. Both
+kernels now use `_two_sum`. **The polar row error is unchanged**: `ell=1528` in the pole-most lane
+reads 2.47e-04 before and after, and re-running the lane dump at Nside 256 with the file stashed
+(`.qwen/tmp/polar_lane_256_fast2sum.log` against `.qwen/tmp/polar_lane_256_2sum.log`) gives
+**bit-identical errors in 28 of 30** (m, ring, ell) cells; the two that move are equator lanes at
+0.25–0.31x of their old error. Keep the fix — a limb that enters the state one rounding off is a bug
+regardless — but stop treating it as the polar cure.
+
+**The lane dump itself is the useful instrument.** `.qwen/tmp/polar_lane_dump.py <nside>` feeds
+`_forward_impl` an `ftm` that is a Kronecker delta at one theta ring, so output column `L-1+m` *is*
+the kernel's `d^l_(m,-2)(theta_ring)` and the growth law per lane is directly readable against 60-digit
+mpmath. It needs `jax_enable_x64=True` (the output refs are float64; a float32 store raises
+`Invalid dtype for swap: Ref dtype: float64. Value dtype: float32`). At Nside 256 the error at
+`ell=760` is 1.3e-07 at the equator, 8e-06 thirty-three rings off the south pole, 6.5e-05 at either
+pole for m=0, and 1.3e-03 for m=2, whose row crosses zero there. North and south lanes of the same m
+agree to the digit and the growth is flat-to-sublinear in ell — this is conditioning at
+|cos theta| → 1, not a one-sided blow-up.
+
+**The seed is innocent too.** A float32-rounded seed is amplified by only **0.1–0.4 ulp** across the
+whole band at every theta including the poles (`.qwen/tmp/seed_amp_probe.log`), which is the mechanism
+behind the old observation that pairing the seeds changed nothing.
+
+**A claim is deleted, not softened.** `8e4ddf5` recorded that "zeroing the recurrence-coefficient
+limbs inside the kernel makes it 23x worse (2.47e-04 → 5.62e-03)". `.qwen/tmp/spin2_limb_probe.py`
+still carries the slot map of the *13-slot* geometry tuple that had `mant_l`; the current
+`_window_geometry` returns 12 slots, so its `IDX = {"coef": (8,9,10), "x": (4,)}` zeroes
+`a0l/bhl/lgs` and `a1h` — including `lgs`, which is not a limb at all. The 23x measured nothing. Any
+future ablation must use coef = (7,8,9), x = (3,), and must never touch slot 10.
+
+**Two probe traps, both re-learned this window.** (1) `XLA_PYTHON_CLIENT_PREALLOCATE=false` does not
+just shrink the pool, it *changes the route*: with the pool at 0.5 GiB the band build fails, the
+negative cache routes to the scatter loop, and Nside 512 spin-2 read **1287.3 / 1160.2 ms (0.02x)**
+against the shipped 9.4 / 8.5 ms. Any perf number measured under that setting is a fallback
+measurement. (2) A sweep that loops several geometries inside one process still OOM-thrashes the last
+one even after the earlier fix in this file — the `score_all_default_all.log` run took 1024 spin 0 as
+122.8 / 161.0 ms with `Allocator (GPU_0_bfc) ran out of memory` in the log, against **28.2 / 30.8 ms**
+with one geometry per process. `.qwen/tmp/score_matrix.sh` is now the driver that enforces it.
+
+**What is left, in order of size.** Spin-2 `alm2map` at Nside ≥ 1024 is 13.2 s (0.01x): the synthesis
+march exists and runs 121.8 ms (0.89x, so not a win even when it works) but its pole-most lane is
+2.47e-04 off the row value, which reaches an `alm2map` pixel as **rel 9.99e-01 at the map's own
+maximum**, rms 2.40e-03 (`.qwen/tmp/synth_map_acc.log`), so it stays behind
+`GMASTER_SPIN2_MARCH_SYNTH=1`. The three arithmetic suspects are now all measured and eliminated —
+seed, primitives, subtraction residual — and the accumulator limb provably never reaches the output,
+because `_accumulate` closes with `(adr + adl)` in float64 and a renormalised pair sums exactly. What
+is left is the recurrence's own conditioning near |cos theta| = 1 in a float32 pair, which the fp64
+march of the same recurrence says is 7.5e-13, i.e. roughly 30 of the ~48 bits the pair is supposed to
+carry. Suite across all of it: **141 passed, 3 skipped** (`.qwen/tmp/pytest_s22c.log`).
+
+**Which calls the seams actually own (`route_probe.py`, a fact this file did not have).** Counting
+calls into `forward_latitudinal`/`inverse_latitudinal` from the shipped E/B entry points at Nside 512
+returns **zero**, with `GMASTER_SPIN2_MARCH=1` set or unset (`.qwen/tmp/route_probe_512.log`). The
+reason is `_use_pallas_sht`: spin ≠ 0 never takes the fused-Pallas branch, and for spin 2 the
+non-Pallas branch first asks `_spin_slabs`, which returns the slab pair whenever `slabs_for` accepts
+the geometry and only then falls through to the generic path whose latitudinal step is
+`utils._forward_latitudinal` / `utils._inverse_latitudinal`. So **the seams are reached exactly when
+the slice is declined** — the same condition `slice_declined` tests, which is why the new default and
+the seam agree by construction rather than by coincidence. Practical consequence: the Nside 512 and
+below spin-2 cells (3.02x / 2.71x) are the slab contraction's, not the march's, and the "marched 512"
+figure of 24.0 ms in `.qwen/tmp/twosum_check.log` was produced by *declining the table route*, not by
+the flag. Any future spin-2 route policy has to be written against `slabs_for`, not against the
+environment.
+
+Slab-streaming the Wigner-d slice (build one m-slab, contract, discard) is not the answer either, and
+the arithmetic is worth recording so nobody re-derives it: at Nside 1024 building both layouts costs
+~1.7 s against the contraction's 0.8 s, so a streamed slice would land near 2.5 s/pass against the
+march's 108 ms. The march wins at exactly the sizes where the table cannot be resident because it
+skips the build, and it loses at the sizes where the table can be resident because the fused kernel
+only reads.
+
+**The synthesis march's map error is not the polar lane, and not arithmetic (`synth_map_err.py`,
+`synth_delta_row.py`).** The number that has been quoted for this route — rel 9.99e-01 at one pixel,
+rms 2.40e-03 — is a Nside 512 measurement of a route that cannot even be reached there. Run at Nside
+1024, where the seam is live, marched synthesis against the exact route in one process gives
+
+```
+max|ref| 3.2482e+02   rms(ref) 5.3147e-01
+||d||_inf / max|ref|  = 9.964e-01
+||d||_2   / ||ref||_2 = 9.302e-01
+worst pixel 3 (phi 5.4978) at theta 0.000797 rad (cos +1.000000): |ref| 3.240e+02, |d| 3.237e+02
+```
+
+(`.qwen/tmp/synth_map_err_1024.log`). An rms ratio of 0.93 means the marched map carries as much
+power as the reference: it is a different map, not a degraded one. That reframes the blocker
+completely — there is no 1e-3 defect to compensate, there is a structural disagreement, and the
+"improve the polar lane" reading of the previous paragraph is wrong.
+
+`.qwen/tmp/synth_delta_row.py <nside>` then tests the kernel alone: one nonzero `flm[ell, L-1+m]`,
+the marched column `L+m` against the exact route's, at five `(ell, m)` per size. The rows are **fine**
+— Nside 256 worst `max rel` 3.53e-05, Nside 1024 worst 1.43e-03 (at `ell=3064, m=2`, the pole lane),
+with `frac>1e-3` at 0.0000–0.0002 of the theta lanes and no leakage into neighbouring columns
+(`.qwen/tmp/synth_delta_256.log`, `.qwen/tmp/synth_delta_1024.log`). Half a percent of one lane at
+1.4e-03 cannot produce a 9.3e-01 rms map difference, so the defect is in the part a positive-order
+delta does not touch. The candidate that is both untested and large enough is the **negative-order
+half**, which the march produces by mirroring (`(-1)^(ell+|s|) d^l_|m|,-2(pi - theta)`) instead of
+from the marched lane; a general `alm` puts about half its power there.
+`.qwen/tmp/synth_negm_delta.py <nside>` is written for exactly that (delta at `L-1-m`, compare column
+`L-m`, with a wrong sign appearing as `S/E = -1` far from any pole where nothing else is marginal).
+
+Probe hygiene notes: the march's output refs are float64, so these probes need
+`jax_enable_x64=True` — with x64 off the store raises `Invalid dtype for swap: Ref dtype: float64.
+Value dtype: float32`, which looks like a kernel bug and is not one. And `complex64` `flm` is
+rejected by the exact route at both sizes (`Cannot lower jaxpr with verifier errors: type of return
+operand 0 ... complex<f64>`), so the probe has to fall back to complex128 input; that is the exact
+route's constraint, not the march's.
+
 
 
 
