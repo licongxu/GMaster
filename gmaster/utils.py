@@ -21,6 +21,7 @@ from ._sht_dfp32 import scalar_forward_latitudinal_dfp32
 from ._theta_matrix import band_bytes as _theta_band_bytes
 from ._theta_matrix import inverse_latitudinal as _theta_matrix_inverse_latitudinal
 from ._theta_matrix import positive_latitudinal as _theta_matrix_latitudinal
+from . import _spin_march_pallas as _spin_march
 from . import _spin_slice
 
 
@@ -528,6 +529,11 @@ def _forward_s2fft_ftm(maps, tables, *, L, nside, reality):
 
 
 def _forward_latitudinal(ftm, *, L, spin, nside, reality, L_lower):
+    if not reality and _spin_march.march_requested(spin):
+        # `GMASTER_SPIN2_MARCH=1`: march the Wigner-d row inside the kernel instead of building the
+        # 73.48 GiB slice that `slabs_for` declines at Nside 1024, or the 13.27 s generic loop that
+        # replaces it.  See gmaster/_spin_march_pallas.py.
+        return _spin_march.forward_latitudinal(ftm, L=L, spin=spin, nside=nside)
     return _ftm_flm_primitive.ftm_to_flm(
         ftm,
         _stable_thetas(L, nside),

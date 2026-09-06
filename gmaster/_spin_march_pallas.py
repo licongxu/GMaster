@@ -1,0 +1,301 @@
+"""Table-free spin-2 latitudinal step: the Wigner-d row is marched, not stored.
+
+Why this exists.  At Nside 1024 the polar Wigner-d slice is 73.48 GiB (`triangle_bytes`),
+`slabs_for` declines it against the 56 GiB budget, and the pipeline pays a 13.27 s/pass generic
+loop while ducc0 does the *whole* spin-2 forward transform in 115 ms (HANDOFF, session 21).
+Generating the row instead of storing it removes the table: one Pallas program owns one
+(m-window row, theta-tile) pair, marches `ell` in registers, and contracts into the four real
+polarised channels inside the same loop -- so the table route's 1:4 load-to-arithmetic ratio
+becomes 1:4 FMA and the right-hand side is read once per degree instead of once per table entry.
+
+The closed form (fit against `_spin_slice._build`, which is itself validated end to end against
+pymaster; `.qwen/tmp/spin2_lowrow_fit.py`):
+
+    d^l_{m,-s}(theta) = (-1)^m 2^(eps_m LG2N) (sin t/2)^alpha (cos t/2)^beta P^{(a,b)}_n(cos t)
+    alpha = m + s,  beta = |m - s|,  n = l - max(m, s),
+    LG2N = log2 sqrt((l+m)!(l-m)! / ((l-s)!(l+s)!)),  eps_m = -1 for m < s else +1.
+
+`n` counts from `max(m, s)`, not `m`: a row below the spin starts its polynomial at ell = s.  And
+DLMF 14.9.16's `(cos t/2)^(m1+m2)` admits the (m, -s) substitution only for m >= s; below the spin
+the pair-swapped branch inverts the factorial ratio, which is the `eps_m` flip.  Measured against
+the shipped slice, missing them costs rel 1.0 on row m=0 and 2.6e-02 on m=1 (`eps_m` recovers
+5.4e-12 and 5.2e-12), while every row m >= s is unaffected -- so a march that skips this is quietly
+wrong in exactly the two rows nothing else checks.
+
+Numerics.  The march carries a float32 (value, limb) pair per theta lane and renormalises each lane
+against a 2^+-24 band every degree; the products go through inline PTX because XLA has no float32
+FMA here and `add(neg(mul(a,b)), mul(a,b))` folds to exactly zero residuals inside Pallas.  Both
+compensations are needed -- coefficient limbs alone give 1.04e-05, state limbs alone the same,
+together 5.73e-08 at Nside 256 and 1.21e-07 at 1024 against an fp64 march of the same shape
+(`.qwen/tmp/spin2_lowrow_cert_256.log`, `spin2_lowrow_cert_1024.log`).  Tile partials leave in
+float64 and are summed across tiles, the same discipline as `_spin_slice._reduce_channels`.
+
+Everything the kernel reads is computed inside the trace from `cos(theta)` and static (L, nside):
+no table is materialised on the host, on the device between calls, or in the module.  Selected by
+`GMASTER_SPIN2_MARCH=1` at the seam in :func:`gmaster.utils._forward_latitudinal`; off by default,
+and any spin other than +2 (or a non-NVIDIA device) keeps the shipped route.
+"""
+from __future__ import annotations
+
+import os
+from functools import partial
+
+import jax
+import jax.numpy as jnp
+import numpy as np
+from jax import lax
+from jax.experimental import pallas as pl
+from jax.experimental.pallas import triton as plt
+from jax.scipy.special import gammaln
+from s2fft.sampling import s2_samples
+
+SPIN = 2
+NC = 4                       # direct re/im, mirror re/im -- the same split as `_rhs_forward`
+BLO, BHI, JUMP = 2.0 ** -24, 2.0 ** 24, 24
+EX_PAD = -(10 ** 7)          # pad theta lanes: never win `emax`, never flush the real lanes
+_TILE = int(os.environ.get("GMASTER_SPIN2_MARCH_TILE", "256"))
+_WARPS = int(os.environ.get("GMASTER_SPIN2_MARCH_WARPS", "1"))
+
+_CALLS: dict = {}
+
+
+def march_requested(spin) -> bool:
+    """True when the caller asked for the march and this build/spin can serve it."""
+    return (int(spin) == SPIN and os.environ.get("GMASTER_SPIN2_MARCH", "0") == "1"
+            and any(d.platform == "gpu" and "NVIDIA" in d.device_kind.upper()
+                    for d in jax.devices()))
+
+
+# --------------------------------------------------------------------------------------- kernel
+def _two_prod(a, b):
+    """(a*b, exact residual): the only exact-FMA pair available under this XLA/Pallas stack."""
+    return plt.elementwise_inline_asm(
+        "mul.rn.f32 $0, $2, $3; neg.f32 $1, $0; fma.rn.f32 $1, $2, $3, $1;",
+        args=[a, b], constraints="=r,=r,r,r", pack=1,
+        result_shape_dtypes=[jax.ShapeDtypeStruct(a.shape, jnp.float32),
+                             jax.ShapeDtypeStruct(a.shape, jnp.float32)])
+
+
+def _fma(a, b, c):
+    # One output + three inputs = operands $0..$3 (numbering covers outputs; $4 does not exist).
+    return plt.elementwise_inline_asm("fma.rn.f32 $0, $1, $2, $3;", args=[a, b, c],
+                                      constraints="=r,r,r,r", pack=1,
+                                      result_shape_dtypes=[
+                                          jax.ShapeDtypeStruct(a.shape, jnp.float32)])[0]
+
+
+def _two_sum(a, b):
+    s = a + b
+    bb = s - a
+    return s, (a - (s - bb)) + (b - bb)
+
+
+def _pow2(d):
+    """2**d for an integer block, assembled from the exponent field; `lax.exp2` is inexact on
+    integer exponents (measured 1.3e-07) and this rescale has to be exact."""
+    biased = jnp.clip(d + 127, 1, 254)
+    return jnp.where(d >= -126, jax.lax.bitcast_convert_type(biased << 23, jnp.float32),
+                     jnp.float32(0.0))
+
+
+def _kern(manr, ex0r, xr, xlr, c1r, c0r, cbr, c1lr, c0lr, cblr, lgnr, sgnr, rr, m0_ref, out_ref,
+          *, L, ntheta, chunk):
+    row = pl.program_id(0)
+    tile = pl.program_id(1)
+    m = plt.load(m0_ref.at[0]) + row
+    nstart = jnp.maximum(m, SPIN)         # a row below the spin starts its polynomial at ell=spin
+    t = tile * chunk + jnp.arange(chunk)
+    valid = t < ntheta
+
+    man = plt.load(manr.at[row, t], mask=valid, other=0.0)
+    ex0 = plt.load(ex0r.at[row, t])
+    ex = ex0
+    xv = plt.load(xr.at[t], mask=valid, other=0.0)
+    xl = plt.load(xlr.at[t], mask=valid, other=0.0)
+    r = plt.load(rr.at[row, t, slice(0, NC)])
+    mf = m.astype(jnp.float32)
+    # P_1^(alpha,beta) = ((alpha+beta+2)/2) cos t + (alpha-beta)/2.  Not `m*cos t + 2`: that seed
+    # leaves every ell >= m+1 a few percent off, growing with ell.
+    alpha = mf + jnp.float32(SPIN)
+    beta = jnp.abs(mf - jnp.float32(SPIN))
+    p1f = ((alpha + beta + 2.0) / 2.0) * xv + ((alpha - beta) / 2.0)
+    sgn = plt.load(sgnr.at[row]).astype(jnp.float64)
+
+    def emit(cur, ex, ell):
+        # One reduction for all four channels: `cur[:, None] * r` is a (chunk, NC) block, so theta
+        # folds through a single Triton tree and the channels share its latency instead of running
+        # four dependent ones; the partial leaves as one (NC,) float64 store.
+        emax = jnp.max(ex)
+        val = cur * _pow2((ex - emax).astype(jnp.int32))
+        sc = jnp.exp2(emax.astype(jnp.float64) + plt.load(lgnr.at[row, ell]).astype(jnp.float64))
+        parts = jnp.sum(val[:, None] * r, axis=0) * (sc * sgn)
+        plt.store(out_ref.at[row, tile, ell, slice(0, NC)], parts.astype(jnp.float64))
+
+    def degree(ell, st):
+        ph, pl_, ch, cl, ex = st
+        c1 = jnp.broadcast_to(plt.load(c1r.at[row, ell]).astype(jnp.float32), xv.shape)
+        c0 = jnp.broadcast_to(plt.load(c0r.at[row, ell]).astype(jnp.float32), xv.shape)
+        cb = jnp.broadcast_to(plt.load(cbr.at[row, ell]).astype(jnp.float32), xv.shape)
+        # (c1*x + c0) to ~2^-48: the product's own residual, cos's limb, the coefficient limb.
+        ah, al = _two_prod(c1, xv)
+        al = _fma(c1, xl, al)
+        al = _fma(jnp.broadcast_to(plt.load(c1lr.at[row, ell]), xv.shape), xv, al)
+        ah, e2 = _two_sum(ah, c0)
+        al = al + jnp.broadcast_to(plt.load(c0lr.at[row, ell]), xv.shape) + e2
+        th, tl = _two_prod(ah, ch)
+        tl = _fma(ah, cl, tl)
+        tl = _fma(al, ch, tl)
+        uh, ul = _two_prod(cb, ph)
+        ul = _fma(cb, pl_, ul)
+        ul = _fma(jnp.broadcast_to(plt.load(cblr.at[row, ell]), xv.shape), ph, ul)
+        nxt = th - uh
+        nxtl = (tl - ul) + ((th - nxt) - uh)
+        hh = nxt + nxtl                       # keep |nxtl| < |nxt| so the limb stays a limb
+        nxtl = nxtl - (hh - nxt)
+        nxt = hh
+        at0 = ell == nstart
+        nxt = jnp.where(at0, man, jnp.where(ell == nstart + 1, man * p1f, nxt))
+        nxtl = jnp.where(at0 | (ell == nstart + 1), jnp.float32(0.0), nxtl)
+        ex = jnp.where(at0, ex0, ex)
+        nxt = jnp.where(valid, nxt, jnp.float32(0.0))
+        nxtl = jnp.where(valid, nxtl, jnp.float32(0.0))
+        big = jnp.maximum(jnp.abs(nxt), jnp.abs(ch))
+        large = big > BHI
+        small = (big < BLO) & (big > 0)
+        mult = jnp.where(large, jnp.float32(2.0 ** -JUMP),
+                         jnp.where(small, jnp.float32(2.0 ** JUMP), jnp.float32(1.0)))
+        ex = ex + jnp.where(large, JUMP, jnp.where(small, -JUMP, 0)).astype(jnp.int32)
+        nxt = nxt * mult
+        nxtl = nxtl * mult
+        emit(nxt, ex, ell)
+        return (jnp.where(valid, ch * mult, jnp.float32(0.0)),
+                jnp.where(valid, cl * mult, jnp.float32(0.0)), nxt, nxtl, ex)
+
+    zb = jnp.zeros_like(man)
+    lax.fori_loop(nstart, L, degree, (zb, zb, man, zb, ex))
+
+
+def _call(L, ntheta, ntile, mb):
+    key = (int(L), int(ntheta), int(ntile), int(mb), _TILE, _WARPS)
+    call = _CALLS.get(key)
+    if call is None:
+        call = jax.jit(pl.pallas_call(
+            partial(_kern, L=L, ntheta=ntheta, chunk=_TILE),
+            out_shape=jax.ShapeDtypeStruct((mb, ntile, L, NC), jnp.float64),
+            grid=(mb, ntile),
+            compiler_params=plt.CompilerParams(num_warps=_WARPS),
+            name="gmaster_spin2_march"))
+        _CALLS[key] = call
+    return call
+
+
+# --------------------------------------------------------------------------------- geometry, in
+def _window_geometry(m0, mb, x, sh, ch, L, npad):
+    """March coefficients and half-angle weights for one m-window, computed inside the trace.
+
+    Returned float32 (high, low) so the kernel reads exactly the bits it multiplies: the limbs are
+    the part the storage width throws away, and the arm needs both to hold 1e-7 at Nside 1024.
+    Theta-axis arrays are padded to a whole tile here, with the pad lanes' exponent pinned to
+    `EX_PAD` -- a zero there would win `emax` against real lanes near 2^-1400 and flush them.
+    """
+    ms = m0 + jnp.arange(mb, dtype=jnp.float64)
+    m_ = ms[:, None]
+    ell_ = jnp.arange(L, dtype=jnp.float64)[None, :]
+    alpha = m_ + SPIN
+    beta = jnp.abs(m_ - SPIN)
+    ns = jnp.maximum(m_, SPIN)
+    n_ = jnp.where(ell_ >= ns, ell_ - ns, 0.0)
+    s_ = 2.0 * n_ + alpha + beta
+    den = jnp.where(n_ >= 2, 2.0 * n_ * (n_ + alpha + beta) * (s_ - 2.0), 1.0)
+    a1 = (s_ - 1.0) * s_ * (s_ - 2.0) / den
+    a0 = (s_ - 1.0) * (4.0 * m_ * SPIN) / den
+    bb = 2.0 * (n_ + alpha - 1.0) * (n_ + beta - 1.0) * s_ / den
+    log2s = alpha * jnp.log2(sh)[None, :] + beta * jnp.log2(ch)[None, :]
+    ex0 = jnp.floor(log2s)
+    mant = jnp.exp2(log2s - ex0)
+    lg2n = 0.5 * (gammaln(ell_ + m_ + 1) + gammaln(ell_ - m_ + 1)
+                  - gammaln(ell_ - SPIN + 1) - gammaln(ell_ + SPIN + 1)) / np.log(2.0)
+    # The pair-swapped branch inverts the factorial ratio below the spin (module docstring).
+    lgs = lg2n * jnp.where(ms >= SPIN, 1.0, -1.0)[:, None]
+    sgn = (-1.0) ** ms
+
+    def hi_lo(a):
+        h = a.astype(jnp.float32)
+        return h, (a - h.astype(jnp.float64)).astype(jnp.float32)
+
+    def pad(a, fill=0.0):
+        if a.shape[-1] == npad:
+            return a
+        return jnp.full(a.shape[:-1] + (npad,), fill, dtype=a.dtype).at[..., :a.shape[-1]].set(a)
+
+    a1h, a1l = hi_lo(a1)
+    a0h, a0l = hi_lo(a0)
+    bhh, bhl = hi_lo(bb)
+    xh, xl = hi_lo(x)
+    return (pad(mant.astype(jnp.float32)), pad(ex0.astype(jnp.int32), EX_PAD),
+            pad(xh), pad(xl),
+            a1h, a0h, bhh, a1l, a0l, bhl, lgs, sgn.astype(jnp.float64))
+
+
+# --------------------------------------------------------------------------------------- driver
+@partial(jax.jit, static_argnames=("L", "spin", "nside"))
+def _forward_impl(ftm, *, L, spin, nside):
+    from gmaster import _spin_slice as ss
+
+    ftm = jnp.asarray(ftm)
+    theta = (jnp.asarray(s2_samples.thetas(L, "healpix", nside), dtype=jnp.float64)
+             + 8 * jnp.finfo(jnp.float64).eps)      # the same grid `utils._stable_thetas` gives
+    ntheta = theta.shape[0]
+    ntile = -(-ntheta // _TILE)
+    npad = ntile * _TILE
+    x = jnp.cos(theta)
+    sh, ch = jnp.sin(theta / 2.0), jnp.cos(theta / 2.0)
+    off = L - 1
+    rev = ftm[::-1]                                  # ring i of rev is the ring at pi - theta_i
+    sign = ss._sign(L, SPIN)
+    ell = jnp.arange(L)[:, None]
+    out = jnp.zeros((L, 2 * L - 1), dtype=jnp.complex128)
+    for (m0, m1, lo) in ss._windows(L):
+        mb = m1 - m0
+        g = _window_geometry(m0, mb, x, sh, ch, L, npad)
+        direct = ftm[:, L + m0:L + m1]
+        mirror = rev[:, L - m1 + 1:L - m0 + 1][:, ::-1]
+        chan = jnp.stack([direct.real.T, direct.imag.T, mirror.real.T, mirror.imag.T], axis=-1)
+        rhs = jnp.zeros((mb, npad, NC), dtype=jnp.float32).at[:, :ntheta].set(
+            lax.convert_element_type(chan, jnp.float32))
+        parts = _call(L, ntheta, ntile, mb)(*g, rhs, jnp.asarray([m0], jnp.int32)).sum(1)
+        parts = parts.transpose(1, 0, 2)             # (m, ell, channel) -> (ell, m, channel)
+        # Each row starts emitting at ell = max(m, spin) and never writes below it, so whatever the
+        # allocator handed back under that has to be zeroed before it reaches the assembly.
+        acc = jnp.where(
+            (ell >= jnp.maximum(jnp.arange(mb)[None, :] + m0, SPIN))[..., None], parts, 0.0)
+        # `acc` is already (ell, m, channel); the shipped kernel returns (m, ell, channel) and
+        # transposes here, which is the only difference in this assembly.
+        out = out.at[lo:, off + m0:off + m1].set(acc[lo:, :, 0] + 1j * acc[lo:, :, 1])
+        mir = sign[lo:, None] * (acc[lo:, :, 2] + 1j * acc[lo:, :, 3])
+        if m0:
+            out = out.at[lo:, off - m1 + 1:off - m0 + 1].set(mir[:, ::-1])
+        else:
+            # Column off is the direct channel alone: m = 0 is its own mirror and does not
+            # satisfy the theta -> pi-theta relation.
+            out = out.at[lo:, off - m1 + 1:off].set(mir[:, 1:][:, ::-1])
+    return out
+
+
+def forward_latitudinal(ftm, *, L, spin, nside):
+    """Analysis latitudinal step with no Wigner-d table.
+
+    Same contract as :func:`gmaster._spin_slice.forward_latitudinal`: ``(L, 2L-1)`` complex with
+    ``flm[ell, L-1+m]``, negative orders through the pi-theta symmetry, zeros below
+    ``ell = max(|m|, spin)``.  The quadrature weight and ring phase shifts are already in ``ftm``
+    and the ``sqrt((2l+1)/4pi)`` / ``(-1)**|spin|`` factors come later in
+    ``_finish_forward_s2fft``; neither belongs here.
+    """
+    if int(spin) != SPIN:
+        raise ValueError(f"march route implements spin=+{SPIN}, got spin={spin}")
+    return _forward_impl(ftm, L=L, spin=spin, nside=nside)
+
+
+def clear_cache():
+    """Drop the compiled kernels (tests, or to free the device)."""
+    _CALLS.clear()
