@@ -56,7 +56,8 @@ cheaper than the scatter loop it replaces.  See :func:`slabs_for`.
 """
 
 import gc
-from functools import partial
+import os
+from functools import lru_cache, partial
 
 import jax
 import jax.numpy as jnp
@@ -66,6 +67,64 @@ from s2fft.recursions.price_mcewen import generate_precomputes_jax
 
 THETA_CONTIG = "theta_contig"  # (m, ell, theta) -- analysis reduces over theta
 ELL_CONTIG = "ell_contig"  # (m, theta, ell) -- synthesis reduces over ell
+
+# Which contraction the latitudinal step runs.  `pallas` reads the slice *once* and
+# holds the four real channels in register accumulators (`_spin_contract_pallas`);
+# `xla` keeps the multiply-and-reduce form, whose four channel products XLA walks
+# the block set with separately.  `pallas` is the default wherever
+# :func:`_kernel_contract` applies -- float32 tables on an NVIDIA GPU -- and within
+# that regime there is no silent fallback: the kernel is used or the call raises,
+# because a swallowed exception here is what made the session-18 band emitter look
+# green while every band came from the old builder.
+# `GMASTER_POLAR_CONTRACT=xla` (or `set_polar_contract("xla")`) is the supported way back.
+_CONTRACT = os.environ.get("GMASTER_POLAR_CONTRACT", "pallas").strip().lower()
+
+
+def set_polar_contract(name):
+    """Select the latitudinal contraction: ``"pallas"`` (default) or ``"xla"``."""
+    global _CONTRACT
+    name = name.strip().lower()
+    if name not in ("pallas", "xla"):
+        raise ValueError(
+            f"GMaster polar contraction must be 'pallas' or 'xla', got {name!r}")
+    previous, _CONTRACT = _CONTRACT, name
+    return previous
+
+
+def polar_contract():
+    """The configured polar contraction."""
+    return _CONTRACT
+
+
+@lru_cache(maxsize=1)
+def _pallas_ok():
+    return any(device.platform == "gpu" and "NVIDIA" in device.device_kind.upper()
+               for device in jax.devices())
+
+
+def _kernel_contract(slab, *, synthesis=False):
+    """Whether the fused Triton contraction should serve this block set.
+
+    Three conditions, all measured:
+
+    * **float32 storage.**  The kernel is a bandwidth design; with float64 tables the
+      products have to be float64, and Triton's float64 path on this card does not
+      reach XLA's -- 0.93 ms against 0.79 on analysis and 1.15 against 0.76 on
+      synthesis at Nside 128, 0.85x and 0.66x, control 1459 GB/s
+      (`.qwen/tmp/spin_contract_tune10_fp64.log`).  The default ``fp64`` configuration
+      therefore keeps the form it always used; the win belongs to
+      ``set_table_precision("fp32")``, like every other win in this project.
+    * **an NVIDIA GPU** (Triton), see :func:`_pallas_ok`.
+    * **for synthesis, the ``(m, theta, ell)`` layout.**  The kernel reduces along the
+      block's last axis; when :func:`slabs_for` could afford only the analysis layout,
+      the strided reduction stays with XLA.
+    """
+    if _CONTRACT != "pallas" or not _pallas_ok():
+        return False
+    if slab[0].dtype != jnp.float32:
+        return False
+    return not synthesis or slab.layout == ELL_CONTIG
+
 
 _CACHE = {}
 # Geometries whose build the pool refused.  Without this every latitudinal pass of a
@@ -491,6 +550,31 @@ def _reduce_channels(prod, axis):
 def forward_latitudinal(ftm, slab, *, L):
     """flm[ell, L-1+m] = sum_theta slice[theta, ell, m] * ftm[theta, L+m].
 
+    Dispatched: on an NVIDIA GPU the contraction runs as the fused Triton kernel in
+    :mod:`gmaster._spin_contract_pallas`, which reads each block *once* and holds the
+    four real channels in register accumulators; the products then happen in the
+    storage precision (float32 tables and float32 rings under
+    ``set_table_precision("fp32")``, float64 both otherwise) with float64 tile
+    partials.  Against the multiply-and-reduce form below that is 4.55x on analysis and
+    4.60x on synthesis at nside 512 float32 (6.97 ms and 7.26 ms against 31.69 and
+    33.39, the analysis contraction running at 1444 GB/s against a 6.16 ms pure-read
+    floor for the 9.37 GiB layout) and 3.77x / 4.01x at nside 256, with the answer
+    moving by 6.3e-08 -- the same order as the float32 table quantum the route already
+    accepts (`.qwen/tmp/spin_contract_tune9.log`).
+    ``GMASTER_POLAR_CONTRACT=xla`` or :func:`set_polar_contract` selects the form
+    below explicitly; it is also what a non-NVIDIA device or a float64 table gets (see
+    :func:`_kernel_contract` for the measured reason).
+    """
+    if _kernel_contract(slab):
+        from gmaster._spin_contract_pallas import forward
+
+        return forward(slab, ftm, L=L)
+    return _forward_latitudinal_xla(ftm, slab, L=L)
+
+
+def _forward_latitudinal_xla(ftm, slab, *, L):
+    """flm[ell, L-1+m] = sum_theta slice[theta, ell, m] * ftm[theta, L+m].
+
     ``slab`` is the ``(m, ell, theta)`` analysis block set from :func:`slabs_for`:
     one block per entry of :func:`_windows`, non-negative orders only, each already
     sliced to its ``ell >= lo`` triangle.  Splitting the theta sum at pi/2 and
@@ -544,6 +628,22 @@ def forward_latitudinal(ftm, slab, *, L):
 
 
 def inverse_latitudinal(flm, slab, *, L):
+    """Transpose of :func:`forward_latitudinal`; ftm is padded to 2L columns.
+
+    Dispatched like :func:`forward_latitudinal`, with one extra condition: the Triton
+    kernel reduces over the *last* axis of the block, so it takes the
+    ``(m, theta, ell)`` synthesis layout only.  When the pool is tight enough that
+    :func:`slabs_for` built the analysis layout alone, that strided reduction stays
+    with XLA.
+    """
+    if _kernel_contract(slab, synthesis=True):
+        from gmaster._spin_contract_pallas import inverse
+
+        return inverse(slab, flm, L=L)
+    return _inverse_latitudinal_xla(flm, slab, L=L)
+
+
+def _inverse_latitudinal_xla(flm, slab, *, L):
     """Transpose of :func:`forward_latitudinal`; ftm is padded to 2L columns.
 
     Reading the forward map as a sum of two contractions over one block gives the
