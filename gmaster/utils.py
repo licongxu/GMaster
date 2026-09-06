@@ -2149,6 +2149,17 @@ def map2alm(map, spin, map_info, alm_info, *, n_iter):
     # Pallas path above already returned with L_work == L.
     L_work = max(L_work, 2 * map_info.nside)
     if spin != 0:
+        if int(spin) == 2:
+            return _map2alm_core_streamed(
+                maps,
+                alm_info._ell,
+                alm_info._m,
+                spin=int(spin),
+                nside=map_info.nside,
+                L=L,
+                L_work=L_work,
+                n_iter=int(n_iter),
+            )
         analysis_slab, synthesis_slab = _spin_slabs(
             L_work, int(spin), nside=map_info.nside
         )
@@ -2164,17 +2175,6 @@ def map2alm(map, spin, map_info, alm_info, *, n_iter):
                 n_iter=int(n_iter),
                 analysis_slab=analysis_slab,
                 synthesis_slab=synthesis_slab,
-            )
-        if int(spin) == 2:
-            return _map2alm_core_streamed(
-                maps,
-                alm_info._ell,
-                alm_info._m,
-                spin=int(spin),
-                nside=map_info.nside,
-                L=L,
-                L_work=L_work,
-                n_iter=int(n_iter),
             )
     if _use_multi_gpu_sht(L_work):
         return _map2alm_core_multi_gpu(
@@ -2223,6 +2223,14 @@ def alm2map(alm, spin, map_info, alm_info):
     # L >= 2*nside; the Pallas path above already returned with L_work == L.
     L_work = max(L_work, 2 * map_info.nside)
     if spin != 0:
+        if int(spin) == 2:
+            return _alm2map_core_streamed(
+                alm,
+                spin=int(spin),
+                nside=map_info.nside,
+                L=L,
+                L_work=L_work,
+            )
         _, synthesis_slab = _spin_slabs(L_work, int(spin), nside=map_info.nside)
         if synthesis_slab is not None:
             return _alm2map_core_slab(
@@ -2232,14 +2240,6 @@ def alm2map(alm, spin, map_info, alm_info):
                 L=L,
                 L_work=L_work,
                 slab=synthesis_slab,
-            )
-        if int(spin) == 2:
-            return _alm2map_core_streamed(
-                alm,
-                spin=int(spin),
-                nside=map_info.nside,
-                L=L,
-                L_work=L_work,
             )
     if _use_multi_gpu_sht(L_work):
         alm = _copy_to_device(alm, _gpu_devices()[0])
