@@ -3895,8 +3895,8 @@ wrong at `ell = m+1` — which is an analytic seed with no recurrence in it — 
 `P_1^(a,b)` is `(a+b+2)/2`. After the fix the float64 arm is **4.56e-16** at Nside 64 and
 **1.53e-15** at Nside 1024 against the oracle, i.e. the Pallas march reproduces the reference exactly.
 
-**Compensating the *state* buys nothing; compensating the *coefficients* buys everything.** Nside
-256, tile 512, 1 warp, same 4-channel RHS, `rel = |arm-ref|/max|ref|`:
+**Both compensations are needed; neither alone is worth much.** Nside 256, tile 512, 1 warp, same
+4-channel RHS, `rel = |arm-ref|/max|ref|`:
 
 ```text
 arm     ms/window  G values/s  rel vs fp64 oracle
@@ -3906,12 +3906,20 @@ f32l       1.32       36.6        8.31e-05     double-single state (hi/lo), floa
 f32ds      1.42       33.9        7.94e-08     double-single state + hi/lo coefficient tables
 ```
 
-`f32l` is within 6 % of plain `f32` — the accumulated round-off of the recurrence is *not* what
-limits a raw float32 march. What limits it is storing `A1, A0, BB` in float32: keeping those as
-hi/lo limb pairs (an exact `mul.rn.f32`/`fma.rn.f32` two-product plus the `c0l` limb) drops the
-error **1100x**, for 33 % runtime. 7.94e-08 is below the shipped float32 table route's own bar
-(7.12e-07..1.15e-06) and below the anchored route's 5.44e-07, and it is achieved with **no anchor
-table at all**.
+The tempting reading of `f32l ~= f32` is "the state does not matter, only the coefficients do".
+**That is wrong, and I wrote it down wrong for an hour.** The arm that tests it is `f32c` — hi/lo
+coefficient tables, *single-limb* float32 state (`(ah+al)*ch - (cb+bl)*ph` to first order in the
+limbs): at Nside 1024 it runs **3.62 ms/window at rel 3.92e-05** (`spin2_f32c_1024.log`), i.e.
+fixing the coefficients alone leaves 3.9e-05 of *state* error, and fixing the state alone leaves
+8.3e-05 of *coefficient* error, while fixing both gives 1.27e-07. The two error sources are
+independent and roughly equal in size; each single fix buys ~2x, the pair buys ~1000x, because the
+error of the whole march is the sum of a per-step coefficient bias and an accumulating state bias
+and neither one can be left standing if you want the 1e-07 class. `f32c` is also only 10 % faster
+than `f32ds`, so there is nothing to win by dropping the state limb even where accuracy allows it.
+
+7.94e-08 (Nside 256) / 1.27e-07 (Nside 1024) is below the shipped float32 table route's own bar
+(7.12e-07..1.15e-06) and below the anchored route's 5.44e-07, achieved with **no anchor table at
+all**.
 
 **One warp per program is what unlocked the serial shape.** Nside 1024, arm `f32`, `ms/window`:
 
@@ -4018,12 +4026,64 @@ Nside 4096 is *scalar* (`ducc_only_4096_0.log`: 1840.97 / 1865.26 ms for map2alm
 the polarised ducc0 cells at 2048/4096 have never been measured here — producing them is part of
 the integrated scoreboard, not something to extrapolate.
 
+**The per-pass projection is measured, not extrapolated** (`spin2_windows_1024.log`, Nside 1024,
+`f32ds`, tile 256 x 1 warp). Because a row's loop starts at `ell = m`, cost should be proportional
+to a window's live-degree count `sum(L - m)`:
+
+```text
+window          measured   linear model   rel          stored cells
+m [   0,  64)     4.03 ms      4.03 (def)  1.27e-07    12.45 M
+m [ 512, 576)     3.22 ms      3.35 ms     2.59e-07    10.32 M
+m [2560,2624)     0.71 ms      0.64 ms     1.71e-07     1.25 M
+```
+
+Two things follow. The rate model is good to ~10 % across a 16x range of window cost, so
+`24.3 x 4.03 = 98 ms` for the whole pass is a sum of measured behaviour rather than a leading
+window times a count; and the accuracy does not degrade in the high-`m` half (2.6e-07 at
+m=512..576 against 1.27e-07 at the leading window, same class), so no window needs special
+handling. This is the property the session-20 map did *not* have available to it: it marches the
+masked rectangle, so every window cost the same 5.65 ms and the pass cost 48 x that.
+
+**ducc0 spin-2 baselines measured fresh on this box** (`ducc_only_1024_2.log`, three separate
+processes of `.qwen/tmp/ducc_only.py 1024 5 2`; the 2048 row is `ducc_only_2048_2.log`, which
+already existed and is quoted as recorded). ducc0 0.39.1, 192 cores, no GPU process on the box,
+min/median/max over reps — and these are **whole `map2alm` / `alm2map` transforms**, which is the
+only fair thing to compare a stage against when stating what is left to win:
+
+```text
+Nside  ducc0 spin-2 map2alm (best/med)      alm2map (best/med)   our latitudinal stage
+ 1024  115.19 / ~118-123 ms                 105.99 / ~108-115    98 ms   (rel 1.27e-07)
+ 2048  732.08 / ~904 ms                     609.54 / ~612 ms     484 ms  (rel 6.40e-08)
+```
+
+So the stage that shipped at 13.27 s and stood at 271 ms after session 20 is now, on its own,
+**below** ducc0's entire forward transform at both sizes: 1.18x at Nside 1024 and 1.51x at Nside
+2048 measured against ducc0's *best* of three processes. A pipeline number still has to add our
+ring stage to the 98 ms, and that is the next thing to measure; what is settled is that the
+polarised latitudinal step is no longer the reason GMaster loses to ducc0 at high Nside.
+
+
+
 
 
 What is left in the kernel, by the same ablations: ~0.2 ms of renormalise chain, ~0.06 ms of
 exponent max, and the residual emit (`2**lg2n` per degree, the `lgnr` scalar read, the store).
 `marchonly` says the floor of this formulation is 0.20/1.05 = 19 % of current cost, so the shape
 has maybe 3x more headroom in it, all of it in the emit.
+
+Two follow-ups on the geometry, both negative (`spin2_warp_sharedtree.log`, `spin2_rload_in.log`):
+
+* After the emit rewrite, **tile 256 x 1 warp is still the optimum**: tile 512 x 2 warps gets to
+  4.36 ms (it was 4.83 at 1 warp, so two warps do help once there is only one tree), tile 1024 x 2
+  is 5.23, and tile 256 x 2 warps regresses to 5.32 against 4.03 at one warp. The old rule
+  "always one warp" is really "keep the reduction inside one warp *and* keep 8 chains per thread";
+  at 256 lanes with 2 warps there are only 4 chains per thread and the loss outweighs the win.
+* **Freeing registers by re-reading the RHS per degree does not work.** The 4-channel RHS is
+  loop-invariant and costs NC blocks of registers, which is exactly where `f32ds` needs them, so
+  re-loading it inside `emit` looked like the cheap way to make tile 512 viable. It is not:
+  4.15 vs 4.03 ms at tile 256 and 8.17 vs 4.83 ms at tile 512. Whatever limits tile 512 is not
+  this register pressure.
+
 
 
 Pallas gotchas this window, each of which cost a run:
