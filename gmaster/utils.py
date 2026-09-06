@@ -599,7 +599,7 @@ def _prepare_inverse_s2fft(flm, *, L):
 
 
 def _inverse_latitudinal(flm, theta, *, L, spin, nside, reality):
-    if not reality and _spin_march.synth_requested(spin, L=L, nside=nside):
+    if not reality and _spin_march.synth_requested(spin):
         # The same table-free row march as the analysis seam, in the synthesis direction (sum over
         # ell per theta lane): 121.8 ms at Nside 1024 against the 13.2 s generic loop the declined
         # slice falls back to.  Unlike analysis this one is still opt-in even where no slice can

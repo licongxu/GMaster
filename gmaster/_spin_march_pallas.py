@@ -84,12 +84,20 @@ def march_requested(spin, *, L=None, nside=None) -> bool:
     `GMASTER_SPIN2_MARCH` decides outright if it is set.  Left unset the march takes the call only
     where there is no alternative -- a geometry too large for any slice (`slice_declined`) -- and
     the shipped table route keeps everything it can.  That default is the measured one: with a
-    slice resident the table route is ~2.5x faster than the march (Nside 512 spin 2 `map2alm`
-    9.4 ms on tables against 24.0 ms marched, `.qwen/tmp/twosum_check.log` section 4), while with
-    no slice the march runs 106.6-109.0 ms against the 13.2 s scatter loop -- the whole 0.01x to
+    slice resident the fused table route runs Nside 512 spin 2 `map2alm` in 9.1-9.4 ms, while the
+    march at that geometry takes 24.0 ms (`.qwen/tmp/twosum_check.log` section 4 -- measured with the
+    table route declined, so the two numbers are not from one allocator setting; they are not to be
+    read as a ratio, only as "the march is not the route to prefer when a slice exists").  With no
+    slice the march runs 106.6-109.0 ms against the 13.2 s scatter loop, which is the whole 0.01x to
     parity at Nside 1024 (107.3 ms against ducc0's 105.9, `.qwen/tmp/score_default_pool.log`).  The
     cost is accuracy -- 3.7e-05 against ducc0 marched, 4.0e-07 on the scatter loop -- so
     `GMASTER_SPIN2_MARCH=0` keeps the exact route at any size.
+
+    The seam only sees a spin-2 call when `_spin_slabs` returns `(None, None)`, which is `slabs_for`
+    declining -- the same test `slice_declined` makes, so "the seam was reached" and "the march is
+    the only route" are the same condition by construction. At Nside 512 the slab route owns the call
+    and neither flag changes anything there: counting calls from the E/B entry points returns zero
+    with `GMASTER_SPIN2_MARCH=1` set (`.qwen/tmp/route_probe_512.log`).
     """
     if int(spin) != SPIN or not _on_nvidia():
         return False
@@ -99,20 +107,24 @@ def march_requested(spin, *, L=None, nside=None) -> bool:
     return L is not None and nside is not None and slice_declined(L, nside)
 
 
-def synth_requested(spin, *, L=None, nside=None) -> bool:
+def synth_requested(spin) -> bool:
     """True for the synthesis march, which is **off unless asked for by name**.
 
-    It used to follow `GMASTER_SPIN2_MARCH`, and that was a correctness bug rather than a tuning
-    choice: the seam sits where a *declined table* routes the call, so at Nside >= 512 turning on
-    the analysis march also switched synthesis over to a kernel that is slower than ducc0 --
-    122.7 ms against 105.7 at Nside 1024 (0.86x), 999.4 ms against 626.5 at Nside 2048 (0.63x),
-    `.qwen/tmp/score_synth_fused.log` -- and is wrong where it matters.  Its entry-level error is
-    4.56e-04 at Nside 512, but a full `alm2map` against the generic route comes out at rel
-    **9.99e-01 at a pixel whose reference value is the maximum of the map** (rms 2.40e-03),
-    `.qwen/tmp/synth_map_acc.log`: the worst lane is a bright polar pixel, not a negligible one,
-    because the marched row drifts by up to 6.0e-03 in exactly the polar lanes
-    (`.qwen/tmp/synth_oracle_512.log`, 120-digit oracle) and the polar rings carry the largest
-    per-ring weights.
+    It stands on its own flag deliberately.  It used to be `GMASTER_SPIN2_MARCH` AND
+    `GMASTER_SPIN2_MARCH_SYNTH`, which was a correctness bug rather than a tuning choice: the seam
+    sits where a *declined table* routes the call, so turning on the analysis march also switched
+    synthesis over to a kernel that is slower than ducc0 -- 122.7 ms against 105.7 at Nside 1024
+    (0.86x), 999.4 ms against 626.5 at Nside 2048 (0.63x), `.qwen/tmp/score_synth_fused.log` -- and
+    is wrong where it matters.  Its entry-level error is 4.56e-04 at Nside 512, but a full `alm2map`
+    against the generic route comes out at rel **9.99e-01 at a pixel whose reference value is the
+    maximum of the map** (rms 2.40e-03), `.qwen/tmp/synth_map_acc.log`, and at Nside 1024 the same
+    comparison gives rms **9.30e-01** -- the marched map carries as much power as the reference, so
+    this is a different map rather than a degraded one (`.qwen/tmp/synth_map_err_1024.log`).  The
+    worst lane is a bright polar pixel, not a negligible one, because the marched row drifts by up to
+    6.0e-03 in exactly the polar lanes (`.qwen/tmp/synth_oracle_512.log`, 120-digit oracle) and the
+    polar rings carry the largest per-ring weights.  Following the analysis default would have the
+    same defect the other way -- the default is on precisely at the large sizes, where this kernel is
+    0.89x rather than a win -- so the analysis flag has no influence here in either direction.
 
     The analysis direction is a different story and now takes the march by default wherever no
     slice can exist: 106.6-109.0 ms against ducc0's 106.6-118.1 ms at Nside 1024, rel alm 3.7e-05,
@@ -126,11 +138,14 @@ def synth_requested(spin, *, L=None, nside=None) -> bool:
     was inert); the primitives (`_two_prod`, `_fma` and `_two_sum` are each bit-exact on this stack,
     `.qwen/tmp/twoprod_probe.log`, `twosum_probe.log`); and the fast-form TwoSum residual, which
     *is* inexact here (~1 ulp, rms 8.2e-09 with |uh| < |th| and 2.0e-08 with |uh| > |th| against
-    0.000e+00 for the branch-free 2Sum, `.qwen/tmp/twosum_order_probe.log`) but fixing it leaves the
-    ell=1528 row error at 2.47e-04 unchanged (`.qwen/tmp/spin2_synth_delta_2sum_512.log`).  The
-    defect sits in the pole-most lane of the row, not in the accumulation across ell.
+    0.000e+00 for the branch-free 2Sum, `.qwen/tmp/twosum_order_probe.log`) but replacing it changes
+    the row error by nothing -- 28 of 30 (m, ring, ell) cells of `.qwen/tmp/polar_lane_dump.py` are
+    bit-identical before and after, and `ell=1528` in the pole lane is 2.47e-04 either way
+    (`.qwen/tmp/polar_lane_256_fast2sum.log`, `polar_lane_256_2sum.log`).  That dump also shows the
+    defect is a lane-growth law rather than a single bad ring: 1.3e-07 at the equator against 6.5e-05
+    at the pole for m=0 at `ell=760`, north and south agreeing to the digit.
     """
-    return (march_requested(spin, L=L, nside=nside)
+    return (int(spin) == SPIN and _on_nvidia()
             and os.environ.get("GMASTER_SPIN2_MARCH_SYNTH", "0") == "1")
 
 
