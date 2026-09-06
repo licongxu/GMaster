@@ -3555,6 +3555,107 @@ untouched; Nside 2048 float32 needs 147 GiB and cannot be resident at any builde
 the only remaining use for a table this big, and 117 G values/s is 3x the 37 G values/s bar
 section 6 set for it — but note the arithmetic in section 11 before spending time there.
 
+## Session 19 (2026-09-06) — spin 2 stops losing: the polar slice is read once, at the storage width
+
+### 11. The polarised contraction was four reads and the wrong precision
+
+Spin 2 was the standing complaint for four sessions and the measurements agreed with it: every
+per-pass spin-2 cell lost to ducc0, and section 15 had already proved the ring stage was not the
+problem (0.34 ms of a 34 ms `map2alm`). What was left is the polar latitudinal contraction in
+`_spin_slice`, and it had two defects, only one of which was structural.
+
+**New module `gmaster/_spin_contract_pallas.py`, dispatched by `_spin_slice._kernel_contract`.** One
+Triton program owns a tile of outputs, loops the reduction axis, loads a block of the slice **once**
+and multiplies it by all four real right-hand sides with four register accumulators. Measured on the
+block set, float32 tables, controls 1359-1377 GB/s (`.qwen/tmp/spin_contract_tune9.log`):
+
+| geometry | direction | `_spin_slice` (XLA) | fused kernel | | against the byte floor |
+|---|---|---|---|---|---|
+| Nside 512 | analysis | 31.69 ms | **6.97 ms** | **4.55x** | 1444 GB/s of 1633, floor 6.16 ms → **88 % of the pure read** |
+| Nside 512 | synthesis | 33.39 ms | **7.26 ms** | **4.60x** | |
+| Nside 256 | analysis | 4.44 ms | **1.18 ms** | 3.77x | |
+| Nside 256 | synthesis | 4.77 ms | **1.19 ms** | 4.01x | |
+
+and the cells the user actually scores (one Nside per process, `GM_PREC=fp32`, ducc0 0.39.1 on all
+192 cores):
+
+| nside | direction | before (session 15) | now | ducc0 | speedup | rel alm | ctrl GB/s |
+|---|---|---|---|---|---|---|---|
+| 256 | `map2alm` | 5.9 ms, 0.83x | **2.3 ms** | 5.0 | **2.17x** | 3.2e-07 | 1369/1352 |
+| 256 | `alm2map` | 5.5 ms, 0.52x | **1.7 ms** | 3.2 | **1.90x** | — | |
+| 512 | `map2alm` | 34.2 ms, 0.76x | **9.4 ms** | 28.1 | **3.00x** | 3.2e-07 | 1384/1364 |
+| 512 | `alm2map` | 37.6 ms, 0.59x | **8.6 ms** | 22.5 | **2.60x** | — | |
+
+`.qwen/tmp/sht_spin2_solo_256.log`, `.qwen/tmp/sht_spin2_solo_512.log`. Four cells that lost are now
+four that win. The whole-MASTER pipeline (`.qwen/tmp/pipeline_spin2_{256,512}.log`):
+
+```
+ nside spin  prec   NaMaster    GMaster  speedup        rel  ctrl GB/s
+   256    2  fp32      170.1       32.2    5.29x    1.2e-07  1338/1420
+   512    2  fp32      684.5      148.0    4.62x    3.1e-07  1448/1423
+   512    0  fp32      331.9       93.8    3.54x    1.6e-07  1424/1409   <- spin 0 unchanged (was 93 ms, 3.45x)
+```
+
+Spin-2 at Nside 512 was 332 ms / 2.03x before this change and is **148 ms / 4.62x**; spin 0 did not
+move, which is the regression check that the dispatch touches only the polar path. Suite: **141
+passed, 3 skipped in 328.10 s** (`pytest_spin2_pallas.log`), the same counts as session 18's 308.35 s.
+
+**Three things had to be true. Only the first was the idea.**
+
+* **One read instead of four.** `_reduce_channels` (session 10) already removed the complex-RHS tax,
+  but a tuple `lax.reduce` still visits the block set once per channel.
+* **Products in the storage precision, float64 only for the tile partial.** The careful spelling —
+  `acc += v.astype(f64) * r.astype(f64)` — runs the *float32* slice at **210 GB/s against a 1361 GB/s
+  control**. Same kernel, same tile, float32 products: **1065 GB/s** (`spin_contract_tune3.log` →
+  `spin_contract_tune5.log`). `cvt.f32.f64` issues at a fraction of the FMA rate and the RHS is loaded
+  four times per table element, so per-element widening is a 5x loss, not free caution.
+* **The right-hand side is never widened in memory.** Synthesis is handed `alm` as complex128 because
+  that is NaMaster's convention; casting the four channels to the slice's own width instead is worth
+  **48.85 → 7.49 ms (6.5x)** at Nside 512 at an unchanged 7.1e-08 relative difference
+  (`spin_contract_tune5.log` → `spin_contract_tune8.log`).
+
+**Dead end 1 — the mask was never the problem.** The reduction axis is `4·nside − 1`: odd, and sharing
+no useful factor with a power-of-two tile, so a single-level loop always ends in a masked tail.
+Splitting that tail into progressively smaller *unmasked* tiles (128, then 16) — the obvious fix — is
+**3x worse**: one fully masked 1024-element tile does Nside 256 analysis in 1.15 ms, the decomposition
+in 3.44 ms. Predicated loads are cheap on this card; short vector loads are expensive. The lever is
+tile *length*, and it saturates: at Nside 512, analysis runs 22.79 / 13.56 / 8.97 / 7.53 / **6.97** /
+7.21 ms at chunk = 64 / 128 / 256 / 512 / **1024** / 2048. Locked: `_E_TILE = 8`, `_RED_CHUNK = 1024`,
+`num_warps = 2` (2 beat 4 in every cell).
+
+**Dead end 2 — float64 tables.** With fp64 storage the products must be fp64 and Triton's fp64 path
+does not reach XLA's: **0.85x** (0.93 vs 0.79 ms) analysis, **0.66x** (1.15 vs 0.76) synthesis at
+Nside 128, control 1459 GB/s (`spin_contract_tune10_fp64.log`). So `_kernel_contract` requires
+`slab[0].dtype == jnp.float32`: the **default fp64 configuration is untouched**, and
+`.qwen/tmp/spin2_route_assert.py` asserts both halves — pallas engaged at fp32, absent at fp64 —
+because session 18 established that a route you infer instead of reading out of the kernel cache is a
+route that silently stops being used. `GMASTER_POLAR_CONTRACT=xla` remains the supported way back.
+
+**Accuracy.** Relative to the XLA form the kernel moves the answer by 6.3e-08 at fp32 storage and
+5.8e-16 at fp64; the pipeline's `rel alm` against ducc0 is 3.1-3.2e-07, the same order the fp32 route
+has carried since session 13 (1.1-1.8e-07) and dominated by the fp32 table and complex64 ring, not by
+this contraction. The fp32 products are exact where both operands are already float32; what is added
+is the float32 tree-sum inside a 1024-element tile, then float64 across tiles.
+
+**The arithmetic section 10 promised, before anyone builds a streamed band.** At Nside 2048 the spin-0
+band is 291.00 GiB = 78.11 G values; at the emitter's measured 117.3 G values/s that is **0.67 s to
+emit**, against a ducc cell of 301.5 ms — so a streamed band that writes and then reads the table
+cannot win at 2048, and no streamer is implemented. Same arithmetic for the case that matters now,
+spin 2 at Nside 1024 (L = 3072, nθ = 4095, 1.93e10 table values, layout 73.48 GiB — declined by
+`_SLAB_BUDGET` 56 GiB, which is why every logged Nside 1024 spin-2 cell is 0.02-0.04x):
+
+* contraction alone at the measured 1444 GB/s: **54.8 ms** vs ducc's 119.3 ms — a 2.2x win, *if the
+  values were free*;
+* emitting them first, even at 117 G values/s: +166 ms → 0.54x. Streaming the table is not enough.
+* the only route that clears it is to **never write the slice**: march `d^l_{m,-2}` in registers and
+  contract inside the same loop, ~8 FMA per value → 1.55e11 FMA. In float32 that is ~5 ms of FMA plus
+  the per-value `exp`/reciprocal of the renormalisation (~5 ms at a quarter rate) against a 119 ms
+  reference; in float64 it is 165 ms of FMA alone, i.e. 0.24x, so like every other win here it is a
+  float32 design. The open risk is numerical, not throughput: `_spin_slice._march` renormalises through
+  `lrenorm` precisely because the ell-recurrence underflows, and the march has only ever been run in
+  float64 (the two halves of the s2fft march already disagree at ~1e-13, per section on the pi-theta
+  symmetry). Build it as a probe against a float128 oracle at Nside 128 before wiring anything.
+
 
 
 
