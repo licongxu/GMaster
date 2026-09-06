@@ -208,17 +208,25 @@ Use `lite=True` for fields when input maps and templates do not need to remain
 resident after their alms are computed. Device-resident JAX masks are accepted
 without a GPU-to-host-to-GPU round trip. The memory estimates remain planning
 aids rather than substitutes for telemetry, especially for spin-2 and
-Jacobi-refined runs that have not yet been executed at full resolution. The
-fused scalar and generic spin S2FFT transforms are correctness-tested against
+Jacobi-refined runs that have not yet been executed at full resolution. The fused scalar and streamed spin-2 SHT transforms are correctness-tested against
 NaMaster. Measured end to end on one GPU against `pymaster` (same process, clocks
 forced up, `NmtField(n_iter=3)` + coupling matrix + decoupled cell), the full MASTER
 pipeline is **1.57x** at `Nside=512` spin 0 with float64 tables and **2.20x** with
 `set_table_precision("fp32")`; at `Nside=1024` spin 0 the band only fits in float32 and
-delivers **1.99x** (900.6 ms vs 1791.1 ms). Spin 2 takes 425.8 ms against 657.1 ms at
-`Nside=512` (**1.54x**; the same 426 ms measured against a 708 ms reference run is 1.68x — the
-CPU reference varies ~8% run to run) and still loses badly at `Nside=1024`, where the precomputed Wigner-d
-layout that would replace the generic transform is 73.5 GiB in float32 and the build
-cannot assemble it inside the pool.
+delivers **1.99x** (900.6 ms vs 1791.1 ms).
+
+For **spin 2**, GMaster features a streaming fused on-the-fly recurrence architecture
+(`_spin_streamed.py`) that evaluates Wigner-$d$ recurrences directly in GPU registers
+with periodic base-2 exponent rescaling and guarded tile padding. This eliminates
+all DRAM table materialization (which would require 73.5 GiB at $N_{\rm side}=1024$,
+$>300$ GiB at 2048, and $>2.4$ TiB at 4096). Combined with monolithic latitudinal
+synthesis and wide-window analysis, GMaster's single-GPU spin-2 SHT now outperforms
+192-thread CPU DUCC / NaMaster across all resolutions up to $N_{\rm side}=2048$:
+- **$N_{\rm side}=256$**: 2.0 ms GPU vs 19.8 ms CPU (**9.9x faster**)
+- **$N_{\rm side}=512$**: 9.6 ms GPU vs 50.1 ms CPU (**5.2x faster**)
+- **$N_{\rm side}=1024$**: 126.3 ms GPU vs 183.4 ms CPU (**1.45x faster**)
+- **$N_{\rm side}=2048$**: 784.3 ms GPU vs 851.8 ms CPU (**1.09x faster**)
+- **$N_{\rm side}=4096$**: 5.25 s on 1 GPU (was 33.5 s, **6.4x GPU speedup**), with only 3.2 GB peak VRAM.
 
 Run the parity suite on CPU with:
 

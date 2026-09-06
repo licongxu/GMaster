@@ -456,9 +456,7 @@ def _pool_headroom():
         stats = jax.local_devices()[0].memory_stats()
     except Exception:  # pragma: no cover - backend without statistics
         return float("inf")
-    pool = stats.get("pool_bytes") or 0
-    if not pool:
-        return float("inf")
+    pool = stats.get("bytes_limit") or stats.get("pool_bytes") or float("inf")
     return pool - stats.get("bytes_in_use", 0)
 
 

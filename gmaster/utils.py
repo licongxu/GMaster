@@ -506,25 +506,48 @@ def _forward_s2fft_ftm(maps, tables, *, L, nside, reality):
     m_start = L - 1 if reality else 0
     if reality:
         ftm = healpix_ffts.healpix_fft(maps, L, nside, "jax", reality)
-    else:
-        # One batched transform instead of s2fft's per-ring unroll: the
-        # latter issues one tiny FFT per ring (1023 of them at Nside 256) and
-        # runs launch-bound at ~4 GB/s.  Matches it to 1.6e-15.
-        centered = _forward_ring_fft_full(maps, tables, L=L, nside=nside)
-        ftm = jnp.concatenate(
-            (jnp.zeros((centered.shape[0], 1), dtype=centered.dtype), centered),
-            axis=1,
+        ftm = jnp.einsum(
+            "tm,t->tm",
+            ftm,
+            quadrature_jax.quad_weights_transform(L, "healpix", nside),
+            optimize=True,
         )
-    ftm = jnp.einsum(
-        "tm,t->tm",
-        ftm,
-        quadrature_jax.quad_weights_transform(L, "healpix", nside),
-        optimize=True,
-    )
-    ftm = ftm.at[:, m_start + 1 :].multiply(
-        healpix_ffts.ring_phase_shifts_hp_jax(L, nside, True, reality)
-    )
-    return ftm
+        ftm = ftm.at[:, m_start + 1 :].multiply(
+            healpix_ffts.ring_phase_shifts_hp_jax(L, nside, True, reality)
+        )
+        return ftm
+    else:
+        centered = _forward_ring_fft_full(maps, tables, L=L, nside=nside)
+        if nside >= 4096:
+            ntheta = centered.shape[0]
+            width = centered.shape[1]
+            w = quadrature_jax.quad_weights_transform(L, "healpix", nside).astype(jnp.float32)
+            phi = healpix_ffts.p2phi_rings_jax(jnp.arange(ntheta), nside)
+            chunk_cols = 2048
+            m_all = jnp.arange(-(L - 1), L)
+            res_chunks = []
+            for m_start_idx in range(0, width, chunk_cols):
+                m_end_idx = min(m_start_idx + chunk_cols, width)
+                m_sub = m_all[m_start_idx:m_end_idx]
+                phase_sub = jnp.exp(-1j * phi[:, None] * m_sub[None, :]).astype(centered.dtype)
+                res_chunks.append(centered[:, m_start_idx:m_end_idx] * (w[:, None] * phase_sub))
+            shifted = jnp.concatenate(res_chunks, axis=1)
+            return jnp.pad(shifted, ((0, 0), (1, 0)))
+        else:
+            ftm = jnp.concatenate(
+                (jnp.zeros((centered.shape[0], 1), dtype=centered.dtype), centered),
+                axis=1,
+            )
+            ftm = jnp.einsum(
+                "tm,t->tm",
+                ftm,
+                quadrature_jax.quad_weights_transform(L, "healpix", nside),
+                optimize=True,
+            )
+            ftm = ftm.at[:, m_start + 1 :].multiply(
+                healpix_ffts.ring_phase_shifts_hp_jax(L, nside, True, reality)
+            )
+            return ftm
 
 
 def _forward_latitudinal(ftm, *, L, spin, nside, reality, L_lower):
@@ -1127,7 +1150,7 @@ def _inverse_ring_fft_herm(ftm_positive, tables, *, L, nside):
     return jnp.where(used, slots[source], 0.0)
 
 
-@lru_cache(maxsize=2)
+@lru_cache(maxsize=4)
 def _spin_ring_analysis_tables(L, nside, device=None):
     """Constant factors of the polarised analysis ring chirp-Z.
 
@@ -1136,6 +1159,8 @@ def _spin_ring_analysis_tables(L, nside, device=None):
     kernel is shifted by `(width-1) + (L-1)` to bring order `m = -(L-1)` under the output
     window and the convolution bound is `width + 2L - 1`.
     """
+    if nside >= 4096:
+        return ()
     with jax.ensure_compile_time_eval(), jax.default_device(device):
         nphi, _, _, _, width = _ring_czt_constants(L, nside)
         caps = _ring_split_numpy(L, nside)[-1]
@@ -1172,12 +1197,14 @@ def _forward_ring_fft_full(signal, tables, *, L, nside):
     The polar rows keep the chirp-Z; `tables` is `_spin_ring_analysis_tables(L, nside)` so
     its ramps and kernel are built once per geometry instead of inside every trace.
     """
-    chirp_in, kernel_spec, chirp_out = tables
     belt_lo, belt_hi, belt_start, caps = _ring_split_numpy(L, nside)
     width = 4 * nside
+    cplx_dt = tables[0].dtype if tables else (
+        jnp.complex128 if getattr(signal, "dtype", None) in (jnp.float64, jnp.complex128) else jnp.complex64
+    )
     # The signal here is a helicity combination `Q -/+ iU`, so it takes the tables'
     # *complex* type: casting to their real type would silently drop the imaginary part.
-    pixels = jnp.reshape(jnp.asarray(signal), (-1,)).astype(chirp_in.dtype)
+    pixels = jnp.reshape(jnp.asarray(signal), (-1,)).astype(cplx_dt)
 
     cap_out = None
     if caps.size:
@@ -1186,11 +1213,32 @@ def _forward_ring_fft_full(signal, tables, *, L, nside):
         cap_pixels = jnp.where(jnp.asarray(valid)[rows],
                                pixels[jnp.asarray(gather)[rows]], 0.0)
         transform_size = _next_fast_len_pow2(width + 2 * L)
-        embedded = jnp.pad(cap_pixels * chirp_in, ((0, 0), (0, transform_size - width)))
-        convolution = jnp.fft.ifft(
-            jnp.fft.fft(embedded, axis=-1) * kernel_spec, axis=-1
-        )
-        cap_out = chirp_out * convolution[:, width - 1 : width - 1 + 2 * L - 1]
+        if tables:
+            chirp_in, kernel_spec, chirp_out = tables
+            embedded = jnp.pad(cap_pixels * chirp_in, ((0, 0), (0, transform_size - width)))
+            convolution = jnp.fft.ifft(
+                jnp.fft.fft(embedded, axis=-1) * kernel_spec, axis=-1
+            )
+            cap_out = chirp_out * convolution[:, width - 1 : width - 1 + 2 * L - 1]
+        else:
+            nphi, _, _, _, _ = _ring_czt_constants(L, nside)
+            n_index = jnp.arange(width, dtype=jnp.int64)
+            m_index = jnp.arange(-(L - 1), L, dtype=jnp.int64)
+            shift = jnp.arange(transform_size, dtype=jnp.int64) - (width - 1) - (L - 1)
+            res_list = []
+            chunk_size = 1024
+            for c_start in range(0, len(caps), chunk_size):
+                c_end = min(c_start + chunk_size, len(caps))
+                chunk_caps = caps[c_start:c_end]
+                two_nphi = (2 * nphi[chunk_caps])[:, None]
+                c_in = jnp.exp(-1j * _chirp_angle(n_index, two_nphi, False)).astype(cplx_dt)
+                k_spec = jnp.fft.fft(jnp.exp(1j * _chirp_angle(shift, two_nphi, False)), axis=-1).astype(cplx_dt)
+                c_out = jnp.exp(-1j * _chirp_angle(m_index, two_nphi, False)).astype(cplx_dt)
+                sub_pix = cap_pixels[c_start:c_end]
+                embedded = jnp.pad(sub_pix * c_in, ((0, 0), (0, transform_size - width)))
+                conv = jnp.fft.ifft(jnp.fft.fft(embedded, axis=-1) * k_spec, axis=-1)
+                res_list.append(c_out * conv[:, width - 1 : width - 1 + 2 * L - 1])
+            cap_out = jnp.concatenate(res_list, axis=0)
 
     belt_rows = belt_hi - belt_lo
     if belt_rows == 0:
@@ -1207,6 +1255,8 @@ def _forward_ring_fft_full(signal, tables, *, L, nside):
 @lru_cache(maxsize=2)
 def _spin_ring_synthesis_tables(L, nside, device=None):
     """Constant factors of the polarised synthesis ring chirp-Z; polar rows only."""
+    if nside >= 4096:
+        return ()
     with jax.ensure_compile_time_eval(), jax.default_device(device):
         nphi, _, _, _, width = _ring_czt_constants(L, nside)
         caps = _ring_split_numpy(L, nside)[-1]
@@ -1229,40 +1279,51 @@ def _spin_ring_synthesis_tables(L, nside, device=None):
 
 @partial(jax.jit, static_argnames=("L", "nside"))
 def _inverse_ring_fft_complex(centered, tables, *, L, nside):
-    """Complex inverse ring FFT of a centered (ntheta, 2L-1) spectrum.
-
-    The residue identity that serves the forward direction has a reverse: summing
-    `F_m e^{2 pi i p m / nphi}` over a window wider than one period `nphi` only requires
-    adding the coefficients that share a residue and transforming once.  On the belt that
-    means placing `m in [0, L)` in slots `[0, L)` and `m in [-(L-1), 0)` in slots
-    `[4n-L+1, 4n)` and doing one length-`4*nside` inverse transform instead of the chirp-Z
-    pair at `next_pow2(2L-1 + width)`.  For `L > 2*nside` the two slot ranges overlap, so
-    placement is the *sum* of two padded arrays rather than a concatenation — still slice
-    arithmetic, no scatter.  Checked against the chirp-Z form at 8e-16 relative, including
-    the overlapping `L = 3*nside` case.
-
-    The polar rows keep the chirp-Z with `tables` = `_spin_ring_synthesis_tables(L, nside)`
-    and the `wrap_phase` correction that accounts for the shift of their coefficient index.
-    """
-    chirp_c, kernel_spec, chirp_p = tables
+    """Complex inverse ring FFT of a centered (ntheta, 2L-1) spectrum."""
     belt_lo, belt_hi, _, caps = _ring_split_numpy(L, nside)
     nphi, _, _, _, width = _ring_czt_constants(L, nside)
-    grid = jnp.asarray(centered).astype(chirp_c.dtype)
+    cplx_dt = tables[0].dtype if tables else ring_dtype()
+    grid = jnp.asarray(centered).astype(cplx_dt)
 
     cap_res = None
     if caps.size:
         cap_grid = grid[jnp.asarray(caps)]
         transform_size = _next_fast_len_pow2(2 * L - 1 + width)
-        embedded = jnp.pad(cap_grid * chirp_c,
-                           ((0, 0), (0, transform_size - (2 * L - 1))))
-        convolution = jnp.fft.ifft(
-            jnp.fft.fft(embedded, axis=-1) * kernel_spec, axis=-1
-        )
-        p_index = jnp.arange(width, dtype=jnp.int64)
-        cap_res = chirp_p * convolution[:, 2 * L - 2 : 2 * L - 2 + width]
-        rows_nphi = nphi[jnp.asarray(caps)][:, None]
-        wrap_phase = ((L - 1) % rows_nphi) * p_index[None, :] % rows_nphi
-        cap_res *= jnp.exp(-1j * wrap_phase * (2 * jnp.pi / rows_nphi))
+        if tables:
+            chirp_c, kernel_spec, chirp_p = tables
+            embedded = jnp.pad(cap_grid * chirp_c,
+                               ((0, 0), (0, transform_size - (2 * L - 1))))
+            convolution = jnp.fft.ifft(
+                jnp.fft.fft(embedded, axis=-1) * kernel_spec, axis=-1
+            )
+            p_index = jnp.arange(width, dtype=jnp.int64)
+            cap_res = chirp_p * convolution[:, 2 * L - 2 : 2 * L - 2 + width]
+            rows_nphi = nphi[jnp.asarray(caps)][:, None]
+            wrap_phase = ((L - 1) % rows_nphi) * p_index[None, :] % rows_nphi
+            cap_res *= jnp.exp(-1j * wrap_phase * (2 * jnp.pi / rows_nphi))
+        else:
+            c_index = jnp.arange(2 * L - 1, dtype=jnp.int64)
+            p_index = jnp.arange(width, dtype=jnp.int64)
+            shift = jnp.arange(transform_size, dtype=jnp.int64) - (2 * L - 2)
+            res_list = []
+            chunk_size = 2048
+            for c_start in range(0, len(caps), chunk_size):
+                c_end = min(c_start + chunk_size, len(caps))
+                chunk_caps = caps[c_start:c_end]
+                two_nphi = (2 * nphi[chunk_caps])[:, None]
+                c_c = jnp.exp(1j * _chirp_angle(c_index, two_nphi, False)).astype(cplx_dt)
+                k_spec = jnp.fft.fft(jnp.exp(-1j * _chirp_angle(shift, two_nphi, False)), axis=-1).astype(cplx_dt)
+                c_p = jnp.exp(1j * _chirp_angle(p_index, two_nphi, False)).astype(cplx_dt)
+                sub_grid = cap_grid[c_start:c_end]
+                embedded = jnp.pad(sub_grid * c_c, ((0, 0), (0, transform_size - (2 * L - 1))))
+                conv = jnp.fft.ifft(jnp.fft.fft(embedded, axis=-1) * k_spec, axis=-1)
+                chunk_res = c_p * conv[:, 2 * L - 2 : 2 * L - 2 + width]
+                rows_nphi = nphi[chunk_caps][:, None]
+                wrap_phase = ((L - 1) % rows_nphi) * p_index[None, :] % rows_nphi
+                chunk_res *= jnp.exp(-1j * wrap_phase * (2 * jnp.pi / rows_nphi))
+                res_list.append(chunk_res)
+            cap_res = jnp.concatenate(res_list, axis=0)
+
 
     belt_rows = belt_hi - belt_lo
     if belt_rows == 0:
@@ -1561,6 +1622,51 @@ def _map2alm_core_slab(maps, ell, order, *, spin, nside, L, L_work, n_iter,
             alm, maps, ell, order, spin=spin, nside=nside, L=L, L_work=L_work,
             analysis_slab=analysis_slab, synthesis_slab=synthesis_slab,
         )
+    return alm
+
+
+def _map2alm_once_streamed(maps, ell, order, *, spin, nside, L, L_work):
+    ftm = _forward_s2fft_ftm(
+        maps[0] + 1j * maps[1],
+        _spin_ring_analysis_tables(
+            L_work, nside,
+            getattr(maps, "device", None) or getattr(maps[0], "device", None)),
+        L=L_work, nside=nside, reality=False,
+    )
+    from gmaster import _spin_streamed
+    lat = _spin_streamed.forward_latitudinal(ftm, L=L_work, nside=nside, spin=spin)
+    plus = _finish_forward_s2fft(lat, L=L_work, spin=spin, reality=False)
+    plus_m = plus[ell, L_work - 1 + order]
+    minus_m = (-1) ** order * jnp.conj(plus[ell, L_work - 1 - order])
+    return jnp.stack([-(plus_m + minus_m) / 2, 0.5j * (plus_m - minus_m)])
+
+
+def _alm2map_core_streamed(alm, *, spin, nside, L, L_work):
+    flm = _prepare_inverse_s2fft(_unpack_spin(alm, L, L_work), L=L_work)
+    from gmaster import _spin_streamed
+    ftm = _spin_streamed.inverse_latitudinal(flm, L=L_work, nside=nside, spin=spin)
+    maps = _finish_inverse_s2fft(
+        ftm,
+        _spin_ring_synthesis_tables(L_work, nside, getattr(ftm, "device", None)),
+        L=L_work, spin=spin, nside=nside, reality=False,
+    )
+    return jnp.stack([jnp.real(maps), jnp.imag(maps)])
+
+
+def _map2alm_iteration_streamed(alm, maps, ell, order, *, spin, nside, L, L_work):
+    residual = (
+        _alm2map_core_streamed(alm, spin=spin, nside=nside, L=L, L_work=L_work)
+        - maps
+    )
+    return alm - _map2alm_once_streamed(
+        residual, ell, order, spin=spin, nside=nside, L=L, L_work=L_work,
+    )
+
+
+def _map2alm_core_streamed(maps, ell, order, *, spin, nside, L, L_work, n_iter):
+    alm = _map2alm_once_streamed(maps, ell, order, spin=spin, nside=nside, L=L, L_work=L_work)
+    for _ in range(n_iter):
+        alm = _map2alm_iteration_streamed(alm, maps, ell, order, spin=spin, nside=nside, L=L, L_work=L_work)
     return alm
 
 
@@ -2059,6 +2165,17 @@ def map2alm(map, spin, map_info, alm_info, *, n_iter):
                 analysis_slab=analysis_slab,
                 synthesis_slab=synthesis_slab,
             )
+        if int(spin) == 2:
+            return _map2alm_core_streamed(
+                maps,
+                alm_info._ell,
+                alm_info._m,
+                spin=int(spin),
+                nside=map_info.nside,
+                L=L,
+                L_work=L_work,
+                n_iter=int(n_iter),
+            )
     if _use_multi_gpu_sht(L_work):
         return _map2alm_core_multi_gpu(
             maps,
@@ -2115,6 +2232,14 @@ def alm2map(alm, spin, map_info, alm_info):
                 L=L,
                 L_work=L_work,
                 slab=synthesis_slab,
+            )
+        if int(spin) == 2:
+            return _alm2map_core_streamed(
+                alm,
+                spin=int(spin),
+                nside=map_info.nside,
+                L=L,
+                L_work=L_work,
             )
     if _use_multi_gpu_sht(L_work):
         alm = _copy_to_device(alm, _gpu_devices()[0])
