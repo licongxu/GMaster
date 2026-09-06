@@ -3807,6 +3807,51 @@ next to a `rel alm`.
 `GMASTER_POLAR_CONTRACT=xla` style) and the first log must contain the kernel's ms/window *and* the
 pipeline's `rel alm`, because a generator route that is only fast is not a win.
 
+## Session 20 (later): anchoring kills the serial recurrence, and the same math in a map is 2500x faster
+
+The scan oracle was accurate but its 14.4 s/window was XLA per-degree dispatch, and the emitter
+cross-check above said a generator might not clear ducc0. Anchoring has a second consequence that
+was not exploited until now: **a segment that starts from stored `(ell-1, ell)` values does not need
+the segments before it**, so the `ell`-recurrence is not a serial chain of L steps at all - it is
+`ceil(L/K)` *independent* programs of K unrolled steps, which is the shape XLA and this card are good
+at. `.qwen/tmp/spin2_fused_block.py`'s `segblock` implements exactly that (one program per
+`(theta-tile, S segments)`, K unrolled steps, `prev/cur/ex` in registers, the per-lane scale `w`
+constant inside a segment so it folds into the RHS once, 4 real channels contracted in fp32, fp64
+only for the emitted partial).
+
+Two things had to be right, and each was wrong in its own way first: **k=0 emits the anchor itself**
+(the pair is `(V_{e-1}, V_e)`, so the segment's first emitted degree is `e`, and the carry must
+advance only `cur` at k=0 or the k=1 step gets `prev = V_e`), and the seed overrides `at0/at1` must
+stay inside the loop so a row whose triangle starts mid-segment re-seeds itself - the row's garbage
+below `m` never reaches an output because the two consecutive overrides at `m` and `m+1` reset the
+pair. With that, the error profile against `ell mod K` is the textbook sawtooth the anchored model
+predicts: 1.3e-07 at k=0 (exactly the anchor's own float32 storage error) rising to 4.9e-07 at k=7.
+
+Measured, same yardstick as everything above (`spin2_fused_block_256_seg_sweep.log`,
+`spin2_fused_block_512_seg.log`, `spin2_fused_block_1024_seg.log`):
+
+```text
+nside   scan arm      parallel-segment arm    accuracy   S (segments/program) -> G values/s
+ 256    955 ms/window  0.61 ms/window (S=64)   4.10e-07   8: 32.9   16: 55.4   32: 78.5   64: 82.0
+ 512   3592 ms/window  1.84 ms/window (S=64)   4.51e-07   32: 71.2  64: 109.6
+1024  13989 ms/window  5.65 ms/window (S=128)  5.44e-07   64: 105.6 128: 142.5   (median 1.27e-08)
+```
+
+**At Nside 1024 the whole polarised spin-2 latitudinal pass is 48 x 5.65 ms = 271 ms in plain XLA**
+(the probe computes the masked rectangle, so a kernel that marches only `ell >= m0` should land near
+150 ms), against the **13.27 s** generic per-window loop that ships today at that Nside - **~49x** -
+and against ducc0's ~119 ms, where we are still ~2.3x behind. It is not yet a ducc win at 1024; it
+is the first version of this step that runs at all, at an accuracy (5.44e-07, median 1.27e-08) at or
+below the shipped float32 table route's own error, with **no 73.48 GiB slice anywhere**.
+
+Where the headroom demonstrably is: at S=64 the block logs **1267 GFLOP/s** on a 41,440 GFLOP/s fp32
+FFMA peak (**3 %**) and at S=128 it moves 1.50 GiB of anchors per window in 5.65 ms = **280 GB/s**
+against the card's 1444 GB/s stream rate - so it is neither bandwidth-bound nor compute-bound, it is
+latency/ILP-bound inside the K-step chain, which is precisely what a Pallas port controls (deeper
+unroll, the four channels as one vector op, the anchor gather hoisted one segment ahead). The scan
+comparison is not a subtlety: 13,989 -> 5.65 ms is **2500x**, and that is only the difference between
+expressing the recurrence as a chain and expressing it as a map.
+
 **DFT / brute-force note (`record-brute`), recorded as a cost model, not a measurement.** The probe
 script and its log for the no-FFT direct DFT are no longer in `.qwen/tmp` (checked: `ls .qwen/tmp/*brute*`
 → nothing), so I am not quoting a number for it. What the model says, with the fp32 rate measured above:
