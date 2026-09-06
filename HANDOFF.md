@@ -3867,6 +3867,179 @@ plain-FFT ring stage this repo already ships for that same Nside. Rejected: the 
 makes the ring DFT a power-of-two plain FFT, and Bluestein's 3x overhead is the wrong tool there
 (sessions 14/15). The fused march changes none of that — it removes the *slice*, not the ring transform.
 
+---
+
+## Session 21 — the anchor table is dead: a serial compensated float32 march, table-free, at 123 ms/pass for Nside 1024 spin-2
+
+Probe: `.qwen/tmp/spin2_pallas_march.py` (logs `spin2_march_1024.log`, `spin2_ds_1024_b.log`,
+`spin2_ds_512.log`, `spin2_arms_256.log`, `spin2_march_geom.log`, `spin2_march_ablate.log`,
+`spin2_ds_sweep.log`). Arms `f64 | f32 | f32l | f32ds` march the same Jacobi coefficients against the
+same 4 real polarised RHS, one Pallas program per (m-row, theta-tile), a serial `lax.fori_loop` in
+`ell` from `m` (so a row touches only its own triangle), and one scalar `plt.store` per output value.
+Reference is a numpy float64 march of the same coefficients, which I validated first this time
+(below) because last window's whole debugging cycle went into an unvalidated reference.
+
+**The reference is right, and the thing that was wrong was one seed coefficient.** My numpy oracle
+agrees with `spin2_fused_block.py`'s `block("f64")` — the construction `spin2_jacobi_gate_arms.log`
+validates against the production table to 2.1e-12 — to **2.76e-08** over all `m >= 2, ell >= m` at
+Nside 64 (`oracle_march_64_0.npy` vs `oracle_fb_64_0.npy`; that residual is the fused block's float32
+RHS, my oracle carries float64). Everything below is therefore measured against something real.
+
+**`P_1` is `((alpha+beta+2)/2)·cos(theta) + (alpha-beta)/2` = `(m+1)cos(theta) + 2`, not
+`m·cos(theta) + 2`.** The kernel seeded `ell = m+1` with the latter and it cost a full debugging
+window: identical relative error in the float64 and float32 arms (0.98), *exact* at `ell = m` and
+wrong at `ell = m+1` — which is an analytic seed with no recurrence in it — growing with `ell`
+(`first ell over 1e-4 = 4m+8`, i.e. proportional to `1/m`). Ratio at `m=12`: 1.0000 at `ell=12`,
+0.9348 at 13, 1.5370 at 14. The generic three-term coefficients `(alpha+beta)/2` and
+`(alpha-beta)/2` look like they should assemble `P_1`; they do not — the `x` coefficient of
+`P_1^(a,b)` is `(a+b+2)/2`. After the fix the float64 arm is **4.56e-16** at Nside 64 and
+**1.53e-15** at Nside 1024 against the oracle, i.e. the Pallas march reproduces the reference exactly.
+
+**Compensating the *state* buys nothing; compensating the *coefficients* buys everything.** Nside
+256, tile 512, 1 warp, same 4-channel RHS, `rel = |arm-ref|/max|ref|`:
+
+```text
+arm     ms/window  G values/s  rel vs fp64 oracle
+f64       11.78        4.1        7.50e-16
+f32        1.07       45.2        8.83e-05     plain float32 everything
+f32l       1.32       36.6        8.31e-05     double-single state (hi/lo), float32 coefficients
+f32ds      1.42       33.9        7.94e-08     double-single state + hi/lo coefficient tables
+```
+
+`f32l` is within 6 % of plain `f32` — the accumulated round-off of the recurrence is *not* what
+limits a raw float32 march. What limits it is storing `A1, A0, BB` in float32: keeping those as
+hi/lo limb pairs (an exact `mul.rn.f32`/`fma.rn.f32` two-product plus the `c0l` limb) drops the
+error **1100x**, for 33 % runtime. 7.94e-08 is below the shipped float32 table route's own bar
+(7.12e-07..1.15e-06) and below the anchored route's 5.44e-07, and it is achieved with **no anchor
+table at all**.
+
+**One warp per program is what unlocked the serial shape.** Nside 1024, arm `f32`, `ms/window`:
+
+```text
+tile x warps     128x4    128x1    256x1    512x1    256x2   1024x1
+ms/window        27.13     6.81     4.47     4.15     7.43     7.44
+```
+
+4 warps means every per-degree `jnp.sum` over the theta tile crosses warps through shared memory
+with a barrier, in the middle of a serial chain; 1 warp with 8-16 theta lanes per thread replaces
+that with intra-thread adds plus 5 shuffles, and the same launch that cost 27.13 ms costs 4.15 ms.
+`tile 256 x 2` is worse than `tile 256 x 1` (7.43 vs 4.47) and `tile 1024 x 1` spills (7.44), so
+the win is intra-thread ILP plus barrier-free reductions, not merely "fewer warps".
+
+**Where the remaining time is** (Nside 1024, `f32`, tile 128 x 4 warps, `MARCH_ABLATE`):
+
+```text
+variant                                   ms/window   what it removes
+full                                        27.13      -
+marchonly (no emit, one store per program)   0.43      the entire per-degree emit
+chan1 (1 channel reduced instead of 4)      18.29      3 cross-lane reductions + 3 stores
+nomax (exponent max replaced by a constant) 25.98      1 cross-lane reduction
+norenorm (band check removed)               26.87      the whole renormalise chain
+nocoef (3 per-degree scalar loads hoisted)  29.33      nothing (it is free; NaN - semantics broken)
+```
+
+The **recurrence itself is free**: 0.43 ms for all 4096 programs x 3072 serial steps = 1869 G
+values/s, because the chains are independent across theta lanes and pipeline perfectly. 100 % of
+the cost is the emit — the 4 per-degree theta reductions and the per-degree scalar stores. The
+per-degree coefficient reads and the renormalise chain are free.
+
+**Headline, Nside 1024, spin-2, table-free, accurate** (`spin2_ds_1024_b.log`): arm `f32ds`,
+tile 256, 1 warp:
+
+```text
+5.05 ms/window   157.8 G values/s   rel 1.20e-07   non-finite 0
+projected whole pass = 24.3 x window = 0.123 s
+```
+
+(tile 512: 5.49 ms/window, rel 1.47e-07, 133 ms projected — tile 256 is the sweet spot.)
+
+The projection factor is 24.3, not 48: the serial march starts each row at `ell = m`, so a window
+does `sum(L - m)` live degrees and the pass is `L(L+1)/2 / 194592 = 24.3` windows, whereas the
+session-20 segment map always marches the masked rectangle and pays 48.
+
+| Nside 1024 spin-2 latitudinal pass | ms/pass | rel | slice/table traffic |
+|---|---|---|---|
+| generic per-window loop shipped today | 13,270 | ~1e-13 (fp64 table) | 73.48 GiB slice, declined |
+| session-20 anchored segment map (XLA) | 271 | 5.44e-07 | 1.50 GiB anchors/window, ~72 GiB/pass |
+| serial compensated march (Pallas), 4 independent reductions | 123 | 1.20e-07 | 4.7 MB of fp32 coefficient limbs/window |
+| **this: same kernel, one shared-tree reduction + one `(NC,)` store** | **98** | **1.27e-07** | same |
+| ducc0 CPU — **whole** spin-2 forward transform, not this step alone | 107–119.3 | — | on-the-fly recurrence |
+
+Read that last row carefully, because it is the one place this session could lie to a reader. The
+119.3 ms figure is ducc0's **entire** spin-2 `map2alm` at Nside 1024 (session 19's note is even
+blunter: the shipped table contraction "cannot be compared to ducc0's 119 ms, which is a full
+forward transform with its own harmonic synthesis"). The 98 ms above is **one stage** of our
+pipeline. So the defensible statement is: *the table-free polarised spin-2 latitudinal step now
+costs less than ducc0's whole forward transform*, i.e. the stage that was 13.27 s and then 271 ms
+is no longer what puts us behind — and whether the **pipeline** beats ducc0 at Nside 1024 is a
+question only the integrated number can answer, because our ring stage is not in that 98 ms. What
+is unambiguous is the comparison against our own alternatives: **2.8x faster than the anchored map
+at 4.3x better accuracy, with 320x less coefficient traffic than the anchor table** (`6 arrays x 64
+rows x 3072 degrees x 4 B = 4.7 MB` versus 1.50 GiB/window), and no 73.48 GiB layout anywhere.
+
+
+The last 20 % came from the emit alone. At the operating point (Nside 256, tile 256, 1 warp) the
+split was `full 1.05 / marchonly 0.20 / chan1 0.80 / nomax 0.99 / norenorm 0.95` ms — 81 % emit,
+of which the four *independent* per-channel theta reductions were 0.33 ms. Storing the RHS as
+`(MB, theta, NC)` and writing `jnp.sum(val[:, None] * r, axis=0)` turns four dependent 5-deep
+shuffle trees into **one** Triton tree over a `(TB, NC)` block, and the four scalar `plt.store`s
+into one 32 B store. Measured (`spin2_ds_sharedtree.log`, `spin2_ds_tile_sharedtree.log`):
+
+```text
+Nside 256, tile 256 x 1 warp   1.05 -> 0.80 ms/window   rel 8.41e-08 -> 5.73e-08
+Nside 1024, tile 256 x 1 warp  5.05 -> 4.03 ms/window   rel 1.20e-07 -> 1.27e-07   198 G values/s
+tile sweep at Nside 1024 (f32ds, 1 warp): 128 -> 4.86   256 -> 4.03   512 -> 4.83 ms/window
+```
+
+Tile 256 is a real optimum, not a plateau: 512 wins on store count, 128 wins on resident warps,
+and 256 splits the difference. The accuracy is unchanged in kind (both are ~1e-07, well inside the
+shipped float32 route's 7.12e-07 bar) because the change is a reduction order, not a precision
+change; the float64 control stays exact (4.56e-16).
+
+**It gets better with size, which is the whole point of aiming past 1024** (`spin2_ds_2048.log`,
+`spin2_ds_4096.log`, arm `f32ds`, tile 256 x 1 warp):
+
+```text
+Nside   ms/window   G values/s   rel            projected pass
+ 1024      4.03        198       1.27e-07        98 ms   (24.3 windows)
+ 2048     10.03        320       6.40e-08       484 ms   (48.3 windows)
+ 4096     42.99        299       1.61e-07       4.14 s   (96.3 windows)
+```
+
+The rate is flat-to-improving and the accuracy is flat across a 16x range of `L^2` work, which is
+the behaviour the session-20 anchor gate measured as "error at fixed K is independent of L"
+(K=8: 6.41e-07 at L=768, 5.06e-07 at L=1536, 5.16e-07 at L=3072) — here with no K at all, because
+the compensation replaced the restart. The fp32 renormalise band is fixed at `2^±24` per row
+regardless of `L`, and the per-degree overheads amortise over a longer chain.
+
+For scale at the top size: the Wigner-d slice at Nside 4096 would be ~4.7 TiB, and this kernel's
+tables are 75 MB of fp32 coefficient limbs per window. The only ducc0 cell logged in this repo at
+Nside 4096 is *scalar* (`ducc_only_4096_0.log`: 1840.97 / 1865.26 ms for map2alm / alm2map), and
+the polarised ducc0 cells at 2048/4096 have never been measured here — producing them is part of
+the integrated scoreboard, not something to extrapolate.
+
+
+
+What is left in the kernel, by the same ablations: ~0.2 ms of renormalise chain, ~0.06 ms of
+exponent max, and the residual emit (`2**lg2n` per degree, the `lgnr` scalar read, the store).
+`marchonly` says the floor of this formulation is 0.20/1.05 = 19 % of current cost, so the shape
+has maybe 3x more headroom in it, all of it in the emit.
+
+
+Pallas gotchas this window, each of which cost a run:
+* `elementwise_inline_asm` operand numbering is `$0..$(n-1)` over *all* operands including outputs.
+  `fma.rn.f32 $0, $2, $3, $4` with 1 output + 3 inputs is a **ptxas parse error** (`error code 65280`,
+  `line 1316;`) that JAX reports with no useful text; correct is `$0, $1, $2, $3`.
+* Block indexing `ex[0]`, `val[0]` does not lower on Pallas GPU (`Unimplemented primitive: slice`).
+  To ablate a `jnp.max`, replace it with a constant, not with a lane.
+* A `fori_loop` whose only sink is an accumulator gets deleted wholesale; a per-degree
+  `plt.store` is what keeps a march alive (`marchonly` needs its one post-loop store).
+* A sweep that pipes the probe through `grep "^   f32ds"` silently returns nothing, because the arm
+  column is `f"{arm:>6}"`: `f32` gets three leading spaces, `f32ds` only one. Two configs were
+  read as "timed out" and one as "the compensated kernel takes 5 min to compile" before `grep
+  "f32ds +[0-9]"` showed they had all run fine. Match on the value, not the padded label.
+
+
 
 
 
