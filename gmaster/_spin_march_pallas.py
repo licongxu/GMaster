@@ -66,6 +66,17 @@ def march_requested(spin) -> bool:
                     for d in jax.devices()))
 
 
+def synth_requested(spin) -> bool:
+    """True for the synthesis march; follows `GMASTER_SPIN2_MARCH` unless turned off alone.
+
+    Split out because the two directions do not carry the same accuracy: the analysis march gives
+    3.6e-05 relative alm against ducc0 at Nside 1024 (`.qwen/tmp/sht_vs_ducc_s29_march_1024_2048_2.log`)
+    while the synthesis kernel is 8e-06 against the shipped step at Nside 64, dominated by
+    cancellation in the pole lanes of a single degree (`.qwen/tmp/spin2_synth_delta_32.log`).
+    """
+    return march_requested(spin) and os.environ.get("GMASTER_SPIN2_MARCH_SYNTH", "1") != "0"
+
+
 # --------------------------------------------------------------------------------------- kernel
 def _two_prod(a, b):
     """(a*b, exact residual): the only exact-FMA pair available under this XLA/Pallas stack."""
@@ -96,6 +107,12 @@ def _pow2(d):
     biased = jnp.clip(d + 127, 1, 254)
     return jnp.where(d >= -126, jax.lax.bitcast_convert_type(biased << 23, jnp.float32),
                      jnp.float32(0.0))
+
+
+def _pow2_f64(d):
+    """The same exact power of two in float64, for rescaling an accumulator block."""
+    biased = jnp.clip(d + 1023, 1, 2046).astype(jnp.int64)
+    return jax.lax.bitcast_convert_type(biased << 52, jnp.float64)
 
 
 def _kern(manr, ex0r, xr, xlr, c1r, c0r, cbr, c1lr, c0lr, cblr, lgnr, sgnr, rr, m0_ref, out_ref,
@@ -190,6 +207,21 @@ def _call(L, ntheta, ntile, mb):
 
 
 # --------------------------------------------------------------------------------- geometry, in
+def _log2_norm(m0, mb, L):
+    """`log2 sqrt((l+m)!(l-m)! / ((l-s)!(l+s)!))` for one m-window, with the below-spin flip.
+
+    Shared by the analysis emit and the synthesis coefficient split: the pair-swapped branch of
+    DLMF 14.9.16 inverts the factorial ratio below the spin (module docstring), so the whole row
+    `m < s` carries the negated exponent.
+    """
+    ms = m0 + jnp.arange(mb, dtype=jnp.float64)
+    m_ = ms[:, None]
+    ell_ = jnp.arange(L, dtype=jnp.float64)[None, :]
+    lg2n = 0.5 * (gammaln(ell_ + m_ + 1) + gammaln(ell_ - m_ + 1)
+                  - gammaln(ell_ - SPIN + 1) - gammaln(ell_ + SPIN + 1)) / np.log(2.0)
+    return lg2n * jnp.where(ms >= SPIN, 1.0, -1.0)[:, None]
+
+
 def _window_geometry(m0, mb, x, sh, ch, L, npad):
     """March coefficients and half-angle weights for one m-window, computed inside the trace.
 
@@ -213,10 +245,7 @@ def _window_geometry(m0, mb, x, sh, ch, L, npad):
     log2s = alpha * jnp.log2(sh)[None, :] + beta * jnp.log2(ch)[None, :]
     ex0 = jnp.floor(log2s)
     mant = jnp.exp2(log2s - ex0)
-    lg2n = 0.5 * (gammaln(ell_ + m_ + 1) + gammaln(ell_ - m_ + 1)
-                  - gammaln(ell_ - SPIN + 1) - gammaln(ell_ + SPIN + 1)) / np.log(2.0)
-    # The pair-swapped branch inverts the factorial ratio below the spin (module docstring).
-    lgs = lg2n * jnp.where(ms >= SPIN, 1.0, -1.0)[:, None]
+    lgs = _log2_norm(m0, mb, L)
     sgn = (-1.0) ** ms
 
     def hi_lo(a):
@@ -294,6 +323,217 @@ def forward_latitudinal(ftm, *, L, spin, nside):
     if int(spin) != SPIN:
         raise ValueError(f"march route implements spin=+{SPIN}, got spin={spin}")
     return _forward_impl(ftm, L=L, spin=spin, nside=nside)
+
+
+# ------------------------------------------------------------------- synthesis: the same row, summed
+def _kern_synth(manr, ex0r, xr, xlr, c1r, c0r, cbr, c1lr, c0lr, cblr, lexr,
+                chr_, clr, cih, cil, m0_ref, out_ref, *, L, ntheta, chunk):
+    """One (m-window row, theta tile): march the row and accumulate ``d^l_(m,-s) c_l`` per lane.
+
+    The analysis kernel reduces the theta axis at every degree; the synthesis contraction is the
+    transpose of that sum, so it keeps a per-lane accumulator and walks `ell`.  Terms span ~2^2800
+    at Nside 1024, so the accumulator carries its own per-lane exponent and meets each term through
+    the exact power ``2**(tex - aex)``: `tex` is the march exponent plus the integer part of the
+    factorial ratio, whose fractional part and the ``(-1)**m`` sign ride in the coefficient.  That
+    way no ``2**+-1400`` is ever formed, and the alignment stays exact.
+
+    The accumulator is a second float32 (value, limb) pair, not a float64 one.  This GPU does
+    float64 at 1/64 rate, and the dozen float64 ops per degree the first version ran cost more than
+    the entire march: 793.9 ms for the synthesis step against 111.6 ms for the analysis step at
+    Nside 1024 (`.qwen/tmp/sht_vs_ducc_s29_ab2_1024_2.log`).
+    """
+    row = pl.program_id(0)
+    tile = pl.program_id(1)
+    m = plt.load(m0_ref.at[0]) + row
+    nstart = jnp.maximum(m, SPIN)
+    t = tile * chunk + jnp.arange(chunk)
+    valid = t < ntheta
+
+    man = plt.load(manr.at[row, t], mask=valid, other=0.0)
+    ex0 = plt.load(ex0r.at[row, t])
+    ex = ex0
+    xv = plt.load(xr.at[t], mask=valid, other=0.0)
+    xl = plt.load(xlr.at[t], mask=valid, other=0.0)
+    mf = m.astype(jnp.float32)
+    alpha = mf + jnp.float32(SPIN)
+    beta = jnp.abs(mf - jnp.float32(SPIN))
+    p1f = ((alpha + beta + 2.0) / 2.0) * xv + ((alpha - beta) / 2.0)
+
+    def add_pair(hh, lo, ph, pl):
+        """(hh, lo) += (ph, pl) for two compensated float32 pairs, result renormalised."""
+        sh, se = _two_sum(hh, ph)
+        sl = lo + (pl + se)
+        nh = sh + sl
+        return nh, sl - (nh - sh)
+
+    def degree(ell, st):
+        ph, pl_, ch, cl, ex, ah_r, al_r, ah_i, al_i, aex = st
+        c1 = jnp.broadcast_to(plt.load(c1r.at[row, ell]).astype(jnp.float32), xv.shape)
+        c0 = jnp.broadcast_to(plt.load(c0r.at[row, ell]).astype(jnp.float32), xv.shape)
+        cb = jnp.broadcast_to(plt.load(cbr.at[row, ell]).astype(jnp.float32), xv.shape)
+        ah, al = _two_prod(c1, xv)
+        al = _fma(c1, xl, al)
+        al = _fma(jnp.broadcast_to(plt.load(c1lr.at[row, ell]), xv.shape), xv, al)
+        ah, e2 = _two_sum(ah, c0)
+        al = al + jnp.broadcast_to(plt.load(c0lr.at[row, ell]), xv.shape) + e2
+        th, tl = _two_prod(ah, ch)
+        tl = _fma(ah, cl, tl)
+        tl = _fma(al, ch, tl)
+        uh, ul = _two_prod(cb, ph)
+        ul = _fma(cb, pl_, ul)
+        ul = _fma(jnp.broadcast_to(plt.load(cblr.at[row, ell]), xv.shape), ph, ul)
+        nxt = th - uh
+        nxtl = (tl - ul) + ((th - nxt) - uh)
+        hh = nxt + nxtl
+        nxtl = nxtl - (hh - nxt)
+        nxt = hh
+        at0 = ell == nstart
+        nxt = jnp.where(at0, man, jnp.where(ell == nstart + 1, man * p1f, nxt))
+        nxtl = jnp.where(at0 | (ell == nstart + 1), jnp.float32(0.0), nxtl)
+        ex = jnp.where(at0, ex0, ex)
+        nxt = jnp.where(valid, nxt, jnp.float32(0.0))
+        nxtl = jnp.where(valid, nxtl, jnp.float32(0.0))
+        big = jnp.maximum(jnp.abs(nxt), jnp.abs(ch))
+        large = big > BHI
+        small = (big < BLO) & (big > 0)
+        dmult = jnp.where(large, jnp.float32(2.0 ** -JUMP),
+                          jnp.where(small, jnp.float32(2.0 ** JUMP), jnp.float32(1.0)))
+        ex = ex + jnp.where(large, JUMP, jnp.where(small, -JUMP, 0)).astype(jnp.int32)
+        nxt = nxt * dmult
+        nxtl = nxtl * dmult
+
+        # Bring the degree's value into the accumulator's block: the alignment is a power of two,
+        # so both the value and its limb scale exactly.
+        lex = jnp.broadcast_to(plt.load(lexr.at[row, ell]), xv.shape)
+        tex = jnp.where(valid, ex + lex, aex)
+        drift = tex - aex
+        aex = jnp.where(at0, tex,
+                        aex + jnp.where(drift > 90, drift - 90,
+                                        jnp.where(drift < -90, drift + 90, 0)))
+        ds = _pow2((tex - aex).astype(jnp.int32))
+        nd, ndl = nxt * ds, nxtl * ds
+        pr, pl = _two_prod(nd, jnp.broadcast_to(plt.load(chr_.at[row, ell]), xv.shape))
+        pl = _fma(nd, jnp.broadcast_to(plt.load(clr.at[row, ell]), xv.shape), pl)
+        pl = _fma(ndl, jnp.broadcast_to(plt.load(chr_.at[row, ell]), xv.shape), pl)
+        pi, pli = _two_prod(nd, jnp.broadcast_to(plt.load(cih.at[row, ell]), xv.shape))
+        pli = _fma(nd, jnp.broadcast_to(plt.load(cil.at[row, ell]), xv.shape), pli)
+        pli = _fma(ndl, jnp.broadcast_to(plt.load(cih.at[row, ell]), xv.shape), pli)
+        ah_r, al_r = add_pair(ah_r, al_r, pr, pl)
+        ah_i, al_i = add_pair(ah_i, al_i, pi, pli)
+        amax = jnp.maximum(jnp.abs(ah_r), jnp.abs(ah_i))
+        abig = amax > BHI
+        asmall = (amax < BLO) & (amax > 0)
+        amult = jnp.where(abig, jnp.float32(2.0 ** -JUMP),
+                          jnp.where(asmall, jnp.float32(2.0 ** JUMP), jnp.float32(1.0)))
+        aex = aex + jnp.where(abig, JUMP, jnp.where(asmall, -JUMP, 0)).astype(jnp.int32)
+        ah_r, al_r, ah_i, al_i = (ah_r * amult, al_r * amult, ah_i * amult, al_i * amult)
+        return (jnp.where(valid, ch * dmult, jnp.float32(0.0)),
+                jnp.where(valid, cl * dmult, jnp.float32(0.0)), nxt, nxtl, ex,
+                ah_r, al_r, ah_i, al_i, aex)
+
+    zb = jnp.zeros_like(man)
+    (_, _, _, _, _, ah_r, al_r, ah_i, al_i, aex) = lax.fori_loop(
+        nstart, L, degree, (zb, zb, man, zb, ex, zb, zb, zb, zb, jnp.zeros(xv.shape, jnp.int32)))
+    sc = _pow2_f64(aex)
+    plt.store(out_ref.at[row, tile, slice(0, chunk), slice(0, 2)],
+              jnp.stack([(ah_r.astype(jnp.float64) + al_r.astype(jnp.float64)) * sc,
+                         (ah_i.astype(jnp.float64) + al_i.astype(jnp.float64)) * sc], axis=-1))
+
+
+def _call_synth(L, ntheta, ntile, mb):
+    key = ("synth", int(L), int(ntheta), int(ntile), int(mb), _TILE, _WARPS)
+    call = _CALLS.get(key)
+    if call is None:
+        call = jax.jit(pl.pallas_call(
+            partial(_kern_synth, L=L, ntheta=ntheta, chunk=_TILE),
+            out_shape=jax.ShapeDtypeStruct((mb, ntile, _TILE, 2), jnp.float64),
+            grid=(mb, ntile),
+            compiler_params=plt.CompilerParams(num_warps=_WARPS),
+            name="gmaster_spin2_synth"))
+        _CALLS[key] = call
+    return call
+
+
+def _synth_coeff(flm, m0, mb, L, *, mirror):
+    """Coefficient sequence and exponent split for one window of orders.
+
+    ``lgs`` is split into ``lex`` (integer, folded into the term exponent) and a ``[1, 2)`` factor
+    that rides in the float32 coefficient together with the closed form's ``(-1)**m``; the mirror
+    half carries the slice's own ``(-1)**(ell + |spin|)``, which the delta probe
+    (``.qwen/tmp/spin2_synth_negm_64.log``) shows is exactly the ``theta -> pi - theta`` factor the
+    shipped synthesis applies to negative orders.
+    """
+    from gmaster import _spin_slice as ss
+
+    ms = m0 + jnp.arange(mb)
+    cols = L - 1 + ms if not mirror else L - 1 - ms
+    c = flm[:, cols]                                   # (L, mb) complex
+    if mirror:
+        c = c * ss._sign(L, SPIN)[:, None]
+    lgs = _log2_norm(m0, mb, L)                        # (mb, L) float64
+    lex = jnp.floor(lgs)
+    sc = jnp.exp2(lgs - lex) * ((-1.0) ** ms)[:, None]
+    # Split the float64 coefficient into a float32 high part plus limb.  The contraction inside the
+    # kernel is float32 (float64 is 1/64-rate here), so the coefficient keeps its precision only if
+    # it arrives as a pair -- a float32 coefficient alone is re-spent at every degree of the same
+    # lane and its error grows like L * 2**-24 (measured 5.9e-06 at Nside 32).
+    out = []
+    for part in (c.real.T * sc, c.imag.T * sc):
+        hi = part.astype(jnp.float32)
+        out.append(hi)
+        out.append((part - hi.astype(jnp.float64)).astype(jnp.float32))
+    crh, clr, cih, cil = out
+    return crh, clr, cih, cil, lex.astype(jnp.int32)
+
+
+@partial(jax.jit, static_argnames=("L", "spin", "nside"))
+def _inverse_impl(flm, *, L, spin, nside):
+    from gmaster import _spin_slice as ss
+
+    flm = jnp.asarray(flm)
+    theta = (jnp.asarray(s2_samples.thetas(L, "healpix", nside), dtype=jnp.float64)
+             + 8 * jnp.finfo(jnp.float64).eps)
+    ntheta = theta.shape[0]
+    ntile = -(-ntheta // _TILE)
+    npad = ntile * _TILE
+    x = jnp.cos(theta)
+    sh, ch = jnp.sin(theta / 2.0), jnp.cos(theta / 2.0)
+    out = jnp.zeros((ntheta, 2 * L), dtype=jnp.complex128)
+    for (m0, m1, lo) in ss._windows(L):
+        mb = m1 - m0
+        g = _window_geometry(m0, mb, x, sh, ch, L, npad)
+        crh, clr, cih, cil, lex = _synth_coeff(flm, m0, mb, L, mirror=False)
+        v = _call_synth(L, ntheta, ntile, mb)(
+            *g[:10], lex, crh, clr, cih, cil, jnp.asarray([m0], jnp.int32))
+        v = v.reshape(mb, npad, 2)[:, :ntheta]
+        out = out.at[:, L + m0:L + m1].set(v[:, :, 0].T + 1j * v[:, :, 1].T)
+        # Negative orders ride the same row on the pi - theta grid, which is the same geometry with
+        # cos -> -cos and the half-angle sines and cosines swapped.  m = 0 has no separate negative
+        # column: it is its own mirror and lands on `L` alone.
+        n0 = max(int(m0), 1)
+        if n0 < m1:
+            nb = m1 - n0
+            gm = _window_geometry(n0, nb, -x, ch, sh, L, npad)
+            crh, clr, cih, cil, lexm = _synth_coeff(flm, n0, nb, L, mirror=True)
+            vm = _call_synth(L, ntheta, ntile, nb)(
+                *gm[:10], lexm, crh, clr, cih, cil, jnp.asarray([n0], jnp.int32))
+            vm = vm.reshape(nb, npad, 2)[:, :ntheta]
+            val = (vm[:, :, 0].T + 1j * vm[:, :, 1].T)[:, ::-1]   # ascending column = descending m
+            out = out.at[:, L - m1 + 1:L - n0 + 1].set(val)
+    return out
+
+
+def inverse_latitudinal(flm, *, L, spin, nside):
+    """Synthesis latitudinal step with no Wigner-d table.
+
+    ``(L, 2L-1)`` complex in (``flm[ell, L-1+m]``) to ``(4*nside-1, 2L)`` complex, the contract
+    `utils._inverse_latitudinal` has today; the kernel is the same certified ``d^l_(m,-2)`` the
+    analysis march uses, measured against the shipped route at rel 1e-14 with unit scalar
+    (``.qwen/tmp/spin2_synth_row2_64.log``).
+    """
+    if int(spin) != SPIN:
+        raise ValueError(f"march route implements spin=+{SPIN}, got spin={spin}")
+    return _inverse_impl(flm, L=L, spin=spin, nside=nside)
 
 
 def clear_cache():

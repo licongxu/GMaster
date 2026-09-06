@@ -598,6 +598,12 @@ def _prepare_inverse_s2fft(flm, *, L):
 
 
 def _inverse_latitudinal(flm, theta, *, L, spin, nside, reality):
+    if not reality and _spin_march.synth_requested(spin):
+        # `GMASTER_SPIN2_MARCH=1`: the same table-free row march as the analysis seam, in the
+        # synthesis direction (sum over ell per theta lane).  The shipped route needs the whole
+        # Wigner-d slice, which `slabs_for` declines at large Nside, and falls back to a generic
+        # loop costing 13.2 s/pass at Nside 1024 and 168 s at 2048.
+        return _spin_march.inverse_latitudinal(flm, L=L, spin=spin, nside=nside)
     return _ftm_flm_primitive.flm_to_ftm(
         flm,
         theta,
