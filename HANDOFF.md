@@ -3852,6 +3852,12 @@ unroll, the four channels as one vector op, the anchor gather hoisted one segmen
 comparison is not a subtlety: 13,989 -> 5.65 ms is **2500x**, and that is only the difference between
 expressing the recurrence as a chain and expressing it as a map.
 
+The rate does not fall apart in the high-`m` half (`spin2_fused_block_1024_w512_seg.log`, window
+m 512..576): **5.69 ms/window, 141.4 G values/s, 1697 GFLOP/s, all-compared 8.95e-07, median
+5.84e-08** — same speed as the leading window and the same accuracy class as the single-RHS gate at
+that window (9.71e-07), so no window needs special handling and 48 x 5.7 ms = 271 ms stands as the
+measured per-pass cost of this formulation at Nside 1024.
+
 **DFT / brute-force note (`record-brute`), recorded as a cost model, not a measurement.** The probe
 script and its log for the no-FFT direct DFT are no longer in `.qwen/tmp` (checked: `ls .qwen/tmp/*brute*`
 → nothing), so I am not quoting a number for it. What the model says, with the fp32 rate measured above:
