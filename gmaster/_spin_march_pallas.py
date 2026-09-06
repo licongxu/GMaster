@@ -67,14 +67,30 @@ def march_requested(spin) -> bool:
 
 
 def synth_requested(spin) -> bool:
-    """True for the synthesis march; follows `GMASTER_SPIN2_MARCH` unless turned off alone.
+    """True for the synthesis march, which is **off unless asked for by name**.
 
-    Split out because the two directions do not carry the same accuracy: the analysis march gives
-    3.6e-05 relative alm against ducc0 at Nside 1024 (`.qwen/tmp/sht_vs_ducc_s29_march_1024_2048_2.log`)
-    while the synthesis kernel is 8e-06 against the shipped step at Nside 64, dominated by
-    cancellation in the pole lanes of a single degree (`.qwen/tmp/spin2_synth_delta_32.log`).
+    It used to follow `GMASTER_SPIN2_MARCH`, and that was a correctness bug rather than a tuning
+    choice: the seam sits where a *declined table* routes the call, so at Nside >= 512 turning on
+    the analysis march also switched synthesis over to a kernel that is slower than ducc0 --
+    122.7 ms against 105.7 at Nside 1024 (0.86x), 999.4 ms against 626.5 at Nside 2048 (0.63x),
+    `.qwen/tmp/score_synth_fused.log` -- and is wrong where it matters.  Its entry-level error is
+    4.56e-04 at Nside 512, but a full `alm2map` against the generic route comes out at rel
+    **9.99e-01 at a pixel whose reference value is the maximum of the map** (rms 2.40e-03),
+    `.qwen/tmp/synth_map_acc.log`: the worst lane is a bright polar pixel, not a negligible one,
+    because the marched row drifts by up to 6.0e-03 in exactly the polar lanes
+    (`.qwen/tmp/synth_oracle_512.log`, 120-digit oracle) and the polar rings carry the largest
+    per-ring weights.
+
+    The analysis direction is a different story and stays on `GMASTER_SPIN2_MARCH`: it beats ducc0
+    at 1.05x/1.11x with rel alm 3.6e-05/6.1e-05 (same log).  What is not settled is why the
+    synthesis lane pair delivers roughly 29 bits at the extreme rows instead of the ~48 it costs:
+    a float64 march of the same recurrence is good to 7.5e-13 at ell = 1526
+    (`.qwen/tmp/march_fp64_scan.log`), so it is arithmetic and not the algorithm; zeroing the
+    recurrence-coefficient limbs inside the kernel makes it 23x worse (2.47e-04 -> 5.62e-03), so
+    they are doing real work, and pairing the seeds changes nothing at Nside 512
+    (`.qwen/tmp/spin2_synth_delta_seedlimb_512.log`) for ~3% of the run time.
     """
-    return march_requested(spin) and os.environ.get("GMASTER_SPIN2_MARCH_SYNTH", "1") != "0"
+    return march_requested(spin) and os.environ.get("GMASTER_SPIN2_MARCH_SYNTH", "0") == "1"
 
 
 # --------------------------------------------------------------------------------------- kernel
