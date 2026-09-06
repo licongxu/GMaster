@@ -59,14 +59,47 @@ _WARPS = int(os.environ.get("GMASTER_SPIN2_MARCH_WARPS", "1"))
 _CALLS: dict = {}
 
 
-def march_requested(spin) -> bool:
-    """True when the caller asked for the march and this build/spin can serve it."""
-    return (int(spin) == SPIN and os.environ.get("GMASTER_SPIN2_MARCH", "0") == "1"
-            and any(d.platform == "gpu" and "NVIDIA" in d.device_kind.upper()
-                    for d in jax.devices()))
+def _on_nvidia() -> bool:
+    return any(d.platform == "gpu" and "NVIDIA" in d.device_kind.upper()
+               for d in jax.devices())
 
 
-def synth_requested(spin) -> bool:
+def slice_declined(L, nside) -> bool:
+    """True when no Wigner-d slice can be resident for this geometry, at any storage precision.
+
+    `slabs_for` returns `(None, None)` above `_SLAB_BUDGET` and the caller drops to the generic
+    scatter loop, which for spin 2 at Nside 1024 is a 13.2 s latitudinal step
+    (`.qwen/tmp/score_s2_routes_1024.log`: 13 255 ms against ducc0's 112.9 ms, 0.01x).  fp32 tables
+    are the cheapest the layout can ever be, so testing them is what "cannot exist" means.
+    """
+    from gmaster import _spin_slice as ss
+    from gmaster import utils
+
+    return ss.triangle_bytes(nside, L, utils.table_dtype()) > ss._SLAB_BUDGET
+
+
+def march_requested(spin, *, L=None, nside=None) -> bool:
+    """True when the analysis march should serve this call.
+
+    `GMASTER_SPIN2_MARCH` decides outright if it is set.  Left unset the march takes the call only
+    where there is no alternative -- a geometry too large for any slice (`slice_declined`) -- and
+    the shipped table route keeps everything it can.  That default is the measured one: with a
+    slice resident the table route is ~2.5x faster than the march (Nside 512 spin 2 `map2alm`
+    9.4 ms on tables against 24.0 ms marched, `.qwen/tmp/twosum_check.log` section 4), while with
+    no slice the march runs 106.6-109.0 ms against the 13.2 s scatter loop -- the whole 0.01x to
+    parity at Nside 1024 (107.3 ms against ducc0's 105.9, `.qwen/tmp/score_default_pool.log`).  The
+    cost is accuracy -- 3.7e-05 against ducc0 marched, 4.0e-07 on the scatter loop -- so
+    `GMASTER_SPIN2_MARCH=0` keeps the exact route at any size.
+    """
+    if int(spin) != SPIN or not _on_nvidia():
+        return False
+    flag = os.environ.get("GMASTER_SPIN2_MARCH")
+    if flag is not None:
+        return flag == "1"
+    return L is not None and nside is not None and slice_declined(L, nside)
+
+
+def synth_requested(spin, *, L=None, nside=None) -> bool:
     """True for the synthesis march, which is **off unless asked for by name**.
 
     It used to follow `GMASTER_SPIN2_MARCH`, and that was a correctness bug rather than a tuning
@@ -81,16 +114,24 @@ def synth_requested(spin) -> bool:
     (`.qwen/tmp/synth_oracle_512.log`, 120-digit oracle) and the polar rings carry the largest
     per-ring weights.
 
-    The analysis direction is a different story and stays on `GMASTER_SPIN2_MARCH`: it beats ducc0
-    at 1.05x/1.11x with rel alm 3.6e-05/6.1e-05 (same log).  What is not settled is why the
-    synthesis lane pair delivers roughly 29 bits at the extreme rows instead of the ~48 it costs:
-    a float64 march of the same recurrence is good to 7.5e-13 at ell = 1526
-    (`.qwen/tmp/march_fp64_scan.log`), so it is arithmetic and not the algorithm; zeroing the
-    recurrence-coefficient limbs inside the kernel makes it 23x worse (2.47e-04 -> 5.62e-03), so
-    they are doing real work, and pairing the seeds changes nothing at Nside 512
-    (`.qwen/tmp/spin2_synth_delta_seedlimb_512.log`) for ~3% of the run time.
+    The analysis direction is a different story and now takes the march by default wherever no
+    slice can exist: 106.6-109.0 ms against ducc0's 106.6-118.1 ms at Nside 1024, rel alm 3.7e-05,
+    where the scatter loop it replaces takes 13.2 s (`.qwen/tmp/score_s2_routes_1024.log`).
+
+    What is not settled is why the synthesis lane pair delivers roughly 29 bits at the extreme rows
+    instead of the ~48 it costs.  A float64 march of the same recurrence holds 7.5e-13 at
+    ell = 1526 (`.qwen/tmp/march_fp64_scan.log`), so it is arithmetic and not the algorithm.  Three
+    suspects have been measured and eliminated: the seed (a float32-rounded seed is amplified by
+    only 0.1-0.4 ulp across the whole band, `.qwen/tmp/seed_amp_probe.log`, which is why pairing it
+    was inert); the primitives (`_two_prod`, `_fma` and `_two_sum` are each bit-exact on this stack,
+    `.qwen/tmp/twoprod_probe.log`, `twosum_probe.log`); and the fast-form TwoSum residual, which
+    *is* inexact here (~1 ulp, rms 8.2e-09 with |uh| < |th| and 2.0e-08 with |uh| > |th| against
+    0.000e+00 for the branch-free 2Sum, `.qwen/tmp/twosum_order_probe.log`) but fixing it leaves the
+    ell=1528 row error at 2.47e-04 unchanged (`.qwen/tmp/spin2_synth_delta_2sum_512.log`).  The
+    defect sits in the pole-most lane of the row, not in the accumulation across ell.
     """
-    return march_requested(spin) and os.environ.get("GMASTER_SPIN2_MARCH_SYNTH", "0") == "1"
+    return (march_requested(spin, L=L, nside=nside)
+            and os.environ.get("GMASTER_SPIN2_MARCH_SYNTH", "0") == "1")
 
 
 # --------------------------------------------------------------------------------------- kernel

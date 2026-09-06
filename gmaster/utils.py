@@ -529,10 +529,11 @@ def _forward_s2fft_ftm(maps, tables, *, L, nside, reality):
 
 
 def _forward_latitudinal(ftm, *, L, spin, nside, reality, L_lower):
-    if not reality and _spin_march.march_requested(spin):
-        # `GMASTER_SPIN2_MARCH=1`: march the Wigner-d row inside the kernel instead of building the
-        # 73.48 GiB slice that `slabs_for` declines at Nside 1024, or the 13.27 s generic loop that
-        # replaces it.  See gmaster/_spin_march_pallas.py.
+    if not reality and _spin_march.march_requested(spin, L=L, nside=nside):
+        # March the Wigner-d row inside the kernel instead of building the 73.48 GiB slice that
+        # `slabs_for` declines at Nside 1024, or the 13.2 s generic scatter loop that replaces it.
+        # With a slice resident the table route wins and keeps the call; see
+        # :func:`gmaster._spin_march_pallas.march_requested`.
         return _spin_march.forward_latitudinal(ftm, L=L, spin=spin, nside=nside)
     return _ftm_flm_primitive.ftm_to_flm(
         ftm,
@@ -598,11 +599,13 @@ def _prepare_inverse_s2fft(flm, *, L):
 
 
 def _inverse_latitudinal(flm, theta, *, L, spin, nside, reality):
-    if not reality and _spin_march.synth_requested(spin):
-        # `GMASTER_SPIN2_MARCH=1`: the same table-free row march as the analysis seam, in the
-        # synthesis direction (sum over ell per theta lane).  The shipped route needs the whole
-        # Wigner-d slice, which `slabs_for` declines at large Nside, and falls back to a generic
-        # loop costing 13.2 s/pass at Nside 1024 and 168 s at 2048.
+    if not reality and _spin_march.synth_requested(spin, L=L, nside=nside):
+        # The same table-free row march as the analysis seam, in the synthesis direction (sum over
+        # ell per theta lane): 121.8 ms at Nside 1024 against the 13.2 s generic loop the declined
+        # slice falls back to.  Unlike analysis this one is still opt-in even where no slice can
+        # exist -- it is 0.78-0.89x against ducc0 rather than ahead, and its pole-most lane is
+        # 2.47e-04 off the row value, which reaches an `alm2map` pixel as rel 9.99e-01 at the map's
+        # own maximum (`.qwen/tmp/synth_map_acc.log`).
         return _spin_march.inverse_latitudinal(flm, L=L, spin=spin, nside=nside)
     return _ftm_flm_primitive.flm_to_ftm(
         flm,
