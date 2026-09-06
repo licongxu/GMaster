@@ -181,8 +181,14 @@ def _kern(manr, ex0r, xr, xlr, c1r, c0r, cbr, c1lr, c0lr, cblr, lgnr, sgnr, rr, 
         uh, ul = _two_prod(cb, ph)
         ul = _fma(cb, pl_, ul)
         ul = _fma(jnp.broadcast_to(plt.load(cblr.at[row, ell]), xv.shape), ph, ul)
-        nxt = th - uh
-        nxtl = (tl - ul) + ((th - nxt) - uh)
+        # The residual of `th - uh` comes from the branch-free 2Sum, never the fast form
+        # `(th - nxt) - uh`: on this stack the fast form is off by ~1 ulp of `nxt` (rms 8.2e-09 when
+        # |uh| < |th|, 2.0e-08 when |uh| > |th|) against 0.000e+00 for `_two_sum` in both orderings
+        # (`.qwen/tmp/twosum_order_probe.log`).  It fixes the lane state, not the polar defect --
+        # the row error at ell=1528 is 2.47e-04 either way (`.qwen/tmp/polar_lane_256_fast2sum.log`
+        # against `.qwen/tmp/polar_lane_256_2sum.log`).
+        nxt, e3 = _two_sum(th, -uh)
+        nxtl = (tl - ul) + e3
         hh = nxt + nxtl                       # keep |nxtl| < |nxt| so the limb stays a limb
         nxtl = nxtl - (hh - nxt)
         nxt = hh
@@ -445,8 +451,14 @@ def _kern_synth(manr, ex0r, xr, xlr, c1r, c0r, cbr, c1lr, c0lr, cblr,
         uh, ul = _two_prod(cb, ph)
         ul = _fma(cb, pl_, ul)
         ul = _fma(jnp.broadcast_to(plt.load(cblr.at[row, ell]), xv.shape), ph, ul)
-        nxt = th - uh
-        nxtl = (tl - ul) + ((th - nxt) - uh)
+        # The residual of `th - uh` comes from the branch-free 2Sum, never the fast form
+        # `(th - nxt) - uh`: on this stack the fast form is off by ~1 ulp of `nxt` (rms 8.2e-09 when
+        # |uh| < |th|, 2.0e-08 when |uh| > |th|) against 0.000e+00 for `_two_sum` in both orderings
+        # (`.qwen/tmp/twosum_order_probe.log`).  It fixes the lane state, not the polar defect --
+        # the row error at ell=1528 is 2.47e-04 either way (`.qwen/tmp/polar_lane_256_fast2sum.log`
+        # against `.qwen/tmp/polar_lane_256_2sum.log`).
+        nxt, e3 = _two_sum(th, -uh)
+        nxtl = (tl - ul) + e3
         hh = nxt + nxtl
         nxtl = nxtl - (hh - nxt)
         nxt = hh
