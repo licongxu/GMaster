@@ -3656,6 +3656,115 @@ spin 2 at Nside 1024 (L = 3072, nθ = 4095, 1.93e10 table values, layout 73.48 G
   float64 (the two halves of the s2fft march already disagree at ~1e-13, per section on the pi-theta
   symmetry). Build it as a probe against a float128 oracle at Nside 128 before wiring anything.
 
+## Session 20 (2026-09-06): the fused spin-2 march is validated in float64, fails in float32, and degree anchors fix it
+
+Spin 2 only, as directed. Everything below is a measured number from a log in `.qwen/tmp`; nothing is
+wired into `gmaster/` yet, and no default changed.
+
+**The machine lever first.** `.qwen/tmp/fp32_ffma_rate.py` → `fp32_ffma_rate.log`, an unrolled
+dependent `v = v*a + b` chain so no bandwidth can flatter it:
+
+```text
+<class 'jax.numpy.float32'>  n 16,777,216  steps 256   0.2 ms  41.44 TFLOP/s  -> 2.0e11 FMA in  4.8 ms
+<class 'jax.numpy.float64'>  n 16,777,216  steps 256   9.6 ms   0.90 TFLOP/s  -> 2.0e11 FMA in 222.4 ms
+```
+
+46:1 on CUDA cores. The fused march+contraction is `1.94e10` slice values × ~10-15 fp32 ops at Nside
+1024, so its arithmetic is **~5-7 ms against ducc0's 107 ms** for the entire spin-2 forward transform;
+the same kernel in float64 would cost 222 ms and lose outright. Throughput is settled and it is not
+the obstacle — fp32-only design.
+
+**Why the march must be the Jacobi closed form.** `.qwen/tmp/spin_march_fp32.log` (re-read this
+session) is the shipped `_spin_slice._march` in float32: `non-finite 249` and `4.05e+05` relative on
+the m<192 windows, `1.00e+00` on the last, with the float64 chain self-consistent to `3.0e-16`. Its
+step coefficient is a difference of O(L) terms recomputed inside the loop, which is exactly the
+cancellation float32 cannot survive. The Jacobi form has no such term — its step coefficients depend
+only on `(n, alpha, beta)`, built once in float64 and cast:
+
+```text
+d^l_{m,-2}(th) = (-1)^m sqrt((l+m)!(l-m)!/((l-2)!(l+2)!))
+                 (sin th/2)^(m+2) (cos th/2)^|m-2| P^(m+2,|m-2|)_(l-m)(cos th)
+```
+
+with DLMF 18.9.5 coefficients spelled so nothing is a difference of large numbers (`alpha²−beta² →
+4·m·spin`), seeds `P_0 = 1`, `P_1 = (m+1)cos th + 2`. `.qwen/tmp/spin2_jacobi_lanes.log` locks it
+value-by-value at Nside 64 with a delta RHS (the contraction *is* the slice element), per theta lane
+including the poles, for the spin-coupled rows `m = 2, 3` where `beta = |m−2|` changes character:
+relative 1.16e-13…1.19e-13 against a float64 march, `clean`.
+
+**The accuracy gate.** `.qwen/tmp/spin2_jacobi_gate.py` → `spin2_jacobi_gate_arms.log`, four windows
+at Nside 128/256, scored on the operation the pipeline really performs — the slice contracted over
+theta against a complex ring transform — normalised by `max|ref|` and restricted to entries above
+1e-8 of it (a per-element relative error near a Jacobi zero measures nothing). Line 1 of each block
+is the yardstick: **what today's shipped route costs on the same metric**, float32 table × complex64
+RHS.
+
+```text
+window              today's route   fused fp64     fused fp32     fp32 + fp64 products
+n128  m [0,64)         3.35e-07      2.76e-12       4.65e-05       identical to fp32
+n128  m[96,160)        5.00e-07      2.09e-12       7.81e-06       identical to fp32
+n256  m [0,64)         7.12e-07      9.56e-12       1.22e-04       identical to fp32
+n256  m[256,320)       1.15e-06      1.20e-11       1.80e-05       identical to fp32
+```
+
+Three verdicts. (1) The float64 arm at ~1e-11 says the design and every convention are right: the
+per-theta-lane `(mantissa, exponent)` carry — the endpoint prefactor spans 2^±3000 and must be
+renormalised **per lane**, not per `(m, ell)` — and the emission that folds `log2 N(ell, m)` **into
+the exponent** instead of multiplying (N reaches 1e+1300 while the theta sum sits at 2^−3000; the
+multiply form underflows to zero and reports a relative error of exactly 1, which is how the first
+version of this gate "lost" the high-m windows). (2) float64 products change nothing, so the
+contraction is not the defect. (3) The **float32 recurrence** is: forward recurrence in `ell` leaks
+into the dominant solution and over L=384-768 degrees it loses three digits. 4.65e-05 vs a bar of
+7.12e-07 is not shippable.
+
+**The fix: refuse to march that far — anchored restart, measured.**
+`.qwen/tmp/spin2_anchor_gate.py` → `spin2_anchor_gate.log` (reference = production table) and
+`.qwen/tmp/spin2_anchor_gate2.py` → `spin2_anchor_gate_256.log`, `spin2_anchor_gate_512.log`, which
+makes the **float64 march its own oracle and its own anchor builder** so it scales past the wall that
+stopped the first script (`RESOURCE_EXHAUSTED: 36.19 GiB` inside `ss._build` at Nside 512 — session 12
+again). Anchors are the float32 `(ell−1, ell)` pair at every K-th degree, both members riding one
+shared per-lane exponent, in **march space** (divide out `(-1)^m N` in log space first — anchoring the
+raw table value re-introduces that factor and the row drifts to 1e+35).
+
+```text
+anchor period K          pure       128        64        32        16        8
+n256 m [0,64)          1.22e-04   2.61e-05  8.82e-06  3.42e-06  1.21e-06  6.41e-07
+n256 m[256,320)        1.80e-05   7.08e-06  5.23e-06  3.39e-06  2.03e-06  8.30e-07
+n512 m [0,64)          3.04e-04     --      9.30e-06  3.93e-06  1.21e-06  5.06e-07   (median 1.65e-08)
+n512 m[512,576)        2.70e-05     --      4.98e-06  2.90e-06  1.65e-06  7.25e-07
+shipped fp32 table route, same metric:  7.12e-07 (n256 m<64)   1.15e-06 (n256 m 256..320)
+```
+
+**The error at fixed K is independent of L** — 6.41e-07 at L=768 vs 5.06e-07 at L=1536 — and grows
+~linearly in K, exactly as it must when each segment pays only its own K degrees of round-off.
+**K=8 lands at or below the shipped float32 route's own error** (5.06e-07…8.30e-07 vs 7.12e-07…1.15e-06)
+with a median ~20x better; K=16 is 1.21e-06…1.65e-06, same order for half the bytes. Accuracy gate:
+**GO for an anchored fp32 march**.
+
+**And the anchor table is the capacity lever the whole exercise was for.** Measured per 64-row m
+window: **0.09 GiB** at Nside 256/K=8, **0.37 GiB** at Nside 512/K=8 — scaling as `ntheta·L²/(2K)`, so
+**~36 GiB for the whole triangle at Nside 1024/K=8, ~18 GiB at K=16**, against the **73.48 GiB** layout
+`slabs_for` still declines (session 12). Storing the anchor exponent as int16 rather than float64
+brings K=8 to ~24 GiB. The fused kernel would then read a table that *fits* the 71.2 GiB pool, sparsely
+(once per segment per `(m, theta)`), and never materialise the slice: that is the difference between
+Nside 1024 spin-2 sitting at **13.27 s/pass** in the generic per-window loop and a real shot at ducc0's
+**107 ms**.
+
+**Not built: the kernel.** Next is a `lax.scan` oracle of the actual block — march `ell` inside a
+`(m-window, theta-tile)` block, contract `nxt·w·f` into the 4 real channels, per-`(m, tile)` partials
+and a cheap reduce, K=8 anchor reads, rows `m < spin` routed through the swap
+`d^l_{m'm} = (-1)^(m-m') d^l_{mm'}` — scored against this gate's float64 march, then ported to Pallas
+behind a default-off env gate, with the speed number and the `rel alm` number required in the same log.
+
+**DFT / brute-force note (`record-brute`), recorded as a cost model, not a measurement.** The probe
+script and its log for the no-FFT direct DFT are no longer in `.qwen/tmp` (checked: `ls .qwen/tmp/*brute*`
+→ nothing), so I am not quoting a number for it. What the model says, with the fp32 rate measured above:
+a direct DFT of the `2·nside` equatorial belt rings at the band limit `N = 4·nside` is
+`2·nside·(4·nside)²` complex MACs ≈ `5.4e12` fp32 FMA at Nside 1024 ≈ **130 ms**, which is ~2.3x the
+plain-FFT ring stage this repo already ships for that same Nside. Rejected: the belt (constant `nphi`)
+makes the ring DFT a power-of-two plain FFT, and Bluestein's 3x overhead is the wrong tool there
+(sessions 14/15). The fused march changes none of that — it removes the *slice*, not the ring transform.
+
 
 
 
