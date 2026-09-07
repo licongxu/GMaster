@@ -4575,7 +4575,7 @@ current run had overwritten it.
    free (above). Candidates left: the analysis coefficient low limbs, the `_row_coeffs` /
    `_init_exponents` / `log_norm` table builds (analysis geometry has no separate budget knob —
    `_forward_latitudinal_march` builds rows *and* marches), and the tile reduction over `ntile`.
-2. Nside 4096 has still never been measured end to end (the slab route needs 1.1 TiB; the march fits).
+2. Nside 4096 measured the same day (below) — the march serves it, and it is now the worst spin-2 cell.
 3. Nside 256 spin-0 traced route (1.22x/1.30x measured) blocked on hoisting the Legendre band build out
    of the trace, not on guarding its cache drain.
 
@@ -4612,3 +4612,64 @@ and was contention — check `pgrep`/`nvidia-smi` before every measurement. (b) 
 "<pattern>"` wait loop matches its own command line: two loops queued behind a test suite never fired,
 and a `pkill -f` aimed at one killed the killing shell. Use the bracket form (`[a]n_sweep`) or kill by
 PID.
+
+### Session 25 addendum 2: Nside 4096 spin 2 runs on the march, and the win does not survive the decade
+
+The first end-to-end Nside 4096 spin-2 comparison ever taken here (fresh process, fp32 tables, one card,
+`.qwen/tmp/score_n4096_spin2.log`, `synth reserve: 16.0 GiB pool: 71.2 GiB`, `band budget: 40 GiB`):
+
+```text
+  4096    2  map2alm     4025.6      4765.7       0.84x 1.9e-04 |s|=1.6e+07  1359/1439
+  4096    2  alm2map     3918.9      3594.6       1.09x          -  synth=-
+```
+
+So the capacity question is settled — **the march fits at 4096**: no OOM, no fallback, no
+`XLA_PYTHON_CLIENT_PREALLOCATE` trick, control bandwidth 1359/1439 GB/s (card healthy). `synth=-` is
+expected: the marched route never populates `_theta_matrix._SYNTH_CACHE`. The alm agreement is
+`1.9e-04` against the correctly rescaled denominator (the `|s| = 1.6e+07` convention factor grows with
+`L`; at 2048 it reads `2.5e+05`), the same order as the 2048 cell.
+
+The performance answer is worse than hoped, and it is a *scaling* answer, not a fixed-cost one:
+
+| direction | ducc 2048 → 4096 | GMaster 2048 → 4096 | ratio 2048 → 4096 |
+|---|---|---|---|
+| `map2alm` | 649.5 → 4025.6 (**6.20x**) | 587.2 → 4765.7 (**8.11x**) | 1.11x → **0.84x** |
+| `alm2map` | 609.8 → 3918.9 (**6.43x**) | 507.5 → 3594.6 (**7.08x**) | 1.20x → **1.09x** |
+
+The march's work is *exactly* the number of `(m, ell, theta)` triples, which is `∝ L² · ntheta ∝ n³` =
+8.0x for a doubling — GMaster analysis pays 8.11x, i.e. it is at its asymptotic issue-bound cost with
+nothing leaking. ducc0 gains sub-cubic (6.20x) between these two sizes, so whatever it is bound by at
+2048 relaxes by 4096, and the crossover that session 25 pushed the other way at 2048 comes back. Making
+4096 win is therefore **not** reachable by removing per-degree overheads (they are already ~1-5% of the
+step, see the four dead candidates above); it needs either a lower op count per triple than the
+compensated Jacobi recurrence + 4-channel contraction, or a different work decomposition. The cheapest
+structural candidate is the anchored-restart idea in memory
+(`spin2-anchored-jacobi-march.md`), which trades the serial degree march for parallel segments — its
+measured XLA segment map was 2.3x behind ducc at small `N`, so it must first beat the march, not ducc.
+
+Do not read this as "4096 is broken": 1.09x synthesis and 0.84x analysis at `L = 12287` on one GPU,
+against 192 cores, is the first time this repo has a *measured* 4096 polarised number at all.
+
+### Session 25 addendum 3: the analysis `emit` contraction is at its floor too
+
+The last untested block was whether `jnp.sum(val[:, None] * r, axis=0)` pays for materialising a
+`(chunk, NC)` tile (256 float32 lanes x 4 channels on top of the march state with `_WARPS=1`). Three
+arms, one config per process, `.qwen/tmp/analysis_emit_form.log`:
+
+| arm | Nside 1024 | Nside 2048 | reading |
+|---|---|---|---|
+| `ship` — the shipped 2-D contraction | **103.13 ms** | **537.27 ms** | baseline |
+| `sepchan` — four 1-D `jnp.sum(val * r_c)` | 105.52 (0.977x) | 625.17 (**0.859x**) | splits the tree, costs real time |
+| `nostore` — same contraction, every degree to slot 0 | 110.69 (0.932x) | 569.74 (0.943x) | store volume is *not* a cost either |
+
+`sepchan` agrees with `ship` to `max|diff|/max|out|` = 1.8e-13 (1024) and 1.1e-13 (2048), so the arms are
+the same maths; both rewrites lose. Combined with the `noscale` arm (1.009x, deleting the exponent
+rescale) this pins the emit's cost: **the multiply-accumulate itself** — which is the same conclusion
+`analysis_emit_cost.py` gave from the other side (deleting the whole emit block is 1.481x at 2048, and
+deleting only its bookkeeping is nothing).
+
+That closes the analysis march. Recorded so the next session does not spend GPU time here: the per-degree
+rescale (1.009x), the coefficient low limbs (1.031x), the assembly form (0.98x), the tile layout (already
+256/1), the geometry rebuild (2-5%) and now the contraction form (0.86-0.98x) are all measured dead. The
+analysis step is its compensated recurrence plus its contraction, and beating it is an algorithm change
+(anchored restarts, or a cheaper per-triple op count), not a rewrite of any block in it.
