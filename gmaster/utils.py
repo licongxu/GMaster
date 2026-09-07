@@ -599,13 +599,13 @@ def _prepare_inverse_s2fft(flm, *, L):
 
 
 def _inverse_latitudinal(flm, theta, *, L, spin, nside, reality):
-    if not reality and _spin_march.synth_requested(spin):
+    if not reality and _spin_march.synth_requested(spin, L=L, nside=nside):
         # The same table-free row march as the analysis seam, in the synthesis direction (sum over
-        # ell per theta lane): 121.8 ms at Nside 1024 against the 13.2 s generic loop the declined
-        # slice falls back to.  Unlike analysis this one is still opt-in even where no slice can
-        # exist -- it is 0.78-0.89x against ducc0 rather than ahead, and its pole-most lane is
-        # 2.47e-04 off the row value, which reaches an `alm2map` pixel as rel 9.99e-01 at the map's
-        # own maximum (`.qwen/tmp/synth_map_acc.log`).
+        # ell per theta lane): 122.7 ms at Nside 1024 against the 13.2 s generic loop the declined
+        # slice falls back to.  It takes the same no-slice default as analysis but has its own flag,
+        # `GMASTER_SPIN2_MARCH_SYNTH=0` to restore the exact route, because it is 0.86x against
+        # ducc0 rather than ahead (105.7 ms) and its map is 1.968e-04 max / 6.370e-06 rms off ducc0
+        # where the scatter loop is 1.095e-09 (`.qwen/tmp/synth_vs_ducc_1024.log`).
         return _spin_march.inverse_latitudinal(flm, L=L, spin=spin, nside=nside)
     return _ftm_flm_primitive.flm_to_ftm(
         flm,

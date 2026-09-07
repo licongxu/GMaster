@@ -107,28 +107,35 @@ def march_requested(spin, *, L=None, nside=None) -> bool:
     return L is not None and nside is not None and slice_declined(L, nside)
 
 
-def synth_requested(spin) -> bool:
-    """True for the synthesis march, which is **off unless asked for by name**.
+def synth_requested(spin, *, L=None, nside=None) -> bool:
+    """True for the synthesis march: its own flag, otherwise the no-slice rule.
 
-    It stands on its own flag deliberately.  It used to be `GMASTER_SPIN2_MARCH` AND
-    `GMASTER_SPIN2_MARCH_SYNTH`, which was a correctness bug rather than a tuning choice: the seam
-    sits where a *declined table* routes the call, so turning on the analysis march also switched
-    synthesis over to a kernel that is slower than ducc0 -- 122.7 ms against 105.7 at Nside 1024
-    (0.86x), 999.4 ms against 626.5 at Nside 2048 (0.63x), `.qwen/tmp/score_synth_fused.log` -- and
-    is wrong where it matters.  Its entry-level error is 4.56e-04 at Nside 512, but a full `alm2map`
-    against the generic route comes out at rel **9.99e-01 at a pixel whose reference value is the
-    maximum of the map** (rms 2.40e-03), `.qwen/tmp/synth_map_acc.log`, and at Nside 1024 the same
-    comparison gives rms **9.30e-01** -- the marched map carries as much power as the reference, so
-    this is a different map rather than a degraded one (`.qwen/tmp/synth_map_err_1024.log`).  The
-    worst lane is a bright polar pixel, not a negligible one, because the marched row drifts by up to
-    6.0e-03 in exactly the polar lanes (`.qwen/tmp/synth_oracle_512.log`, 120-digit oracle) and the
-    polar rings carry the largest per-ring weights.  Following the analysis default would have the
-    same defect the other way -- the default is on precisely at the large sizes, where this kernel is
-    0.89x rather than a win -- so the analysis flag has no influence here in either direction.
+    The flag is separate from `GMASTER_SPIN2_MARCH` because the two directions have different
+    economics -- analysis is ahead of ducc0 without a table while synthesis is behind it -- but the
+    *default* is the same rule: march wherever `slice_declined` says no Wigner-d slice can exist, and
+    keep the exact route everywhere else.  `GMASTER_SPIN2_MARCH_SYNTH=0` restores the exact route at
+    any size; `=1` forces this one.
 
-    The analysis direction is a different story and now takes the march by default wherever no
-    slice can exist: 106.6-109.0 ms against ducc0's 106.6-118.1 ms at Nside 1024, rel alm 3.7e-05,
-    where the scatter loop it replaces takes 13.2 s (`.qwen/tmp/score_s2_routes_1024.log`).
+    Measured at Nside 1024 against ducc0's own map, with alms taken from ducc0's analysis (the input
+    a pipeline actually produces): the marched map is **1.968e-04 max / 6.370e-06 rms** off ducc0 with
+    the fitted convention factor `|s| = 1.00`, where the generic scatter loop it replaces scores
+    1.095e-09 (`.qwen/tmp/synth_vs_ducc_1024.log`).  That is roughly the polar-lane row error
+    (2.47e-04 at `ell = 1528`) arriving at one pole-most pixel; the map rms is 6e-06.  The cost side:
+    122.7 ms against ducc0's 105.7 (0.86x) and against **13.2 s** for the scatter loop, i.e. this
+    turns a 0.01x cell into ~0.8x.  It is still behind ducc0, so this is not a win, it is the removal
+    of a two-order-of-magnitude default.
+
+    One convention difference to know about.  The march's recurrence starts at `ell = max(m, spin)`,
+    so it contributes nothing from `ell < |spin|`, whereas s2fft's `flm_to_ftm` and ducc0 both do use
+    such terms if handed them (`.qwen/tmp/ducc_ell_below_spin.log`: injecting `|alm| = 1e3` at
+    `ell < 2` moves ducc0's map by 0.14 of its maximum).  Inputs that come out of any spin-2 analysis
+    have essentially nothing there -- ducc0 returns exactly 0.0 at `ell = 0` and noise level at
+    `ell = 1` -- which is why this never shows up in a pipeline, but a hand-built `alm` with
+    sub-spin power will silently lose it.  The number that used to be quoted for this route, rms
+    0.93 (`.qwen/tmp/synth_map_err_1024.log`), was exactly that: a probe feeding a red random `alm`
+    whose largest coefficients sit at `ell = 0, 1`, so only m = -1, 0, +1 columns disagreed
+    (`.qwen/tmp/synth_which_columns_512.log`) while every `ell >= 2` term matched to 1.75e-06
+    (`.qwen/tmp/synth_per_m_ell_256.log`).
 
     What is not settled is why the synthesis lane pair delivers roughly 29 bits at the extreme rows
     instead of the ~48 it costs.  A float64 march of the same recurrence holds 7.5e-13 at
@@ -145,8 +152,12 @@ def synth_requested(spin) -> bool:
     defect is a lane-growth law rather than a single bad ring: 1.3e-07 at the equator against 6.5e-05
     at the pole for m=0 at `ell=760`, north and south agreeing to the digit.
     """
-    return (int(spin) == SPIN and _on_nvidia()
-            and os.environ.get("GMASTER_SPIN2_MARCH_SYNTH", "0") == "1")
+    if int(spin) != SPIN or not _on_nvidia():
+        return False
+    flag = os.environ.get("GMASTER_SPIN2_MARCH_SYNTH")
+    if flag is not None:
+        return flag == "1"
+    return L is not None and nside is not None and slice_declined(L, nside)
 
 
 # --------------------------------------------------------------------------------------- kernel
