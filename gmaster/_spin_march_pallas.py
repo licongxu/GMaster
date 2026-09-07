@@ -644,7 +644,13 @@ def _inverse_impl(flm, *, L, spin, nside):
     npad = ntile * _ST
     x = jnp.cos(theta)
     sh, ch = jnp.sin(theta / 2.0), jnp.cos(theta / 2.0)
-    out = jnp.zeros((ntheta, 2 * L), dtype=jnp.complex128)
+    # The window column ranges are disjoint and tile the result, so the result is assembled by one
+    # concatenation instead of `out.at[...].set` per window.  XLA scatter is out-of-place, so the
+    # per-window form copied the whole (ntheta, 2L) complex128 buffer 48 times at Nside 1024 and 96
+    # times at 2048 -- 1.50 GiB per copy at the latter -- which was 65% and 81% of this step:
+    # 138.75 -> 47.29 ms (2.93x) and 1805.60 -> 346.99 ms (5.20x), bit-identical output
+    # (`.qwen/tmp/synth_assembly_ab.log`).
+    dirs, mirs = [], []
     for (m0, m1, lo) in ss._windows(L):
         mb = m1 - m0
         g = _window_geometry(m0, mb, x, sh, ch, L, npad)
@@ -658,15 +664,20 @@ def _inverse_impl(flm, *, L, spin, nside):
         v = _call_synth(L, ntheta, ntile, mb)(*g[:10], *dc, *mc,
                                               jnp.asarray([m0], jnp.int32))
         v = v.reshape(mb, npad, 4)[:, :ntheta]
-        out = out.at[:, L + m0:L + m1].set(v[:, :, 0].T + 1j * v[:, :, 1].T)
+        dirs.append(v[:, :, 0].T + 1j * v[:, :, 1].T)             # columns L+m0 .. L+m1-1
         # `R_m(pi - theta_i)` is the marched lane at the mirrored ring, so the mirror accumulator
         # lands at the reversed theta axis; its rows are descending orders by the column layout.
         n0 = max(int(m0), 1)
         if n0 < m1:
             re = v[n0 - m0:, :, 2][::-1, ::-1].T
             im = v[n0 - m0:, :, 3][::-1, ::-1].T
-            out = out.at[:, L - m1 + 1:L - n0 + 1].set(re + 1j * im)
-    return out
+            mirs.append(re + 1j * im)                             # columns L-m1+1 .. L-n0
+    direct = jnp.concatenate(dirs, axis=1)                        # (ntheta, L)
+    # Ascending windows cover descending columns, so the mirror half goes in reverse window order;
+    # column 0 is never written by either half and stays the zero the contract asks for.
+    mir = jnp.concatenate(mirs[::-1], axis=1)                     # (ntheta, L-1)
+    return jnp.concatenate([jnp.zeros((ntheta, 1), dtype=direct.dtype), mir, direct], axis=1)
+
 
 
 def inverse_latitudinal(flm, *, L, spin, nside):
