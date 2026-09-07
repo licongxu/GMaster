@@ -758,8 +758,13 @@ def _pallas_block_size(nside):
 
 
 # Above this working bandlimit the refinement loop runs op-by-op instead of as
-# one traced program; see `_map2alm_core_pallas` for the measured crossover.
-_PALLAS_TRACED_MAX_L = 256
+# one traced program; see `_map2alm_core_pallas` for the measured crossover.  384 is Nside 128, the
+# largest size the single program is safe at: the Legendre band engages at Nside 256 (1.22x / 1.30x on
+# the traced route, `.qwen/tmp/spin0_traced.log`), and `_theta_matrix._band` clears its build caches
+# with `slab.block_until_ready()` every `_BUILD_CLEAR_EVERY` blocks, which raises
+# `AttributeError: 'block_until_ready' is not available on traced array float32[160, 64, 512]` when the
+# geometry is first built inside an outer trace (`.qwen/tmp/s24_256_0.log`).
+_PALLAS_TRACED_MAX_L = 384
 
 
 def _use_multi_gpu_pallas(L, values):
@@ -1800,12 +1805,14 @@ def _map2alm_core_pallas(
 ):
     """Analytic pseudo-Cl analysis, traced whole or run op-by-op.
 
-    Tracing the refinement loop as one program removes the per-primitive host
-    dispatch, which at small bandlimit is the whole cost (Nside 32-64 are
-    launch-bound: the device idles between kernels).  Above the crossover the
-    monolithic program is the slower of the two: Nside 128 goes 15 -> 18 ms and
-    Nside 256 58 -> 82 ms, because one large program holds every intermediate
-    live at once and loses the allocator's reuse between boundaries.
+    Tracing the refinement loop as one program removes the per-primitive host dispatch, which at small
+    bandlimit is the whole cost: at Nside 128 the op-by-op route takes 1.058 ms for a 196608-pixel map
+    whose device work is 0.333 ms, so one program over the same body is 3.17x faster with bit-identical
+    output -- 1.96x on the inverse, and 2.18x / 1.77x with two refinement iterations
+    (`.qwen/tmp/spin0_traced.log`, `.qwen/tmp/spin0_traced_it2.log`).  Nside 256 measured faster traced
+    too (1.22x / 1.30x) but cannot be traced at all while the Legendre band engages there, and Nside
+    512 and 1024 are level to 1.02x either way, so the crossover sits at Nside 128.  It was previously
+    256, which left Nside 128 -- the one small spin-0 cell that lost to ducc0 -- on the op-by-op route.
     """
     core = (_map2alm_core_pallas_traced if L_work <= _PALLAS_TRACED_MAX_L
             else _map2alm_core_pallas_eager)
