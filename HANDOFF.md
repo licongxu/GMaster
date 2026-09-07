@@ -4896,6 +4896,12 @@ One fresh process per row, GPU1, `ducc0 0.39.1` on 192 cores, `n_iter=0`, `L = 3
 | 4096 | `map2alm` | 2003.5 | 7516.9 | **2479.1** | 0.27x → **0.81x** | **3.03x** | `score_n4096_spin0.log` → `score_n4096_spin0_synth.log` |
 | 4096 | `alm2map` | 2002.0 | 10050.4 | **2204.3** | 0.20x → **0.91x** | **4.56x** | (same pair) |
 
+A later probe into the same call (see *rhs build* below) took the analysis direction further in the same
+session, and those are the numbers now shipped: **2048 `map2alm` 419.9 ms = 0.76x** (ducc0 320.4) and
+**4096 `map2alm` 2251.5 ms = 0.87x** (ducc0 1956.8), `alm2map` 322.1 (0.95x) and 2140.3 (0.93x),
+`rel alm` unchanged at 6.9e-05 / 2.1e-04 (`.qwen/tmp/score_n2048_spin0_rhs1.log`,
+`.qwen/tmp/score_n4096_spin0_rhs1.log`). The table above stays as the route-change-only A/B.
+
 The two directions are independent, and the intermediate run proves it: with only the analysis fold in
 place, `map2alm` was already 442.2 (0.72x) while `alm2map` sat unchanged at 1267.1 (0.24x)
 (`.qwen/tmp/score_n2048_spin0_fold.log`).
@@ -4992,9 +4998,40 @@ shape (both are read at import and baked at trace time), `.qwen/tmp/spin0_fold_t
 No knob is worth adding: 256/1 already wins, and 512 collapses. The 2.15x came from the lane halving
 itself, not from a shape effect.
 
+### The rhs build was 29% of the folded call, and it was neither bandwidth nor scatter
+
+`.qwen/tmp/spin0_fold_rhs_cost.py 2048` takes the fold's producer chain apart. First a free fact: the
+ring parameters are bit-symmetric across the mirror — `max|phi - phi_rev| = 0.000e+00` and
+`max|w/w_rev - 1| = 0.000e+00` — so the partner half of the rhs needs no second exponential, and the
+whole-grid phase chain costs only **5.10 ms**. The cost is the *per-window* rhs:
+
+```text
+  rhs fp64 (shipped form)     5.10 ms   rhs fp32+one-exp     1.45 ms   (3.52x)  diff/max 2.119e-04
+  window rhs build, 96 windows: fp64 in  126.89 ms   fp32 in    64.16 ms
+  same build, concatenate instead of zeros+scatter: 122.00 ms  (1.04x)  npad 4096 vs north 4096
+  bit-identical to the shipped build in 96/96 windows
+```
+
+126.89 ms to interleave four planes into `(64, 4096, 4)` float32, 96 times, is ~3 GB/s — nowhere near
+the 1.4 TB/s the card streams at, so it is not bytes; and replacing the `zeros().at[:, :north].set()`
+dynamic-slice update with a plain concatenate buys **1.04x**, so it is not the scatter form either
+(unlike the synthesis assembly, where the same rewrite was 3.34x — `scatter-vs-concat-assembly`). What
+is left is the interleaved store itself, repeated once per window: the fix is to stack and convert the
+whole `(L, npad, NC)` block **once** and slice each window's rows out of it.
+
+In isolation that looked like 126 ms; in the real call it returned **22 ms at 2048** (442.0 → 419.9) and
+**228 ms at 4096** (2479.1 → 2251.5), because part of the per-window cost was already overlapping with
+the producer that feeds `g_north`. Take the isolated number as an upper bound, never as the price.
+
+Two things this probe ruled out: computing the phase exponential in float32 (2.4x cheaper and
+**rejected** — `m * phi` reaches ~4e4, so the float32 *argument* loses 2.1e-04 of the result; the value
+width is not the constraint, the argument range is), and the `npad != north` padding path, which is a
+no-op at any power-of-two Nside ≥ 128 because `north = 2*nside` is already a whole number of 256-lane
+tiles.
+
 ### Where the remaining gap is
 
-`map2alm` at 2048 is 442.0 against ducc0's 309.2 (0.70x) and 2479.1 against 2003.5 at 4096 (0.81x). The
+`map2alm` at 2048 is 419.9 against ducc0's 320.4 (0.76x) and 2251.5 against 1956.8 at 4096 (0.87x). The
 latitudinal stage is the whole call there, and it is the same issue-bound compensated recurrence session
 25 addendum 3 measured out (per-degree rescale 1.009x, coefficient limbs 1.031x, assembly form 0.98x,
 tile layout already optimal, emit contraction 0.86-0.98x — all dead). Roughly 1.6e11 (m, ell, theta)
