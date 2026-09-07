@@ -4386,6 +4386,90 @@ Nside 16/48/64 against `flm_to_ftm` (max rel 2.4e-06 / 4.9e-06 / 8.5e-06), with 
 would break on. Nothing covered the march route before, because it is default-on only above every size
 the suite runs at.
 
+## Session 24 (2026-09-07): the small-Nside floor was Python dispatch, and fusing boundaries beat ducc0 everywhere below 1024
+
+Every small cell that lost to ducc0 lost to the *host*, not the GPU. The two fixes are one jit
+boundary moved and one boundary removed:
+
+| spin | nside | dir | before | after | ducc ms | source |
+|---|---|---|---|---|---|---|
+| 2 | 64 | map2alm | 0.25x | **1.88x** | 0.6 | `score_small_default.log` → `score_s24_small.log` |
+| 2 | 64 | alm2map | 0.94x | **1.49x** | 0.5 | |
+| 2 | 128 | map2alm | 0.66x | **2.63x** | 1.4 | |
+| 2 | 128 | alm2map | 1.79x | 1.75x | 1.0 | |
+| 2 | 256 | map2alm | 2.03x | **3.31x** | 4.8 | |
+| 2 | 256 | alm2map | 1.98x | **2.05x** | 3.2 | |
+| 2 | 512 | map2alm | 2.96x | **3.23x** | 30.0 | |
+| 2 | 512 | alm2map | 3.03x | 2.82x | 24.5 | |
+| 0 | 128 | map2alm | 0.54x | **1.29x** | 0.8 | `score_s24_spin0.log` → `score_s24_spin0b.log` |
+| 0 | 128 | alm2map | 0.94x | 0.97x | 0.7 | |
+| 0 | 256 | both | 1.88x / 1.38x | 1.74x / 1.18x | 2.3 / 1.7 | unchanged route, ducc jitter |
+
+Relative alm error is unchanged in every one of these cells (2.7e-07 / 3.5e-07 / 3.2e-07 at spin 2,
+2.1e-07 / 2.5e-07 / 2.7e-07 at spin 0) because both changes are boundary changes, not arithmetic ones.
+
+### The polarised route was three jits and an eager epilogue (`ffc1fbb`)
+
+`_map2alm_once_slab` ran the ring FFT, the slab contraction and `_finish_forward_s2fft` as three jits
+and then did `plus[ell, L_work-1+order]`, its parity conjugate and the E/B combination eagerly. At
+Nside 64 that costs 1.700 ms for a 49152-pixel map whose device work is ~0.2 ms. One program over the
+same body: **7.91x** at 64 (1.700 → 0.215 ms), 2.54x at 128, 1.05x at 256, bit-identical
+(`.qwen/tmp/slab_fuse2.log`); the synthesis is 1.29x / 1.09x / 1.06x the same way
+(`.qwen/tmp/slab_fuse_synth.log`). The fused body takes the ring tables as an argument so
+`_spin_ring_analysis_tables`' host cache keeps serving them instead of a table being baked into the
+executable.
+
+The boundary carries the Wigner-d slab, so it is gated at `_SLAB_FUSE_MAX_BYTES = 4 GiB` — Nside 256 in
+fp32 (2.44 GiB) and no further. Nside 512's slab is 18.7 GiB, and a boundary holding both it and the
+maps is exactly the layout doubling `_inverse_latitudinal_slab` exists to avoid.
+
+`test_fused_slab_route_is_bit_identical_to_the_split_route` (`62115ff`) asserts exact equality between
+the fused and split bodies in both directions and pins the gate, so a geometry cannot drift onto a
+boundary that was measured and rejected.
+
+### Spin 0: the traced/eager crossover was stale (`a043d91`)
+
+`_PALLAS_TRACED_MAX_L` was 256, justified by "Nside 128 goes 15 → 18 ms and Nside 256 58 → 82 ms"
+traced. Neither number reproduces. Forced traced, same body, bit-identical
+(`.qwen/tmp/spin0_traced.log`, `.qwen/tmp/spin0_traced_it2.log`):
+
+| nside | `n_iter=0` fwd / inv | `n_iter=2` fwd / inv |
+|---|---|---|
+| 64 | 0.98x / 1.00x | 1.00x / 1.00x |
+| 128 | **3.17x** / 1.96x | **2.18x** / 1.77x |
+| 256 | 1.22x / 1.30x | 1.08x / 1.28x |
+| 512 | 1.02x / 1.01x | — |
+| 1024 | 1.01x / 1.01x | — |
+
+Crossover moved to 384 (Nside 128), which is the cell that was losing. 256 is *not* traceable at all
+right now, for a reason unrelated to speed: the Legendre band engages there and
+`_theta_matrix._band` drains and clears its build caches with `slab.block_until_ready()` every
+`_BUILD_CLEAR_EVERY` blocks — tracers have no such method — so a band geometry first built inside an
+outer trace dies with `AttributeError` on `float32[160, 64, 512]` (`.qwen/tmp/s24_256_0.log`, reached
+through `_fused_forward_sht` → `positive_latitudinal` → `_band`). Guarding that loop would also let the
+band be *built* inside the traced program, where XLA would recompute it on every call, so the gate is
+the right place to stop. Unlocking the 1.2x at 256 means hoisting the band build out of the trace, not
+just guarding it.
+
+### Two probe traps worth remembering
+
+`_map2alm_once_pallas_spin` and `_spin_forward_latitudinal` are **not** the shipped spin-2 route —
+`_use_pallas_sht` returns False for `spin != 0`, so at small Nside spin 2 runs the slab route. A stage
+probe that times them measures a dead path, and it announces itself: the "whole call" came out at
+2.465 ms while the shipped `map2alm` was 1.713 ms (`.qwen/tmp/spin2_stage_floor.log`). The first fused
+A/B was also wrong for the same family of reason — wiring `_forward_latitudinal` instead of
+`_forward_latitudinal_slab` silently swapped in the generic scatter route and reported the fusion as
+0.13x (`slab_fuse.log`) before the corrected probe gave 7.91x. An A/B must differ in exactly one thing,
+and the shape of a table that contradicts the shipped number is how to catch it.
+
+ducc0's cold-vs-warm question is closed: first call is 0.96–1.04x the min over later calls at both
+1024 and 2048 and both spins, with RSS growth of 0.00–0.30 GiB (`.qwen/tmp/ducc_cold_vs_warm.log`), so
+ducc0 gets no benchmark cache advantage and the speedups above are honest.
+
+Suite: 144 passed / 3 skipped (`pytest_s24a.log`), 146 passed / 3 skipped after the new test
+(`pytest_s24b.log`), both on GPU1.
+
+
 
 
 
