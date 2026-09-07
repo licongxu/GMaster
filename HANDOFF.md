@@ -4338,6 +4338,55 @@ both sides of the equation. When a discrepancy lives in a handful of output colu
 indices can reach them before believing anything about magnitude; here that single question named
 `ell < |spin|` in one step, after two sessions of "improve the polar lane".
 
+### The synthesis seam was 65-81 % assembly, not marching (`13e9078` → `da60123`)
+
+With both march directions on, the seam timings were 137.84 ms (synthesis) against 102.05 ms
+(analysis) at Nside 1024 and **1809.49 ms against 568.91 ms** at 2048 — synthesis superlinear
+(13x for 8x the pixels) where analysis scales 5.7x. `.qwen/tmp/synth_superlinear.py` put the growth in
+the per-window assembly: 1.28 ms per window at 1024 against 10.74 ms at 2048, on a `(ntheta, 2L)`
+complex128 destination that is 0.37 GiB and 1.50 GiB respectively. `_inverse_impl` wrote each window
+with `out.at[:, cols].set(...)`, and **XLA scatter is out-of-place**, so every window copied the whole
+destination — 48 copies at 1024, 96 at 2048.
+
+The window column ranges are disjoint and tile the result (`_spin_slice._windows` is
+`(m0, m1, lo=m0)` over `range(0, L, 64)`; direct → `L+m0..L+m1-1`, mirror → `L-m1+1..L-n0` with
+`n0 = max(m0, 1)`, ascending windows meaning *descending* mirror columns), so the assembly is one
+n-ary concatenate: `[zero column, mirror blocks in reverse window order, direct blocks]`.
+
+```
+nside 1024  bit-identical: True  max|diff| 0.000e+00   scatter 138.75 ms -> concat 47.29 ms  (2.93x)
+nside 2048  bit-identical: True  max|diff| 0.000e+00   scatter 1805.60 ms -> concat 346.99 ms (5.20x)
+```
+
+(`.qwen/tmp/synth_assembly_ab.log`; shipped score cells in `.qwen/tmp/score_assembly_fix.log`, accuracy
+re-checked in `.qwen/tmp/synth_vs_ducc_assembly.log`). Scoreboard for spin 2 on the march route,
+fresh process per cell, ducc0 → GMaster:
+
+| nside | direction | ducc0 ms | GMaster ms | ratio |
+|---|---|---|---|---|
+| 1024 | map2alm | 116.7 | 107.4 | **1.09x** |
+| 1024 | alm2map | 109.2 | 95.2 | **1.15x** (session start: 0.01x, then 0.92x) |
+| 2048 | map2alm | 652.5 | 610.8 | **1.07x** |
+| 2048 | alm2map | 614.5 | 729.3 | **0.84x** (session start: 0.39x) |
+
+Nside 2048 had never been measured cleanly before this session — every earlier attempt died
+`RESOURCE_EXHAUSTED` / `CUDA_ERROR_OUT_OF_MEMORY` under the other tenant's load.
+
+**The same change in the analysis direction was measured and rejected**
+(`.qwen/tmp/forward_assembly_ab.log`): `_forward_impl` has the same loop shape and disjoint columns,
+but the concat arm is **0.37x at 1024 and 0.64x at 2048 and is not bit-identical**
+(`max|diff| 3.77e-07`). Two look-alike halves of one kernel are not one code path; A/B each direction
+and check bit-identity in the same probe as the timing. The analysis scatter chain stays. (The
+non-identity is unexplained; it only went unchased because the arm lost on time — if a future attempt
+at the analysis assembly looks fast, understand it first.)
+
+`tests/test_sht.py::test_spin2_march_synthesis_matches_the_route_it_replaces` now pins the seam at
+Nside 16/48/64 against `flm_to_ftm` (max rel 2.4e-06 / 4.9e-06 / 8.5e-06), with Nside 48 chosen because
+`L = 144` makes the window widths 64/64/16 — the ragged last window is what the concatenated assembly
+would break on. Nothing covered the march route before, because it is default-on only above every size
+the suite runs at.
+
+
 
 
 
