@@ -717,9 +717,13 @@ def _inverse_impl(flm, *, L, spin, nside):
     # The window column ranges are disjoint and tile the result, so the result is assembled by one
     # concatenation instead of `out.at[...].set` per window.  XLA scatter is out-of-place, so the
     # per-window form copied the whole (ntheta, 2L) complex128 buffer 48 times at Nside 1024 and 96
-    # times at 2048 -- 1.50 GiB per copy at the latter -- which was 65% and 81% of this step:
-    # 138.75 -> 47.29 ms (2.93x) and 1805.60 -> 346.99 ms (5.20x), bit-identical output
-    # (`.qwen/tmp/synth_assembly_ab.log`).
+    # times at 2048 -- 1.50 GiB per copy at the latter.  Re-measured end to end in one process with
+    # both arms on identical inputs: 114.36 -> 64.35 ms (**1.78x**) at 1024 and 1611.28 -> 482.72 ms
+    # (**3.34x**) at 2048, `max|diff| 0.000e+00` (bit-identical), `.qwen/tmp/synth_assembly_ab2.log`.
+    # The numbers this comment used to quote (2.93x / 5.20x) came from the same A/B under different
+    # conditions and the log it cited had since been overwritten by an unrelated probe; the direction
+    # was right, the magnitudes were not.  Analysis assembly does *not* benefit (0.98-0.99x,
+    # `.qwen/tmp/analysis_assembly_ab.log`) -- do not port this back and forth.
     dirs, mirs = [], []
     for (m0, m1, lo) in ss._windows(L):
         mb = m1 - m0

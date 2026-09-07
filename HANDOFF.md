@@ -4569,6 +4569,18 @@ an existing log name destroys the evidence a source comment cites — use a new 
 this session: a stale `pytest_s25b.log` left from an earlier session read "141 passed" before the
 current run had overwritten it.
 
+**Resolved the same session by regenerating the evidence** (`.qwen/tmp/synth_assembly_ab2.py` →
+`.qwen/tmp/synth_assembly_ab2.log`, one process, x64 on, both arms on identical inputs):
+
+```text
+nside 1024  bit-identical True  max|diff| 0.000e+00   scatter 114.36 ms -> concat  64.35 ms  1.78x
+nside 2048  bit-identical True  max|diff| 0.000e+00   scatter 1611.28 ms -> concat 482.72 ms  3.34x
+```
+
+The design choice stands (bit-identical, large win), the old magnitudes do not: **2.93x / 5.20x were
+optimistic; 1.78x / 3.34x is what the same A/B measures today.** `_inverse_impl`'s comment now cites the
+new log and says so in as many words. Quote the new pair.
+
 ### Next
 
 1. **Spin-2 `map2alm` at 1024/2048 is now the weakest spin-2 cell (1.10x / 1.11x)**, and its rescale is
@@ -4673,3 +4685,94 @@ rescale (1.009x), the coefficient low limbs (1.031x), the assembly form (0.98x),
 256/1), the geometry rebuild (2-5%) and now the contraction form (0.86-0.98x) are all measured dead. The
 analysis step is its compensated recurrence plus its contraction, and beating it is an algorithm change
 (anchored restarts, or a cheaper per-triple op count), not a rewrite of any block in it.
+
+### Session 25 addendum 4: spin 0 has a route cliff at 2048, and Nside 4096 is now measured for both spins
+
+Spin 0 at Nside 4096 had never been measured end to end either. Fresh process, fp32 tables, one card,
+`.qwen/tmp/score_n4096_spin0.log`:
+
+```text
+  4096    0  map2alm     2014.4      7516.9       0.27x 3.4e-07 |s|=1.6e+07  1410/1373
+  4096    0  alm2map     2022.3     10050.4       0.20x          -  synth=-
+```
+
+Put next to the spin-0 cells below it, this is a **route cliff, not a scaling law**:
+
+| nside | ducc `map2alm`/`alm2map` | GMaster | ratio | route |
+|---|---|---|---|---|
+| 1024 | 57.4 / 51.1 | 28.5 / 30.9 | **2.02x / 1.65x** (`sht_vs_ducc_s25_1024_0.log`) | precomputed Legendre band |
+| 2048 | 301.5 / 287.3 | 1048.1 / 1356.6 | 0.29x / 0.21x (`sht_vs_ducc_s26_2048_0.log`) | band declined → fp64 scalar kernel |
+| 4096 | 2014.4 / 2022.3 | 7516.9 / 10050.4 | **0.27x / 0.20x** (above) | band declined → fp64 scalar kernel |
+
+GMaster's own time grows 28.5 → 1048 ms (37x) for a doubling whose work grows 8x, because
+`utils._prefer_theta_band` compares the band against `_MATRIX_BAND_BUDGET` (40 GiB) and the fp32 band
+only engages at 1024 (36.7 GiB); both Nside 2048 and 4096 decline and fall through to
+`scalar_forward_latitudinal`, which regenerates the Legendre row in **float64** on every call. That is
+the 1/64-rate path of `fp64-roofline-wall`, and it is why these are the two worst cells in the repo —
+spin 0 loses 3.5-5x while spin 2 at the same sizes is within 20% of parity or ahead.
+
+These four cells (spin 0 at 2048 and 4096, both directions) are the largest single gap against ducc0
+anywhere in the scoreboard, and unlike the spin-2 analysis cells they are not a measured-out kernel:
+there is no fp32 marched spin-0 route at all. `gmaster/_spin_march_pallas.py` is closed over `SPIN = 2`
+(`march_requested`/`synth_requested` return False for any other spin), but its math degenerates cleanly
+at s = 0: `alpha = beta = m`, `a0 ∝ m·s` vanishes, `ns = m`, and `_log2_norm` becomes
+`log2 sqrt((l+m)!(l-m)!/(l!)²)`. The mirror channel would change form (for spin 0 the negative order is
+the same row times `(-1)^m`, with no `theta -> pi - theta` reversal).
+
+### Session 25 addendum 5: the north-south fold is real, and it is a **spin-0 only** lever
+
+The lever that looked like a free 2x for every march is the HEALPix north-south fold: rings pair as
+`i <-> nring-1-i` with *identical* transform weights, so if the latitudinal row obeys a self-parity law
+the whole southern half folds onto the north and the (m, ell, theta) triple count — the entire cost of a
+table-free march — halves. Both premises were tested before writing a kernel (`.qwen/tmp/ns_fold_probe.log`,
+CPU, nside 32/64):
+
+```text
+  grid: max|cos(theta_rev)+cos(theta)| 3.331e-16   rel max|w_rev - w| 0.000e+00
+  spin0 antisymmetric : (l+m) even 2.104e-13   (l+m) odd 1.000e+00
+  spin0 symmetric     : (l+m) even 1.000e+00   (l+m) odd 2.900e-13
+```
+
+So the law holds **exactly for spin 0**: `d^l_{m0}(pi - theta) = (-1)^(l+m) d^l_{m0}(theta)`, the ring
+weights are bit-identical across the mirror, the pixel mirror at fixed phi is an exact involution, and no
+longitude phase appears. Spin-0 alms of a mirror-antisymmetric map vanish in the even class to ~1e-13
+relative, and the symmetric map in the odd class.
+
+**It does not hold for spin 2, and that is structural, not numerical.** `_spin_slice._build`'s own
+docstring states the relation the shipped polar route depends on:
+
+    T[m, pi - theta, ell] == (-1)**(ell - spin) * T[-m, theta, ell]
+
+the spheroid row reflected through the equator lands on the **opposite order**, not on itself — which is
+precisely what the march's mirror channels already consume (they contract `F(pi-theta, -m)` against the
+`+m` row). Folding `+m` would require the `-m` row in the same program, i.e. marching two rows, which
+gives the work back. The fold A/B confirms it numerically (`.qwen/tmp/ns_fold_ab.py`, Nside 1024 fp32,
+half theta with an 8-channel rhs carrying both parity classes):
+
+```text
+  kernel only, 48 windows: shipped 96.91 ms   folded 90.55 ms   ** 1.070x **   (theta lanes 2048/4095)
+  fold vs shipped march: max|diff|/max|out| 9.391e-01   rms 2.108e-02
+```
+
+Two independent lessons in those two lines. The **0.939** is the missing self-parity (the fold is wrong
+for spin 2, as predicted). The **1.070x** is a warning for the spin-0 version: doubling the channel count
+to 8 to carry both parity classes leaves the contraction's multiply count unchanged while doubling each
+program's reduction width and its accumulator footprint (with `_TILE/_WARPS = 256/1` that is 8 fp32
+accumulators x 8 lanes per thread), so halving the recurrence bought 7% instead of the ~1.5x the
+68%/32% split predicts. **A spin-0 fold must halve the channels too** — a 4-channel parity-selected emit
+(a two-degree unrolled loop over an `(2, chunk, 4)` rhs block, which needs only the 2-argument
+concatenate the Triton lowering does support), not an 8-channel one.
+
+Where that leaves the plan, in value order:
+
+1. **Spin-0 folded band** (best prize-per-risk, and it does not need a new kernel): the band builder
+   already splits rows by parity of `ell - m0` (`_theta_matrix._band`), which is exactly the two classes
+   the fold needs, and the 1024 analysis band is 36.7 GiB fp32 read every call — a memory-bound stage
+   inside a 28.5 ms `map2alm` against ducc0's 57.4. Building it over the northern grid only halves both
+   the resident band and the read, and the rhs becomes `C± = F(i,m) ± F(i',m)` with the equator lane
+   split half into each copy. Same trick, applied to the synthesis band, halves `alm2map` too.
+2. **Spin-0 marched route** at 2048/4096 (the 0.20-0.29x cells), with the fold as above: the march
+   replaces the declined band + fp64 scalar kernel; the closed form, limbs, windows and exponent
+   bookkeeping all already exist in `_spin_march_pallas` and degenerate at s = 0.
+3. Spin 2 keeps its current routes. Do not try to fold it: the row's equatorial reflection changes the
+   order, not the row.
