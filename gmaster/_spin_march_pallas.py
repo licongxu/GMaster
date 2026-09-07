@@ -501,15 +501,23 @@ def _forward_fold_impl(positive, weights, phase, *, L, nside):
 
     from gmaster import _spin_slice as ss
 
+    # The four channels of the rhs are interleaved on the last axis, so building them per window is
+    # a strided store per window: measured 126.9 ms of the 442 ms Nside 2048 `map2alm`, against
+    # ~2 ms for the same bytes streamed once (`.qwen/tmp/spin0_fold_rhs_cost_2048b.log` -- neither
+    # bandwidth nor the `zeros().at[].set` form is the cost, a concatenate is 1.04x).  So the whole
+    # (L, npad, NC) block is built once and each window slices its own rows out of it.
+    chan_all = jnp.stack([g_north.real, g_north.imag, g_part.real, g_part.imag], axis=-1)
+    rhs_all = lax.convert_element_type(chan_all, jnp.float32)
+    if npad != north:
+        rhs_all = jnp.concatenate(
+            [rhs_all, jnp.zeros((L, npad - north, NC), dtype=jnp.float32)], axis=1)
+
     cols = []
     norm = jnp.sqrt((2.0 * jnp.arange(L, dtype=jnp.float64) + 1.0) / (4.0 * jnp.pi))
     for (m0, m1, lo) in ss._windows(L):
         mb = m1 - m0
         g = _window_geometry(m0, mb, x, sh, ch, L, npad, spin=0)
-        chan = jnp.stack([g_north[m0:m1].real, g_north[m0:m1].imag,
-                          g_part[m0:m1].real, g_part[m0:m1].imag], axis=-1)
-        rhs = jnp.zeros((mb, npad, NC), dtype=jnp.float32).at[:, :north].set(
-            lax.convert_element_type(chan, jnp.float32))
+        rhs = rhs_all[m0:m1]
         parts = _call(L, north, ntile, mb, spin=0)(
             *g, rhs, jnp.asarray([m0], jnp.int32)).sum(1)      # (mb, L, NC)
         ms = m0 + jnp.arange(mb)
