@@ -5054,3 +5054,86 @@ correctness evidence is the probes: `spin0_fold_debug.py` (march vs band route a
 unchanged by the hoist), `spin0_fold_synth.py` (march vs the fp64 kernel at 32/64/128/2048, both
 spectra), `spin0_fold_rows.py` / `spin0_fold_one.py` (fold algebra and marched rows against independent
 references), plus the unchanged `rel alm` column in the 2048/4096 score logs.
+
+---
+
+## Session 27 — the spin-2 rhs hoist is a wash, the analysis assembly is already optimal, and the spin-2 pipeline is 1.9-2.1x
+
+No shipped change. Both candidates session 26 left open on the spin-2 analysis driver were measured
+and both came back dead, so the tree is `e3f3e04` unchanged. Everything below is from logs read this
+session; GPU1 throughout, ducc0 0.39.1 on all 192 cores, `GM_PREC=fp32` for the transform cells.
+
+**Baseline, spin 2, transform only** (`.qwen/tmp/score_spin2_s27base.log`, 5 reps):
+
+| nside | direction | ducc0 ms | GMaster ms | ratio | rel alm |
+|---|---|---|---|---|---|
+| 1024 | `map2alm` | 121.3 | 107.9 | **1.12x** | 3.7e-05 |
+| 1024 | `alm2map` | 107.5 | 71.2 | **1.51x** | — |
+| 2048 | `map2alm` | 618.1 | 587.7 | **1.05x** | 6.1e-05 |
+| 2048 | `alm2map` | 579.0 | 528.8 | **1.09x** | — |
+| 4096 | `map2alm` | 3790.1 | 4757.7 | **0.80x** | 1.9e-04 |
+| 4096 | `alm2map` | 3786.3 | 3510.2 | **1.08x** | — |
+
+**Candidate 1, the one session 26 named as untested: hoist the spin-2 rhs build.** Implemented as a
+single `(L, npad, NC)` float32 buffer per call — window `m0..m1` is the row slice `m0:m1`, the direct
+half is `ftm[:, L:2L].T`, and the mirror half collapses onto the *same* column offset through the
+doubly-reversed map (`ftm[::-1, 1:L+1][:, ::-1]`, column `m` is ring-reversed column `L - m`), so the
+four strided transposes run once per call instead of 96 times. **Bit-identical to the shipped driver at
+every size tested** — `max|diff| 0.000e+00` at nside 64/128/256 (`.qwen/tmp/spin2_rhs_ident.py`) and
+again at 1024/2048/4096 (`.qwen/tmp/spin2_rhs_ident_big.log`). The speed is a wash:
+
+| nside | shipped, per-window | hoisted once per call | ratio |
+|---|---|---|---|
+| 64 | 0.48 ms | 0.46 ms | 1.024x |
+| 128 | 1.64 ms | 1.63 ms | 1.008x |
+| 256 | 5.81 ms | 5.78 ms | 1.004x |
+| 1024 | 103.06 ms | 102.49 ms | 1.006x |
+| 2048 | 564.81 ms | 573.61 ms | **0.985x** |
+| 4096 | 4609.24 ms | 4619.47 ms | 0.998x |
+
+So spin 0's 29%-of-the-call rhs build has **no spin-2 analogue**: spin 0's cost was the ring phase
+exponential chain it recomputes, and spin 2's rhs is pure permutation, which XLA already folds well.
+The hoist is also a memory regression — one resident `(L, npad, 4)` fp32 buffer is 805 MB at 2048 and
+3.2 GiB at 4096, against 8.4 MB per window for the shipped form, at the sizes where the pool is
+tightest. Reverted rather than shipped at 1.0x.
+
+**Candidate 2, the result assembly.** The shipped driver finishes with 96 (192 at 4096)
+`out.at[lo:, ...].set(...)` updates of an `(L, 2L-1)` float64 array — 1.2 GiB at 2048 — and the folded
+spin-0 driver uses one `concatenate` instead. Rewritten the same way (the mask
+`acc = where(ell >= max(m, spin))` already zeroes exactly the rows the scatter left at zero, since
+`lo = m0`), the 2x2 against the rhs choice is (`.qwen/tmp/spin2_assembly_ab.log`):
+
+| nside | perwin + scatter | perwin + concat | hoist + scatter | hoist + concat |
+|---|---|---|---|---|
+| 1024 | **102.97 ms** | 103.47 ms | 102.60 ms | 103.37 ms |
+| 2048 | **564.33 ms** | 574.52 ms | 572.18 ms | 578.21 ms |
+
+Concatenate loses by 0.5-1.8%, which reproduces session 25's independent measurement of the same
+rewrite (`analysis_assembly_ab`, 0.992x / 0.981x) — the analysis direction is not synthesis, where the
+same change bought 2.93x / 5.20x. XLA folds a chain of dynamic-update-slices into the consumer much
+better than a 192-operand concatenate does. **The shipped form stands.** (Incidental: at 1024 the
+concatenate arm was *not* bit-identical, 8.9e-16 — reordering the complex adds — while at 2048 it was.
+Moot given it loses, but it says the two forms are not exactly interchangeable.)
+
+**Spin-2 pipeline against NaMaster, first measurement at these sizes** (library default fp64 tables,
+`nlb=30`, `n_iter=3`, `repeats=3`):
+
+```
+nside=1024  spin=2: TOTAL 3362->1609ms (2.1x) | field 967->614ms (2x)  coupling 1844->359ms (5x)
+            coupled_cell 125->1ms (227x)  decouple 1->2ms (1x) | rel 3.69e-06
+nside=2048  spin=2: TOTAL 18467->9852ms (1.9x) | field 5062->3964ms (1x)  coupling 10609->2771ms (4x)
+            coupled_cell 614->3ms (190x)  decouple 5->4ms (1x) | rel 1.09e-05 | GPUpeak=12.7GiB
+```
+(`.qwen/tmp/pipe_n1024_spin2_s27.log`, `.qwen/tmp/pipe_n2048_spin2_s27.log`.) For comparison spin 0 at
+2048 is 1.5x since session 26 (`pipe_n2048_spin0_fold.log`). The pattern is the same in both spins:
+the coupling matrix and the coupled cell are 4-300x, and **`field` is the stage at parity** — 3964 ms
+of the 9852 ms at 2048. That stage is `NmtField.__init__`, whose bulk is one
+`map2alm(maps, spin, ..., n_iter=3)`: an analysis pass plus three (synthesis, analysis) residual
+corrections — 4 analysis and 3 synthesis latitudinal passes over the same march — so it inherits the
+march's 1.05x and cannot be fixed independently of it.
+
+**What this closes.** Session 26's "One unspent, unmeasured candidate" paragraph is now spent: the
+spin-2 rhs build is hoisted-for-free, not hoisted-for-gain, and the assembly was already the faster of
+the two forms. Spin-2 analysis above 1024 is the recurrence and nothing else, exactly as session 25
+addendum 3 concluded for the other blocks; 4096 `map2alm` (0.80x) is the largest spin-2 cell left and
+it needs the same algorithm change, not another block rewrite.
