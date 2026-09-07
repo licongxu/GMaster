@@ -525,7 +525,10 @@ def test_spin2_march_synthesis_matches_the_route_it_replaces(nside):
     `ell < |spin|` is zeroed because the march's recurrence starts at `ell = max(m, spin)` and
     contributes nothing below the spin while the exact route does use those terms; every analysis
     output already satisfies that, which is why the convention difference never reaches a pipeline.
-    Measured here: max rel 2.4e-06 (nside 16), 4.9e-06 (48), 8.5e-06 (64).
+    Measured here with the default (plain-float32) accumulation and, in brackets, the compensated
+    one: max rel 2.54e-06 [2.42e-06] at nside 16, 4.90e-06 [4.93e-06] at 48, 8.52e-06 [8.47e-06] at
+    64, and 1.01e-05 for both at 128 (`.qwen/tmp/synth_march_rel.log`) — dropping the accumulation
+    limb is not what limits this step.
     """
     from gmaster import _spin_march_pallas as march
 

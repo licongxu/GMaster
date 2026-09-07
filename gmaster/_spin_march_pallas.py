@@ -417,6 +417,10 @@ def forward_latitudinal(ftm, *, L, spin, nside):
 # ------------------------------------------------------------------- synthesis: the same row, summed
 _ST = int(os.environ.get("GMASTER_SPIN2_MARCH_SYNTH_TILE", "512"))
 _SW = int(os.environ.get("GMASTER_SPIN2_MARCH_SYNTH_WARPS", "4"))
+# `fast` accumulates the contraction in plain float32, `comp` in (value, limb) float32 pairs; see
+# `_accumulate_fast` for the measured cost and error of the difference.
+_ACC = os.environ.get("GMASTER_SPIN2_MARCH_SYNTH_ACC", "fast")
+_ACC_FAST = _ACC != "comp"
 
 
 def _add_pair(hh, lo, ph, pl):
@@ -467,6 +471,37 @@ def _accumulate(nd, ndl, tex, aex, at0, rh, rl, ih, il, a_r, a_l, b_r, b_l):
     return a_r * amult, a_l * amult, b_r * amult, b_l * amult, aex
 
 
+def _accumulate_fast(nd, tex, aex, at0, rh, ih, a_r, b_r):
+    """Plain-float32 accumulation of one degree's term: same range guards, no limbs.
+
+    The range half of `_accumulate` (the `lift`/`ds` alignment and the 2^+-24 accumulator guard) is
+    what keeps a 6000-term sum inside float32's exponent range and is kept verbatim.  What is
+    dropped is the *precision* half: the limb operands (neither the marched limb nor the
+    coefficient limbs are read at all, so the kernel does not even load them) and the
+    accumulator limb.  At 4 elements/thread that is 61 of the step's ~165 vector operations, and the
+    step is warp-issue-bound at ~100% of the machine's issue rate, so the saving is the op count
+    itself: 83.41 -> 51.96 ms over all 48 windows at Nside 1024 (1.605x), with max|diff| 1.260e-07
+    against the compensated arm and 2.15e-06 relative to the window's own maximum
+    (`.qwen/tmp/synth_acc_cost_1024.log`).
+    """
+    aex = jnp.where(at0, tex, aex)
+    lift = jnp.maximum(tex - aex - 90, 0).astype(jnp.int32)
+    aex = aex + lift
+    res = _pow2(-lift)
+    a_r, b_r = a_r * res, b_r * res
+    ds = _pow2((tex - aex).astype(jnp.int32))
+    nd = nd * ds
+    a_r = a_r + nd * rh
+    b_r = b_r + nd * ih
+    amax = jnp.maximum(jnp.abs(a_r), jnp.abs(b_r))
+    abig = amax > BHI
+    asmall = (amax < BLO) & (amax > 0)
+    amult = jnp.where(abig, jnp.float32(2.0 ** -JUMP),
+                      jnp.where(asmall, jnp.float32(2.0 ** JUMP), jnp.float32(1.0)))
+    aex = aex + jnp.where(abig, JUMP, jnp.where(asmall, -JUMP, 0)).astype(jnp.int32)
+    return a_r * amult, b_r * amult, aex
+
+
 def _kern_synth(manr, ex0r, xr, xlr, c1r, c0r, cbr, c1lr, c0lr, cblr,
                 lexdr, drh, drl, dih, dil, lexmr, mrh, mrl, mih, mil,
                 m0_ref, out_ref, *, L, ntheta, chunk):
@@ -480,10 +515,12 @@ def _kern_synth(manr, ex0r, xr, xlr, c1r, c0r, cbr, c1lr, c0lr, cblr,
     differs -- before this the negative orders ran a second, identical march on a `-cos` geometry,
     which is why synthesis cost 197.7 ms against analysis' 111.6 at Nside 1024.
 
-    Both accumulators are float32 (value, limb) pairs, not float64 ones: this GPU runs float64 at
-    1/64 rate, and an fp64 accumulator alone cost 793.9 ms for this step
-    (`.qwen/tmp/sht_vs_ducc_s29_ab2_1024_2.log`).  Output channel 0/1 is the direct (positive m)
-    sum, 2/3 the mirror (negative m) sum, which the caller stores at the reversed theta axis.
+    The accumulation is plain float32 by default; `GMASTER_SPIN2_MARCH_SYNTH_ACC=comp` restores the
+    (value, limb) pairs and `_accumulate_fast` records what the two cost.  Float64 accumulators are
+    not an option on this GPU, which runs float64 at 1/64 rate -- an fp64 accumulator alone cost
+    793.9 ms for this step (`.qwen/tmp/sht_vs_ducc_s29_ab2_1024_2.log`).  Output channel 0/1 is the
+    direct (positive m) sum, 2/3 the mirror (negative m) sum, which the caller stores at the
+    reversed theta axis.
     """
     row = pl.program_id(0)
     tile = pl.program_id(1)
@@ -503,7 +540,11 @@ def _kern_synth(manr, ex0r, xr, xlr, c1r, c0r, cbr, c1lr, c0lr, cblr,
     p1f = ((alpha + beta + 2.0) / 2.0) * xv + ((alpha - beta) / 2.0)
 
     def degree(ell, st):
-        (ph, pl_, ch, cl, ex, adr, adl, adi, adli, aexd, amr, aml, ami, amli, aexm) = st
+        if _ACC_FAST:
+            (ph, pl_, ch, cl, ex, adr, adi, aexd, amr, ami, aexm) = st
+        else:
+            (ph, pl_, ch, cl, ex, adr, adl, adi, adli, aexd,
+             amr, aml, ami, amli, aexm) = st
         c1 = jnp.broadcast_to(plt.load(c1r.at[row, ell]).astype(jnp.float32), xv.shape)
         c0 = jnp.broadcast_to(plt.load(c0r.at[row, ell]).astype(jnp.float32), xv.shape)
         cb = jnp.broadcast_to(plt.load(cbr.at[row, ell]).astype(jnp.float32), xv.shape)
@@ -547,6 +588,23 @@ def _kern_synth(manr, ex0r, xr, xlr, c1r, c0r, cbr, c1lr, c0lr, cblr,
         # Both sums consume the same marched value; only the coefficient set and the block
         # exponent differ.  Pad lanes track their own accumulator so `EX_PAD` cannot poison it.
         lex = jnp.broadcast_to(plt.load(lexdr.at[row, ell]), xv.shape)
+        chs = jnp.where(valid, ch * dmult, jnp.float32(0.0))
+        cls = jnp.where(valid, cl * dmult, jnp.float32(0.0))
+        if _ACC_FAST:
+            tex = jnp.where(valid, ex + lex, aexd)
+            adr, adi, aexd = _accumulate_fast(
+                nxt, tex, aexd, at0,
+                jnp.broadcast_to(plt.load(drh.at[row, ell]), xv.shape),
+                jnp.broadcast_to(plt.load(dih.at[row, ell]), xv.shape),
+                adr, adi)
+            lexm = jnp.broadcast_to(plt.load(lexmr.at[row, ell]), xv.shape)
+            texm = jnp.where(valid, ex + lexm, aexm)
+            amr, ami, aexm = _accumulate_fast(
+                nxt, texm, aexm, at0,
+                jnp.broadcast_to(plt.load(mrh.at[row, ell]), xv.shape),
+                jnp.broadcast_to(plt.load(mih.at[row, ell]), xv.shape),
+                amr, ami)
+            return chs, cls, nxt, nxtl, ex, adr, adi, aexd, amr, ami, aexm
         tex = jnp.where(valid, ex + lex, aexd)
         adr, adl, adi, adli, aexd = _accumulate(
             nxt, nxtl, tex, aexd, at0,
@@ -564,12 +622,24 @@ def _kern_synth(manr, ex0r, xr, xlr, c1r, c0r, cbr, c1lr, c0lr, cblr,
             jnp.broadcast_to(plt.load(mih.at[row, ell]), xv.shape),
             jnp.broadcast_to(plt.load(mil.at[row, ell]), xv.shape),
             amr, aml, ami, amli)
-        return (jnp.where(valid, ch * dmult, jnp.float32(0.0)),
-                jnp.where(valid, cl * dmult, jnp.float32(0.0)), nxt, nxtl, ex,
+        return (chs, cls, nxt, nxtl, ex,
                 adr, adl, adi, adli, aexd, amr, aml, ami, amli, aexm)
 
     zb = jnp.zeros_like(man)
     zi = jnp.zeros(xv.shape, jnp.int32)
+    if _ACC_FAST:
+        (_, _, _, _, _, adr, adi, aexd,
+         amr, ami, aexm) = lax.fori_loop(
+            nstart, L, degree, (zb, zb, man, zb, ex, zb, zb, zi, zb, zb, zi))
+        sd = _pow2_f64(aexd)
+        sm_ = _pow2_f64(aexm)
+        plt.store(out_ref.at[row, tile, slice(0, chunk), slice(0, 2)],
+                  jnp.stack([adr.astype(jnp.float64) * sd,
+                             adi.astype(jnp.float64) * sd], axis=-1))
+        plt.store(out_ref.at[row, tile, slice(0, chunk), slice(2, 4)],
+                  jnp.stack([amr.astype(jnp.float64) * sm_,
+                             ami.astype(jnp.float64) * sm_], axis=-1))
+        return
     (_, _, _, _, _, adr, adl, adi, adli, aexd,
      amr, aml, ami, amli, aexm) = lax.fori_loop(
         nstart, L, degree, (zb, zb, man, zb, ex, zb, zb, zb, zb, zi,
