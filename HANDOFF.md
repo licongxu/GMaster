@@ -4927,6 +4927,25 @@ parameter: `1024 2 map2alm 118.3 / 112.4 = 1.05x`, `alm2map 108.4 / 75.9 = 1.43x
 which is where session 25 left it. Suite on the shipped default after both seams landed: **146 passed,
 3 skipped in 319.47 s** (`.qwen/tmp/pytest_s26.log`), the same counts as session 25.
 
+### The same A/B end to end: Nside 2048 spin 0 goes from losing the MASTER pipeline to winning it
+
+`python -m benchmarks.benchmark_pipeline --nside 2048 --spins 0 --repeats 3` (library default fp64
+tables, `n_iter=3`, `nlb=30`, medians of 3, one process per arm; NaMaster CPU is the reference in both
+runs, so the two `TOTAL` reference columns are independent measurements of the same thing):
+
+| arm | NaMaster TOTAL | GMaster TOTAL | ratio | `field` | `coupling` | `coupled_cell` | rel `dCl` | log |
+|---|---|---|---|---|---|---|---|---|
+| `GMASTER_SPIN0_MARCH=0` (route before this session) | 10684 ms | 17020 ms | **0.63x** | 2517 → **7669** (0.33x) | 5579 → 1529 (3.6x) | 134 → 0 (313x) | 3.67e-12 | `pipe_n2048_spin0_nofold.log` |
+| default (folded march) | 10823 ms | **7138 ms** | **1.5x** | 2543 → **2739** (0.93x) | 5628 → 1536 (3.7x) | 135 → 0 (301x) | **1.38e-06** | `pipe_n2048_spin0_fold.log` |
+
+**2.39x on the whole pipeline**, and it flips the sign of the comparison: the cell that used to make
+GMaster 1.6x *slower* than NaMaster at Nside 2048 now finishes in 0.66x NaMaster's time. All of the
+movement is in `field` (mask construction runs the transform on every blurring iteration), which goes
+0.33x → 0.93x and is now the worst remaining pipeline stage; `coupling` and `coupled_cell` are
+unchanged, as they must be. The cost is visible too: `rel dCl` moves **3.67e-12 → 1.38e-06**, which is
+the march's alm error propagating quadratically, and is the number to quote if anyone asks what the fold
+costs a power spectrum.
+
 ### Accuracy cost of the trade, stated
 
 The march replaces a route accurate to 3.4-3.7e-07 with the march's own float32-lane accuracy. Against
@@ -4947,10 +4966,14 @@ direction is `rel alm 6.9e-05` at 2048 and `2.1e-04` at 4096 (`|s|`-fitted again
 3.7e-07 and 3.4e-07 for the kernel that used to serve those cells. That is the price of 2.15x/3.03x on
 `map2alm` and 3.89x/4.56x on `alm2map`; the band geometries (512, 1024 fp32) keep their 3.6e-07.
 
-The 2048 synthesis figure is the worst-case input the probe can build — a **white** coefficient vector
-flat to `ell = 6143`, which puts as much power as possible into exactly the high degrees where the
-marched lane has accumulated 6144 recurrence steps (`|ref|max 2.618e+03`, `.qwen/tmp/spin0_fold_synth_2048.log`).
-`GM_FALL=1` on the same probe re-runs it with a `1/(ell+1)` spectrum, which is closer to a sky.
+The 2048 figure is the worst-case input the probe can build — a **white** coefficient vector flat to
+`ell = 6143`, which puts as much power as possible into exactly the high degrees where the marched lane
+has accumulated 6144 recurrence steps (`|ref|max 2.618e+03`, `.qwen/tmp/spin0_fold_synth_2048.log`).
+With a falling spectrum (`GM_FALL=1`, `alm /= ell + 1`, `.qwen/tmp/spin0_fold_synth_2048_fall.log`) the
+same comparison is **max rel 1.216e-03 and rms-rel 3.116e-05** — the rms error is what a synthesized map
+actually looks like, and it is 40x below the max, which lives at the pole-most lane (`ring 0, m = 0`)
+where `|ref|` is also largest. The pipeline-level statement of the same trade is the `rel dCl` column
+above: **1.38e-06**.
 
 ### Occupancy probe: the shape is already right
 
