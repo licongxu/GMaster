@@ -4776,3 +4776,42 @@ Where that leaves the plan, in value order:
    bookkeeping all already exist in `_spin_march_pallas` and degenerate at s = 0.
 3. Spin 2 keeps its current routes. Do not try to fold it: the row's equatorial reflection changes the
    order, not the row.
+
+### Session 25 addendum 6: the folded spin-0 band is priced — 95% of the call is the band read
+
+Whether the spin-0 fold is worth building comes down to whether the latitudinal stage is band-read
+bound. Measured directly (`CUDA_VISIBLE_DEVICES=1 JAX_ENABLE_X64=1 GM_PREC=fp32 python -u
+.qwen/tmp/spin0_stage_split.py 512 1024`, median of 5, shipped default route):
+
+```text
+ nside     total       fft   lat(band)  lat share   band GiB  implied GB/s
+   512      4.57      0.28        3.71     81.1%        4.7          1358   band=on
+  1024     28.12      1.72       26.83     95.4%       36.8          1471   band=on
+```
+
+So at Nside 1024 the ring FFT is 1.72 ms of a 28.12 ms call and the band contraction is **26.83 ms
+(95.4%)**, consuming an implied **1471 GB/s** — the same number the score harness's independent fp64-sum
+control reports for this card (1410/1373, 1359/1439 GB/s in the two 4096 logs), i.e. the stage is at the
+achievable streaming rate, not at a scheduling limit. **Reading half as many band bytes therefore takes
+about half the time**, and the fold's arithmetic is:
+
+| nside | ducc `map2alm` | GMaster now | GMaster with a northern-grid band | ratio now → then |
+|---|---|---|---|---|
+| 512 | ~14.5 | 4.57 | ~2.7 (0.28 + 3.71/2) | 3.15x → **~5.4x** |
+| 1024 | 57.4 | 28.12 | ~15.1 (1.72 + 26.83/2) | 2.02x → **~3.8x** |
+
+(The 512 ducc figure is the shipped score cell; the "then" column assumes the fold halves `lat` and
+leaves the fft stage alone, which is what the 95%-at-peak-bandwidth measurement implies. It does *not*
+help at Nside 2048: halving a ~290 GiB fp32 band is still 145 GiB against a 71.2 GiB pool, so those
+cells still need the marched route.)
+
+Two concrete work items follow, both spin-0-only and both now priced:
+
+1. **Northern-grid band.** `_theta_matrix._band` already returns rows split by parity of `ell - m0`,
+   which is exactly the `(-1)^(l+m)` pairing, so the builder change is to march the northern grid (with
+   the equator lane halved) and the consumer change is to feed `C± = F(i,m) ± F(i',m)` instead of `F`.
+   Halves the resident band *and* the read: 36.8 → 18.4 GiB at 1024, which also relaxes
+   `_MATRIX_BAND_BUDGET` pressure at 1024. Do the analysis band first (`map2alm` is 95% one stage),
+   then the synthesis copy in `_synth_band`.
+2. **Marched spin-0 route** for the band-declined 2048/4096 cells (0.29x/0.21x and 0.27x/0.20x), with a
+   **4-channel parity-selected** emit — not the 8-channel form that measured 1.070x.
