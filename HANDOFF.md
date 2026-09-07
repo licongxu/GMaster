@@ -5298,3 +5298,49 @@ spin 2. GPU peak 12.6 GiB at the largest cell, peak RSS 91.2 GB (pymaster's own 
 **To reclaim the spin-2 win**, root-cause the uninitialized read first. Trials must be counted by
 *process*, not by repeats: only the first build in a process gets fresh pages, so 24 repeats inside one
 process is one trial for this purpose, and a clean sweep needs ≳100 processes at 128.
+
+### Root-cause progress: the poisoned-allocator trick, and what it named
+
+Reproducing a 1-in-24 event is hopeless, so `.qwen/tmp/nan_poison.py` **poisons the device pool**: it
+fills 24 GiB with NaN, frees it, and then builds — so any buffer read before it is written reads NaN on
+purpose. That raised the rate enough to matter: two wide arms NaN'd one, two narrow controls stayed
+clean. With the rate boosted, `jax_debug_nans` (which had been silent in 24 unpolluted trials — at a
+1-in-24 rate that is only a 36% chance of silence, so it was never a fair test) **caught it**:
+
+```
+FloatingPointError: ('jit(_map2alm_once)', 'nan') ... the de-optimized function did not produce
+invalid values during its execution
+  gmaster/field.py:197  self.alm = map2alm(...)
+  gmaster/utils.py:2149  return _map2alm_core(...)
+  gmaster/utils.py:1643  alm = _map2alm_once(...)
+```
+
+That message is the finding: the NaN exists **only in the optimized executable** — the uncompiled Python
+of the same function is clean — and it depends on prior buffer contents. Together with
+first-allocation-only, that is an XLA-level buffer/aliasing issue around the marched analysis, not an
+arithmetic error and not a bug in the recurrence. (`.qwen/tmp/nan_hunt2.log`.)
+
+**The instrumentation hides it.** Twenty poisoned trials with `jax.debug.callback` NaN counters on
+`utils._forward_s2fft`, `utils._map2alm_once` and `_spin_march.forward_latitudinal` were all clean
+(`.qwen/tmp/nan_stage.log`, `.qwen/tmp/nan_seam.log`), because the callback is an effect node that
+changes the schedule and the buffer layout. Stage-level callbacks therefore cannot localize this, and a
+plain `np.asarray` inside a wrapper is a `TracerArrayConversionError` (the seams run inside the enclosing
+trace) — both dead ends, recorded so nobody repeats them.
+
+**The one partially-written device buffer in the route** is the analysis Pallas slab: `_call` allocates
+`out_shape = (mb, ntile, L, 4)` float64 (252 MB per launch at nside 1024 with `mb = 128`) with
+`grid = (mb, ntile)`, while `_kern` stores only `ell >= nstart = max(m, spin)`. The driver masks that
+wedge (`acc = jnp.where(ell >= max(m, spin), parts, 0)`) after the tile sum, which is semantically
+sufficient — and the wedge feeds nothing downstream, which is exactly the kind of provably-dead select
+an optimizer may drop, and exactly the buffer whose garbage the poison finds. A direct
+concrete-in/concrete-out test of the seam under poisoning (`.qwen/tmp/nan_wedge.py`) is the right next
+probe but needs the seam's real input contract; measured from the stage log, the seam runs at
+**`L_work = 3·nside`** (one above `L = 3·nside − 1`) with an `ftm` of `(4·nside − 1, 2·L_work − 1)`, and
+the first attempts at that shape still fail a `jnp.stack` shape check — worth ten minutes of reading
+`_forward_impl` before running it.
+
+**Cheapest decisive experiment for the next session**: with the poison in place, make the kernel write
+the wedge (or force the select to be live, e.g. `parts = parts * jnp.where(mask, 1.0, 0.0)` before the
+tile sum instead of `jnp.where(..., parts, 0.0)` after it) and see whether the poisoned wide build stops
+NaNing. If it does, the mechanism is proven and the fix is a few bytes of arithmetic at the wedge, after
+which spin 2 can go wide and take back the measured 1.36x / 1.11x.
