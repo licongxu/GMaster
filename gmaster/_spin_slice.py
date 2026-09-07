@@ -174,11 +174,21 @@ _BUILD_RESERVE = 16 * 1024**3
 # contraction reads only ``[lo, L)`` (see :func:`forward_latitudinal`).  64 skips
 # 42% of the bytes and measures 1.67x on analysis / 1.60x on synthesis at nside
 # 128; 16-row blocks skip 48% but pay 4x the kernels and give only 1.34x/1.20x.
-_M_BLOCK = 64
+_M_BLOCK = int(os.environ.get("GMASTER_M_BLOCK", "64"))
+# Width for the table-free marched routes, which have no stored slab and therefore no byte-skip
+# argument at all: for them the window is only how the same program count is split across launches
+# (``L/mb`` launches of ``mb * ntile`` programs, one program per ``(m, theta tile)`` pair).  128 is
+# used there up to a per-launch program ceiling, above which it measures 0.94-0.96x; see
+# :func:`gmaster._spin_march_pallas._march_windows` for the full measured table.  256 is worse than
+# 128 even where 128 wins (316.0 vs 300.8 ms on the folded spin-0 analysis at nside 2048) because the
+# per-window padded right-hand side doubles with the width, and 32 is much worse (634 ms).  The
+# stored-slab sweep that chose 64 (``HANDOFF`` "``_M_BLOCK`` ... is not a lever") is a different
+# route: there wider means reading more of the ``ell < |m|`` half.
+_MARCH_M_BLOCK = int(os.environ.get("GMASTER_MARCH_M_BLOCK", "128"))
 _WINDOW_CACHE = {}
 
 
-def _windows(L):
+def _windows(L, block=None):
     """``(m0, m1, lo)`` per stored window of *non-negative* orders.
 
     Only orders ``0..L-1`` are stored.  ``T[m, pi-theta, ell] == (-1)**(ell - m') *
@@ -188,11 +198,16 @@ def _windows(L):
     rings reversed (see :func:`forward_latitudinal`).  ``lo = m0`` because within a
     window of non-negative orders the smallest ``|m|`` is the first one, and
     ``d^ell_{m,-spin}`` vanishes below ``ell = |m|``.
+
+    ``block`` overrides the width for callers that never see a slab (the table-free marches,
+    :data:`_MARCH_M_BLOCK`); every stored layout uses :data:`_M_BLOCK` so that the builder, the
+    budget and the contraction stay in agreement.
     """
-    cached = _WINDOW_CACHE.get(L)
+    block = _M_BLOCK if block is None else block
+    cached = _WINDOW_CACHE.get((L, block))
     if cached is None:
-        cached = tuple((a, min(a + _M_BLOCK, L), a) for a in range(0, L, _M_BLOCK))
-        _WINDOW_CACHE[L] = cached
+        cached = tuple((a, min(a + block, L), a) for a in range(0, L, block))
+        _WINDOW_CACHE[(L, block)] = cached
     return cached
 
 

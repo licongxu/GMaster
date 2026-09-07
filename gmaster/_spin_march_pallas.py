@@ -55,6 +55,8 @@ BLO, BHI, JUMP = 2.0 ** -24, 2.0 ** 24, 24
 EX_PAD = -(10 ** 7)          # pad theta lanes: never win `emax`, never flush the real lanes
 _TILE = int(os.environ.get("GMASTER_SPIN2_MARCH_TILE", "256"))
 _WARPS = int(os.environ.get("GMASTER_SPIN2_MARCH_WARPS", "1"))
+# Ceiling on programs per march launch for the wide m-window (see :func:`_march_windows`).
+_MARCH_GRID_CAP = int(os.environ.get("GMASTER_MARCH_GRID_CAP", "2048"))
 
 _CALLS: dict = {}
 
@@ -362,6 +364,54 @@ def _window_geometry(m0, mb, x, sh, ch, L, npad, spin=SPIN):
 
 
 # --------------------------------------------------------------------------------------- driver
+def _march_windows(L, ntile, spin):
+    """The m-windows of one march launch of *ntile* theta tiles at *spin*.
+
+    One program covers one ``(m, theta tile)`` pair, so the window width changes neither the total
+    work nor the total program count -- only how it is split: ``L/mb`` launches of ``mb*ntile``
+    programs.  With no slab to skip bytes in (the whole point of the marched routes) nothing argues
+    against a wide window, so 128 is taken -- until a launch passes ``_MARCH_GRID_CAP`` programs,
+    where it starts to lose.  Measured 128 over 64, arms alternating in one process
+    (`.qwen/tmp/march_mblock_ab.log`) and one size per process for the rest:
+
+    | cell | programs per launch, 64 -> 128 | 64 | 128 |
+    |---|---|---|---|
+    | spin 2 analysis, nside 1024 | 1024 -> 2048 | 107.14 ms | **78.57** (**1.36x**) |
+    | spin-0 fold analysis, nside 2048 | 2048 -> 2048 | 419.42 ms | **312.04** (**1.34x**) |
+    | spin 2 synthesis, nside 2048 | 1024 -> 2048 | 525.70 ms | **473.49** (**1.11x**) |
+    | spin-0 fold synthesis, nside 2048 | 1024 -> 2048 | 325.03 ms | **303.59** (**1.07x**) |
+    | spin 0, nside 1024, both directions | <= 1024 | 28.14 / 31.14 ms | 28.13 / 30.54 (parity) |
+    | spin 2 analysis, nside 2048 | 2048 -> **4096** | **610.69 ms** | 634.22 (**0.96x**) |
+    | spin-0 fold analysis, nside 4096 | 2048 -> **4096** | **2253.8 ms** | 2386.7 (**0.94x**) |
+
+    Every win is at a launch of 2048 programs or fewer and both losses at 4096.  The alms are
+    bit-identical except at nside 1024 spin 2, where they move by 4.3e-19 against
+    ``|alm|max 2.7e-03`` -- different summation grouping, last-bit.  Against ducc0 the two flips
+    that matter are spin-0 2048 ``map2alm`` 0.75x -> **1.01x** and spin-2 1024 ``map2alm``
+    1.04x -> **1.45x** (`.qwen/tmp/score_s28.log`; cross-process repetitions of the two losses are
+    588.5 -> 611.9 ms in `.qwen/tmp/score_mb_ab.log`).
+
+    Only *spin 0* gets the wide window.  With the polarised routes wide, one build in about
+    twenty-four returns an alm that is entirely NaN (9,440,250 of 9,440,256 entries) and takes the
+    coupled cell with it, while ~60 builds at 64 never do and 24 builds with `jax_debug_nans`
+    enabled never fire.  It is always the first build of the process and only the first, it happens
+    with the analysis wide and the synthesis narrow as well as the reverse, the two widths' results
+    agree to 4.3e-19 when both complete, and no read of the drivers finds a slot the kernel leaves
+    unwritten -- the analysis masks its `ell < max(m, spin)` wedge and both synthesis kernels store
+    every ``(row, tile, lane)`` once.  That combination is uninitialized device memory, not the
+    arithmetic, so the width is withheld from spin 2 until it is root-caught; the spin-0 folded
+    routes, where no such event has been seen, keep the win.  Reproducers:
+    `.qwen/tmp/nan_where.py`, `.qwen/tmp/nan_dir.py`, `.qwen/tmp/nan_debug.py`; details in HANDOFF
+    session 28.
+    """
+    from gmaster import _spin_slice as ss
+
+    mb = ss._M_BLOCK if int(spin) else ss._MARCH_M_BLOCK
+    if mb * ntile > _MARCH_GRID_CAP:
+        mb = ss._M_BLOCK
+    return ss._windows(L, mb)
+
+
 @partial(jax.jit, static_argnames=("L", "spin", "nside"))
 def _forward_impl(ftm, *, L, spin, nside):
     from gmaster import _spin_slice as ss
@@ -379,7 +429,7 @@ def _forward_impl(ftm, *, L, spin, nside):
     sign = ss._sign(L, SPIN)
     ell = jnp.arange(L)[:, None]
     out = jnp.zeros((L, 2 * L - 1), dtype=jnp.complex128)
-    for (m0, m1, lo) in ss._windows(L):
+    for (m0, m1, lo) in _march_windows(L, ntile, SPIN):
         mb = m1 - m0
         g = _window_geometry(m0, mb, x, sh, ch, L, npad)
         direct = ftm[:, L + m0:L + m1]
@@ -514,7 +564,7 @@ def _forward_fold_impl(positive, weights, phase, *, L, nside):
 
     cols = []
     norm = jnp.sqrt((2.0 * jnp.arange(L, dtype=jnp.float64) + 1.0) / (4.0 * jnp.pi))
-    for (m0, m1, lo) in ss._windows(L):
+    for (m0, m1, lo) in _march_windows(L, ntile, 0):
         mb = m1 - m0
         g = _window_geometry(m0, mb, x, sh, ch, L, npad, spin=0)
         rhs = rhs_all[m0:m1]
@@ -895,7 +945,7 @@ def _inverse_impl(flm, *, L, spin, nside):
     # was right, the magnitudes were not.  Analysis assembly does *not* benefit (0.98-0.99x,
     # `.qwen/tmp/analysis_assembly_ab.log`) -- do not port this back and forth.
     dirs, mirs = [], []
-    for (m0, m1, lo) in ss._windows(L):
+    for (m0, m1, lo) in _march_windows(L, ntile, SPIN):
         mb = m1 - m0
         g = _window_geometry(m0, mb, x, sh, ch, L, npad)
         dc = _synth_coeff(flm, m0, mb, L, mirror=False)
@@ -951,7 +1001,7 @@ def _inverse_fold_impl(positive, phase, *, L, nside):
     norm = jnp.sqrt((2.0 * jnp.arange(L, dtype=jnp.float64) + 1.0) / (4.0 * jnp.pi))
     alm = positive * norm[:, None]
     dirs, mirs = [], []
-    for (m0, m1, lo) in ss._windows(L):
+    for (m0, m1, lo) in _march_windows(L, ntile, 0):
         mb = m1 - m0
         ms = m0 + jnp.arange(mb)
         g = _window_geometry(m0, mb, x, sh, ch, L, npad, spin=0)

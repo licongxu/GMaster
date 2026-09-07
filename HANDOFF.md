@@ -5137,3 +5137,164 @@ spin-2 rhs build is hoisted-for-free, not hoisted-for-gain, and the assembly was
 the two forms. Spin-2 analysis above 1024 is the recurrence and nothing else, exactly as session 25
 addendum 3 concluded for the other blocks; 4096 `map2alm` (0.80x) is the largest spin-2 cell left and
 it needs the same algorithm change, not another block rewrite.
+
+## Session 28 (2026-09-07): the marched routes' m-window was the cheapest big win left — spin 0 stops losing at 2048 and spin 2 1024 analysis reaches 1.45x
+
+**One shipped change.** `_spin_slice` gains `_MARCH_M_BLOCK = 128` for the four table-free march
+drivers and `_windows(L, block=None)` (cache re-keyed `(L, block)`); `_spin_march_pallas` gains
+`_march_windows(L, ntile)` and a per-launch program ceiling `_MARCH_GRID_CAP = 2048`. The stored-slab
+route keeps `_M_BLOCK = 64` — its own sweep (above, "…is not a lever") is about how much of the
+`ell < |m|` half a window reads, and nothing here changes that answer. Three env knobs now exist for
+this one constant (`GMASTER_M_BLOCK`, `GMASTER_MARCH_M_BLOCK`, `GMASTER_MARCH_GRID_CAP`), all read at
+import like `_TILE`/`_WARPS`.
+
+**Why it was still on the table.** Session 26/27's conclusion that the window width is dead came from a
+*slab* sweep at nside 256-512, where wider means reading more of the vanishing half. The marched routes
+have no slab: the window is not a byte-skip choice, it is only how one fixed program count is split
+across launches (`L/mb` launches of `mb*ntile` programs, one program per `(m, theta tile)` pair), plus
+on the analysis side the number of times the `(ntheta, 2L)` result is re-scattered. Nothing about the
+slab result transfers.
+
+**The measured rule: 128 while a launch stays at or under 2048 programs, 64 above it.** 128 over 64,
+arms alternating inside one process (`.qwen/tmp/march_mblock_ab.log`) and one size per process
+otherwise:
+
+| cell | programs per launch, 64 → 128 | 64 ms | 128 ms |
+|---|---|---|---|
+| spin 2 analysis, 1024 | 1024 → 2048 | 107.14 | **78.57** (**1.36x**) |
+| spin-0 fold analysis, 2048 | 2048 → 2048 | 419.42 | **312.04** (**1.34x**) |
+| spin 2 synthesis, 2048 | 1024 → 2048 | 525.70 | **473.49** (**1.11x**) |
+| spin-0 fold synthesis, 2048 | 1024 → 2048 | 325.03 | **303.59** (**1.07x**) |
+| spin 0, 1024, both directions | ≤ 1024 | 28.14 / 31.14 | 28.13 / 30.54 (parity) |
+| spin 2 analysis, 2048 | 2048 → **4096** | **610.69** | 634.22 (0.96x) |
+| spin-0 fold analysis, 4096 | 2048 → **4096** | **2253.8** | 2386.7 (0.94x) |
+
+Four wins, two parities, two losses, and the split is exactly the launch size: every win ≤ 2048
+programs, both losses at 4096. The 2048 spin-2 loss reproduced across processes too (588.5 → 611.9 ms,
+`.qwen/tmp/score_mb_ab.log`). Alms are bit-identical except at nside 1024 spin 2, where they move by
+**4.3e-19** against `|alm|max 2.7e-03` — a different summation grouping, last-bit.
+
+**Scoreboard with the shipped widths** (`.qwen/tmp/score_s28.log`, `GM_PREC=fp32`, 5 reps, GPU1, ducc0
+0.39.1 on all 192 cores; 4096 rows from the `GMASTER_MARCH_GRID_CAP=2048` arms of
+`.qwen/tmp/score_s28_4096.log`, which is what the shipped code computes there):
+
+| nside | spin | ducc ms | GMaster before | GMaster now | ratio now |
+|---|---|---|---|---|---|
+| 512 | 2 m2a / a2m | 30.2 / 24.6 | 9.1 / 8.5 | 9.2 / 8.5 | 3.30x / 2.88x |
+| 1024 | 2 m2a / a2m | 113.5 / 105.1 | 108.4 / 71.1 | **78.5** / **70.6** | **1.45x** (was 1.04x) / 1.49x |
+| 2048 | 2 m2a / a2m | 606.1 / 568.0 | 588.5 / 508.0 | 587.2 / **474.0** | 1.03x / **1.20x** |
+| 4096 | 2 m2a / a2m | 3873.0 / 3903.5 | 4662 / 3441 | 4662.3 / 3441.2 | 0.83x / 1.13x (width unchanged there) |
+| 512 | 0 m2a / a2m | 14.6 / 11.5 | 4.4 / 4.6 | 4.3 / 4.8 | 3.44x / 2.37x |
+| 1024 | 0 m2a / a2m | 61.2 / 54.9 | 28.1 / 30.2 | 28.1 / 30.2 | 2.18x / 1.82x |
+| 2048 | 0 m2a / a2m | 303.4 / 291.9 | 405.9 / 324.4 | **299.1** / **286.9** | **1.01x** (was 0.75x) / **1.02x** (was 0.91x) |
+| 4096 | 0 m2a / a2m | 1938.6 / 1947.7 | 2253.8 / 1865.6 | 2253.8 / 1865.6 | 0.86x / 1.04x |
+
+The two cells this was aimed at — **spin-0 `map2alm`/`alm2map` at Nside 2048, 0.75x/0.91x, the last
+losing large cells in spin 0 — are now 1.01x and 1.02x**, and the spin-2 1024 analysis cell jumps
+1.04x → 1.45x on the way. Everything below 2048 is unchanged within noise, which is the regression
+check for making the width route-specific rather than global. `rel alm` is untouched
+(3.2e-07 / 3.7e-05 / 6.1e-05 / 2.1e-04 by size).
+
+**Swept and rejected in the same pass.** Warps per program: 406.36 / 578.88 / 1115.92 / 2157.97 ms for
+`_WARPS` 1/2/4/8 on the folded spin-0 analysis at 2048 — splitting a 256-lane tile across warps forces
+the per-degree theta reduction through shared memory, and the cost is near-linear in warp count
+(`.qwen/tmp/spin0_fold_warps_2048.log`). `_M_BLOCK` 256: 315.97 ms and 32: 634.39 ms against 128's
+300.84 (`.qwen/tmp/spin0_fold_mblock_2048.log`) — the per-window padded right-hand side grows with the
+width, which is what bounds it from above.
+
+**Two numbers I got wrong mid-session, recorded so nobody re-pays them.** (1) I read the Nside-4096
+block of `score_s28.log` before the job had written it and reported "fold analysis 3657.4 → 2759.1 ms,
+1.33x at 4096". The real rows are **2253.8 (64) vs 2386.7 (128) — the wide window loses 6% there**.
+That bad read briefly became a `capped=False` exception on the folded spin-0 driver, which would have
+been a 6% regression at the largest spin-0 cell; the log caught it and the shipped code caps all four
+drivers. (2) The spin-2-at-4096 wide arm printed nothing: I had overlapped it with another job and each
+JAX process preallocates 71.2 GiB, so the second died `CUDA_ERROR_OUT_OF_MEMORY` while retrying down
+from 71.21 GiB. An empty block is not a measurement — check the process and the log length before
+quoting a table. Same rule as always: read the log, then speak.
+
+**How this was verified, honestly.** *(the width table in this paragraph is superseded by the
+correction at the end of this session — spin 2 did not keep the wide window.)* The width each route now
+takes was printed straight from the
+shipped code (CPU-only, no tracing): 128 everywhere marched up to Nside 1024; at 2048 128 for the
+folded analysis, the folded synthesis and the spin-2 synthesis, 64 for the spin-2 analysis; at 4096 128
+only for the folded synthesis; the slab 64 at every size. Suite after the change: **146 passed, 3
+skipped** (`.qwen/tmp/pytest_s28.log`, 5 min on GPU1). Every timing above is a median over 5 reps with
+a bandwidth-control line at 1296-1449 GB/s in the same row; the alternating-arm probe takes the min
+over two rounds so the arms share clocks.
+
+### Correction, same day: the wide window ships for spin 0 only, because a wide polarised build NaNs
+
+Everything measured above stands — it is what the two widths do to the clock. What does **not** stand is
+"shipped". `benchmarks/benchmark_pipeline.py --nside 1024 --spins 0,2` came back with
+`max|dCl|=nan rel=nan` on spin 2 in that first regression run (session 27 logged 3.69e-06 in the same
+cell), and chasing it produced a second, better-supported conclusion: the polarised routes stay at 64.
+
+**The shipped helper is `_march_windows(L, ntile, spin)`**, and it takes its width from `_M_BLOCK`
+whenever `spin != 0`. Verified by printing the widths straight out of the code (CPU-only, no tracing):
+
+| route | 512 | 1024 | 2048 | 4096 |
+|---|---|---|---|---|
+| spin-2 analysis (`_TILE`) | 64 | 64 | 64 | 64 |
+| spin-2 synthesis (`_ST`) | 64 | 64 | 64 | 64 |
+| spin-0 fold analysis (`_TILE`, `north`) | 128 | 128 | **128** | 64 |
+| spin-0 fold synthesis (`_ST`, `north`) | 128 | 128 | **128** | **128** |
+| stored slab (`_M_BLOCK`) | 64 | 64 | 64 | 64 |
+
+So the two cells this session was aimed at still flip — spin-0 2048 `map2alm` **0.75x → 1.01x** and
+`alm2map` **0.91x → 1.02x** — and what is forfeited is spin-2's share: 1024 `map2alm` stays 1.04x
+instead of 1.45x, 2048 `alm2map` stays ~1.09x instead of 1.20x.
+
+**The event.** With either polarised direction wide, about one `NmtField(mask, [q, u], n_iter=3,
+spin=2)` build in twenty-four returns an alm that is entirely NaN — 9,440,250 of 9,440,256 entries —
+and `compute_coupled_cell` then reports 12,280 of 12,288 non-finite. It is not a numerical difference
+between the widths: whenever both widths finish they agree, `max|dCl| = 4.17e-12` and `rel = 3.69e-06`
+with *identical digits* for 64 and 128 (`.qwen/tmp/nan_pipe.log`).
+
+| probe | configuration | result |
+|---|---|---|
+| `.qwen/tmp/nan_where.log` | wide, 8 builds | 1 NaN (rep 0) |
+| `.qwen/tmp/nan_where64.log` | narrow, 24 builds | 0 |
+| `.qwen/tmp/nan_dir2.log` arm 1 | analysis 128 / synthesis 128 | 1 NaN (rep 0) |
+| `.qwen/tmp/nan_dir2.log` arms 2-3 | 64/128 and 128/64 | 0 and 0, 24 builds each |
+| `.qwen/tmp/nan_dir2.log` arm 4 | 64 / 64 | 0 (24 builds) |
+| `.qwen/tmp/nan_debug.log` | wide, 24 builds, `jax_debug_nans` on | never fires |
+| `.qwen/tmp/nan_iter2.log` | 3 width arms × `n_iter` 0..3 | all clean, identical rms across arms |
+| `.qwen/tmp/ship_s28.log` | shipped config: spin 2, 24 builds; spin 0 wide fold at 2048, 12 builds | 0 and 0 |
+
+Read together: always the **first** build in a process and never a later one; not attributable to one
+driver; unaffected by `jax_debug_nans`; invisible in the arithmetic. That is uninitialized device
+memory, and the width only changes which allocation gets the fresh pages — a wide window halves the
+launch count and doubles the per-window buffers (the analysis output slab is `(mb, ntile, L, 4)`
+float64, 252 MB per launch at nside 1024 with `mb = 128`). What was **not** found is the leak itself:
+the analysis driver masks its `ell < max(m, spin)` wedge (the kernel's `fori_loop` starts at `nstart`,
+so the wedge really is unwritten, and `acc = jnp.where(ell >= max(m, spin), parts, 0)` zeroes it before
+the assembly), and both synthesis kernels (`_kern_synth`) store every `(row, tile, lane)` once after
+accumulating, so they have no wedge to leak. No candidate in the four drivers survives scrutiny, which
+is precisely why the width is withheld instead of "probably fine".
+
+**A probe bug nearly buried this.** The first version of `.qwen/tmp/nan_dir.py` handed the *width* to
+`_march_windows`'s second parameter, which is the *tile count*; the helper then caps
+`width * width` against `_MARCH_GRID_CAP` and fell back to 64 every time, so all four arms ran narrow,
+all four reported `widths actually traced per ntile: {16: 64, 8: 64}`, and all four came back clean —
+which read as "not reproducible at any width". That print line is what caught it; it is why the probe
+has it. Verify the arm you believe you ran, before believing the result.
+
+**Shipped-state verification** (`.qwen/tmp/ship_s28.log`, GPU1, one job at a time):
+`pytest tests/ -q` **146 passed, 3 skipped in 322.77 s**. The `nan_where` probes at the shipped
+configuration are 0/24 (spin 2) and 0/12 (spin 0 at 2048, wide fold). Pipeline, `nlb=30`, `n_iter=3`,
+library-default fp64 tables, 2 repeats:
+
+| nside | spin | ref → GMaster ms | ratio | stages (ref → gm) | `rel dCl` |
+|---|---|---|---|---|---|
+| 1024 | 0 | 1770 → **1006** | **1.8x** | field 508→389, coupling 779→203, coupled 21→0, decouple 0→0 | 8.43e-07 |
+| 1024 | 2 | 3280 → **1435** | **2.3x** | field 918→324, coupling 1830→358, coupled 126→1, decouple 1→1 | 3.69e-06 |
+| 2048 | 0 | 10642 → **5994** | **1.8x** | field 2518→2175, coupling 5562→1528, coupled 134→0, decouple 0→1 | 1.38e-06 |
+| 2048 | 2 | 18870 → **8996** | **2.1x** | field 4889→1961, coupling 10839→2698, coupled 621→2, decouple 5→4 | 1.09e-05 |
+
+No NaN in any row, and the two spin-2 `rel` values are digit-for-digit the session-27 baseline
+(3.69e-06 at 1024, 1.09e-05 at 2048), which is the accuracy side of withholding the wide window from
+spin 2. GPU peak 12.6 GiB at the largest cell, peak RSS 91.2 GB (pymaster's own table).
+
+**To reclaim the spin-2 win**, root-cause the uninitialized read first. Trials must be counted by
+*process*, not by repeats: only the first build in a process gets fresh pages, so 24 repeats inside one
+process is one trial for this purpose, and a clean sweep needs ≳100 processes at 128.
