@@ -704,6 +704,16 @@ _SPIN_PALLAS_MAX_L = 768
 # also decline on `RESOURCE_EXHAUSTED`, and `_spin_slice` checks live pool headroom.
 _MATRIX_BAND_BUDGET = 40 * 1024**3
 
+# Largest Wigner-d slab that may ride a fused analysis boundary.  The fusion is a 7.9x / 2.5x win at
+# Nside 64 / 128 (`.qwen/tmp/slab_fuse2.log`) and 1.05x at 256, where the slab is 2.44 GiB; at Nside
+# 512 it is 18.7 GiB and a boundary carrying both it and the maps is the layout-doubling that
+# `_inverse_latitudinal_slab` exists to avoid, so the split route keeps the call there.
+_SLAB_FUSE_MAX_BYTES = 4 * 1024**3
+
+
+def _slab_bytes(slab):
+    return sum(int(a.nbytes) for a in slab) if isinstance(slab, tuple) else int(slab.nbytes)
+
 
 def _spin_slabs(L_work, spin, *, nside):
     """Cached (analysis, synthesis) Wigner-d slabs for a polarised transform.
@@ -1523,15 +1533,9 @@ def _inverse_latitudinal_slab(flm, slab, *, L):
     return _spin_slice.inverse_latitudinal(flm, slab, L=L)
 
 
-def _map2alm_once_slab(maps, ell, order, *, spin, nside, L, L_work, slab):
-    """Polarised analysis with the latitudinal step replaced by a slab contraction."""
-    ftm = _forward_s2fft_ftm(
-        maps[0] + 1j * maps[1],
-        _spin_ring_analysis_tables(
-            L_work, nside,
-            getattr(maps, "device", None) or getattr(maps[0], "device", None)),
-        L=L_work, nside=nside, reality=False,
-    )
+def _map2alm_once_slab_body(maps, tables, ell, order, *, spin, nside, L, L_work, slab):
+    ftm = _forward_s2fft_ftm(maps[0] + 1j * maps[1], tables,
+                             L=L_work, nside=nside, reality=False)
     plus = _finish_forward_s2fft(
         _forward_latitudinal_slab(ftm, slab, L=L_work),
         L=L_work,
@@ -1543,15 +1547,53 @@ def _map2alm_once_slab(maps, ell, order, *, spin, nside, L, L_work, slab):
     return jnp.stack([-(plus_m + minus_m) / 2, 0.5j * (plus_m - minus_m)])
 
 
-def _alm2map_core_slab(alm, *, spin, nside, L, L_work, slab):
+_map2alm_once_slab_fused = jax.jit(
+    _map2alm_once_slab_body, static_argnames=("spin", "nside", "L", "L_work")
+)
+
+
+def _map2alm_once_slab(maps, ell, order, *, spin, nside, L, L_work, slab):
+    """Polarised analysis with the latitudinal step replaced by a slab contraction.
+
+    The ring FFT, the contraction, the epilogue and the E/B combination are one program while the slab
+    is small enough to ride the boundary.  Run as three jits with an eager gather afterwards the call
+    cost 1.700 / 1.944 ms at Nside 64 / 128 whatever the map size, because `plus[ell, L_work-1+order]`
+    and its parity conjugate are dispatched op by op; fused it is 0.215 and 0.765 ms (7.91x, 2.54x)
+    with bit-identical output (`.qwen/tmp/slab_fuse2.log`).  Nside 512 is past the fuse gate: there
+    the slab is 19 GiB and XLA counts it against the pool of a boundary that also carries the maps.
+    """
+    tables = _spin_ring_analysis_tables(
+        L_work, nside,
+        getattr(maps, "device", None) or getattr(maps[0], "device", None))
+    if _slab_bytes(slab) <= _SLAB_FUSE_MAX_BYTES:
+        return _map2alm_once_slab_fused(
+            maps, tables, ell, order, spin=spin, nside=nside, L=L, L_work=L_work,
+            slab=slab)
+    return _map2alm_once_slab_body(
+        maps, tables, ell, order, spin=spin, nside=nside, L=L, L_work=L_work,
+        slab=slab)
+
+
+def _alm2map_core_slab_body(alm, slab, tables, *, spin, nside, L, L_work):
     flm = _prepare_inverse_s2fft(_unpack_spin(alm, L, L_work), L=L_work)
     ftm = _inverse_latitudinal_slab(flm, slab, L=L_work)
     maps = _finish_inverse_s2fft(
-        ftm,
-        _spin_ring_synthesis_tables(L_work, nside, getattr(ftm, "device", None)),
+        ftm, tables,
         L=L_work, spin=spin, nside=nside, reality=False,
     )
     return jnp.stack([jnp.real(maps), jnp.imag(maps)])
+
+
+_alm2map_core_slab_fused = jax.jit(
+    _alm2map_core_slab_body, static_argnames=("spin", "nside", "L", "L_work")
+)
+
+
+def _alm2map_core_slab(alm, *, spin, nside, L, L_work, slab):
+    return _alm2map_core_slab_fused(
+        alm, slab,
+        _spin_ring_synthesis_tables(L_work, nside, getattr(alm, "device", None)),
+        spin=spin, nside=nside, L=L, L_work=L_work)
 
 
 def _map2alm_iteration_slab(alm, maps, ell, order, *, spin, nside, L, L_work,
