@@ -547,3 +547,41 @@ def test_spin2_march_synthesis_matches_the_route_it_replaces(nside):
     # Column 0 is written by neither half of the assembly and the contract asks for a zero there.
     assert not np.any(new[:, 0])
 
+
+@pytest.mark.skipif(not _HAS_NVIDIA_GPU, reason="requires an NVIDIA GPU")
+@pytest.mark.parametrize("nside", [32, 48])
+def test_fused_slab_route_is_bit_identical_to_the_split_route(nside):
+    """Fusing the polarised slab transform may change the dispatch count and nothing else.
+
+    The win is 2.5-7.9x at Nside 64-256 (`.qwen/tmp/slab_fuse2.log`, `.qwen/tmp/slab_fuse_synth.log`)
+    and the two routes differ only in how many jit boundaries the same body is cut at, so equality here
+    is exact rather than tolerance-based.  Asserting the slab is under `_SLAB_FUSE_MAX_BYTES` pins the
+    gate: moving a geometry onto a boundary the fusion was measured and rejected on would otherwise
+    happen silently.
+    """
+    lmax = 3 * nside - 1
+    L = lmax + 1
+    npix = 12 * nside ** 2
+    rng = np.random.default_rng(7)
+    maps = jnp.asarray(rng.normal(size=(2, npix)) * 1e-3)
+    ell, order = utils._ell_order_arrays(lmax)
+
+    a_slab, s_slab = utils._spin_slabs(L, 2, nside=nside)
+    assert a_slab is not None and s_slab is not None
+    assert utils._slab_bytes(a_slab) <= utils._SLAB_FUSE_MAX_BYTES
+
+    tables = utils._spin_ring_analysis_tables(L, nside, maps.device)
+    got = utils._map2alm_once_slab_fused(maps, tables, ell, order, spin=2, nside=nside,
+                                         L=L, L_work=L, slab=a_slab)
+    ref = utils._map2alm_once_slab_body(maps, tables, ell, order, spin=2, nside=nside,
+                                        L=L, L_work=L, slab=a_slab)
+    np.testing.assert_array_equal(np.asarray(got), np.asarray(ref))
+
+    alm = jnp.asarray(_random_alms(rng, 2, utils.NmtAlmInfo(lmax), 2))
+    s_tables = utils._spin_ring_synthesis_tables(L, nside, alm.device)
+    got = utils._alm2map_core_slab_fused(alm, s_slab, s_tables, spin=2, nside=nside,
+                                         L=L, L_work=L)
+    ref = utils._alm2map_core_slab_body(alm, s_slab, s_tables, spin=2, nside=nside,
+                                        L=L, L_work=L)
+    np.testing.assert_array_equal(np.asarray(got), np.asarray(ref))
+
