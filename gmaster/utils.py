@@ -801,12 +801,21 @@ def _fused_forward_sht(positive, theta, weights, phase, *, L, block_size,
     The scalar path prefers the precomputed Legendre band while it fits (see
     `_prefer_theta_band`) and falls back to the kernel when it does not or
     cannot be materialized concretely, which is what happens on `jax.grad`
-    paths.
+    paths.  Where the band is refused for *size* -- Nside 2048 and above at
+    float32 -- the folded spin-0 march serves the call instead of the fp64
+    on-the-fly kernel, because that kernel is the worst cell in the repo
+    (0.33x at 2048, 0.27x at 4096); see
+    :func:`gmaster._spin_march_pallas.fold_requested`.
     """
-    if _prefer_theta_band((len(theta) + 1) // 4, L, m_start):
+    nside = (len(theta) + 1) // 4
+    if (m_start == 0 and nmt_params.sht_calculator in ("jax", "jax-matrix")
+            and _spin_march.fold_requested(nside, L)):
+        return _spin_march.forward_latitudinal_positive(
+            positive, weights, phase, L=L, nside=nside
+        )
+    if _prefer_theta_band(nside, L, m_start):
         positive_alm = _theta_matrix_latitudinal(
-            positive, L=L, nside=(len(theta) + 1) // 4, weights=weights,
-            phase=phase,
+            positive, L=L, nside=nside, weights=weights, phase=phase
         )
         if positive_alm is not None:
             return positive_alm
@@ -834,6 +843,9 @@ def _fused_inverse_sht(positive, theta, phase, *, L, nside, block_size):
     synthesis back to the fused kernel.
     """
     weights = jnp.ones_like(theta)
+    if (nmt_params.sht_calculator in ("jax", "jax-matrix")
+            and _spin_march.fold_synth_requested(nside, L)):
+        return _spin_march.inverse_latitudinal_positive(positive, phase, L=L, nside=nside)
     if _prefer_theta_band(nside, L, 0):
         ftm = _theta_matrix_inverse_latitudinal(
             positive, L=L, nside=nside, weights=weights, phase=phase)

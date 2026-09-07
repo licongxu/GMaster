@@ -199,11 +199,11 @@ def _pow2_f64(d):
 
 
 def _kern(manr, ex0r, xr, xlr, c1r, c0r, cbr, c1lr, c0lr, cblr, lgnr, sgnr, rr, m0_ref, out_ref,
-          *, L, ntheta, chunk):
+          *, L, ntheta, chunk, spin=SPIN):
     row = pl.program_id(0)
     tile = pl.program_id(1)
     m = plt.load(m0_ref.at[0]) + row
-    nstart = jnp.maximum(m, SPIN)         # a row below the spin starts its polynomial at ell=spin
+    nstart = jnp.maximum(m, spin)          # a row below the spin starts its polynomial at ell=spin
     t = tile * chunk + jnp.arange(chunk)
     valid = t < ntheta
 
@@ -216,8 +216,8 @@ def _kern(manr, ex0r, xr, xlr, c1r, c0r, cbr, c1lr, c0lr, cblr, lgnr, sgnr, rr, 
     mf = m.astype(jnp.float32)
     # P_1^(alpha,beta) = ((alpha+beta+2)/2) cos t + (alpha-beta)/2.  Not `m*cos t + 2`: that seed
     # leaves every ell >= m+1 a few percent off, growing with ell.
-    alpha = mf + jnp.float32(SPIN)
-    beta = jnp.abs(mf - jnp.float32(SPIN))
+    alpha = mf + jnp.float32(spin)
+    beta = jnp.abs(mf - jnp.float32(spin))
     p1f = ((alpha + beta + 2.0) / 2.0) * xv + ((alpha - beta) / 2.0)
     sgn = plt.load(sgnr.at[row]).astype(jnp.float64)
 
@@ -281,60 +281,66 @@ def _kern(manr, ex0r, xr, xlr, c1r, c0r, cbr, c1lr, c0lr, cblr, lgnr, sgnr, rr, 
     lax.fori_loop(nstart, L, degree, (zb, zb, man, zb, ex))
 
 
-def _call(L, ntheta, ntile, mb):
-    key = (int(L), int(ntheta), int(ntile), int(mb), _TILE, _WARPS)
+def _call(L, ntheta, ntile, mb, spin=SPIN):
+    key = (int(L), int(ntheta), int(ntile), int(mb), _TILE, _WARPS, int(spin))
     call = _CALLS.get(key)
     if call is None:
         call = jax.jit(pl.pallas_call(
-            partial(_kern, L=L, ntheta=ntheta, chunk=_TILE),
+            partial(_kern, L=L, ntheta=ntheta, chunk=_TILE, spin=spin),
             out_shape=jax.ShapeDtypeStruct((mb, ntile, L, NC), jnp.float64),
             grid=(mb, ntile),
             compiler_params=plt.CompilerParams(num_warps=_WARPS),
-            name="gmaster_spin2_march"))
+            name=f"gmaster_spin{int(spin)}_march"))
         _CALLS[key] = call
     return call
 
 
 # --------------------------------------------------------------------------------- geometry, in
-def _log2_norm(m0, mb, L):
+def _log2_norm(m0, mb, L, spin=SPIN):
     """`log2 sqrt((l+m)!(l-m)! / ((l-s)!(l+s)!))` for one m-window, with the below-spin flip.
 
     Shared by the analysis emit and the synthesis coefficient split: the pair-swapped branch of
     DLMF 14.9.16 inverts the factorial ratio below the spin (module docstring), so the whole row
-    `m < s` carries the negated exponent.
+    `m < s` carries the negated exponent.  At `spin = 0` the flip never fires (`m >= 0` always) and
+    the ratio collapses to `sqrt((l+m)!(l-m)!)/l!`, which is the `d^l_{m,0}` normalisation the
+    folded route marches.
     """
     ms = m0 + jnp.arange(mb, dtype=jnp.float64)
     m_ = ms[:, None]
     ell_ = jnp.arange(L, dtype=jnp.float64)[None, :]
     lg2n = 0.5 * (gammaln(ell_ + m_ + 1) + gammaln(ell_ - m_ + 1)
-                  - gammaln(ell_ - SPIN + 1) - gammaln(ell_ + SPIN + 1)) / np.log(2.0)
-    return lg2n * jnp.where(ms >= SPIN, 1.0, -1.0)[:, None]
+                  - gammaln(ell_ - spin + 1) - gammaln(ell_ + spin + 1)) / np.log(2.0)
+    return lg2n * jnp.where(ms >= spin, 1.0, -1.0)[:, None]
 
 
-def _window_geometry(m0, mb, x, sh, ch, L, npad):
+def _window_geometry(m0, mb, x, sh, ch, L, npad, spin=SPIN):
     """March coefficients and half-angle weights for one m-window, computed inside the trace.
 
     Returned float32 (high, low) so the kernel reads exactly the bits it multiplies: the limbs are
     the part the storage width throws away, and the arm needs both to hold 1e-7 at Nside 1024.
     Theta-axis arrays are padded to a whole tile here, with the pad lanes' exponent pinned to
     `EX_PAD` -- a zero there would win `emax` against real lanes near 2^-1400 and flush them.
+
+    `spin` enters through alpha = m + s, beta = |m - s| and the three Jacobi coefficients, so the
+    same builder serves the folded spin-0 march: there `a0 = (s-1) * 4ms / den` is identically zero
+    and the recurrence reduces to the plain symmetric-Jacobi (Legendre at m = 0) three-term.
     """
     ms = m0 + jnp.arange(mb, dtype=jnp.float64)
     m_ = ms[:, None]
     ell_ = jnp.arange(L, dtype=jnp.float64)[None, :]
-    alpha = m_ + SPIN
-    beta = jnp.abs(m_ - SPIN)
-    ns = jnp.maximum(m_, SPIN)
+    alpha = m_ + spin
+    beta = jnp.abs(m_ - spin)
+    ns = jnp.maximum(m_, spin)
     n_ = jnp.where(ell_ >= ns, ell_ - ns, 0.0)
     s_ = 2.0 * n_ + alpha + beta
     den = jnp.where(n_ >= 2, 2.0 * n_ * (n_ + alpha + beta) * (s_ - 2.0), 1.0)
     a1 = (s_ - 1.0) * s_ * (s_ - 2.0) / den
-    a0 = (s_ - 1.0) * (4.0 * m_ * SPIN) / den
+    a0 = (s_ - 1.0) * (4.0 * m_ * spin) / den
     bb = 2.0 * (n_ + alpha - 1.0) * (n_ + beta - 1.0) * s_ / den
     log2s = alpha * jnp.log2(sh)[None, :] + beta * jnp.log2(ch)[None, :]
     ex0 = jnp.floor(log2s)
     mant = jnp.exp2(log2s - ex0)
-    lgs = _log2_norm(m0, mb, L)
+    lgs = _log2_norm(m0, mb, L, spin)
     sgn = (-1.0) ** ms
 
     def hi_lo(a):
@@ -412,6 +418,130 @@ def forward_latitudinal(ftm, *, L, spin, nside):
     if int(spin) != SPIN:
         raise ValueError(f"march route implements spin=+{SPIN}, got spin={spin}")
     return _forward_impl(ftm, L=L, spin=spin, nside=nside)
+
+
+# ------------------------------------------------------- spin 0: the antipodal fold halves the grid
+def fold_requested(nside, L) -> bool:
+    """True when the folded spin-0 march should serve a latitudinal call.
+
+    Left unset the march takes the call only where the Legendre band is refused for *size*, because
+    a resident table beats it: Nside 1024 reads its 36.75 GiB band in 26.83 ms at 1471 GB/s, which
+    is the card's streaming rate and about half what a march over the same folded lane count costs
+    (`.qwen/tmp/spin0_stage_split.log`).  Where the band cannot exist the alternative is the fp64
+    on-the-fly scalar kernel, and that is the worst cell in the repo: Nside 2048 `map2alm` 949.2 ms
+    (0.33x) and Nside 4096 7516.9 ms (0.27x) against ducc0's 315.6 and 2014.4
+    (`.qwen/tmp/score_n2048_spin0_s26.log`, `.qwen/tmp/score_n4096_spin0.log`).  The fold halves the
+    lane count relative to the spin-2 march, and theta tiles are the kernel's second program axis,
+    so the program count halves with it rather than just the work per program.
+
+    `GMASTER_SPIN0_MARCH=1` serves every scalar call, including the geometries where a band exists,
+    which is how the two routes are compared against each other; `=0` restores the fp64 kernel
+    everywhere.  The accuracy cost is the march's own -- float32 lanes and a 2^+-24 renormalisation
+    band, measured against ducc0 in the scoring runs below, against 3.4e-07 for the kernel it
+    replaces.
+    """
+    from gmaster import utils
+
+    on_gpu = _on_nvidia()
+    flag = os.environ.get("GMASTER_SPIN0_MARCH")
+    if flag is not None:
+        return flag == "1" and on_gpu
+    return on_gpu and not utils._prefer_theta_band(nside, L, 0)
+
+
+def fold_synth_requested(nside, L) -> bool:
+    """True when the folded spin-0 march should serve a synthesis latitudinal call.
+
+    Mirrors `fold_requested` for the inverse direction -- the synthesis band is refused by the same
+    size test plus its own 16 GiB reserve, so Nside 2048/4096 fall all the way to the fp64 on-the-fly
+    kernel, which is the worst cell on the board (`2048 0 alm2map 305.8 1267.1 0.24x`,
+    `4096 0 alm2map 2022.3 10050.4 0.20x`).  Its own flag so the two directions can be A/B'd apart;
+    unset falls back to `GMASTER_SPIN0_MARCH` so one switch still flips the whole spin-0 route.
+    """
+    from gmaster import utils
+
+    on_gpu = _on_nvidia()
+    flag = os.environ.get("GMASTER_SPIN0_MARCH_SYNTH")
+    if flag is None:
+        flag = os.environ.get("GMASTER_SPIN0_MARCH")
+    if flag is not None:
+        return flag == "1" and on_gpu
+    return on_gpu and not utils._prefer_theta_band(nside, L, 0)
+
+
+@partial(jax.jit, static_argnames=("L", "nside"))
+def _forward_fold_impl(positive, weights, phase, *, L, nside):
+    from gmaster import utils
+
+    positive = jnp.asarray(positive)
+    theta = jnp.asarray(utils._stable_thetas(L, nside), dtype=jnp.float64)
+    ntheta = theta.shape[0]
+    north = (ntheta + 1) // 2
+    ntile = -(-north // _TILE)
+    npad = ntile * _TILE
+    tn = theta[:north]
+    x = jnp.cos(tn)
+    sh, ch = jnp.sin(tn / 2.0), jnp.cos(tn / 2.0)
+    # Ring `ntheta - 1 - i` sits at `pi - theta_i`, shares its ring weight and its phi with ring i,
+    # and `d^l_{m,0}(pi - theta) = (-1)**(l+m) d^l_{m,0}(theta)`.  So the latitudinal sum over the
+    # whole sphere is, per northern lane, one row contracted against two right-hand sides,
+    #     A_lm = sum_north d [G_i + (-1)**(l+m) G_i'],
+    # and the parity factor -- which is not constant along a marched row, the way it is in the
+    # parity-split band -- is applied outside the kernel to the two fp64 partials rather than
+    # selected inside it per degree.  This is the same algebra `_theta_matrix._transform` performs;
+    # there the row split makes `(-1)**(l+m)` a per-column sign, here the row is marched whole.
+    m = jnp.arange(L, dtype=jnp.float64)[:, None]
+    folded = positive.T * weights[None, :] * jnp.exp(1j * (m * phase[None, :]))
+    jn = jnp.arange(north)
+    partner = ntheta - 1 - jn
+    g_north = folded[:, jn]
+    # The equator lane is its own partner and is counted once, matching both the band and the fused
+    # kernel, which skips the south half there.
+    g_part = jnp.where(partner == jn, 0.0, folded[:, partner])
+
+    from gmaster import _spin_slice as ss
+
+    cols = []
+    norm = jnp.sqrt((2.0 * jnp.arange(L, dtype=jnp.float64) + 1.0) / (4.0 * jnp.pi))
+    for (m0, m1, lo) in ss._windows(L):
+        mb = m1 - m0
+        g = _window_geometry(m0, mb, x, sh, ch, L, npad, spin=0)
+        chan = jnp.stack([g_north[m0:m1].real, g_north[m0:m1].imag,
+                          g_part[m0:m1].real, g_part[m0:m1].imag], axis=-1)
+        rhs = jnp.zeros((mb, npad, NC), dtype=jnp.float32).at[:, :north].set(
+            lax.convert_element_type(chan, jnp.float32))
+        parts = _call(L, north, ntile, mb, spin=0)(
+            *g, rhs, jnp.asarray([m0], jnp.int32)).sum(1)      # (mb, L, NC)
+        ms = m0 + jnp.arange(mb)
+        # Rows emit from `ell = m` and never below it, so whatever the allocator handed back under
+        # that has to be zeroed before it reaches the assembly.
+        parts = jnp.where((jnp.arange(L)[None, :] >= ms[:, None])[..., None], parts, 0.0)
+        sgn = 1.0 - 2.0 * ((ms[:, None] + jnp.arange(L)[None, :]) % 2)
+        # The scalar route's rows are `sqrt((2l+1)/4pi) * d^l_{m0}`, not the bare Wigner row: the
+        # band's `_diagonal_normalization` seed carries the degree factor (measured as a constant
+        # ratio of exactly that over every row and lane, 5.2e-08 at Nside 32), and so does the
+        # fused kernel that shares the seed.  The march closes the form on the bare row, so the
+        # degree factor is applied here rather than inside the kernel, where it would also land on
+        # the spin-2 route -- whose contract deliberately leaves it to `_finish_forward_s2fft`.
+        block = ((parts[..., 0] + 1j * parts[..., 1])
+                 + sgn * (parts[..., 2] + 1j * parts[..., 3])) * norm[None, :]
+        cols.append(block.T)                                    # (L, mb)
+    # Window column ranges are disjoint and tile the positive-m block, so one concatenation assembles
+    # it; `out.at[...].set` per window would copy the whole buffer once per window (see
+    # `_inverse_impl`).
+    return jnp.concatenate(cols, axis=1)
+
+
+def forward_latitudinal_positive(positive, weights, phase, *, L, nside):
+    """Folded table-free spin-0 analysis latitudinal step.
+
+    Same contract as :func:`gmaster._theta_matrix.positive_latitudinal`: the ``(4*nside-1, L)``
+    positive-m block of the ring-FFT map in, the ``(L, L)`` complex ``(ell, m)`` block out, with the
+    quadrature weight and ring phase inside the contraction and the ``sqrt((2l+1)/4pi)`` factor left
+    to the caller.  Negative orders never appear here: for spin 0 they follow from the real-map
+    symmetry in ``_finish_forward_s2fft``, which is why this route needs no mirror channel.
+    """
+    return _forward_fold_impl(positive, weights, phase, L=L, nside=nside)
 
 
 # ------------------------------------------------------------------- synthesis: the same row, summed
@@ -504,7 +634,7 @@ def _accumulate_fast(nd, tex, aex, at0, rh, ih, a_r, b_r):
 
 def _kern_synth(manr, ex0r, xr, xlr, c1r, c0r, cbr, c1lr, c0lr, cblr,
                 lexdr, drh, drl, dih, dil, lexmr, mrh, mrl, mih, mil,
-                m0_ref, out_ref, *, L, ntheta, chunk):
+                m0_ref, out_ref, *, L, ntheta, chunk, spin=SPIN):
     """One (m-window row, theta tile): march the row once, sum it against both order signs.
 
     The synthesis contraction is the transpose of the analysis sum, so it keeps a per-lane
@@ -525,7 +655,7 @@ def _kern_synth(manr, ex0r, xr, xlr, c1r, c0r, cbr, c1lr, c0lr, cblr,
     row = pl.program_id(0)
     tile = pl.program_id(1)
     m = plt.load(m0_ref.at[0]) + row
-    nstart = jnp.maximum(m, SPIN)
+    nstart = jnp.maximum(m, spin)
     t = tile * chunk + jnp.arange(chunk)
     valid = t < ntheta
 
@@ -535,8 +665,8 @@ def _kern_synth(manr, ex0r, xr, xlr, c1r, c0r, cbr, c1lr, c0lr, cblr,
     xv = plt.load(xr.at[t], mask=valid, other=0.0)
     xl = plt.load(xlr.at[t], mask=valid, other=0.0)
     mf = m.astype(jnp.float32)
-    alpha = mf + jnp.float32(SPIN)
-    beta = jnp.abs(mf - jnp.float32(SPIN))
+    alpha = mf + jnp.float32(spin)
+    beta = jnp.abs(mf - jnp.float32(spin))
     p1f = ((alpha + beta + 2.0) / 2.0) * xv + ((alpha - beta) / 2.0)
 
     def degree(ell, st):
@@ -655,16 +785,16 @@ def _kern_synth(manr, ex0r, xr, xlr, c1r, c0r, cbr, c1lr, c0lr, cblr,
                          (ami.astype(jnp.float64) + amli.astype(jnp.float64)) * sm_], axis=-1))
 
 
-def _call_synth(L, ntheta, ntile, mb):
-    key = ("synth", int(L), int(ntheta), int(ntile), int(mb), _ST, _SW)
+def _call_synth(L, ntheta, ntile, mb, spin=SPIN):
+    key = ("synth", int(L), int(ntheta), int(ntile), int(mb), _ST, _SW, int(spin))
     call = _CALLS.get(key)
     if call is None:
         call = jax.jit(pl.pallas_call(
-            partial(_kern_synth, L=L, ntheta=ntheta, chunk=_ST),
+            partial(_kern_synth, L=L, ntheta=ntheta, chunk=_ST, spin=spin),
             out_shape=jax.ShapeDtypeStruct((mb, ntile, _ST, 4), jnp.float64),
             grid=(mb, ntile),
             compiler_params=plt.CompilerParams(num_warps=_SW),
-            name="gmaster_spin2_synth"))
+            name=f"gmaster_spin{int(spin)}_synth"))
         _CALLS[key] = call
     return call
 
@@ -695,6 +825,38 @@ def _synth_coeff(flm, m0, mb, L, *, mirror):
     sc = jnp.exp2(lgs - lex) * ((-1.0) ** ms)[:, None]
     out = []
     for part in (c.real.T * sc, c.imag.T * sc):
+        hi = part.astype(jnp.float32)
+        out.append(hi)
+        out.append((part - hi.astype(jnp.float64)).astype(jnp.float32))
+    drh, drl, dih, dil = out
+    return lex.astype(jnp.int32), drh, drl, dih, dil
+
+
+def _synth_coeff0(alm, m0, mb, L, *, mirror):
+    """Spin-0 synthesis coefficients for one m-window, read from the positive-m block.
+
+    Same split as `_synth_coeff`, with two differences forced by the fold: the alm input is the
+    `(ell, m)` positive block (so a window reads columns `m0:m0+mb` directly, not the centred
+    `L-1+m` layout), and the "mirror" set is not a negative order at all -- it is the *southern*
+    half of the same order, `(-1)^(ell+m)` applied so the northern marched row can serve the
+    partner ring, exactly like `_theta_matrix._inverse`'s `acc_e - acc_o` block sign.  Because the
+    parity is `+-1` it leaves `lex` untouched, so both sets share one exponent array.
+
+    `alm` arrives already carrying `sqrt((2l+1)/4pi)`; the marched row is the bare `d^l_(m,0)`, so
+    the degree factor has to ride in the coefficient here (the analysis fold applies it outside the
+    kernel instead, where the row is what gets scaled).
+    """
+    ms = m0 + jnp.arange(mb)
+    c = alm[:, m0:m0 + mb]                             # (L, mb) complex
+    lgs = _log2_norm(m0, mb, L, 0)                     # (mb, L) float64
+    lex = jnp.floor(lgs)
+    sc = jnp.exp2(lgs - lex) * ((-1.0) ** ms)[:, None]
+    if mirror:
+        parity = 1.0 - 2.0 * ((ms[:, None] + jnp.arange(L)[None, :]) % 2)
+    else:
+        parity = 1.0
+    out = []
+    for part in (c.real.T * sc * parity, c.imag.T * sc * parity):
         hi = part.astype(jnp.float32)
         out.append(hi)
         out.append((part - hi.astype(jnp.float64)).astype(jnp.float32))
@@ -752,6 +914,61 @@ def _inverse_impl(flm, *, L, spin, nside):
     mir = jnp.concatenate(mirs[::-1], axis=1)                     # (ntheta, L-1)
     return jnp.concatenate([jnp.zeros((ntheta, 1), dtype=direct.dtype), mir, direct], axis=1)
 
+
+
+@partial(jax.jit, static_argnames=("L", "nside"))
+def _inverse_fold_impl(positive, phase, *, L, nside):
+    """Spin-0 synthesis latitudinal step on the northern grid, table-free.
+
+    The transpose of `_forward_fold_impl`: one march over `theta[:north]` feeds two accumulators
+    that differ only in the coefficient set, the direct one for the northern rings and a
+    `(-1)^(ell+m)`-signed one for the southern partners of those same lanes.  The partner's own
+    ring phase is applied outside the kernel (synthesis carries no quadrature weight, so `weights`
+    is 1 by contract), and the south half is stored at the reversed theta axis -- the same assembly
+    `_theta_matrix._inverse` uses, including dropping the equator lane, which is its own partner and
+    contributes only through the direct accumulator.
+    """
+    from gmaster import _spin_slice as ss
+    from gmaster import utils
+
+    positive = jnp.asarray(positive)
+    theta = jnp.asarray(utils._stable_thetas(L, nside), dtype=jnp.float64)
+    ntheta = theta.shape[0]
+    north = (ntheta + 1) // 2
+    ntile = -(-north // _ST)
+    npad = ntile * _ST
+    tn = theta[:north]
+    x = jnp.cos(tn)
+    sh, ch = jnp.sin(tn / 2.0), jnp.cos(tn / 2.0)
+    norm = jnp.sqrt((2.0 * jnp.arange(L, dtype=jnp.float64) + 1.0) / (4.0 * jnp.pi))
+    alm = positive * norm[:, None]
+    dirs, mirs = [], []
+    for (m0, m1, lo) in ss._windows(L):
+        mb = m1 - m0
+        ms = m0 + jnp.arange(mb)
+        g = _window_geometry(m0, mb, x, sh, ch, L, npad, spin=0)
+        dc = _synth_coeff0(alm, m0, mb, L, mirror=False)
+        mc = _synth_coeff0(alm, m0, mb, L, mirror=True)
+        v = _call_synth(L, north, ntile, mb, spin=0)(*g[:10], *dc, *mc,
+                                                     jnp.asarray([m0], jnp.int32))
+        v = v.reshape(mb, npad, 4)[:, :north]
+        nf = jnp.exp(1j * (ms[:, None] * phase[:north][None, :]))
+        sf = jnp.exp(1j * (ms[:, None] * jnp.flip(phase)[: north - 1][None, :]))
+        dirs.append((v[:, :, 0] + 1j * v[:, :, 1]) * nf)              # (mb, north)
+        mirs.append((v[:, :, 2] + 1j * v[:, :, 3])[:, :north - 1] * sf)
+    north_vals = jnp.concatenate(dirs, axis=0)                        # (L, north)
+    south_vals = jnp.concatenate(mirs, axis=0)                        # (L, north-1)
+    return jnp.transpose(jnp.concatenate(
+        [north_vals, jnp.flip(south_vals, axis=1)], axis=1))          # (ntheta, L)
+
+
+def inverse_latitudinal_positive(positive, phase, *, L, nside):
+    """Folded spin-0 synthesis: `(L, L)` positive-m block in, `(4*nside-1, L)` complex out.
+
+    Same contract as `_theta_matrix.inverse_latitudinal` / `utils.scalar_inverse_latitudinal`
+    (ring phi phase applied, `sqrt((2l+1)/4pi)` baked in), without the Legendre band.
+    """
+    return _inverse_fold_impl(positive, phase, L=L, nside=nside)
 
 
 def inverse_latitudinal(flm, *, L, spin, nside):
