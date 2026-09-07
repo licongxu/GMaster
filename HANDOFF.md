@@ -4815,3 +4815,166 @@ Two concrete work items follow, both spin-0-only and both now priced:
    then the synthesis copy in `_synth_band`.
 2. **Marched spin-0 route** for the band-declined 2048/4096 cells (0.29x/0.21x and 0.27x/0.20x), with a
    **4-channel parity-selected** emit — not the 8-channel form that measured 1.070x.
+
+## Session 26 (2026-09-07): addendum 6's band prize was already spent; the folded *march* ships and 2048/4096 spin 0 stop losing 4-5x
+
+### Addendum 6 work item 1 was already shipped — the resident band is northern and folded today
+
+The first thing on last session's priced list was "build the band over the northern grid only, 36.8 →
+18.4 GiB at 1024". Reading `_theta_matrix` before writing it kills the item: **the band never stored the
+south.** `_build_slab` (line 92) takes `north = (len(theta) + 1) // 2` and builds `sine/cosine` from
+`theta[:north]` only; `band_bytes` (line 298) counts `north = (4*nside-1+1)//2`; and `_transform` does
+the fold on the *right-hand side*, contracting `north_rhs ± sign[:, None] * south_rhs` with
+`partner = ntheta - 1 - jn` and `sign = 1 - 2*(arange(L) & 1)`, the two signs being exactly the
+parity-split row groups the slab already holds. So the 36.75 GiB the stage split measured at 1024
+**is** the folded table, `18.4 GiB` was a phantom, and the `2.02x → ~3.8x` (1024) and `3.15x → ~5.4x`
+(512) "then" column in addendum 6's table was never available. Recorded here because those two numbers
+were the stated reason to spend a session on the builder.
+
+Nothing else from addendum 6 changes: the fold really is spin-0-only (addendum 5), and the marched route
+(item 2) was the live prize.
+
+### What shipped: one compensated march, northern grid, four channels, both directions
+
+`gmaster/_spin_march_pallas.py` is no longer closed over `SPIN = 2`. `spin` is now a parameter of
+`_kern`, `_call`, `_log2_norm`, `_window_geometry`, `_kern_synth` and `_call_synth` (defaulting to
+`SPIN`, so every spin-2 call site and compiled kernel is unchanged), and two new entry points use it at
+`s = 0`:
+
+- `forward_latitudinal_positive(positive, weights, phase, *, L, nside)` — `(4n-1, L)` positive-m block
+  in, `(L, L)` complex out. Builds `G_j = w_j e^{i m phi_j} F_j` for the whole grid, splits it into
+  `G_north` and `G_partner` (`partner = ntheta-1-j`, zeroed on the equator lane because it is its own
+  partner and counted once), stacks them as a 4-channel float32 rhs, and marches the northern lanes
+  once. The `(-1)^(ell+m)` combine is applied **outside** the kernel to the two fp64 partials
+  (`(P0 + iP1) + sgn*(P2 + iP3)`), where it costs one multiply per output instead of a per-degree
+  select inside the recurrence. This is the 4-channel form addendum 5 asked for, not the 8-channel one
+  that measured 1.070x.
+- `inverse_latitudinal_positive(positive, phase, *, L, nside)` — its transpose: same northern march,
+  two coefficient sets (direct, and the southern one carrying `(-1)^(ell+m)`), each ring's phi factor
+  applied outside, south half stored at the reversed theta axis and truncated to `north-1` lanes
+  because the equator contributes only through the direct accumulator. No `m = 0` mirror zeroing —
+  that guard is spin-2-specific (there the mirror is the *negative order*), the spin-0 mirror is a
+  hemisphere and every row of a window is genuine.
+
+Seams: `utils._fused_forward_sht` / `utils._fused_inverse_sht` ask
+`_spin_march.fold_requested(nside, L)` / `fold_synth_requested(nside, L)` **before** the band test.
+Left unset the takeover happens exactly where the band is refused for *size*; `GMASTER_SPIN0_MARCH=1`
+forces the march even where a band exists (that is how the two routes were compared), `=0` restores the
+fp64 kernel, and `GMASTER_SPIN0_MARCH_SYNTH` overrides the synthesis direction alone.
+
+### The two conventions that had to be learned before it produced numbers
+
+1. **`_log2_norm` must be given the spin.** With the default still `SPIN = 2` inside it, `spin = 0`
+   windows read `gammaln(ell - SPIN + 1)` and hit its poles at `ell = 0, 1`: the analysis fold returned
+   `nan` at exactly `(ell, m) = (0,0), (1,0), (1,1)` and nothing else. That non-finite pattern is the
+   diagnosis — poles, not cancellation.
+2. **The rows carry `sqrt((2l+1)/4pi)`; the closed form does not.** After the poles were gone the fold
+   was still ~0.5 relative off, so the two halves were separated: the fold algebra reproduces the band
+   route to 1.27e-07 when fed the band's *own* rows (`.qwen/tmp/spin0_fold_rows.py`, arm C), and the
+   marched rows match an independent `scipy.special.lpmv` reference (`d^l_{m0} = sqrt((l-m)!/(l+m)!)
+   P_l^m(cos theta)`, Condon-Shortley included, `.qwen/tmp/spin0_fold_one.py`,
+   `.qwen/tmp/spin0_fold_lanes.py`) to 9.4e-08 at lane 0. Both halves were right; the *convention*
+   differed. The shipped rows are `sqrt((2l+1)/4pi) * d^l_{m0}` — measured as a constant ratio exactly
+   equal to that factor over every `m` and lane to 5.2e-08 at Nside 32 (`band[0,0] = 0.282095 =
+   1/sqrt(4pi)`, `band[1,0] = 0.488602`, `band[2,0] = 0.630783`) — while the closed form closes on the
+   bare row. The analysis fold therefore multiplies by the degree factor after the kernel (putting it
+   inside would also have landed on the spin-2 route, whose contract deliberately leaves it to
+   `_finish_forward_s2fft`); the synthesis fold carries it in the coefficient, which is where the
+   synthesis kernel's scaling lives. With `sc = exp2(lgs - lex) * (-1)**m` the coefficient is exactly
+   the inverse of the marched row's own `(-1)^m exp2(-lgs)` convention, so the product is the bare row
+   times `alm`, as the transpose of analysis requires.
+
+### Score: the two worst cells in the repo are now within 10-30% of ducc0
+
+One fresh process per row, GPU1, `ducc0 0.39.1` on 192 cores, `n_iter=0`, `L = 3*nside`, median of
+3 (2048/4096) or 5 (512/1024) reps; GMaster times after a clock ramp, control bandwidths 1348-1421 GB/s.
+
+| nside | dir | ducc0 ms | before | after | ratio before → after | speedup | log |
+|---|---|---|---|---|---|---|---|
+| 2048 | `map2alm` | 309.2 | 949.2 | **442.0** | 0.33x → **0.70x** | **2.15x** | `score_n2048_spin0_s26.log` → `score_n2048_spin0_synth.log` |
+| 2048 | `alm2map` | 304.2 | 1258.4 | **323.3** | 0.24x → **0.94x** | **3.89x** | (same pair) |
+| 4096 | `map2alm` | 2003.5 | 7516.9 | **2479.1** | 0.27x → **0.81x** | **3.03x** | `score_n4096_spin0.log` → `score_n4096_spin0_synth.log` |
+| 4096 | `alm2map` | 2002.0 | 10050.4 | **2204.3** | 0.20x → **0.91x** | **4.56x** | (same pair) |
+
+The two directions are independent, and the intermediate run proves it: with only the analysis fold in
+place, `map2alm` was already 442.2 (0.72x) while `alm2map` sat unchanged at 1267.1 (0.24x)
+(`.qwen/tmp/score_n2048_spin0_fold.log`).
+
+**The band still owns every geometry where it fits, and the takeover is a win even where it doesn't.**
+With `GM_PREC=fp32` (the config every band win in this project assumes) nothing moved:
+
+```text
+   512    0  map2alm       16.1         4.4       3.67x 3.7e-07      score_n512_1024_spin0_fp32.log
+   512    0  alm2map       11.4         4.5       2.52x
+  1024    0  map2alm       59.0        28.3       2.09x 3.6e-07
+  1024    0  alm2map       57.2        30.9       1.85x
+```
+
+With the library's own fp64 default the 1024 band (73.5 GiB) is refused, so that cell is now served by
+the march, and the A/B of the takeover itself is:
+
+| nside 1024, fp64 tables | `map2alm` | `alm2map` | log |
+|---|---|---|---|
+| fp64 scalar kernel (`GMASTER_SPIN0_MARCH=0`) | 125.1 (0.50x) | 164.0 (0.34x) | `score_n1024_spin0_fp64kernel.log` |
+| folded march (default) | **91.4 (0.68x)** | **69.3 (0.82x)** | `score_n512_1024_spin0_synth.log` |
+
+so "the march takes over wherever the band is refused for size" is correct in both precisions —
+1.37x and 2.37x ahead of the kernel it replaces, not just at 2048+ but at 1024 too.
+
+Spin 2 was re-measured because the two kernels it runs on are the same functions that gained the `spin`
+parameter: `1024 2 map2alm 118.3 / 112.4 = 1.05x`, `alm2map 108.4 / 75.9 = 1.43x`, `2048 2 map2alm
+614.4 / 632.5 = 0.97x`, `alm2map 573.1 / 546.1 = 1.05x` (`.qwen/tmp/score_spin2_regression_s26.log`),
+which is where session 25 left it. Suite on the shipped default after both seams landed: **146 passed,
+3 skipped in 319.47 s** (`.qwen/tmp/pytest_s26.log`), the same counts as session 25.
+
+### Accuracy cost of the trade, stated
+
+The march replaces a route accurate to 3.4-3.7e-07 with the march's own float32-lane accuracy. Against
+the fp64 kernel on the same input (`.qwen/tmp/spin0_fold_synth.py N`, march vs kernel / band vs kernel):
+
+| nside | march vs fp64 kernel | band vs fp64 kernel |
+|---|---|---|
+| 32 | 8.62e-06 | 1.02e-07 |
+| 64 | 3.05e-05 | 8.70e-08 |
+| 128 | 7.91e-05 | 9.49e-08 |
+| 2048 | 2.87e-03 (north) / 2.03e-03 (south) / 6.59e-08 (equator lane) | band declined |
+
+Two notes on reading that table. The south half is not uniformly worse than the north — at 64 it is
+3.05e-05 against the north's 7.59e-06, at 128 it is the *north* (ring 0) that is worst — because the
+southern rings receive only the `(-1)^(ell+m)` accumulator, an alternating sum in `ell` whose
+cancellation amplifies the same lane error. And the harness's own end-to-end number for the analysis
+direction is `rel alm 6.9e-05` at 2048 and `2.1e-04` at 4096 (`|s|`-fitted against ducc0), against
+3.7e-07 and 3.4e-07 for the kernel that used to serve those cells. That is the price of 2.15x/3.03x on
+`map2alm` and 3.89x/4.56x on `alm2map`; the band geometries (512, 1024 fp32) keep their 3.6e-07.
+
+The 2048 synthesis figure is the worst-case input the probe can build — a **white** coefficient vector
+flat to `ell = 6143`, which puts as much power as possible into exactly the high degrees where the
+marched lane has accumulated 6144 recurrence steps (`|ref|max 2.618e+03`, `.qwen/tmp/spin0_fold_synth_2048.log`).
+`GM_FALL=1` on the same probe re-runs it with a `1/(ell+1)` spectrum, which is closer to a sky.
+
+### Occupancy probe: the shape is already right
+
+Halving the theta lanes halves the *program count* (theta tiles are the kernel's second grid axis), which
+at Nside 2048 means 64 m-rows x 16 tiles = 1024 programs at `_TILE/_WARPS = 256/1`. One process per
+shape (both are read at import and baked at trace time), `.qwen/tmp/spin0_fold_tile.py 2048 3`
+(`.qwen/tmp/spin0_fold_tile_2048.log`):
+
+```text
+  tile 256  435.79 ms   (control, shipped)
+  tile 128  436.61 ms
+  tile  64  443.55 ms
+  tile 512 2272.00 ms
+```
+
+No knob is worth adding: 256/1 already wins, and 512 collapses. The 2.15x came from the lane halving
+itself, not from a shape effect.
+
+### Where the remaining gap is
+
+`map2alm` at 2048 is 442.0 against ducc0's 309.2 (0.70x) and 2479.1 against 2003.5 at 4096 (0.81x). The
+latitudinal stage is the whole call there, and it is the same issue-bound compensated recurrence session
+25 addendum 3 measured out (per-degree rescale 1.009x, coefficient limbs 1.031x, assembly form 0.98x,
+tile layout already optimal, emit contraction 0.86-0.98x — all dead). Roughly 1.6e11 (m, ell, theta)
+triples in 442 ms is ~20% of this card's non-tensor fp32 peak, and the compensation doubles the op count
+of the recurrence itself. Closing the last 30% is an algorithm change (a cheaper per-triple op count, or
+anchored restarts that let a lane run uncompensated between anchors), not another rewrite of a block.
