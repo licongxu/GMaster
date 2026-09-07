@@ -4469,10 +4469,146 @@ ducc0 gets no benchmark cache advantage and the speedups above are honest.
 Suite: 144 passed / 3 skipped (`pytest_s24a.log`), 146 passed / 3 skipped after the new test
 (`pytest_s24b.log`), both on GPU1.
 
+## Session 25 (2026-09-07): the synthesis march is issue-bound — cutting the accumulation closed the 2048 cell
 
+Spin-2 `alm2map` was the last sub-1x cell: 729.3 ms against ducc0's 614.5 at Nside 2048 (0.84x). It is
+**507.5 ms = 1.20x** now, and Nside 1024 went 95.2 → **71.4 ms** against 109.8 (**1.15x → 1.54x**),
+from one change: the synthesis contraction accumulates in plain float32.
 
+### Where the time was (`.qwen/tmp/synth_march_decomp.log`, one geometry per process)
 
+| nside | `_inverse_impl` | build (all windows) | assembly | march |
+|---|---|---|---|---|
+| 1024 | 88.82 ms | 11.31 | ~0.3 | **88.77 (100%)** |
+| 2048 | 676.48 ms | 37.67 | 1.05 | **675.26 (94%)** |
 
+The "no march" arm dead-code-eliminates the geometry build (nothing consumes it), so build+assembly
+reads 1.05 ms while build alone reads 37.67; the honest split at 2048 is ~638 kernel + 37 build + 1
+assembly. Assembly — the piece the previous three sessions worked on — was already 0.15%.
 
+### Two things that were not the problem
 
+**Layout.** `_ST`/`_SW` swept one config per process; every arm produced the same checksum, so both
+knobs are numerically free (`.qwen/tmp/synth_sweep_1024b.log`): 512/4 **88.97** ms, 256/2 89.53,
+512/8 103.62, 256/4 106.44, 1024/8 110.93, 128/4 113.39, 512/16 116.17. The shipped 512/4 is already
+optimal; re-checked after the win (`.qwen/tmp/synth_sweep_fast_final.log`), still 512/4.
 
+**The critical path.** Moving the 2^±24 guard one step off the recurrence chain — deciding it from the
+carried `ch, ph` instead of the just-produced `nxt`, which is the same pair the current code tests —
+gave **1.012x** and was *not* bit-identical (worst `max|diff|` 1.880e+15,
+`.qwen/tmp/synth_guard_delay_1024.log`). Abandoned. The guard is not what the march waits on.
+
+Both null results point the same way: the step is warp-issue-bound, so cost is vector operations per
+(m, ell, theta) triple, nothing else.
+
+### The accumulation is 38% of the step and most of it is bookkeeping
+
+Three accumulation arms over the same march and the same stores, all 48 windows at Nside 1024
+(`.qwen/tmp/synth_acc_cost_1024.log`):
+
+| arm | ms | ratio | max\|diff\| vs exact | rel to window max |
+|---|---|---|---|---|
+| exact: (value, limb) products, (value, limb) accumulator | 83.41 | 1.000x | — | — |
+| drop the accumulator limb | 67.20 | 1.241x | 1.260e-07 | 2.150e-06 |
+| drop every limb | 51.96 | **1.605x** | 1.260e-07 | 2.150e-06 |
+
+Once the accumulator limb is gone, the product limbs contribute nothing: the two cheap arms are
+identical in output and the cheaper is 16% faster than the middle. `_accumulate_fast` keeps the range
+half of `_accumulate` verbatim (the `lift`/`ds` alignment and the 2^±24 guards — what keeps a
+6000-term sum inside float32's exponent range) and drops only the precision half. The fast arm does not
+load the coefficient limbs at all.
+
+### Accuracy, measured in the same log as the speed
+
+Map level, flat-spectrum (worst-case) synthesis alms, Nside 1024, base map max 6.839e-01 / rms
+1.226e-01 (`.qwen/tmp/synth_fast_acc.log`):
+
+```
+fast - comp   max|diff| 5.525e-07   rms diff / base rms 8.111e-07
+alm2map: comp 101.13 ms   fast 76.50 ms   1.322x
+```
+
+~350x below the 1.968e-04 max / 6.370e-06 rms the marched synthesis already ships against ducc0, and
+against the *exact* route the two arms are indistinguishable (`.qwen/tmp/synth_march_rel.log`: max rel
+2.54e-06 vs 2.42e-06 at nside 16, 8.52e-06 vs 8.47e-06 at 64, 1.01e-05 vs 1.01e-05 at 128 — the
+contract is limited by the march, not the accumulation).
+
+### Scoreboard after (`.qwen/tmp/score_fast_synth.log`, fresh process per cell)
+
+| nside | spin | ducc ms | GMaster before | after | ratio |
+|---|---|---|---|---|---|
+| 1024 | 2 m2a / a2m | 119.7 / 109.8 | 108.5 / 95.2 | 108.5 / **71.4** | 1.10x / **1.54x** |
+| 2048 | 2 m2a / a2m | 649.5 / 609.8 | 587.2 / 729.3 | 587.2 / **507.5** | 1.11x / **1.20x** |
+| 512 | 2 m2a / a2m | 28.8 / 25.6 | 9.2 / 8.5 | 9.2 / 8.5 | 3.15x / 3.01x (slab route, untouched) |
+
+**Every cell from Nside 64 to 2048 is now above parity except spin-0 `alm2map` at Nside 128 (0.97x).**
+Escape hatch: `GMASTER_SPIN2_MARCH_SYNTH_ACC=comp` restores the compensated accumulator.
+Suite: 146 passed / 3 skipped (`pytest_s25b.log`), GPU1.
+
+### Where the analysis time is NOT (`.qwen/tmp/analysis_emit_cost.log`, Nside 2048, 96 windows)
+
+```
+ship      338.25 ms   1.000x
+noscale   335.25 ms   1.009x     # drops the cross-lane max and the per-lane pow2 rescale
+noreduce  228.42 ms   1.481x     # drops the 4-channel theta contraction
+```
+
+So the per-degree rescale (`jnp.max(ex)` + vector `_pow2` + float64 `exp2`) is ~1% and the
+shared-exponent idea for it is worthless; the remaining analysis cost is the compensated recurrence and
+the contraction itself. `.qwen/tmp/analysis_coeflimb.py` tests the next candidate — whether the three
+coefficient low limbs (`c1l`, `c0l`, `cbl` loads + FMAs per degree) are worth their accuracy.
+
+### Documentation defect worth fixing
+
+`_inverse_impl`'s comment cites `.qwen/tmp/synth_assembly_ab.log` for "138.75 → 47.29 ms (2.93x) and
+1805.60 → 346.99 ms (5.20x), bit-identical". That file exists and contains no such run: it is the
+*x64-less march-vs-table* probe, whose concat form reads **slower** (0.38x at 1024, 0.86x at 2048,
+`bit-identical: False`). The 2.93x/5.20x claim is almost certainly about a different probe (the fp32
+assembly A/B), so the citation must be regenerated, not trusted. General trap: re-running a probe under
+an existing log name destroys the evidence a source comment cites — use a new name. Same trap bit again
+this session: a stale `pytest_s25b.log` left from an earlier session read "141 passed" before the
+current run had overwritten it.
+
+### Next
+
+1. **Spin-2 `map2alm` at 1024/2048 is now the weakest spin-2 cell (1.10x / 1.11x)**, and its rescale is
+   free (above). Candidates left: the analysis coefficient low limbs, the `_row_coeffs` /
+   `_init_exponents` / `log_norm` table builds (analysis geometry has no separate budget knob —
+   `_forward_latitudinal_march` builds rows *and* marches), and the tile reduction over `ntile`.
+2. Nside 4096 has still never been measured end to end (the slab route needs 1.1 TiB; the march fits).
+3. Nside 256 spin-0 traced route (1.22x/1.30x measured) blocked on hoisting the Legendre band build out
+   of the trace, not on guarding its cache drain.
+
+### Session 25 addendum: the analysis march measured out of candidates
+
+Every lead in the list above was measured the same day, and all four are dead. The analysis route at
+1024/2048 is the march (`slice_declined` is true there), and what it costs is the compensated
+recurrence plus the 4-channel contraction.
+
+**The geometry rebuild is not the 184 ms.** `_forward_impl` calls `_window_geometry` per window *inside*
+the trace, so four `gammaln` on `(mb, L)` float64 plus the Jacobi limb split run on every call. Timed as
+one jit over all windows (`.qwen/tmp/analysis_geom_cost.log`): **8.66 ms at Nside 1024 (48 windows,
+0.38 GiB) and 31.39 ms at 2048 (96 windows, 1.51 GiB)** — 2-5% of the call. Caching it is worth a
+commit only if the freed time is needed elsewhere; it is not a lever.
+
+**The analysis layout is already at its optimum** (one config per process, `.qwen/tmp/an_sweep_1024.log`,
+Nside 1024 latitudinal step): `_TILE/_WARPS` = **256/1 102.49 ms**, 512/2 114.90, 512/1 132.27,
+128/1 134.83, 512/4 140.21, 1024/4 150.03. The synthesis march likes 512/4 and the analysis march likes
+256/1; do not "unify" them.
+
+**The scatter→concat port fails again, as this memory tree already said it would.** The synthesis fix
+does not transfer: same disjoint-column structure, `(L, 2L-1)` destination, and the concat arm measured
+1.019x / 1.032x / **0.992x / 0.981x** at Nside 256/512/1024/2048
+(`.qwen/tmp/analysis_assembly_ab.log`, `max|diff|/max|out|` 0 to 1.8e-17). An earlier run of the same
+idea recorded 0.37x/0.64x. The magnitudes differ between probe shapes; the verdict does not. Reverted.
+
+**The coefficient low limbs buy 3.1%.** Dropping `c1l`, `c0l` and `cbl` (three loads and three FMAs per
+degree) measured **1.031x** (`.qwen/tmp/analysis_coeflimb.log`) — the transcription's own accuracy
+column in that probe is not trustworthy, but the speed ceiling is: 3% is not worth a new default.
+
+**Two probe traps hit and recorded.** (a) Two of my own background jobs on GPU1 (a pytest suite plus a
+probe) made the same shipped step read 98.7 ms and 170.6 ms, which looked like a routing contradiction
+and was contention — check `pgrep`/`nvidia-smi` before every measurement. (b) A `while pgrep -f
+"<pattern>"` wait loop matches its own command line: two loops queued behind a test suite never fired,
+and a `pkill -f` aimed at one killed the killing shell. Use the bracket form (`[a]n_sweep`) or kill by
+PID.
