@@ -5038,3 +5038,19 @@ tile layout already optimal, emit contraction 0.86-0.98x — all dead). Roughly 
 triples in 442 ms is ~20% of this card's non-tensor fp32 peak, and the compensation doubles the op count
 of the recurrence itself. Closing the last 30% is an algorithm change (a cheaper per-triple op count, or
 anchored restarts that let a lane run uncompensated between anchors), not another rewrite of a block.
+
+One unspent, unmeasured candidate that this session's probe exposes but did not test: the spin-2 driver
+`_forward_impl` builds its rhs the same per-window way (`ftm[:, L + m0:L + m1]` plus the mirrored slice,
+each transposed and interleaved, then `zeros().at[:, :ntheta].set`), and for spin 2 that transpose is a
+real strided read rather than a row slice. Spin 0's per-window build measured 126.9 ms isolated, so
+spin 2's is worth measuring the same way — but note spin 0 only recovered 17% of its isolated figure in
+situ, so measure the *call*, not just the block.
+
+**How this was verified, honestly:** the suite does not exercise the folded route (it runs at nsides
+where the band serves), so a green `pytest tests/ -q` is an import and spin-2 regression check only —
+**146 passed, 3 skipped** before the rhs hoist, and **44 passed, 3 skipped** for
+`tests/test_sht.py tests/test_table_precision.py` after it (`.qwen/tmp/pytest_sht_s26b.log`). The fold's
+correctness evidence is the probes: `spin0_fold_debug.py` (march vs band route at Nside 64, 1.242e-05 and
+unchanged by the hoist), `spin0_fold_synth.py` (march vs the fp64 kernel at 32/64/128/2048, both
+spectra), `spin0_fold_rows.py` / `spin0_fold_one.py` (fold algebra and marched rows against independent
+references), plus the unchanged `rel alm` column in the 2048/4096 score logs.
