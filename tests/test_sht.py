@@ -509,3 +509,41 @@ def test_spin_ring_window_matches_direct_dft_both_ways(nside, L):
         scale = float(np.max(np.abs(synth)))
         np.testing.assert_allclose(backward[start[ring]:start[ring] + period], synth,
                                    rtol=0.0, atol=1e-12 * scale)
+
+
+@pytest.mark.skipif(not _HAS_NVIDIA_GPU, reason="requires an NVIDIA GPU")
+@pytest.mark.parametrize("nside", [16, 48, 64])
+def test_spin2_march_synthesis_matches_the_route_it_replaces(nside):
+    """The table-free synthesis march against the exact `flm_to_ftm` it replaces.
+
+    The march is the default only where no Wigner-d slice can exist (`slice_declined`), which is far
+    above every size a test runs at, so the seam is called directly here. Nside 48 is the interesting
+    case: L = 144 makes `_spin_slice._windows` widths 64/64/16, and `_inverse_impl` assembles its
+    result by concatenating the per-window blocks -- valid only because the windows tile orders
+    0..L-1 with `lo == m0`, so a ragged final window is what would break silently.
+
+    `ell < |spin|` is zeroed because the march's recurrence starts at `ell = max(m, spin)` and
+    contributes nothing below the spin while the exact route does use those terms; every analysis
+    output already satisfies that, which is why the convention difference never reaches a pipeline.
+    Measured here: max rel 2.4e-06 (nside 16), 4.9e-06 (48), 8.5e-06 (64).
+    """
+    from gmaster import _spin_march_pallas as march
+
+    lmax = 3 * nside - 1
+    L = lmax + 1
+    rng = np.random.default_rng(11)
+    flm = rng.normal(size=(L, 2 * L - 1)) + 1j * rng.normal(size=(L, 2 * L - 1))
+    flm[:2] = 0.0                       # rows are ell: no sub-spin power
+    jflm = jnp.asarray(flm)
+
+    exact = utils._inverse_latitudinal(jflm, utils._stable_thetas(L, nside), L=L, spin=2,
+                                       nside=nside, reality=False)
+    got = march.inverse_latitudinal(jflm, L=L, spin=2, nside=nside)
+    assert got.shape == exact.shape
+
+    ref, new = np.asarray(exact), np.asarray(got)
+    scale = float(np.max(np.abs(ref)))
+    np.testing.assert_allclose(new, ref, rtol=0.0, atol=1e-4 * scale)
+    # Column 0 is written by neither half of the assembly and the contract asks for a zero there.
+    assert not np.any(new[:, 0])
+
