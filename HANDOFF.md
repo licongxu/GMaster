@@ -4261,6 +4261,84 @@ rejected by the exact route at both sizes (`Cannot lower jaxpr with verifier err
 operand 0 ... complex<f64>`), so the probe has to fall back to complex128 input; that is the exact
 route's constraint, not the march's.
 
+## Session 23 (2026-09-07): the rms 0.93 is `ell < |spin|`, and the synthesis march is the default
+
+**This supersedes the last two paragraphs.** The negative-order hypothesis is wrong — the mirror is
+correct. The whole 0.93 is the section of the band below the spin, which the march cannot represent and
+which the probe had filled with the largest coefficients in the map.
+
+The step that cracked it was to stop comparing maps and compare **columns**. `.qwen/tmp/synth_which_columns.py`
+takes the full random band, marched against exact, and reports the residual norm per output column:
+
+```
+ref (2047, 3072) 4.5859e+02 ||ref|| 6.2040e+02   new max 4.9634e-01 ||new|| 1.6879e+01
+   col   m=col-L    ||d|| col  ||ref|| col     ratio  worst theta    cos t
+  1536        +0   6.1921e+02   6.1966e+02 9.993e-01     0.001595  +1.0000
+  1535        -1   1.8257e+01   1.7276e+01 1.057e+00     0.834086  +0.6719
+  1537        +1   1.8257e+01   2.1839e+01 8.360e-01     1.581213  -0.0104
+  1534        -2   1.1820e-06   7.9791e+00 1.481e-07     0.059013  +0.9983
+  1538        +2   8.8261e-07   5.8836e+00 1.500e-07     2.887348  -0.9679
+columns above 1e-6 of the worst column's error: 3 of 3072
+```
+
+(`.qwen/tmp/synth_which_columns_512.log`). **Three** dead columns out of 3072 — `m = -1, 0, +1` — and
+everything with `|m| >= 2` agreeing to ~1e-07. The m = 0 column carries almost all the reference power
+because the probe's red `l^-1.5` spectrum puts its biggest coefficients at `ell = 0, 1`, and `ell < 2`
+is precisely the set of degrees that can reach those three columns. The march's recurrence starts at
+`nstart = max(m, spin)` with `P_1 = ((alpha+beta+2)/2)cos(theta) + (alpha-beta)/2`, so it contributes
+exactly zero from `ell < |spin|`; s2fft's `flm_to_ftm` does not skip them.
+
+Two controls close it out. Filling the band **from `ell = max(m, 2)`** instead of `ell = 0` makes the
+march match the exact route at <= 1.75e-06 for every `m in {0,1,2,3,6}` up to the full band, with
+`||new||/||ref|| = 1.000000` (`.qwen/tmp/synth_per_m_ell_256.log`) — so both order signs and every
+degree are fine, and the earlier `synth_negm_delta.py` suspicion is discharged. And the convention
+difference is real but unreachable in a pipeline: ducc0 *does* consume sub-spin terms if you hand them
+to it (injecting `|alm| = 1e3` at `ell < 2` moves its map by 1.427e-01 of its maximum), yet its own
+spin-2 analysis emits exactly 0.0 at `ell = 0` and 6.2e-06 at `ell = 1` (`.qwen/tmp/ducc_ell_below_spin.log`),
+i.e. nothing that came out of an analysis carries that power.
+
+**What decides the default is accuracy against ducc0, not against our own exact route**
+(`.qwen/tmp/synth_vs_ducc.py`, alms taken from ducc0's analysis of a masked pair at Nside 1024, where
+the seam is live):
+
+```
+ducc0 analysis at ell<2: max|alm| 1.620e-09  (max over all ell 4.181e-09)
+ exact: max|d|/max|ref| 1.095e-09  rms|d|/rms|ref| 1.289e-10  |s|=1.00e+00
+ march: max|d|/max|ref| 1.968e-04  rms|d|/rms|ref| 6.370e-06  |s|=1.00e+00
+```
+
+6.4e-06 rms and a 2e-04 worst pixel — the polar-lane row error arriving at the pole-most ring — on the
+input a pipeline actually produces. `synth_requested` therefore now takes the same rule as analysis
+(march wherever `slice_declined`, own `GMASTER_SPIN2_MARCH_SYNTH` override, `=0` restores the exact
+route), shipped in `13e9078`. Fresh-process score cell at Nside 1024: `alm2map 112.1 → 122.3 ms =
+0.92x` where it was **0.01x** (the 13.2 s scatter loop), `map2alm 118.0 → 107.8 ms = 1.10x`
+(`.qwen/tmp/score_1024_spin2_synthdefault.log`). Suite 141 passed / 3 skipped
+(`.qwen/tmp/pytest_s23a.log`).
+
+**The flags, measured rather than inferred** (`/scratch/scratch-lxu/agent_dev/auto_research_agent/GMaster/.qwen/tmp/route_table_1024.py`
+counts seam calls with every executable cache dropped between cells, so it reports the route taken and
+not the flag value):
+
+```
+                                           env  spin  analysis seam  synthesis seam
+                                     (default)     2              1               1
+                                       MARCH=0     2              0               1
+                                       SYNTH=0     2              1               0
+                              MARCH=0, SYNTH=1     2              0               1
+                              MARCH=1, SYNTH=0     2              1               0
+```
+
+and spin 0 is `0 0` in all seven combinations. The two flags are independent, which is the point: the
+directions have different economics against ducc0 (1.10x ahead one way, 0.92x behind the other) even
+though they share the no-slice default.
+
+**Method note worth keeping.** A per-row delta probe and a linearity test cannot see a missing index
+range — `f(a+b) = f(a) + f(b)` is satisfied by a route that silently drops a whole set of inputs, on
+both sides of the equation. When a discrepancy lives in a handful of output columns, ask which *input*
+indices can reach them before believing anything about magnitude; here that single question named
+`ell < |spin|` in one step, after two sessions of "improve the polar lane".
+
+
 
 
 
