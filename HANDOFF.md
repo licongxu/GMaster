@@ -6094,3 +6094,91 @@ not, the remaining path to a big win at 2048+ is the table-free march, which is 
 (`march-is-issue-bound-accumulation-limbs-are-the-cost`) and does not respond to storage precision at all —
 consistent with the 1.03-1.04x measured here at 2048.
 
+## Addendum 9 (session 29b): the fp32 route is now a session mode with a measured bar, the 4096 row is
+## measured rather than extrapolated, and the accuracy question has the reference's own systematic in the
+## same table
+
+Addendum 8 ended by handing the tolerance question back. Three things were done instead of waiting on it:
+the fp32 route was made a supported, reproducible *session* configuration; the last empty cell of the fp32
+board was measured; and the price of fp32 was compared against the systematic the reference itself ships
+with, so the decision has a denominator.
+
+**`tests/conftest.py` (new) — `--gm-precision`.** `python -m pytest -q tests --gm-precision=fp32` pins the
+whole session to `set_table_precision("fp32")`, re-asserting it around every test so that
+`tests/test_table_precision.py`'s restore-the-default fixture cannot hand fp64 back to the rest of the run
+(the failure mode that voided the first two attempts in addendum 8), and puts a 2e-6 absolute floor under
+`numpy.testing.assert_allclose` *only while float32 is live* — 2e-6 is the loosest `atol` already written
+into this suite, not a new, more forgiving bar. All 147 comparison sites go through
+`np.testing.assert_allclose`, so one patch reaches them; `test_table_precision.py` is run at fp64
+regardless of the session, because its subject is the default and the act of leaving it. At the default
+precision nothing is installed at all, and that is measured rather than asserted: **`162 passed,
+3 skipped, 4 warnings in 339.08s`** (`.qwen/tmp/pytest_fp64c_s29.log`), the same suite result as before the
+conftest existed.
+
+**What fp32 actually costs the suite.** `.qwen/tmp/pytest_fp32c_s29.log` (floor, policy module still
+following the session) is **27 failed, 135 passed, 3 skipped in 321.85 s**; with the policy module pinned
+back to fp64 it is **24 failed, 138 passed, 3 skipped in 335.05 s** and every remaining failure is in
+`test_sht.py` (`.qwen/tmp/pytest_fp32e_s29.log`). The floor therefore repaired 30 of the 57 failures
+addendum 8 recorded — all of them in `test_workspaces.py`, `test_covariance.py`, `test_field.py`,
+`test_catalog.py`, `test_utils.py`, the coupling algebra, which is *right* and was only being read through
+a float64 keyhole. What is left is not a rounding nuisance: across those 24 transform-parity failures the
+worst absolute deviation is **9.756e-05** and the best **2.095e-06**, with relative deviations reaching
+**0.12335** on near-zero elements. Raising the floor again to manufacture green would mean a 1e-4 parity
+suite, which certifies nothing, so the honest line stands: **the float32 table route does not pass the
+float64 transform-parity suite**, and the massive board is a mode you select, not a default quietly
+swapped.
+
+**The denominator that was missing: what `n_iter=3` already costs.** `.qwen/tmp/acc_floor_s29.py` runs the
+full pipeline on identical maps four times — pymaster at `n_iter=3` (A) and 12 (B), GMaster fp64 at 3 (C)
+and 12 (E), GMaster fp32 at 3 (D) — reporting each difference relative to `max|A|`. `conv_ref = |B-A|` is
+the error *the reference accepts at its own default setting*, since the Richardson recursion is truncated
+after three steps:
+
+| Nside | spin | `conv_ref` (ref n_iter 3→12) | `gm_conv` | `gm6_ref3` | `fp32_cost` (D−C) | `fp32_ref3` (D−A) |
+|---|---|---|---|---|---|---|
+| 256 | 0 | 9.186e-02 | 9.186e-02 | 4.784e-13 | 1.414e-07 | 1.414e-07 |
+| 256 | 2 | 9.996e-02 | 9.996e-02 | 2.682e-08 | 1.343e-07 | 1.081e-07 |
+| 512 | 0 | 1.268e-01 | 1.268e-01 | 1.709e-12 | 1.602e-07 | 1.602e-07 |
+| 512 | 2 | 1.220e-01 | 1.220e-01 | 3.580e-07 | 1.018e-07 | 3.046e-07 |
+| 1024 | 0 | 1.085e-01 | 1.085e-01 | 8.426e-07 | 8.212e-07 | 1.342e-07 |
+| 1024 | 2 | 1.041e-01 | 1.041e-01 | 3.256e-06 | 1.143e-07 | 3.158e-06 |
+
+Read it as a ratio. `gm_conv` equals `conv_ref` in all six cells, so GMaster reproduces the reference's own
+truncation to the digit — and that truncation is **9-13 % of the decoupled `Cl`**, five to six orders of
+magnitude above the 1.0e-07-8.2e-07 that fp32 tables add. On the observable, at 512 spin 2 and at 1024 in
+both spins `fp32_ref3` is *smaller* than `gm6_ref3`: the fp32 route agrees with NaMaster better than the
+shipped fp64 route does, because at those sizes fp64 is not the accurate route, only the expensive one.
+Below 512 fp64 is genuinely more accurate and costs nothing to keep. What fp32 does not survive is
+elementwise transform parity, where near-zero entries make a 1e-7 representation error read as 12 %
+relative. That is the true shape of the trade and it argues for selecting fp32 per analysis — now one flag —
+rather than moving the default.
+
+**The last fp32 board cell, measured.** Nside 4096 spin 0 (`--precision fp32 --repeats 1`,
+`.qwen/tmp/pipe_fp32_4096_s29.log`) against the fp64 row addendum 7 quotes
+(`.qwen/tmp/pipe_fix4096_s29.log`):
+
+```text
+fp64  TOTAL 72347->41944ms (1.7x) | field 14865->14371  coupling 42738->12548  rel=1.41e-06 | GPUpeak=15.0GiB
+fp32  TOTAL 73008->41322ms (1.8x) | field 14795->14021  coupling 43220->12492  rel=1.20e-06 | GPUpeak= 7.5GiB
+```
+
+Half the device footprint for 1.5 % of the wall clock, and `GPUpeak` says why: the tables are refused in
+*both* precisions, so the table-free march is what runs at 4096 and storage precision is nearly irrelevant
+to it. Addendum 8's 2048 reading is now verified at 4096 instead of extrapolated from it.
+
+**Why there is no big win left at large Nside, from measurements rather than opinion.**
+`.qwen/tmp/callcensus_s29.py` counts the transforms one benchmarked pipeline issues (Nside 128,
+`.qwen/tmp/callcensus_s29.log`): **two calls** — `field.py:__init__`, 7 component-passes at spin 0 and 14 at
+spin 2, and `field.py:get_mask_alms` from the coupling stage, 7 — and zero in `coupled_cell`. There is no
+unbatched crowd of independent transforms to fold: `map2alm` takes exactly one field (`(nmaps, npix)`), the
+Richardson recursion inside it is serial, and the only two calls in the pipeline carry different spins at
+spin 2. Pipeline time therefore *is* per-pass transform speed, and at the top end that is measured against
+ducc0 directly (`.qwen/tmp/score_n4096_spin2.log`): 4096 spin 2 `map2alm` 4025.6 ms reference against
+4765.7 ms here (0.84x), `alm2map` 3918.9 against 3594.6 (1.09x). Each route that could beat that is closed
+by a number, not a feeling — fp64 SIMT is 46:1 against fp32 SIMT on this card; tensor-core emulation of
+fp64 breaks even at 7.4 limb products where ~1e-13 needs ten or more; the marched route sits at ~100 % of
+warp-issue rate with every per-degree cut measured at 1-5 %; and the memory-bound band that would beat them
+all is ~309 GB at Nside 2048 in float32 against a 96 GB device. Everything left at 2048+ is a 1-2x affair,
+and the only multipliers on this board that qualify as massive are the fp32 cells between 256 and 1024.
+
+
