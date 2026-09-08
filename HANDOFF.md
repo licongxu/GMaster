@@ -6026,3 +6026,71 @@ all four `ncls` shapes through `test_arbitrary_spin_workspaces_match_namaster`,
 `test_spin2_workspaces_match_namaster`, `test_pure_spin2_workspaces_match_namaster` (the
 `even_levels`/`odd_levels` selection path) and the anisotropic workspaces.
 
+### Session 29 addendum 8 — fp32 tables are the biggest board lever left: 2.2-6.8x instead of 1.5-3.1x
+
+Everything above this block is the shipped default, `table_dtype() == float64` (verified live).
+`set_table_precision("fp32")` has always existed and is documented as "opt-in and never inferred", because
+it costs ~1e-7 of table representation error — and it was last scored in the isolated-transform harness.
+Scored end to end against the CPU reference it is the largest single multiplier on the board, so it is now
+scored properly: `benchmarks/benchmark_pipeline.py` grew `--precision` (`6d4ea4e`, default `fp64`, header
+line prints which precision a row belongs to) and every row below prints its own `rel dCl` in the same log
+line as its milliseconds.
+
+**TOTAL against NaMaster CPU, shipped fp64 vs `--precision fp32`, GPU1, repeats 9 at 64-512 and 3 at
+1024-2048** (`pipe_fix_tiny_s29.log` / `pipe_fix_s29.log` / `pipe_fix2048_s29.log` for fp64;
+`pipe_fp32_small_s29.log`, `pipe_fp32_512_s29.log`, `pipe_fp32_big_s29.log` for fp32):
+
+| Nside | spin 0 fp64 | spin 0 fp32 | spin 2 fp64 | spin 2 fp32 | `rel dCl` fp32 (s0 / s2) |
+|---|---|---|---|---|---|
+| 64 | 5 ms **1.8x** | 4 ms **2.2x** | 6 ms **2.5x** | 4 ms **3.7x** | 4.39e-08 / 1.09e-07 |
+| 128 | 12 ms **1.5x** | 12 ms **1.6x** | 13 ms **3.1x** | 10 ms **3.9x** | 4.26e-08 / 1.40e-07 |
+| 256 | 28 ms **2.1x** | 20 ms **3.2x** | 54 ms **3.1x** | 24 ms **6.8x** | 1.41e-07 / 1.19e-07 |
+| 512 | 164 ms **2.0x** | 93 ms **3.6x** | 349 ms **2.0x** | 142 ms **4.9x** | 1.60e-07 / 3.12e-07 |
+| 1024 | 944 ms **1.8x** | 637 ms **2.8x** | 1261 ms **2.5x** | 1072 ms **3.1x** | 1.34e-07 / 3.22e-06 |
+| 2048 | 5535 ms **1.8x** | 5319 ms **2.0x** | 8448 ms **2.1x** | 8237 ms **2.2x** | 1.44e-06 / 1.09e-05 |
+
+Throughput multipliers on GMaster's own time: 1.25-1.77x spin 0 and 1.18-2.46x spin 2 from 64 to 1024, and
+**only 1.03-1.04x at 2048**. The board reads 3.2-6.8x from 256 to 512 in both spins.
+
+**Where it comes from, and why it dies at 2048.** Two effects, both in `field`: `utils.ring_dtype()`
+follows the table precision, so the azimuthal stage runs `complex64` FFTs (its docstring cites 4.08 → 0.83
+ms at Nside 1024), and fp32 bytes let the geometry pass the fit test for the band route, which fp64
+declines. The two are separable in `GPUpeak`. At 512 spin 2 the band is resident in *both* precisions and
+fp32 simply halves it (57.6 → 29.2 GiB), so that cell's 239 → 69 ms is the fp32 ring FFT and the fp32 table
+reads. At 1024 spin 0 the picture is a route switch: 0.9 GiB on fp64 (tables refused, march running)
+against **37.3 GiB** on fp32. And at 2048 spin 0 it is **2.2 GiB in fp32 too** — still refused, so the
+table-free march runs and fp32 buys only the 4% the ring stage alone is worth. Stage evidence for `field`: spin 2 256 34 → 9 ms, 512 239 →
+69 ms, 1024 499 → 464 ms, 2048 3650 → 3522 ms; spin 0 512 64 → 29 ms, 1024 356 → 204 ms, 2048 1930 →
+1845 ms. `coupling` is unchanged (fp32 does not touch it: 512 spin 2 is 46 vs 45 ms) because the
+mode-coupling build consumes the coupled cell, which is fp64 arithmetic regardless of table storage.
+
+**The accuracy framing that makes this usable.** fp32 `rel dCl` is 4.3e-08-1.6e-07 for spin 0 and
+1.1e-07-3.2e-06 for spin 2 from 64 to 1024. At every size from 512 up that is the same order as, or
+better than, the fp64 default's *own* error at the same size (512: 1.71e-12 / 3.56e-07; 1024: 8.43e-07 /
+3.69e-06; 2048: 1.38e-06 / 1.09e-05) — at 1024 the fp32 band route beats the fp64 march route on accuracy
+in both spins while being 1.2-1.5x faster, because the fp64 default there is not a more accurate route,
+just a more expensive one. Below 512 the fp64 default is genuinely more accurate (1e-14-1e-10) and costs
+nothing to keep, since those cells are dispatch-bound.
+
+**Not flipped, and now we know why in numbers.** The shipped default stays fp64. The gate was the suite
+under fp32, and it is **57 failed, 105 passed, 3 skipped in 324.87 s** (`.qwen/tmp/pytest_fp32b_s29.log`,
+`.qwen/tmp/fp32_plugin.py` = `-p fp32_plugin`, which sets `jax_enable_x64` at configure and re-asserts fp32
+in `pytest_runtest_setup`; the first attempt through `python -c` was void twice over — its first line was
+`JAX is not using 64-bit precision`, and `tests/test_table_precision.py`'s autouse `_restore_precision`
+fixture hands fp64 back after each of its own tests). The failures are not crashes or wrong routes, they
+are tolerance: `Max absolute difference among violations: 9.29e-08`, `Max relative 1.32e-05`, on 42/45
+elements of a coupling check — i.e. the suite's bar against `pymaster` is ~1e-10 absolute while fp32 tables
+land at ~1e-8/1e-7. Distribution: 24 in `test_sht.py`, 17 in `test_workspaces.py`, 6 `test_covariance.py`,
+4 `test_field.py`, 3 `test_table_precision.py`, 2 `test_catalog.py`, 1 `test_utils.py`.
+
+**So the honest statement of the lever is:** the 3.2-6.8x band from 256 to 512 (and 2.8-3.1x at 1024) is
+real and reproducible, and it is priced at exactly the thing the repo's own test bar forbids — 1e-8 absolute
+agreement with the reference instead of 1e-10. That is a scientific trade-off for the user to accept, not a
+default to change silently. What would keep the speed and drop the price is the *selective* version of the
+same idea: the win is concentrated in the ring FFT stage (`complex64`, ~4.5x cheaper per its own
+measurement) and in table storage, while `rel dCl` at 512-1024 is dominated by neither. If the tolerance
+question is answered in the affirmative for a given analysis, `--precision fp32` is measured and ready; if
+not, the remaining path to a big win at 2048+ is the table-free march, which is fp64 warp-issue-bound
+(`march-is-issue-bound-accumulation-limbs-are-the-cost`) and does not respond to storage precision at all —
+consistent with the 1.03-1.04x measured here at 2048.
+
