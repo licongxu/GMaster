@@ -5682,3 +5682,69 @@ theta tile (monotone-worse wider) have all been measured. What is left at that s
 itself: the march runs the fp64 recurrence on a path an order of magnitude behind the CPU's fp64 rate,
 so closing 0.83x there needs a different recurrence, not another tuning pass.
 
+### Session 29 addendum 3 — the synthesis theta tile is per-spin, and the folded spin-0 route wanted it twice as wide
+
+**Shipped change** (`gmaster/_spin_march_pallas.py`): `_ST` (512) is now the *spin-2* synthesis theta
+tile, and a new `_ST0` (1024, `GMASTER_SPIN0_SYNTH_TILE`) serves the folded spin-0 synthesis wherever
+`north >= 4 * _ST0` — on a HEALPix grid `north = 2 * nside`, so exactly Nside >= 2048, the only sizes
+where the fold runs and where the win was measured. One helper, `_synth_tile(spin, ntheta)`, feeds both
+`_call_synth` (kernel `chunk`, `out_shape`, `_CALLS` key) and `_inverse_fold_impl` (`ntile`, `npad`), so
+the launch geometry and the compiled kernel cannot disagree.
+
+Why the fold wants a different width: it hands the kernel `north = (ntheta + 1) // 2` rows, so a fixed
+tile width gives half as many programs per m-window as the spin-2 launch gets (8 instead of 16 at
+Nside 2048), and each program's prologue is amortised over half as many rows. Widening the tile trades
+those prologues for a longer march.
+
+spin-0 `alm2map` against ducc0, `GM_PREC=fp32`, 5 reps, one geometry per process
+(`.qwen/tmp/st2048_s29.log`, `.qwen/tmp/st_spin0_s29.log`):
+
+| Nside | 512 (was shipped) | 256 | **1024 (now)** | 2048 |
+|---|---|---|---|---|
+| 2048 | 287.4 ms / 0.99x | 270.0 / 1.04x | **243.7 / 1.17x** | 401.2 / 0.71x |
+| 4096 | 1885.1 ms / 1.02x | — | **1745.8 / 1.10x** | — |
+| 1024 | 31.0 ms / 1.73x | — | 30.7 / 1.70x | 30.7 / 1.59x (flat) |
+
+Spin 2 at the same geometry wants the opposite (`st2048_s29.log`): 512 → **453.7 ms / 1.25x**, 256 →
+508.1 / 1.11x, 1024 → 524.6 / 1.08x. That is why the width became per-spin instead of being raised.
+
+**Bit-identical, so not a trade.** Both tiles compile inside one process — mutating the constant and
+calling `jax.clear_caches()` + `smp.clear_cache()`, because `_inverse_fold_impl` is jitted on
+`(L, nside)` only and would otherwise silently re-time the first arm — reps interleaved, maps compared
+to each other and to ducc0's own synthesis of the same alms (`.qwen/tmp/st0_ab_s29.py`,
+`st0_ab_s29.log`):
+
+| Nside | tile | GM ms | vs ducc0 | map diff | compiled key (L, ntheta, ntile, mb, chunk) |
+|---|---|---|---|---|---|
+| 2048 | 512 | 288.5 | 1.00x | — | (6144, 4096, 8, 128, 512) |
+| 2048 | 1024 | **245.3** | **1.17x** | **0.0e+00** | (6144, 4096, 4, 128, 1024) |
+| 4096 | 512 | 1872.0 | 1.01x | — | (12288, 8192, 16, 128, 512) |
+| 4096 | 1024 | **1736.6** | **1.09x** | **0.0e+00** | (12288, 8192, 8, 128, 1024) |
+
+Each theta lane's march is independent, so a tile boundary moves work and not rounding; the
+ducc0-referenced map error is unchanged at 7.4e-04 (2048) and 1.5e-03 (4096). The printed compile keys
+are the proof two different executables were timed, which is the thing an in-process config A/B
+usually gets wrong.
+
+**The analysis tile stays 256 for both spins.** Same grid, both directions, `TILE = ST` per arm
+(`.qwen/tmp/tilespin_s29.log`): spin 0 at 2048 is 292.9 ms (1.01x) / 311.5 (0.97x) / 1016.9 (0.30x) at
+`_TILE` 256/512/1024; spin 2 at 2048 is 574.5 (1.07x) / 751.6 (0.82x) / 1413.1 (0.43x); spin 2 at 1024
+is 76.9 (1.43x) / 96.6 (1.14x) / 337.0 (0.32x). **And narrower is worse too** (`.qwen/tmp/tile128_s29.log`,
+`_TILE=128`): 2048 spin 0 `map2alm` 531.6 ms (0.56x), 2048 spin 2 1216.5 ms (0.50x), 4096 spin 0 4158.4 ms
+(0.46x) — 1.8-2.1x behind the shipped 256. So 256 is a genuine two-sided optimum for analysis, not a
+plateau, while the folded spin-0 synthesis wants four times that width; the two directions of the same
+kernel are tuned apart and must stay that way.
+
+**A hand-off number that was wrong, retired.** The brief this session inherited listed spin-0
+`map2alm` at Nside 1024 as "0.82x / 0.77x, the worst large cell". Nothing in this file or in any log
+supports it: the same harness in one-geometry processes gives **28.2 ms against ducc0's 57.0-60.1 ms =
+2.02-2.15x** (`st_spin0_s29.log`, `s0fold_s29.log`), matching the session-24 and session-28 rows. The
+change that number implied — turning the fold on at 1024 — is a large loss: at Nside 512
+`GMASTER_SPIN0_MARCH=1` takes `map2alm` from 4.4 ms (3.43x) to 12.7 ms (1.19x) and `alm2map` from 4.6
+(2.39x) to 10.4 (1.14x). `fold_requested`'s size gate is correct as shipped; do not widen it.
+
+New guard: `tests/test_sht.py::test_synthesis_tile_is_per_spin_and_still_powers_of_two` (5 sizes) pins
+the two use sites of the width against each other and keeps `ntile` a power of two — the Triton
+lowering rule from addendum 1, asserted at sizes the suite cannot afford to run on a GPU. Suite:
+**157 passed, 3 skipped in 343.41 s** (`pytest_s29d.log`).
+
