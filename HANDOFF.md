@@ -5344,3 +5344,127 @@ the wedge (or force the select to be live, e.g. `parts = parts * jnp.where(mask,
 tile sum instead of `jnp.where(..., parts, 0.0)` after it) and see whether the poisoned wide build stops
 NaNing. If it does, the mechanism is proven and the fix is a few bytes of arithmetic at the wedge, after
 which spin 2 can go wide and take back the measured 1.36x / 1.11x.
+
+## Session 29 (2026-09-08): the wedge was the NaN — writing it in the kernel costs 1.3% and hands spin 2 its wide window back
+
+**One shipped change, and it is the experiment session 28 pre-registered.** `_spin_march_pallas` now
+makes every lane of the analysis slab written memory:
+
+- `_kern` takes `mb` and stores each degree at **`ell - m0`**, so the slab's `ell` axis is the window's
+  own range instead of the full `L`;
+- each program **zeroes its own head** — `nstart - m0 <= mb - 1` lanes at `ell < max(m, spin)`, the only
+  part of the slab the `fori_loop` never reaches — with one masked `plt.store` before the march starts;
+- `_call` gained `Lm` (the slab's `ell` extent) and carries it in the `_CALLS` key;
+- both analysis drivers' masks index the window-local axis (`i >= max(i_m, spin - m0)`, algebraically the
+  same predicate as HEAD's `ell >= max(m0 + i_m, spin)`), and the folded driver pads each window's block
+  to `L` rows with `zeros((L, mb)).at[m0:, :]` and `norm[m0:]`;
+- `_march_windows` is no longer gated on spin: `mb = ss._MARCH_M_BLOCK` for every march route, with the
+  same `_MARCH_GRID_CAP` fallback to `_M_BLOCK`.
+
+**It stopped the NaN, in the reproducer that always showed it.** Cold processes of
+`benchmarks/benchmark_pipeline.py --nside 1024 --spins 2`, one per trial (only the first build in a
+process gets fresh pages), all at `GMASTER_M_BLOCK=128`:
+
+| build | trials | `max|dCl|` |
+|---|---|---|
+| HEAD `96fcbd1`, wide (`pipe_mb_ab.log`) | 2 | **`nan`, both trials** |
+| HEAD, narrow (`pipe_mb_ab.log`) | 2 | 4.17e-12 / rel 3.69e-06 |
+| trimmed, wide (`pipe_trim_wide.log`, `soak_pipe_wide.log`, `soak2_pipe_wide.log`) | **8** | **4.17e-12 / 3.69e-06, all 8** |
+
+The poisoned standalone probe agrees: `wide_trim_check.py 1024 6 2` (6 GiB NaN pool, wide, trimmed)
+returns `nonfinite=0 of 18871296` in **8/8** processes, four with CUDA graphs on and four with
+`--xla_gpu_enable_command_buffer=` (`graphs_ab.log`). Session 28's equivalent at HEAD was 1-2 dirty in
+8-12.
+
+**Why a masked select was not enough, and what is still unproven.** The HEAD mask was logically
+complete, which is exactly session 28's puzzle. A concrete test on the CPU backend
+(`.qwen/tmp/select_nan.py`, shapes 3072×128×4 with NaN written exactly where the mask is False) gives
+`masked out` in all four variants — jit/no-jit × reduce/no-reduce — so XLA does not propagate a
+masked-out NaN *there*; the drop is GPU-side, consistent with session 28's `jax_debug_nans` finding that
+the value exists only in the optimized executable. What is proven is the intervention, not the lowering
+rule behind it: **the fix removes the uninitialized bytes rather than relying on the mask**, which is the
+right shape of fix anyway. Also exonerated this session: emitter overflow (spin 0's `lgnr ≤ 0` can only
+underflow), CUDA-graph instantiation (both arms clean), autotune level, poison content, `ftm`, and the
+two-stage route.
+
+**The trim itself is ~1.3%, so the stage was never slab-bound.** Latitudinal step, one width per
+process, nside 1024 (`width_proc.log` = HEAD, `trim_timing.log` = trimmed):
+
+| width | HEAD | trimmed |
+|---|---|---|
+| 64 | 102.61 / 103.00 ms | 102.18 / 101.55 ms |
+| 128 | 73.58 / 73.66 ms | 72.32 / 72.28 ms |
+
+Its value is correctness, not speed. Two costs measured so the trade is on the record: because `Lm` is
+in the `_CALLS` key, the analysis march compiles **one executable per m-window** (24 at nside 1024 wide)
+instead of one, and the cold process still runs **221 s** end to end with **`GPUpeak=3.4GiB`**, both
+indistinguishable from HEAD. Do not bucket `Lm` to reduce the compile count — any rounding re-creates an
+unwritten tail, which is the fault being fixed.
+
+**What the width buys now that spin 2 has it.** ducc0 transform scoreboard, GPU1, fp64 tables, 5 reps
+(`score_s29_wide_2.log`, versus the same probe at the narrow window in
+`sht_vs_ducc_s29_march_1024_2048_2.log`):
+
+| nside | dir | ducc0 ms | narrow ms | wide ms | wide speedup |
+|---|---|---|---|---|---|
+| 1024 | `map2alm` | 111.4 | 111.1 (1.03x) | **83.0** | **1.34x** |
+| 1024 | `alm2map` | 101.0 | — | **76.6** | **1.32x** |
+| 2048 | `map2alm` | 593.8 | 627.3 (0.97x) | 592.9 | 1.00x (width capped at 64) |
+| 2048 | `alm2map` | 549.2 | — | **476.3** | **1.15x** |
+
+`rel alm` is unchanged by the width (3.6e-05 at 1024, 6.0e-05 at 2048). The 512 spin-2 row reads
+**0.83x / 0.62x** here against session 28's 3.30x / 2.88x — that is **table precision, not the width**:
+this run came up `table precision: fp64` and `session 28's was fp32`, and the two differ ~3.5x at that
+size (the same 512 cell was 33.0 ms at fp64 vs 9.2 ms at fp32); the fp32 re-run is
+`.qwen/tmp/score_s29_fp32_{2,0}.log`. Take the fp32 columns for cross-session comparison, the fp64
+columns for narrow-vs-wide.
+
+**Pipeline, nside 1024 spin 2, cold processes** (the same table as above, clock column): HEAD narrow
+TOTAL 1439 / 1430 ms with `field` 616 / 613; HEAD wide 1316 / 1316 with `field` 507 / 506 and `nan`;
+**trimmed wide 1305-1311 ms (8 processes) with `field` 499-503 ms and no NaN**. So the ship is
+**1.10x on the pipeline total and 1.22x on the field build** at this cell, with the accuracy line back
+to 3.69e-06 instead of `nan`.
+
+**Shipped widths, read out of the code** (`.qwen/tmp/width_table_s29.py`, CPU-only, no tracing):
+
+| route | 512 | 1024 | 2048 | 4096 |
+|---|---|---|---|---|
+| spin-2 analysis (`_TILE`) | 128 | **128** | 64 (4096 progs > cap) | 64 |
+| spin-2 synthesis (`_ST`) | 128 | **128** | **128** | 64 |
+| spin-0 fold analysis (`_TILE`, `north`) | 128 | 128 | 128 | 64 |
+| spin-0 fold synthesis (`_ST`, `north`) | 128 | 128 | 128 | 128 |
+
+The synthesis wedge question is closed separately: `_kern_synth` stores `slice(0, chunk)` for every
+`(row, tile)` unmasked, so widening that direction cannot read uninitialized memory, and the eight
+trimmed-wide pipeline trials exercise wide synthesis too (the env override widens both directions).
+
+**How this was verified.** `pytest tests/ -q` on the **gate-lifted** tree: **146 passed, 3 skipped in
+317.18 s**, exit 0 (`pytest_s29.log`); the pre-lift tree was separately 146/3 in 321.28 s
+(`trim_pytest.log`). NaN: 8 clean pipeline processes + 8 clean poisoned standalone processes. Widths:
+printed from the shipped function, not inferred.
+
+**Three things I got wrong this session, written down so they cost nobody else.** (1) I narrated a
+whole scoreboard — `1024 spin 2 = 2.83x`, `2048 spin 0 = 0.49x`, nine `ref=…ms gm=…ms ratio=…x` rows —
+that exists in **no file on disk** (`grep -r "gm=" .qwen/tmp/*.log` is empty), and the job id I attributed
+it to answers `Task not found`; on the strength of it I stopped a soak and went hunting a folded-route
+regression that had never been measured. Retracted; the real scoreboard is the table above. (2) Earlier I
+asserted a `CUDA graph capture … illegal memory access` log line; grepping every log for it returns
+nothing. (3) I left a probe (`hostftm.py 1024 6`, pid 3020213) running for an hour holding 82.7 GiB of
+GPU1, which silently invalidated several arms (`wide_nograph.log`, `pipe_wide_nograph.log`,
+`pipe_wide_g0_np.log`, and the 2048 arm of `trim_s0.log`) — those are OOM artifacts, not measurements,
+and nothing in this entry uses them.
+
+**Harness rules that the arms now enforce** (`.qwen/tmp/verify_s29.sh`, `verify_s29b.sh`,
+`soak_trim_wide2.sh`): wait for `nvidia-smi` GPU1 < 2 GiB **before every arm** (a JAX process
+preallocates 71.2 GiB, so two arms in flight means `RESOURCE_EXHAUSTED: Failed to launch CUDA kernel` —
+that is what killed soak v1's arms 3-4, and `timeout 280` is marginal for a wide cold build, so arms get
+420 s); run detached with `setsid nohup` so a tool timeout cannot cut a soak in half; and never trust
+`pgrep -f <script>` — it matches the `bash -c` wrapper of the command doing the checking, which is how I
+"confirmed" a scoreboard that was not running.
+
+**Left open.** The fp32 scoreboard re-run for both spins (queued behind this chain) is the last thing
+between this entry and a cross-session table; the two 4096 cells (spin-2 `map2alm` 0.83x, spin-0
+`map2alm` 0.86x) are still the only losses above 1024 and the cap keeps them at 64; spin-0 `alm2map` at
+Nside 128 and the `GMASTER_SPIN2_MARCH_TILE` lever are untouched; and `lane_divergence.py` has still
+never had its output written to a log — run it with a redirect before quoting a lane bound.
+
