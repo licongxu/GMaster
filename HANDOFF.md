@@ -5400,17 +5400,32 @@ process, nside 1024 (`width_proc.log` = HEAD, `trim_timing.log` = trimmed):
 | 64 | 102.61 / 103.00 ms | 102.18 / 101.55 ms |
 | 128 | 73.58 / 73.66 ms | 72.32 / 72.28 ms |
 
-Its value is correctness, not speed. One cost is on the record and one is **not yet measured**: because
-`Lm` is in the `_CALLS` key, the analysis march compiles **one executable per m-window** (24 at nside
-1024 wide, 96 at nside 2048 spin 0) instead of one. The shipped tree's own cold wall clock is **155 s**
-at nside 1024 spin 2 and **271-278 s** at nside 2048 spin 0, `GPUpeak=3.4-3.7GiB`
-(`.qwen/tmp/coldcost.log`). What I wrote here first — "*indistinguishable from HEAD*" — was never
-measured: the two `parent-…` arms of that log imported the **shipped** package, because the driver did
-`cd $GMASTER` first and `''` (cwd) sits in `sys.path` ahead of `PYTHONPATH`, so the worktree was shadowed
-and the A/B ran the same tree twice. The rows labelled `parent` there are void; the rerun is
-`.qwen/tmp/coldcost2.log`, whose arms bootstrap `sys.path.insert(0, tree)` and print the `gmaster` file
-they imported (`.qwen/tmp/run_tree.py`). Do not bucket `Lm` to reduce the compile count — any rounding
-re-creates an unwritten tail, which is the fault being fixed.
+Its value is correctness, not speed. The cost it was expected to carry is now measured, and it is not
+separable from noise. Because `Lm` is in the `_CALLS` key, the analysis march compiles **one executable
+per m-window** (24 at nside 1024 spin 2, 96 at nside 2048 spin 0) instead of one for all windows.
+Cold-process wall clock, arms alternating so clock drift cannot masquerade as compile cost, two passes,
+every arm printing the `gmaster` file it imported (`.qwen/tmp/coldcost2.log`):
+
+| cell | shipped | `96fcbd1` |
+|---|---|---|
+| 1024 spin 2 (24 windows) | 157 / 144 s | 147 / 140 s |
+| 2048 spin 0 (96 windows) | 272 / 267 s | 274 / 256 s |
+
+Mean gaps of +7 s and +4.5 s against a within-tree spread of 13 s (shipped 1024) and 18 s (the parent's
+own 2048 pair), so the honest statement is **no measurable cold-start cost, upper bound ~7 s on a
+150-270 s process**. Do not bucket `Lm` to reduce the compile count — any rounding re-creates an
+unwritten tail, which is the fault being fixed.
+
+**Why the first attempt at that table said nothing.** The driver did `cd $GMASTER` before running the
+`96fcbd1` arms, and `''` (cwd) sits in `sys.path` ahead of `PYTHONPATH`, so the worktree was shadowed and
+all four arms printed `TREE .../GMaster/gmaster/__init__.py`; the rows labelled `parent` in
+`.qwen/tmp/coldcost.log` are void, and the "indistinguishable from HEAD" sentence I wrote from them was
+never measured. It looked self-consistent (278 s vs 271 s), which is exactly how a void A/B survives a
+glance. The editable install is *not* the culprit — `__editable__.gmaster-0.1.0.pth` appends its finder,
+so `PYTHONPATH` does win from a neutral cwd. Use `.qwen/tmp/run_tree.py` for benchmarks and
+`.qwen/tmp/insert_tree.py` (`pytest -p insert_tree`, `$GM_TREE`) for tests: both `sys.path.insert(0,
+tree)` and assert `gmaster.__file__.startswith(tree + "/")`. Treat any A/B log whose provenance lines do
+not differ as unmeasured.
 
 **What the width buys now that spin 2 has it.** ducc0 transform scoreboard, GPU1, `GM_PREC=fp32`, 5
 reps — the same settings as session 28's table, so the columns are comparable
