@@ -445,14 +445,17 @@ def _synth_windows(L, ntile, spin):
     with room: `_ST0` leaves it 4 theta tiles at nside 2048 and 8 at 4096, where the analysis has 16
     and 32.  So the window is grown to fill the ceiling (`cap // ntile`, rounded down to a power of
     two, capped at `_MARCH_M_SYNTH0_MAX`) instead of stopping at 128.  Measured against ducc0, spin-0
-    `alm2map`, fp32, 5 reps, one geometry per process (`.qwen/tmp/swin_s29.log`, and the 4096 point
-    twice over in `.qwen/tmp/s29y.log`): **2048 223.5 ms / 1.36x against 246.3 ms / 1.24x shipped**
-    and **4096 1643.5 ms / 1.20x against 1740.0 ms / 1.14x**, with `rel alm` digit-for-digit unchanged
-    (6.9e-05 / 2.1e-04) because the window only groups independent m-lanes into one launch.  Nside
-    1024 is identical either way (30.2 ms), and Nside 512 -- the only geometry with fewer than four
-    theta tiles, so a 512-wide launch is only 1024 programs -- loses 0.3 ms (4.6 -> 4.9), which is
-    why the rule stops there.  The analysis route keeps `_march_windows`: growing its window past the
-    ceiling does not widen anything, it trips the fallback to `_M_BLOCK` and costs 1.37x at 2048.
+    `alm2map`, fp32, 5 reps, one geometry per process (`.qwen/tmp/swinf_s29.log`, against the
+    pre-change `BOARD` stage of `.qwen/tmp/s29z.log`): **2048 215.6 ms / 1.40x against 246.3 ms /
+    1.24x** and **4096 1649.2 ms / 1.19x against 1740.0 ms / 1.14x**, with `rel alm` digit-for-digit
+    unchanged (6.9e-05 / 2.1e-04) because the window only groups independent m-lanes into one launch.
+    Reproduced in the width sweep of `.qwen/tmp/swin_s29.log` (2048: 217.2 ms with the ceiling at 512,
+    249.6 ms with it at 256; 4096: 1670.6 ms) and at 4096 again in `.qwen/tmp/s29y.log` (1650.3 ms).
+    Nside 1024 does not move (30.2 ms either way, 24 launches of 128 orders against 6 of 512), and the
+    four-tile gate exists because Nside 512 -- two theta tiles, so the rule would pick 256 or 512 there
+    -- measured 4.9 and 5.0 ms against the shipped 4.4 ms in that same pair of arms.  The analysis
+    route keeps `_march_windows`: growing its window past the ceiling does not widen anything, it
+    trips the fallback to `_M_BLOCK` and costs 1.37x at 2048.
     """
     from gmaster import _spin_slice as ss
 

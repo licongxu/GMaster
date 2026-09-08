@@ -187,11 +187,13 @@ _M_BLOCK = int(os.environ.get("GMASTER_M_BLOCK", "64"))
 _MARCH_M_BLOCK = int(os.environ.get("GMASTER_MARCH_M_BLOCK", "128"))
 # Ceiling for the order window of the *folded spin-0 synthesis* launch, which is the one marched
 # route with few enough theta tiles to fill the program ceiling with a wide window: `_ST0` gives it 4
-# tiles at 2048 and 8 at 4096, where the analysis route has 16 and 32.  Worth 1.10x at 2048
-# (246.3 -> 223.5 ms) and 1.06x at 4096 (1740.0 -> 1643.5 ms), `rel alm` unchanged.  Raising the
-# global `_MARCH_M_BLOCK` cannot reach them -- the analysis overflows the ceiling first and silently
-# drops to `_M_BLOCK`, which is 1.37x worse there (`.qwen/tmp/s29y.log`: the 256 arm at nside 2048
-# reads 405.3 ms, i.e. the 64-window value, not a 256-window one).  See
+# tiles at 2048 and 8 at 4096, where the analysis route has 16 and 32.  Worth 1.14x at 2048 (246.3 ->
+# 215.6 ms, a 512-wide window over those 4 tiles) and 1.06x at 4096 (1740.0 -> 1649.2 ms, where the
+# ceiling itself holds the window to 256), `rel alm` unchanged (`.qwen/tmp/s29z.log` against
+# `.qwen/tmp/swinf_s29.log`).  Raising the global `_MARCH_M_BLOCK` cannot reach them -- the analysis
+# overflows the ceiling first and silently drops to `_M_BLOCK`, which is 1.37x worse there
+# (`.qwen/tmp/s29y.log`: the 256 arm at nside 2048 reads 405.3 ms on `map2alm`, i.e. the 64-window
+# value, not a 256-window one).  See
 # :func:`gmaster._spin_march_pallas._synth_windows` for the rule and its measured table.
 _MARCH_M_SYNTH0_MAX = int(os.environ.get("GMASTER_MARCH_M_SYNTH0_MAX", "512"))
 _WINDOW_CACHE = {}
