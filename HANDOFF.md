@@ -6231,5 +6231,92 @@ right thing to try before any further march tuning — with the caveat already i
 2-2.5x for accuracy and can drop a 1.85x cell to 0.74x, i.e. below the reference. If it is ever raised for
 accuracy, it must be per-geometry and paired with a route check, never globally.
 
+## Addendum 11 (session 29d): the float32 route never failed on its tables — it failed because
+## `set_table_precision` was also re-typing the *map*, and holding the azimuthal stage open makes the
+## whole suite pass
+
+Addendum 9 ended on a sentence that is now false: "the float32 table route does not pass the float64
+transform-parity suite". It passed all along on the part addendum 9 was blaming. Of the 24 failures, **21 are
+ring/azimuth parities that contain no Legendre or Wigner table at all** —
+`test_ring_analysis_matches_direct_dft_ring_by_ring`, `test_spin_ring_window_matches_direct_dft_both_ways`,
+`test_ring_synthesis_from_positive_half_matches_centred_window` — and their dtype comes from one line:
+
+```python
+pixels = jnp.reshape(jnp.asarray(map_flat), (-1,)).astype(chirp_in.real.dtype)
+```
+
+in `_forward_ring_fft_positive`. `ring_dtype()` followed `table_dtype()`, so asking for half-size tables also
+silently downcasted the pixel data and ran the azimuthal transform of the science map in float32. The two
+precisions are bought for different reasons — halved *table* bytes change which theta route a geometry
+dispatches to, which is where the whole 2.5-5.4x lives, while the *ring* type changes the FFT the map runs in
+for a ~4.5x azimuthal saving — and coupling them meant the big lever dragged the small one with it.
+
+**`set_ring_precision(name)` / `--gm-ring-precision`.** `gmaster/utils.py` gains `nmt_params.ring_precision`
+with `"follow"` (the default, byte-identical to every published number), `"fp64"` and `"fp32"`, an
+`nmt.set_ring_precision` setter that clears the four ring-table caches, and `nmt.ring_dtype` as the public
+read. `tests/conftest.py` takes the matching `--gm-ring-precision`. `set_table_precision` still clears the
+ring caches, so the two flags commute.
+
+**What it costs, measured.** `.qwen/tmp/ringprec_s29.py` (one process per arm) with `REPEATS=3`; GMaster
+absolute milliseconds, because the CPU reference column itself moved 71 → 128 ms between two adjacent arms at
+256 spin 0 and the ratio column is therefore not the comparison at small `Nside` (addendum 8's ~8 % is
+optimistic):
+
+| Nside | spin | tables fp32, rings follow | tables fp32, rings fp64 | cost | `rel dCl` follow → fp64 |
+|---|---|---|---|---|---|
+| 256 | 0 | 29 ms (2.44x) | 22 ms (5.82x) | −24 % | 1.41e-07 → **6.48e-09** |
+| 256 | 2 | 35 ms (5.94x) | 36 ms (5.44x) | +3 % | 1.19e-07 → **3.22e-08** |
+| 512 | 0 | 96 ms (4.01x) | 104 ms (3.66x) | +8 % | 1.60e-07 → **7.17e-09** |
+| 512 | 2 | 143 ms (5.00x) | 160 ms (5.42x) | +12 % | 3.12e-07 → 3.56e-07 |
+| 1024 | 0 | 637 ms (2.84x) | 678 ms (2.55x) | +6 % | 1.34e-07 → **5.60e-08** |
+| 1024 | 2 | 1068 ms (3.08x) | 1127 ms (2.88x) | +6 % | 3.22e-06 → 3.46e-06 |
+
+At the two geometries where the tables are refused and the march runs, the ring precision is the *only* thing
+this flag can change, and it changes little: `2048 0 fp32/fp64 TOTAL 10262->5543ms (1.85x)`,
+`2048 2 fp32/fp64 TOTAL 18363->8456ms (2.17x)` (`.qwen/tmp/ringprec_scaled_s29.log`), against the board's
+5535 ms fp64 default. **An exact azimuthal transform costs 0-12 % of the pipeline and buys 5-25x on the
+agreement**, everywhere except the two cells whose error is the spin-2 march (512 s2, 1024 s2), which this
+flag cannot touch and which addendum 10 already attributes to the recurrence.
+
+**The suite result that motivated it.** With the tables at float32 and the rings held at `complex128`, the
+full suite is green at both floors tried, and green means *the same counts as the shipped float64 run* once
+the two new tests are included (`.qwen/tmp/ringverify_s29.log`, each arm its own process):
+
+```text
+fp64 default, no floor installed        162 passed, 3 skipped  in 339.08s   (pytest_fp64c_s29.log)
+fp32 tables, rings follow, 2e-6 atol    24 failed, 138 passed, 3 skipped in 335.05s  (pytest_fp32e_s29.log)
+fp32 tables, rings fp64, 2e-6 absolute  162 passed, 3 skipped  in 366.27s   (ringprec_s29.log)
+fp32 tables, rings fp64, 2e-6 relative  162 passed, 3 skipped  in 363.55s   (ringprec_scaled_s29.log)
+policy module only, with the 2 new tests 11 passed             in  28.31s   (ringverify_s29.log)
+shipped default, with the 2 new tests   164 passed, 3 skipped  in 365.02s   (ringverify_s29.log)
+fp32 tables, rings fp64, 2e-6 relative  164 passed, 3 skipped  in 343.33s   (ringverify_s29.log)
+```
+
+**The floor was changed from absolute to relative, and that matters more than it looks.** The 2e-6 of
+addendum 9 was an *absolute* `atol`, and this suite compares O(1) ring sums and O(1e-12) decoupled `Cl`s in
+the same run — so for the pipeline comparisons 2e-6 absolute is ~six orders of magnitude looser than the
+quantity being compared, i.e. those assertions could not fail. `_floored_assert_allclose` now floors at
+`2e-6 * max|desired|`, which says the same thing at every scale (agree to two parts per million) and is
+*stricter* than the old floor wherever the reference is small. Green is reported for both.
+
+`tests/test_table_precision.py` grows two tests (`11 passed in 28.31s`, `.qwen/tmp/ringverify_s29.log`):
+that `follow` couples and `fp64`/`fp32` pin, and that a ring switch rebuilds rather than reuses — the second
+one asserting `fp32 == fp64.astype(complex64)` exactly, which also pins that the recurrence generating the
+chirp is unchanged by the storage choice.
+
+**What is NOT changed.** The shipped default is still float64 tables with `ring_precision = "follow"`, so
+every row in addenda 8-10 reproduces verbatim. The recommended float32 route is now
+`--precision fp32` **plus** `set_ring_precision("fp64")` (or `--gm-precision=fp32 --gm-ring-precision=fp64`
+for the suite); the follow-rings rows stay in this file as the historical numbers. Flipping the library
+default is still the user's call, but the argument for it is now stronger than addendum 9 left it: at a
+2 ppm bar and ≤12 % of wall clock, the fast route no longer fails anything.
+
+**Where the error is now, and what that implies.** With exact rings the residual `rel dCl` at 512 spin 0 is
+**7.17e-09** and at 1024 spin 0 **5.60e-08** — better than the shipped fp64 default's 8.43e-07, because the
+fp32 tables engage the band and the band is the accurate route (addendum 10). The two cells that stay near
+3e-6 are both spin 2 with a table-free or triangle-limited route, so they are the march. That leaves exactly
+one accuracy target and one speed target, and they are the same object.
+
+
 
 
