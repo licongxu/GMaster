@@ -93,6 +93,28 @@ def compute_coupled_cell_flat(
 _OFFSET_CHUNK = 16
 
 
+@partial(jax.jit, static_argnames=("dtype", "lmax", "ncls", "slots", "signs"))
+def _assemble_mcm(dtype, blocks, *, lmax, ncls, slots, signs):
+    """Place the coupling blocks into the mode-coupling matrix in one program.
+
+    The chain of ``matrix.at[:, i, :, j].set(...)`` this replaces was up to eight host
+    dispatches, each copying the whole ``(lmax + 1, ncls, lmax + 1, ncls)`` array.  Traced
+    inside one program the same unrolled chain lowers to a single pass over the output,
+    which takes the `coupling` stage of the pipeline from 6 ms to 3 ms at Nside 32 spin 2
+    (``.qwen/tmp/pipe4_s29.log`` against ``.qwen/tmp/pipe_fix32_s29.log``) and from 2674 ms
+    to 2578 ms at Nside 2048 spin 2 (``.qwen/tmp/pipe2_s29.log`` against
+    ``.qwen/tmp/pipe_fix2048_s29.log``), where each update was copying a 9.7 GB matrix.
+    Values are bit-identical because every sign here is exactly ``+-1``: the agreement with
+    the reference is unchanged (rel ``dCl`` 1.09e-05 at 2048 spin 2 in both logs).
+    """
+    matrix = jnp.zeros((ncls, ncls, lmax + 1, lmax + 1), dtype=dtype)
+    for block, (row, column), sign in zip(blocks, slots, signs):
+        matrix = matrix.at[row, column].set(block * sign)
+    return matrix.transpose(2, 0, 3, 1).reshape(
+        (ncls * (lmax + 1), ncls * (lmax + 1))
+    )
+
+
 @partial(jax.jit, static_argnames="lmax")
 def _coupling_matrix_tt(window_cls, *, lmax):
     """Exact scalar MASTER matrix using the threej_cosmo recurrence.
@@ -1004,37 +1026,34 @@ class NmtWorkspace:
             te_levels = (te, pure_te)
             even_levels = (even, even_one, even_two)
             odd_levels = (odd, odd_one, odd_two)
-        n_ell = self.lmax + 1
-        matrix = jnp.zeros(
-            (n_ell, self.ncls, n_ell, self.ncls), dtype=window_cls.dtype
-        )
+        blocks = []
+        slots = []
+        signs = []
         if self.ncls == 1:
-            matrix = matrix.at[:, 0, :, 0].set(scalar)
+            blocks.append(scalar)
+            slots.append((0, 0))
+            signs.append(1)
         elif self.ncls == 2:
             sign = (-1) ** (self.spin1 + self.spin2)
             pure_e = self.pure_e1 + self.pure_e2
             pure_b = self.pure_b1 + self.pure_b2
-            matrix = matrix.at[:, 0, :, 0].set(
-                (te_levels[pure_e] if pure_any else te) * sign
-            )
-            matrix = matrix.at[:, 1, :, 1].set(
-                (te_levels[pure_b] if pure_any else te) * sign
-            )
+            for index, level in enumerate((pure_e, pure_b)):
+                blocks.append(te_levels[level] if pure_any else te)
+                slots.append((index, index))
+                signs.append(sign)
         else:
             offset = 3 if self.ncls == 7 else 0
             if self.ncls == 7:
-                matrix = matrix.at[:, 0, :, 0].set(scalar)
                 mixed_sign = (-1) ** self.spin2
-                matrix = matrix.at[:, 1, :, 1].set(
-                    (te_levels[int(self.pure_e2)] if pure_any else te) * mixed_sign
-                )
-                matrix = matrix.at[:, 2, :, 2].set(
-                    (te_levels[int(self.pure_b2)] if pure_any else te) * mixed_sign
-                )
-                pure_e1 = self.pure_e2
-                pure_b1 = self.pure_b2
-                pure_e2 = self.pure_e2
-                pure_b2 = self.pure_b2
+                blocks.append(scalar)
+                slots.append((0, 0))
+                signs.append(1)
+                for index, level in enumerate((int(self.pure_e2), int(self.pure_b2))):
+                    blocks.append(te_levels[level] if pure_any else te)
+                    slots.append((1 + index, 1 + index))
+                    signs.append(mixed_sign)
+                pure_e1 = pure_e2 = self.pure_e2
+                pure_b1 = pure_b2 = self.pure_b2
             else:
                 pure_e1, pure_b1 = self.pure_e1, self.pure_b1
                 pure_e2, pure_b2 = self.pure_e2, self.pure_b2
@@ -1048,20 +1067,20 @@ class NmtWorkspace:
                 pure_b1 + pure_b2,
             )
             for index, level in enumerate(levels):
-                matrix = matrix.at[
-                    :, offset + index, :, offset + index
-                ].set((even_levels[level] if pure_any else even) * spin_sign)
-            cross_levels = (levels[0], levels[1], levels[2], levels[3])
-            odd_matrices = [
-                (odd_levels[level] if pure_any else odd) * spin_sign
-                for level in cross_levels
-            ]
-            matrix = matrix.at[:, offset, :, offset + 3].set(odd_matrices[0])
-            matrix = matrix.at[:, offset + 1, :, offset + 2].set(-odd_matrices[1])
-            matrix = matrix.at[:, offset + 2, :, offset + 1].set(-odd_matrices[2])
-            matrix = matrix.at[:, offset + 3, :, offset].set(odd_matrices[3])
-        self.mcm = matrix.reshape(
-            (n_ell * self.ncls, n_ell * self.ncls)
+                blocks.append(even_levels[level] if pure_any else even)
+                slots.append((offset + index, offset + index))
+                signs.append(spin_sign)
+            for index, level in enumerate(levels):
+                blocks.append(odd_levels[level] if pure_any else odd)
+                slots.append((offset + index, offset + 3 - index))
+                signs.append(-spin_sign if index in (1, 2) else spin_sign)
+        self.mcm = _assemble_mcm(
+            window_cls.dtype,
+            tuple(blocks),
+            lmax=self.lmax,
+            ncls=self.ncls,
+            slots=tuple(slots),
+            signs=tuple(signs),
         )
         if self.aniso1 or self.aniso2:
             zeros = jnp.zeros_like(self.pcl_mask)
