@@ -843,11 +843,69 @@ def _anisotropic_coupling_matrix(
     return matrix.reshape((ncls * (lmax + 1), ncls * (lmax + 1)))
 
 
+# The two binning operators are a pure function of the binning scheme, and both are
+# assembled with eager indexed scatters — the slowest way to build an array in XLA (two
+# scatters cost ~1.2ms of host time, which is the whole coupling-matrix call at small
+# Nsides).  The key is the host-side copies of the band arrays, so it is exact content
+# equality and needs no device synchronisation.
+_binning_operator_cache: dict = {}
+
+
+def _binning_key(bins):
+    return (
+        bins.n_bands,
+        bins.lmax,
+        bins._bpws_np.tobytes(),
+        bins._ells_np.tobytes(),
+        bins._weights_np.tobytes(),
+        bins._f_ell_np.tobytes(),
+    )
+
+
 def _binning_operators(bins):
+    key = _binning_key(bins)
+    cached = _binning_operator_cache.get(key)
+    if cached is not None:
+        return cached
     output = jnp.zeros((bins.n_bands, bins.lmax + 1), dtype=jnp.float64)
     output = output.at[bins._bpws, bins._ells].set(bins._factors)
     theory = jnp.zeros((bins.lmax + 1, bins.n_bands), dtype=jnp.float64)
-    return output, theory.at[bins._ells, bins._bpws].set(1 / bins._f_ell)
+    cached = (output, theory.at[bins._ells, bins._bpws].set(1 / bins._f_ell))
+    if len(_binning_operator_cache) > 8:
+        _binning_operator_cache.clear()
+    _binning_operator_cache[key] = cached
+    return cached
+
+
+# `_postprocess` expands both operators by eye(ncls) before touching them; the expansion
+# and the two projections below are six more eager dispatches (~0.5ms) whose only varying
+# input is the coupling matrix itself.
+_expanded_binning_cache: dict = {}
+
+
+def _expanded_binning_operators(bins, ncls):
+    key = _binning_key(bins) + (ncls,)
+    cached = _expanded_binning_cache.get(key)
+    if cached is not None:
+        return cached
+    output, theory = _binning_operators(bins)
+    identity = jnp.eye(ncls)
+    cached = (jnp.kron(output, identity), jnp.kron(theory, identity))
+    if len(_expanded_binning_cache) > 4:
+        _expanded_binning_cache.clear()
+    _expanded_binning_cache[key] = cached
+    return cached
+
+
+@partial(jax.jit, static_argnames=("ncls", "norm_type"))
+def _banded_operators(mcm, beam1, beam2, output, theory, wawb, *, ncls, norm_type):
+    beam = jnp.repeat(beam1 * beam2, ncls)
+    one_sided = output @ (mcm * beam[None, :])
+    if norm_type:
+        mcm_binned = wawb * jnp.eye(output.shape[0])
+    else:
+        mcm_binned = one_sided @ theory
+    return mcm_binned, one_sided
 
 
 class NmtWorkspace:
@@ -1148,17 +1206,17 @@ class NmtWorkspace:
         self._postprocess()
 
     def _postprocess(self):
-        output, theory = _binning_operators(self.bins)
-        identity = jnp.eye(self.ncls)
-        output = jnp.kron(output, identity)
-        theory = jnp.kron(theory, identity)
-        beam = jnp.repeat(self.beam1 * self.beam2, self.ncls)
-        beamed = self.mcm * beam[None, :]
-        one_sided = output @ beamed
-        if self.norm_type:
-            self.mcm_binned = self.wawb * jnp.eye(self.nbands * self.ncls)
-        else:
-            self.mcm_binned = one_sided @ theory
+        output, theory = _expanded_binning_operators(self.bins, self.ncls)
+        self.mcm_binned, one_sided = _banded_operators(
+            self.mcm,
+            self.beam1,
+            self.beam2,
+            output,
+            theory,
+            self.wawb,
+            ncls=self.ncls,
+            norm_type=self.norm_type,
+        )
         self.bpws = jnp.linalg.solve(self.mcm_binned, one_sided)
 
     def get_coupling_matrix(self):

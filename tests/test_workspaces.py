@@ -7,8 +7,10 @@ jax.config.update("jax_enable_x64", True)
 import gmaster as nmt
 from gmaster.workspaces import (
     _apply_toeplitz,
+    _binning_operators,
     _coupling_matrix_tt,
     _coupling_matrix_tt_toeplitz,
+    _expanded_binning_operators,
 )
 
 
@@ -184,6 +186,58 @@ def test_scalar_workspace_updates():
         workspace.update_coupling_matrix(np.eye(lmax))
     with pytest.raises(ValueError, match="wrong shape"):
         workspace.couple_cell(np.ones((2, lmax + 1)))
+
+
+def test_binning_caches_are_keyed_on_band_content():
+    lmax = 7
+    wide = nmt.NmtBin.from_lmax_linear(lmax, 2)
+    equal = nmt.NmtBin.from_lmax_linear(lmax, 2)
+    narrow = nmt.NmtBin.from_edges([2, 5], [5, 8])
+
+    operators = _binning_operators(wide)
+    assert _binning_operators(equal) is operators
+    assert _binning_operators(narrow) is not operators
+    assert _expanded_binning_operators(wide, 1) is _expanded_binning_operators(wide, 1)
+    assert _expanded_binning_operators(wide, 3) is not _expanded_binning_operators(
+        wide, 1
+    )
+
+    output, theory = operators
+    expected = np.zeros((wide.n_bands, lmax + 1))
+    expected[wide._bpws_np, wide._ells_np] = wide._weights_np * wide._f_ell_np
+    np.testing.assert_array_equal(np.asarray(output), expected)
+    expected_t = np.zeros((lmax + 1, wide.n_bands))
+    expected_t[wide._ells_np, wide._bpws_np] = 1.0 / wide._f_ell_np
+    np.testing.assert_array_equal(np.asarray(theory), expected_t)
+
+    identity = np.eye(3)
+    expanded = _expanded_binning_operators(wide, 3)
+    np.testing.assert_array_equal(np.asarray(expanded[0]), np.kron(expected, identity))
+    np.testing.assert_array_equal(
+        np.asarray(expanded[1]), np.kron(expected_t, identity)
+    )
+
+
+def test_bandpower_operators_are_rebuilt_when_bins_change():
+    npix = 12 * 4**2
+    lmax = 7
+    field = nmt.NmtField(
+        np.ones(npix), np.ones((1, npix)), lmax=lmax, lmax_mask=lmax
+    )
+    workspace = nmt.NmtWorkspace.from_fields(
+        field, field, nmt.NmtBin.from_lmax_linear(lmax, 2)
+    )
+    before = np.asarray(workspace.get_bandpower_windows())
+
+    new_bins = nmt.NmtBin.from_lmax_linear(lmax, 3)
+    workspace.update_bins(new_bins)
+    after = np.asarray(workspace.get_bandpower_windows())
+    assert after.shape[1] != before.shape[1]
+
+    fresh = nmt.NmtWorkspace.from_fields(field, field, new_bins)
+    np.testing.assert_allclose(
+        after, np.asarray(fresh.get_bandpower_windows()), rtol=1e-12, atol=1e-14
+    )
 
 
 @pytest.mark.parametrize(
