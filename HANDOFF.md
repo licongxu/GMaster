@@ -5400,11 +5400,17 @@ process, nside 1024 (`width_proc.log` = HEAD, `trim_timing.log` = trimmed):
 | 64 | 102.61 / 103.00 ms | 102.18 / 101.55 ms |
 | 128 | 73.58 / 73.66 ms | 72.32 / 72.28 ms |
 
-Its value is correctness, not speed. Two costs measured so the trade is on the record: because `Lm` is
-in the `_CALLS` key, the analysis march compiles **one executable per m-window** (24 at nside 1024 wide)
-instead of one, and the cold process still runs **221 s** end to end with **`GPUpeak=3.4GiB`**, both
-indistinguishable from HEAD. Do not bucket `Lm` to reduce the compile count — any rounding re-creates an
-unwritten tail, which is the fault being fixed.
+Its value is correctness, not speed. One cost is on the record and one is **not yet measured**: because
+`Lm` is in the `_CALLS` key, the analysis march compiles **one executable per m-window** (24 at nside
+1024 wide, 96 at nside 2048 spin 0) instead of one. The shipped tree's own cold wall clock is **155 s**
+at nside 1024 spin 2 and **271-278 s** at nside 2048 spin 0, `GPUpeak=3.4-3.7GiB`
+(`.qwen/tmp/coldcost.log`). What I wrote here first — "*indistinguishable from HEAD*" — was never
+measured: the two `parent-…` arms of that log imported the **shipped** package, because the driver did
+`cd $GMASTER` first and `''` (cwd) sits in `sys.path` ahead of `PYTHONPATH`, so the worktree was shadowed
+and the A/B ran the same tree twice. The rows labelled `parent` there are void; the rerun is
+`.qwen/tmp/coldcost2.log`, whose arms bootstrap `sys.path.insert(0, tree)` and print the `gmaster` file
+they imported (`.qwen/tmp/run_tree.py`). Do not bucket `Lm` to reduce the compile count — any rounding
+re-creates an unwritten tail, which is the fault being fixed.
 
 **What the width buys now that spin 2 has it.** ducc0 transform scoreboard, GPU1, `GM_PREC=fp32`, 5
 reps — the same settings as session 28's table, so the columns are comparable
