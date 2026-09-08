@@ -201,13 +201,22 @@ def _pow2_f64(d):
 
 
 def _kern(manr, ex0r, xr, xlr, c1r, c0r, cbr, c1lr, c0lr, cblr, lgnr, sgnr, rr, m0_ref, out_ref,
-          *, L, ntheta, chunk, spin=SPIN):
+          *, L, ntheta, chunk, mb, spin=SPIN):
     row = pl.program_id(0)
     tile = pl.program_id(1)
-    m = plt.load(m0_ref.at[0]) + row
+    m0 = plt.load(m0_ref.at[0])
+    m = m0 + row
     nstart = jnp.maximum(m, spin)          # a row below the spin starts its polynomial at ell=spin
     t = tile * chunk + jnp.arange(chunk)
     valid = t < ntheta
+
+    # The slab's `ell` axis is the window's own range (`L - m0`): this row writes `L - nstart` lanes
+    # at index `ell - m0`, and its head of `nstart - m0 <= mb - 1` lanes is the only part of the slab
+    # the march itself never reaches, so the program zeroes it rather than leaving it uninitialized.
+    head = jnp.maximum(nstart - m0, 0)
+    plt.store(out_ref.at[row, tile, slice(0, mb), slice(0, NC)],
+              jnp.zeros((mb, NC), dtype=jnp.float64),
+              mask=(jnp.arange(mb) < head)[:, None])
 
     man = plt.load(manr.at[row, t], mask=valid, other=0.0)
     ex0 = plt.load(ex0r.at[row, t])
@@ -231,7 +240,7 @@ def _kern(manr, ex0r, xr, xlr, c1r, c0r, cbr, c1lr, c0lr, cblr, lgnr, sgnr, rr, 
         val = cur * _pow2((ex - emax).astype(jnp.int32))
         sc = jnp.exp2(emax.astype(jnp.float64) + plt.load(lgnr.at[row, ell]).astype(jnp.float64))
         parts = jnp.sum(val[:, None] * r, axis=0) * (sc * sgn)
-        plt.store(out_ref.at[row, tile, ell, slice(0, NC)], parts.astype(jnp.float64))
+        plt.store(out_ref.at[row, tile, ell - m0, slice(0, NC)], parts.astype(jnp.float64))
 
     def degree(ell, st):
         ph, pl_, ch, cl, ex = st
@@ -283,13 +292,16 @@ def _kern(manr, ex0r, xr, xlr, c1r, c0r, cbr, c1lr, c0lr, cblr, lgnr, sgnr, rr, 
     lax.fori_loop(nstart, L, degree, (zb, zb, man, zb, ex))
 
 
-def _call(L, ntheta, ntile, mb, spin=SPIN):
-    key = (int(L), int(ntheta), int(ntile), int(mb), _TILE, _WARPS, int(spin))
+def _call(L, ntheta, ntile, mb, spin=SPIN, Lm=None):
+    # `Lm` is the slab's ell extent: the window's own range `L - m0`, which is what the row writes
+    # (`L - nstart` lanes at index `ell - m0`) plus the head it zeroes.
+    Lm = L if Lm is None else Lm
+    key = (int(L), int(ntheta), int(ntile), int(mb), int(Lm), _TILE, _WARPS, int(spin))
     call = _CALLS.get(key)
     if call is None:
         call = jax.jit(pl.pallas_call(
-            partial(_kern, L=L, ntheta=ntheta, chunk=_TILE, spin=spin),
-            out_shape=jax.ShapeDtypeStruct((mb, ntile, L, NC), jnp.float64),
+            partial(_kern, L=L, ntheta=ntheta, chunk=_TILE, mb=mb, spin=spin),
+            out_shape=jax.ShapeDtypeStruct((mb, ntile, Lm, NC), jnp.float64),
             grid=(mb, ntile),
             compiler_params=plt.CompilerParams(num_warps=_WARPS),
             name=f"gmaster_spin{int(spin)}_march"))
@@ -391,22 +403,30 @@ def _march_windows(L, ntile, spin):
     1.04x -> **1.45x** (`.qwen/tmp/score_s28.log`; cross-process repetitions of the two losses are
     588.5 -> 611.9 ms in `.qwen/tmp/score_mb_ab.log`).
 
-    Only *spin 0* gets the wide window.  With the polarised routes wide, one build in about
-    twenty-four returns an alm that is entirely NaN (9,440,250 of 9,440,256 entries) and takes the
-    coupled cell with it, while ~60 builds at 64 never do and 24 builds with `jax_debug_nans`
-    enabled never fire.  It is always the first build of the process and only the first, it happens
+    **Session 28 withheld it from spin 0 only.**  With the polarised routes wide, one build in about
+    twenty-four returned an alm that was entirely NaN (9,440,250 of 9,440,256 entries) and took the
+    coupled cell with it, while ~60 builds at 64 never did and 24 builds with `jax_debug_nans`
+    enabled never fired.  It was always the first build of the process and only the first, it happened
     with the analysis wide and the synthesis narrow as well as the reverse, the two widths' results
-    agree to 4.3e-19 when both complete, and no read of the drivers finds a slot the kernel leaves
+    agreed to 4.3e-19 when both completed, and no read of the drivers found a slot the kernel leaves
     unwritten -- the analysis masks its `ell < max(m, spin)` wedge and both synthesis kernels store
     every ``(row, tile, lane)`` once.  That combination is uninitialized device memory, not the
-    arithmetic, so the width is withheld from spin 2 until it is root-caught; the spin-0 folded
-    routes, where no such event has been seen, keep the win.  Reproducers:
+    arithmetic, so the width was withheld from spin 2 until it was root-caught; the spin-0 folded
+    routes, where no such event has been seen, kept the win.  Reproducers:
     `.qwen/tmp/nan_where.py`, `.qwen/tmp/nan_dir.py`, `.qwen/tmp/nan_debug.py`; details in HANDOFF
     session 28.
+
+    **The wedge is root-caught and spin 2 takes the width.**  Session 28's pre-registered experiment
+    was "make the kernel write the wedge and see whether the poisoned wide build stops NaNing"; it did.
+    The analysis slab is now the window's own range (`L - m0`), each row stores at `ell - m0`, and the
+    program zeroes its own `<= mb - 1` lane head instead of leaving allocator bytes there, so every
+    lane the reduce reads is written.  With that, `GMASTER_M_BLOCK=128` gave `max|dCl| = 4.17e-12`,
+    `rel = 3.69e-06` -- digit-for-digit the narrow value -- in every pipeline process tried, against
+    2/2 `nan` at the same cell before the fix (`.qwen/tmp/pipe_trim_wide.log`, HANDOFF session 29).
     """
     from gmaster import _spin_slice as ss
 
-    mb = ss._M_BLOCK if int(spin) else ss._MARCH_M_BLOCK
+    mb = ss._MARCH_M_BLOCK
     if mb * ntile > _MARCH_GRID_CAP:
         mb = ss._M_BLOCK
     return ss._windows(L, mb)
@@ -427,7 +447,6 @@ def _forward_impl(ftm, *, L, spin, nside):
     off = L - 1
     rev = ftm[::-1]                                  # ring i of rev is the ring at pi - theta_i
     sign = ss._sign(L, SPIN)
-    ell = jnp.arange(L)[:, None]
     out = jnp.zeros((L, 2 * L - 1), dtype=jnp.complex128)
     for (m0, m1, lo) in _march_windows(L, ntile, SPIN):
         mb = m1 - m0
@@ -437,16 +456,17 @@ def _forward_impl(ftm, *, L, spin, nside):
         chan = jnp.stack([direct.real.T, direct.imag.T, mirror.real.T, mirror.imag.T], axis=-1)
         rhs = jnp.zeros((mb, npad, NC), dtype=jnp.float32).at[:, :ntheta].set(
             lax.convert_element_type(chan, jnp.float32))
-        parts = _call(L, ntheta, ntile, mb)(*g, rhs, jnp.asarray([m0], jnp.int32)).sum(1)
+        parts = _call(L, ntheta, ntile, mb, Lm=L - m0)(*g, rhs, jnp.asarray([m0], jnp.int32)).sum(1)
         parts = parts.transpose(1, 0, 2)             # (m, ell, channel) -> (ell, m, channel)
-        # Each row starts emitting at ell = max(m, spin) and never writes below it, so whatever the
-        # allocator handed back under that has to be zeroed before it reaches the assembly.
+        # Slab index `i` is ell = m0 + i, and row `i_m` emits from max(m0 + i_m, spin); the kernel
+        # zeroed the head, so this mask only pins the contract down outside the kernel.
         acc = jnp.where(
-            (ell >= jnp.maximum(jnp.arange(mb)[None, :] + m0, SPIN))[..., None], parts, 0.0)
+            (jnp.arange(L - m0)[:, None]
+             >= jnp.maximum(jnp.arange(mb)[None, :], SPIN - m0))[..., None], parts, 0.0)
         # `acc` is already (ell, m, channel); the shipped kernel returns (m, ell, channel) and
         # transposes here, which is the only difference in this assembly.
-        out = out.at[lo:, off + m0:off + m1].set(acc[lo:, :, 0] + 1j * acc[lo:, :, 1])
-        mir = sign[lo:, None] * (acc[lo:, :, 2] + 1j * acc[lo:, :, 3])
+        out = out.at[lo:, off + m0:off + m1].set(acc[:, :, 0] + 1j * acc[:, :, 1])
+        mir = sign[lo:, None] * (acc[:, :, 2] + 1j * acc[:, :, 3])
         if m0:
             out = out.at[lo:, off - m1 + 1:off - m0 + 1].set(mir[:, ::-1])
         else:
@@ -568,13 +588,14 @@ def _forward_fold_impl(positive, weights, phase, *, L, nside):
         mb = m1 - m0
         g = _window_geometry(m0, mb, x, sh, ch, L, npad, spin=0)
         rhs = rhs_all[m0:m1]
-        parts = _call(L, north, ntile, mb, spin=0)(
-            *g, rhs, jnp.asarray([m0], jnp.int32)).sum(1)      # (mb, L, NC)
+        parts = _call(L, north, ntile, mb, spin=0, Lm=L - m0)(
+            *g, rhs, jnp.asarray([m0], jnp.int32)).sum(1)      # (mb, L - m0, NC)
         ms = m0 + jnp.arange(mb)
-        # Rows emit from `ell = m` and never below it, so whatever the allocator handed back under
-        # that has to be zeroed before it reaches the assembly.
-        parts = jnp.where((jnp.arange(L)[None, :] >= ms[:, None])[..., None], parts, 0.0)
-        sgn = 1.0 - 2.0 * ((ms[:, None] + jnp.arange(L)[None, :]) % 2)
+        el = m0 + jnp.arange(L - m0)
+        # Rows emit from `ell = m` and never below it; the kernel zeroed that head and the mask keeps
+        # the assembly independent of it.
+        parts = jnp.where((el[None, :] >= ms[:, None])[..., None], parts, 0.0)
+        sgn = 1.0 - 2.0 * ((ms[:, None] + el[None, :]) % 2)
         # The scalar route's rows are `sqrt((2l+1)/4pi) * d^l_{m0}`, not the bare Wigner row: the
         # band's `_diagonal_normalization` seed carries the degree factor (measured as a constant
         # ratio of exactly that over every row and lane, 5.2e-08 at Nside 32), and so does the
@@ -582,8 +603,8 @@ def _forward_fold_impl(positive, weights, phase, *, L, nside):
         # degree factor is applied here rather than inside the kernel, where it would also land on
         # the spin-2 route -- whose contract deliberately leaves it to `_finish_forward_s2fft`.
         block = ((parts[..., 0] + 1j * parts[..., 1])
-                 + sgn * (parts[..., 2] + 1j * parts[..., 3])) * norm[None, :]
-        cols.append(block.T)                                    # (L, mb)
+                 + sgn * (parts[..., 2] + 1j * parts[..., 3])) * norm[m0:][None, :]
+        cols.append(jnp.zeros((L, mb), dtype=block.dtype).at[m0:, :].set(block.T))
     # Window column ranges are disjoint and tile the positive-m block, so one concatenation assembles
     # it; `out.at[...].set` per window would copy the whole buffer once per window (see
     # `_inverse_impl`).
