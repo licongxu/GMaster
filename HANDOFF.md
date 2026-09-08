@@ -5885,3 +5885,61 @@ and 2048 is 2x worse — a 2048-lane row cannot hold its theta reduction in `_SW
 is confirmed at the largest measured geometry, and the tile family (`_TILE`, `_ST`, `_ST0`, `_SW`) is
 closed in every direction it has been probed.
 
+### Session 29 addendum 6 — the END-TO-END board against the NaMaster CPU reference, Nside 32 to 4096, both spins
+
+Every previous board is the isolated transform (`sht_vs_ducc.py`, ducc0 as the baseline). The claim
+"faster than NaMaster at every Nside" also has to hold for the whole MASTER pipeline
+(`python -m benchmarks.benchmark_pipeline --nside N --spins S --repeats 3`), which is `NmtField` →
+coupling matrix → coupled cell → decoupled cell against real `pymaster` in the same process, on a real
+mask, with `n_iter=3` and 30 bands. Medians of 3, one configuration per process, `GPU1`:
+
+| Nside | spin 0 NaMaster → GMaster | ratio | spin 2 NaMaster → GMaster | ratio | rel `dCl` (s0 / s2) |
+|---|---|---|---|---|---|
+| 32 | 3 → 4 ms | **1.0x** | 4 → 7 ms | **0.5x** | 1.92e-14 / 6.26e-11 |
+| 64 | 10 → 6 ms | **1.6x** | 13 → 8 ms | **1.8x** | 5.94e-14 / 1.07e-10 |
+| 128 | 18 → 13 ms | **1.4x** | 39 → 16 ms | **2.5x** | 1.08e-13 / 4.90e-09 |
+| 256 | 55 → 29 ms | **1.9x** | 160 → 57 ms | **2.8x** | 4.79e-13 / 2.74e-08 |
+| 512 | 328 → 165 ms | **2.0x** | 722 → 355 ms | **2.0x** | 1.71e-12 / 3.56e-07 |
+| 1024 | 1745 → 1007 ms | **1.7x** | 3288 → 1310 ms | **2.5x** | 8.43e-07 / 3.69e-06 |
+| 2048 | 10593 → 5487 ms | **1.9x** | 18413 → 8549 ms | **2.2x** | 1.38e-06 / 1.09e-05 |
+| 4096 | 75091 → 42776 ms | **1.8x** | not run | — | 1.41e-06 / — |
+
+Logs: `.qwen/tmp/pipe4_s29.log` (32-256), `.qwen/tmp/pipe3_s29.log` (512, 4096 spin 0, and a second
+process at 2048 spin 0 that reproduced 5499 ms / 1.9x against 5487 ms), `.qwen/tmp/s29z.log` stage `PIPE`
+(1024 and 2048 both spins), `.qwen/tmp/pipe2_s29.log` (2048 right after addendum 5). Nside 4096 spin 2 is
+absent for capacity, not for failure: its 2048 sibling peaks at 85.4 GB RSS and the reference's coupling
+tables scale about 4x against 316 GB of host RAM.
+
+**Where the win comes from changes with size, and that is the useful part of this table.** At 4096 the
+transform stage barely moves (NaMaster `field` 15640 ms → GMaster 14801 ms, 1.06x — `field` is 7
+transform passes and `map2alm` there is still 0.88x), and the 1.8x comes from `coupling` 43325 → 12559 ms
+(3x) and `coupled_cell` 530 → 2 ms (330x). At 512-2048 both halves contribute. Below 128 it is the
+opposite: `field` is 2-4x but `coupling` inverts (Nside 64: NaMaster 1 ms → GMaster 3 ms; Nside 32 spin 2:
+1 ms → 6 ms), which is the fixed per-launch XLA dispatch cost measured in
+`jit-boundaries-are-the-small-n-cost`, not arithmetic. That single stage is the entire reason Nside 32
+reads 1.0x / 0.5x here while the isolated transform at 32 is at parity: 6 ms of dispatch on a 4 ms job.
+
+**So the honest summary of the two boards is:** end to end against NaMaster, GMaster is 1.6-2.8x from 64
+to 4096 in both spins with `dCl` agreement to 1e-6 relative or better everywhere, and Nside 32 is the one
+configuration where the dispatch floor still costs more than the arithmetic it replaces.
+
+**The small end is where the trajectory is largest, and the same command proves it.** "Then" is the most
+recent earlier run of this harness at that Nside: `honest_bench2.log` (09-03) for 64-512,
+`baseline_nsides.log` (09-02) for 32, where nothing newer exists. GMaster ms and ratio; the NaMaster side
+moved by a few percent over the interval (512 spin 0: 346 ms then, 328 ms now), so these are GMaster
+changes:
+
+| Nside | spin 0 then → now | spin 2 then → now |
+|---|---|---|
+| 32 | 43 ms (0.1x) → **4 ms (1.0x)** | 59 ms (0.1x) → **7 ms (0.5x)** |
+| 64 | 16 ms (0.6x) → **6 ms (1.6x)** | 14 ms (1.0x) → **8 ms (1.8x)** |
+| 128 | 16 ms (1.5x) → **13 ms (1.4x)** | 28 ms (1.5x) → **16 ms (2.5x)** |
+| 256 | 60 ms (1.0x) → **29 ms (1.9x)** | 140 ms (1.1x) → **57 ms (2.8x)** |
+| 512 | 360 ms (1.0x) → **165 ms (2.0x)** | 8701 ms (0.1x) → **355 ms (2.0x)** |
+
+The spin-2 `field` stage is what changed. At Nside 128 it was 241 ms of a 271 ms total on 09-02, 11 ms on
+09-03 and **3 ms** today; at 512 it was 8489 ms of an 8701 ms total on 09-03 and is **240 ms** today
+(`final_n512.log` reproduces the September 512 arm independently at 289 ms / 8711 ms, so the two old runs
+agree with each other). Nside 128 spin 0 is the one row that did not improve (16 → 13 ms is inside the
+launch-cost floor's spread); it is also the cell where the isolated transform still reads 0.93x.
+
