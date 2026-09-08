@@ -226,6 +226,19 @@ Run the parity suite on CPU with:
 JAX_ENABLE_X64=1 JAX_PLATFORMS=cpu python -m pytest -q
 ```
 
+The same suite runs at the float32 table precision:
+
+```bash
+python -m pytest -q tests --gm-precision=fp32
+```
+
+That option pins the whole session to `set_table_precision("fp32")` — re-asserting it
+before every test, so a module that restores the default cannot silently move the rest
+of the run back to float64 — and holds `numpy.testing.assert_allclose` to a 2e-6
+absolute floor while float32 is live, which is the loosest bar this suite already uses
+and about the size of the table's own representation error. The default float64 run
+installs nothing: every bar stays exactly as its test file writes it.
+
 The current CPU suite contains 111 passing tests and 5 hardware-dependent skips,
 including direct API/numerical comparisons against NaMaster. Dedicated NVIDIA
 tests cover fused scalar parity and gradients; two-GPU tests cover scalar and
