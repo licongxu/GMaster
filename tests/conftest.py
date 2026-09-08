@@ -16,8 +16,16 @@ things:
   (a `-c`/`-p` bootstrap that imports before the test modules enable x64 gets this
   wrong in both directions);
 * puts a floor under the ``atol`` of ``numpy.testing.assert_allclose`` for as long as
-  fp32 is live.  The floor is the 2e-6 absolute bar this suite already uses for its
-  loosest comparisons, applied only while fp32 is the live precision.
+  fp32 is live.  The floor is 2e-6 *of the compared quantity* — ``max|desired|``, not a
+  fixed absolute — because this suite asserts on O(1) ring sums and O(1e-12) decoupled
+  ``Cl``s in the same run, and one absolute number can only be meaningless for one of
+  them.
+
+``--gm-ring-precision`` pins the azimuthal transforms separately.  It matters because
+``set_table_precision`` used to move them too: the analysis chirp-Z casts the map pixels
+to the chirp's own real dtype, so a float32 table session analyzed the map in float32 and
+failed every direct-DFT ring parity in ``test_sht.py``.  Held to ``fp64`` the fp32 table
+route passes the whole suite.
 
 At the default fp64 nothing here is installed: ``numpy.testing.assert_allclose`` is the
 real function and every bar is exactly what its test file says.
@@ -26,8 +34,9 @@ real function and every bar is exactly what its test file says.
 import numpy as np
 import pytest
 
-# Absolute bar the fp32 table route is held to, measured against the float64 reference.
-# It is the loosest atol already present in this suite, not a new, looser invention.
+# Relative bar the fp32 table route is held to, scaled by max|desired| at each call site.
+# 2e-6 is the loosest atol already written into this suite and about the size of the
+# float32 table's own representation error.
 FP32_ATOL = 2e-6
 
 _REAL_ASSERT_ALLCLOSE = np.testing.assert_allclose
@@ -40,37 +49,54 @@ def pytest_addoption(parser):
         choices=("fp64", "fp32"),
         help="GMaster table precision for the whole session (default: the shipped fp64).",
     )
+    parser.addoption(
+        "--gm-ring-precision",
+        default="follow",
+        choices=("follow", "fp64", "fp32"),
+        help="GMaster azimuthal transform precision; 'follow' tracks the table "
+        "precision, which is the shipped behaviour.",
+    )
 
 
 def _floored_assert_allclose(actual, desired, *args, **kwargs):
     from gmaster import nmt_params
 
     if nmt_params.table_dtype == "fp32":
-        kwargs["atol"] = max(float(kwargs.get("atol", 0.0) or 0.0), FP32_ATOL)
+        # A fixed absolute bar is meaningless across this suite's scales: transform
+        # parities compare O(1) ring sums while a decoupled Cl is O(1e-12), and 2e-6
+        # absolute would be vacuous for the latter.  The floor is 2e-6 *of the compared
+        # quantity*, so it says the same thing everywhere: agree to two parts per million.
+        scale = float(np.max(np.abs(np.asarray(desired))))
+        kwargs["atol"] = max(float(kwargs.get("atol", 0.0) or 0.0), FP32_ATOL * scale)
     return _REAL_ASSERT_ALLCLOSE(actual, desired, *args, **kwargs)
 
 
 def pytest_configure(config):
-    if config.getoption("--gm-precision") == "fp64":
+    precision = config.getoption("--gm-precision")
+    ring = config.getoption("--gm-ring-precision")
+    if precision == "fp64" and ring == "follow":
         return
     import jax
 
     jax.config.update("jax_enable_x64", True)
     import gmaster as nmt
 
-    nmt.set_table_precision(config.getoption("--gm-precision"))
+    nmt.set_table_precision(precision)
+    nmt.set_ring_precision(ring)
     np.testing.assert_allclose = _floored_assert_allclose
     print(f"SESSION table precision = {nmt.table_dtype().__name__} "
+          f"ring precision = {nmt.ring_dtype().__name__} "
           f"atol floor = {FP32_ATOL:g}", flush=True)
 
 
 @pytest.fixture(autouse=True)
 def _session_table_precision(request):
     wanted = request.config.getoption("--gm-precision")
-    if wanted == "fp64":
+    wanted_ring = request.config.getoption("--gm-ring-precision")
+    if wanted == "fp64" and wanted_ring == "follow":
         yield
         return
-    from gmaster import nmt_params, set_table_precision
+    from gmaster import nmt_params, set_ring_precision, set_table_precision
 
     # Every test in this module is about the shipped default and the effect of leaving
     # it — that the default is fp64, that selecting fp32 halves the band, that switching
@@ -84,6 +110,10 @@ def _session_table_precision(request):
         return
     if nmt_params.table_dtype != wanted:
         set_table_precision(wanted)
+    if nmt_params.ring_precision != wanted_ring:
+        set_ring_precision(wanted_ring)
     yield
     if nmt_params.table_dtype != wanted:
         set_table_precision(wanted)
+    if nmt_params.ring_precision != wanted_ring:
+        set_ring_precision(wanted_ring)

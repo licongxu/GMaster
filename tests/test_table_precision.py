@@ -19,6 +19,7 @@ _HAS_NVIDIA_GPU = any(
 def _restore_precision():
     yield
     utils.set_table_precision("fp64")
+    utils.set_ring_precision("follow")
     _theta_matrix.release()
     _spin_slice.clear_cache()
 
@@ -36,6 +37,45 @@ def test_float64_is_the_default():
 def test_unknown_precision_is_rejected():
     with pytest.raises(KeyError):
         utils.set_table_precision("fp16")
+    with pytest.raises(KeyError):
+        utils.set_ring_precision("fp16")
+
+
+def test_ring_precision_follows_the_tables_only_while_it_follows():
+    """`follow` is the historical coupling; `fp64`/`fp32` pin it independently.
+
+    The coupling is not cosmetic: the analysis chirp-Z casts the map pixels to the
+    chirp's own real dtype, so under `follow` an fp32 session analyzes the map in
+    float32 and the ring sums come out ~1e-7.  Held to `fp64` the same session
+    reproduces the float64 ring sums exactly, which is what makes the float32 table
+    route pass the transform-parity suite.
+    """
+    assert utils.nmt_params.ring_precision == "follow"
+    assert utils.ring_dtype() == jnp.complex128
+
+    utils.set_table_precision("fp32")
+    assert utils.ring_dtype() == jnp.complex64
+
+    utils.set_ring_precision("fp64")
+    assert utils.ring_dtype() == jnp.complex128
+    assert utils.table_dtype() == jnp.float32
+
+    utils.set_ring_precision("fp32")
+    assert utils.ring_dtype() == jnp.complex64
+
+
+def test_ring_switch_rebuilds_the_ring_tables():
+    nside, L = 32, 96
+    fp64 = utils._ring_analysis_tables(L, nside)
+    assert fp64[0].dtype == jnp.complex128
+
+    utils.set_ring_precision("fp32")
+    fp32 = utils._ring_analysis_tables(L, nside)
+    assert fp32[0].dtype == jnp.complex64
+    # The chirp is a phase ramp: the two precisions are the same numbers, rounded.
+    np.testing.assert_allclose(
+        np.asarray(fp32[0]), np.asarray(fp64[0]).astype(np.complex64),
+        rtol=0.0, atol=0.0)
 
 
 def test_band_storage_follows_the_selection():

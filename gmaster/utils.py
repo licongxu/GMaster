@@ -34,11 +34,15 @@ class NmtParams:
         # Storage precision of the precomputed transform tables.  Every
         # contraction accumulates in float64 whatever this is.
         self.table_dtype = "fp64"
+        # Element type of the azimuthal transforms.  "follow" keeps the historical
+        # coupling to the table precision; "fp64"/"fp32" pin it independently.
+        self.ring_precision = "follow"
 
 
 nmt_params = NmtParams()
 
 _TABLE_DTYPES = {"fp64": jnp.float64, "fp32": jnp.float32}
+_RING_DTYPES = {"follow": None, "fp64": jnp.complex128, "fp32": jnp.complex64}
 
 
 def table_dtype():
@@ -47,17 +51,45 @@ def table_dtype():
 
 
 def ring_dtype():
-    """Element type of the azimuthal (ring) transforms, following the table precision.
+    """Element type of the azimuthal (ring) transforms.
 
     The ring stage is a batched FFT, and on this card a double-precision FFT is
     compute-bound at roughly the fp64 FMA rate while the fp32 one runs on the tensor-core
     path: the same length transform is ~4.5x cheaper in `complex64` (`.qwen/tmp/ring_fp32_ab.py`:
-    0.91 -> 0.21 ms at Nside 512, 4.08 -> 0.83 ms at 1024).  Its representation error is
-    ~4e-7 relative on the ring sums, the same order as the fp32 table error that
-    `set_table_precision("fp32")` already buys, and the theta contraction downstream of it
-    accumulates in float64 either way.
+    0.91 -> 0.21 ms at Nside 512, 4.08 -> 0.83 ms at 1024).
+
+    With the default ``nmt_params.ring_precision == "follow"`` it tracks
+    `set_table_precision`, which is what every published number used.  The cast is not
+    confined to the chirp tables: `_forward_ring_fft_positive` casts the *pixels* to the
+    chirp's real dtype too, so ``"follow"`` with fp32 tables analyzes the map itself in
+    float32.  ``set_ring_precision("fp64")`` keeps the azimuthal stage exact under fp32
+    tables; ``"fp32"`` buys the ~4.5x regardless of the table choice.
     """
+    forced = _RING_DTYPES[nmt_params.ring_precision]
+    if forced is not None:
+        return forced
     return jnp.complex64 if table_dtype() == jnp.float32 else jnp.complex128
+
+
+def set_ring_precision(name):
+    """Choose the element type of the azimuthal transforms independently of the tables.
+
+    The two precisions are bought for different reasons: halved *table* bytes change which
+    theta route a geometry dispatches to, while the *ring* precision changes the FFT that
+    the map pixels run in.  Following the tables couples them; this breaks the coupling so
+    an fp32 table route can keep an exact azimuthal transform.
+
+    Clears the ring table caches for the same reason `set_table_precision` does.
+    """
+    if name not in _RING_DTYPES:
+        raise KeyError("GMaster ring precision must be 'follow', 'fp64' or 'fp32'")
+    if name == nmt_params.ring_precision:
+        return
+    nmt_params.ring_precision = name
+    _ring_analysis_tables.cache_clear()
+    _ring_synthesis_tables.cache_clear()
+    _spin_ring_analysis_tables.cache_clear()
+    _spin_ring_synthesis_tables.cache_clear()
 
 
 def set_table_precision(name):

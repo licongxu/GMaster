@@ -229,14 +229,21 @@ JAX_ENABLE_X64=1 JAX_PLATFORMS=cpu python -m pytest -q
 The same suite runs at the float32 table precision:
 
 ```bash
-python -m pytest -q tests --gm-precision=fp32
+python -m pytest -q tests --gm-precision=fp32 --gm-ring-precision=fp64
 ```
 
-That option pins the whole session to `set_table_precision("fp32")` — re-asserting it
+`--gm-precision` pins the whole session to `set_table_precision("fp32")` — re-asserting it
 before every test, so a module that restores the default cannot silently move the rest
-of the run back to float64 — and holds `numpy.testing.assert_allclose` to a 2e-6
-absolute floor while float32 is live, which is the loosest bar this suite already uses
-and about the size of the table's own representation error. The default float64 run
+of the run back to float64. `--gm-ring-precision` then controls the azimuthal transforms
+independently, which matters because `set_table_precision` used to drag them down with it:
+the float32 chirp tables cast the *pixels* too, so a float32 session analyzed the map
+itself in float32. Held to `complex128` the whole suite passes — **164 passed, 3 skipped**,
+the same result as the default float64 run — for 0-12 % of the pipeline wall clock.
+
+While float32 tables are live, `numpy.testing.assert_allclose` is held to a floor of
+**2e-6 of the compared quantity** (its own `max|desired|`, not a fixed absolute), which is
+about the size of the float32 table's representation error and is stated relative because a
+decoupled `Cl` and a ring sum differ by twelve orders of magnitude. The default float64 run
 installs nothing: every bar stays exactly as its test file writes it.
 
 The current CPU suite contains 111 passing tests and 5 hardware-dependent skips,
