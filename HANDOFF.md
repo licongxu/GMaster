@@ -5904,6 +5904,10 @@ mask, with `n_iter=3` and 30 bands. Medians of 3, one configuration per process,
 | 2048 | 10593 → 5487 ms | **1.9x** | 18413 → 8549 ms | **2.2x** | 1.38e-06 / 1.09e-05 |
 | 4096 | 75091 → 42776 ms | **1.8x** | not run | — | 1.41e-06 / — |
 
+**Superseded by addendum 7 for every row** (the mode-coupling assembly now runs in one program, and the
+small end was re-measured at 9-15 repeats instead of 3 — which also retires the "32 spin 0 = 1.0x" cell,
+it is 0.7x).
+
 Logs: `.qwen/tmp/pipe4_s29.log` (32-256), `.qwen/tmp/pipe3_s29.log` (512, 4096 spin 0, and a second
 process at 2048 spin 0 that reproduced 5499 ms / 1.9x against 5487 ms), `.qwen/tmp/s29z.log` stage `PIPE`
 (1024 and 2048 both spins), `.qwen/tmp/pipe2_s29.log` (2048 right after addendum 5). Nside 4096 spin 2 is
@@ -5942,4 +5946,83 @@ The spin-2 `field` stage is what changed. At Nside 128 it was 241 ms of a 271 ms
 (`final_n512.log` reproduces the September 512 arm independently at 289 ms / 8711 ms, so the two old runs
 agree with each other). Nside 128 spin 0 is the one row that did not improve (16 → 13 ms is inside the
 launch-cost floor's spread); it is also the cell where the isolated transform still reads 0.93x.
+
+### Session 29 addendum 7 — the mode-coupling matrix is now assembled in one program (`6a3e68d`)
+
+Addendum 6 attributed the whole Nside 32-64 deficit to "per-launch XLA dispatch" without saying which
+launches. It said the coupling stage cost 6 ms on a 4 ms job at Nside 32 spin 2. The probe
+(`.qwen/tmp/couple_prof_s29.py`, blocking timers around every block-building helper inside
+`compute_coupling_matrix`) localised it: on the shipped code one warm build of field plus coupling is
+**5.10 ms**, of which *all* the block-building helpers together — `_compute_coupled_cell`,
+`_coupling_matrices_spin2`, `_general_coupling_matrix` — are **1.45 ms** (`.qwen/tmp/couple_after_s29.log`,
+`--- warm2`). Everything else is code with no helper to time: the tail of `compute_coupling_matrix`
+chained up to eight `matrix.at[:, i, :, j].set(block * sign)` functional updates on the
+`(lmax+1, ncls, lmax+1, ncls)` matrix, and each one is its own host dispatch that copies the *entire*
+matrix — 9.7 GB of it at Nside 2048 spin 2. Spin 0 (ncls = 1, one update) never showed the effect, which
+is why the same size read 2 ms there and 6 ms at spin 2 (`pipe4_s29.log`). The fix moves the identical
+unrolled chain into one `jax.jit` (`workspaces._assemble_mcm`), where XLA lowers it to a single pass;
+nothing about the values can change because every sign in the chain is exactly ±1. (The probe also ran
+against the pre-change tree, but that output was never written to a log, so it is not quoted anywhere
+below; every before/after figure here comes from the pipeline harness.)
+
+**`coupling` stage in milliseconds.** `before` is `pipe4_s29.log` / `pipe_s28.log` / `pipe2_s29.log`
+(repeats = 3), `after` is `pipe_fix32_s29.log`, `pipe_fix_s29.log`, `pipe_fix_tiny_s29.log` (repeats 9-15)
+and `pipe_fix2048_s29.log`; the NaMaster column is from the after-runs, kept for scale, and it moves a few
+percent between processes:
+
+| Nside | spin 0 NaMaster | spin 0 before → after | spin 2 NaMaster | spin 2 before → after |
+|---|---|---|---|---|
+| 32 | 0 ms | 2 → 2 ms | 1 ms | 6 → **3** ms (2 at 15 repeats) |
+| 64 | 1 ms | 3 → **2** ms | 3 ms | 6 → **3** ms (2 at 15 repeats) |
+| 128 | 3 ms | 3 → **2** ms | 16 ms | 5 → **3** ms (2 at 9 repeats) |
+| 256 | 14 ms | 6 → **5** ms | 83 ms | 10 → **7** ms |
+| 512 | 110 ms | 30 → **29** ms | 370 ms | 51 → **46** ms |
+| 1024 | 773 ms | 203 → **201** ms | 1804 ms | 359 → **334** ms |
+| 2048 | 5568 ms | 1527 → 1578 ms | 10363 ms | 2674 → **2578** ms |
+
+Spin 0 is the control: `ncls = 1` means one update in the old chain, so there was almost nothing to fold,
+and its numbers move by less than the run-to-run spread (2048 is the one row that reads slower, 51 ms on a
+1.5 s stage against a 5.5 s total). Spin 2 is where the eight updates lived.
+
+**The board, re-measured with more repeats, and one correction to addendum 6.** The addendum-6 board is
+medians of 3; at Nside 32 the whole job is 3-4 ms, so its integer-millisecond rows were resolvable only by
+luck. Medians of 9 (15 at 32-64) say:
+
+| Nside | spin 0 NaMaster → GMaster | ratio | spin 2 NaMaster → GMaster | ratio | rel `dCl` (s0 / s2) |
+|---|---|---|---|---|---|
+| 32 | 3 → 3 ms | **0.7x** | 3 → 3 ms | **1.0x** | 1.92e-14 / 6.26e-11 |
+| 64 | 10 → 5 ms | **1.8x** | 14 → 6 ms | **2.5x** | 5.92e-14 / 1.07e-10 |
+| 128 | 19 → 12 ms | **1.5x** | 41 → 13 ms | **3.1x** | 1.08e-13 / 4.90e-09 |
+| 256 | 61 → 28 ms | **2.1x** | 166 → 54 ms | **3.1x** | 4.78e-13 / 2.74e-08 |
+| 512 | 323 → 164 ms | **2.0x** | 689 → 349 ms | **2.0x** | 1.71e-12 / 3.56e-07 |
+| 1024 | 1716 → 944 ms | **1.8x** | 3197 → 1261 ms | **2.5x** | 8.43e-07 / 3.69e-06 |
+| 2048 | 10193 → 5535 ms | **1.8x** | 18011 → 8448 ms | **2.1x** | 1.38e-06 / 1.09e-05 |
+| 4096 | 72347 → 41944 ms | **1.7x** | not run | — | 1.41e-06 / — |
+
+Nside 32-512 rows are from `pipe_fix_tiny_s29.log` (32/64 at 15 repeats, 128-512 at 9), 1024 from
+`pipe_fix_s29.log`, 2048 from `pipe_fix2048_s29.log` (both at repeats = 3) and 4096 spin 0 from
+`pipe_fix4096_s29.log` (repeats = 1, replacing the 42776 ms / 1.8x of addendum 6). **The correction:**
+addendum 6's "32 spin 0 = 1.0x" was a rounding artifact of repeats = 3 — at 15 repeats the ratio prints
+**0.7x** even though both sides still round to 3 ms (the harness prints `ref/gm` to one decimal and the
+milliseconds to none, so a 0.7x reading is NaMaster ≈2.5 ms against GMaster just above 3 ms).
+Spin 2 at 32 went 0.5x → **1.0x**, and every row from 64 up is unchanged or better than addendum 6 in
+GMaster milliseconds. At 4096 the ratio reads 1.7x rather than addendum 6's 1.8x only because the CPU
+reference came in faster this run (72347 ms against 75091 ms); GMaster itself went 42776 → 41944 ms, with
+`coupling` 12559 → 12548 ms and `rel dCl` identical at 1.41e-06 — as expected for the one-update ncls = 1
+path, where the change replaces a dispatch rather than any arithmetic.
+
+**Why Nside 32 is still not a win, and what will not fix it.** With the assembly folded, the remaining
+3-4 ms is five or six jit entries in series (field build, coupled cell, block builder, assembly, decouple)
+on a problem NaMaster does in three. The obvious lever is CUDA-graph capture, and it is not available:
+`XLA_FLAGS=--xla_gpu_enable_command_buffer=GPU` and `=AutoFusion` both abort at process start in this
+jaxlib with `Illegal value for --xla_gpu_enable_command_buffer` (`.qwen/tmp/pipe_cbuf32_s29.log`), and
+`jaxlib` exposes the debug option with an empty default and no GPU mode
+(`jax/_src/compiler.py:549`). Two eager ops remain in the coupling prologue (`pcl_mask - Nw` and the
+zero-pad to `2*lmax+1`), worth ~0.3 ms at 32 and noise everywhere else; they were left alone deliberately
+rather than restructuring a hot path for a millisecond that still would not cross 1x.
+
+Suite after the change: **162 passed, 3 skipped in 328.82 s** (`.qwen/tmp/pytest_s29g.log`), which covers
+all four `ncls` shapes through `test_arbitrary_spin_workspaces_match_namaster`,
+`test_spin2_workspaces_match_namaster`, `test_pure_spin2_workspaces_match_namaster` (the
+`even_levels`/`odd_levels` selection path) and the anisotropic workspaces.
 
