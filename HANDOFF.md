@@ -5608,3 +5608,39 @@ it had not.  And `pkill -TERM -f 'verify_s29h.sh'` matches the `bash -c` wrapper
 itself, which killed my own tool call (signal 15) mid-check; use a bracketed pattern
 (`[v]erify_s29h`) for both `pgrep` and `pkill`.
 
+**Which Nsides were actually broken, enumerated** (`.qwen/tmp/lattice_s29.py`, CPU-only, walks the
+shipped `_march_windows` rather than re-deriving it): the masked `(mb, NC)` head block made the spin-2
+analysis march uncompilable at **nside 16, 32, 80, 112, 160, 416 and 928** — ragged last windows of 48,
+96, 112, 80, 96, 96 and 96 rows.  Every power of two was clean: `3n ≡ 0 (mod 128)` iff `n ≡ 0 (mod 128)`
+so nside ≥ 128 gives exact 128-row windows, and nside 64's ragged remainder is 64, itself a power of
+two.  The HEALPix power-of-two lattice is precisely the set that hides this class of bug, and 928/416/160
+are arbitrary-footprint sizes rather than unit-test sizes, so `2b06c44` puts nside 160 in the guard
+alongside the tiny cases (six cases pass in 25.83 s).
+
+**Post-fix fp32 scoreboard re-run** (`score_s29b_spin2.log` / `score_s29b_spin0.log`, same command and
+precision as the session's earlier `score_s29_fp32_2.log`, 5 reps):
+
+| cell | DUCC ms | GMaster ms | speedup | before the fix | rel alm |
+|---|---|---|---|---|---|
+| 512 s2 `map2alm` | 28.6 | 9.3 | 3.07x | 3.11x (8.9 ms) | 3.2e-07 |
+| 512 s2 `alm2map` | 23.8 | 8.7 | 2.72x | 2.69x (8.5 ms) | – |
+| 1024 s2 `map2alm` | 112.2 | 78.2 | **1.44x** | 1.44x (77.8 ms) | 3.7e-05 |
+| 1024 s2 `alm2map` | 101.0 | 71.1 | **1.42x** | 1.41x (71.4 ms) | – |
+| 2048 s2 `map2alm` | 602.0 | 575.1 | **1.05x** | 1.04x (573.7 ms) | 6.1e-05 |
+| 2048 s2 `alm2map` | 561.9 | 459.9 | **1.22x** | 1.22x (457.7 ms) | – |
+| 128 s0 `map2alm` | 0.9 | 0.7 | 1.35x | never scored | 2.5e-07 |
+| 128 s0 `alm2map` | 0.6 | 0.7 | **0.93x** | never scored | – |
+| 256 s0 `map2alm` | 2.4 | 1.2 | 2.00x | – | 2.7e-07 |
+| 256 s0 `alm2map` | 1.9 | 1.2 | 1.59x | – | – |
+| 512 s0 `map2alm` | 15.7 | 4.5 | 3.46x | – | 3.7e-07 |
+| 512 s0 `alm2map` | 12.6 | 4.8 | 2.63x | – | – |
+
+The head-zeroing loop moves no spin-2 ratio at the reported precision and `rel alm` is digit-for-digit
+unchanged; the 512 `map2alm` cell went 8.9 → 9.3 ms while ducc0's own time went 27.6 → 28.6 ms, so that
+is clock spread, not the kernel.  The new Nside-128 spin-0 `alm2map` cell is the loss HANDOFF had listed
+as never measured: **0.93x on a 0.7 ms cell**, which is the sub-millisecond launch-bound regime rather
+than a throughput problem.
+
+**Suite after all three commits:** `pytest tests/ -q` on the fixed tree, **152 passed, 3 skipped in
+324.67 s**, exit 0 (`pytest_s29c.log`) — the 146 that passed before plus the six lane-coverage cases.
+
