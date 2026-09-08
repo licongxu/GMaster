@@ -201,7 +201,7 @@ def _pow2_f64(d):
 
 
 def _kern(manr, ex0r, xr, xlr, c1r, c0r, cbr, c1lr, c0lr, cblr, lgnr, sgnr, rr, m0_ref, out_ref,
-          *, L, ntheta, chunk, mb, spin=SPIN):
+          *, L, ntheta, chunk, spin=SPIN):
     row = pl.program_id(0)
     tile = pl.program_id(1)
     m0 = plt.load(m0_ref.at[0])
@@ -213,10 +213,15 @@ def _kern(manr, ex0r, xr, xlr, c1r, c0r, cbr, c1lr, c0lr, cblr, lgnr, sgnr, rr, 
     # The slab's `ell` axis is the window's own range (`L - m0`): this row writes `L - nstart` lanes
     # at index `ell - m0`, and its head of `nstart - m0 <= mb - 1` lanes is the only part of the slab
     # the march itself never reaches, so the program zeroes it rather than leaving it uninitialized.
-    head = jnp.maximum(nstart - m0, 0)
-    plt.store(out_ref.at[row, tile, slice(0, mb), slice(0, NC)],
-              jnp.zeros((mb, NC), dtype=jnp.float64),
-              mask=(jnp.arange(mb) < head)[:, None])
+    # One lane per iteration, matching `emit`'s store width: the Triton lowering requires every
+    # operation's array to be a power of two in size, and a ragged last window makes `mb` something
+    # like 96 (nside 32, L = 96), so a `(mb, NC)` head block fails to compile on those geometries.
+    def zero_head(i, carry):
+        plt.store(out_ref.at[row, tile, i, slice(0, NC)],
+                  jnp.zeros((NC,), dtype=jnp.float64))
+        return carry
+
+    lax.fori_loop(0, jnp.maximum(nstart - m0, 0), zero_head, ())
 
     man = plt.load(manr.at[row, t], mask=valid, other=0.0)
     ex0 = plt.load(ex0r.at[row, t])
@@ -300,7 +305,7 @@ def _call(L, ntheta, ntile, mb, spin=SPIN, Lm=None):
     call = _CALLS.get(key)
     if call is None:
         call = jax.jit(pl.pallas_call(
-            partial(_kern, L=L, ntheta=ntheta, chunk=_TILE, mb=mb, spin=spin),
+            partial(_kern, L=L, ntheta=ntheta, chunk=_TILE, spin=spin),
             out_shape=jax.ShapeDtypeStruct((mb, ntile, Lm, NC), jnp.float64),
             grid=(mb, ntile),
             compiler_params=plt.CompilerParams(num_warps=_WARPS),
