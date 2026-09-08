@@ -100,7 +100,14 @@ if __name__ == "__main__":
     parser.add_argument("--nside", type=int, default=512)
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--spins", type=str, default="0,2")
+    parser.add_argument(
+        "--precision",
+        type=str,
+        default="fp64",
+        help="GMaster table precision; the shipped default is fp64.",
+    )
     args = parser.parse_args()
+    nmt.set_table_precision(args.precision)
 
     nside = args.nside
     npix = 12 * nside**2
@@ -112,7 +119,7 @@ if __name__ == "__main__":
     map_q = rng.normal(size=npix)
     map_u = rng.normal(size=npix)
 
-    print(f"nside={nside} devices={[str(d) for d in jax.devices()]}")
+    print(f"nside={nside} precision={args.precision} devices={[str(d) for d in jax.devices()]}")
     for spin in [int(s) for s in args.spins.split(',') if s.strip()]:
         ref_out, ref_times = _run_pipeline(
             reference, nside, spin, 30, args.repeats,
