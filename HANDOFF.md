@@ -5369,7 +5369,12 @@ process gets fresh pages), all at `GMASTER_M_BLOCK=128`:
 |---|---|---|
 | HEAD `96fcbd1`, wide (`pipe_mb_ab.log`) | 2 | **`nan`, both trials** |
 | HEAD, narrow (`pipe_mb_ab.log`) | 2 | 4.17e-12 / rel 3.69e-06 |
-| trimmed, wide (`pipe_trim_wide.log`, `soak_pipe_wide.log`, `soak2_pipe_wide.log`) | **8** | **4.17e-12 / 3.69e-06, all 8** |
+| trimmed, wide via `GMASTER_M_BLOCK=128` (`pipe_trim_wide.log`, `soak_pipe_wide.log`, `soak2_pipe_wide.log`) | **8** | **4.17e-12 / 3.69e-06, all 8** |
+| trimmed, wide as the **shipped default** with no override (`soak3_pipe_wide.log`) | **8** | **4.17e-12 / 3.69e-06, all 8** |
+
+The last row is the one that matters for the ship: after the gate was lifted, eight cold processes with
+no `GMASTER_*` override took the wide window by themselves and came back finite, at TOTAL 1311-1312 ms.
+
 
 The poisoned standalone probe agrees: `wide_trim_check.py 1024 6 2` (6 GiB NaN pool, wide, trimmed)
 returns `nonfinite=0 of 18871296` in **8/8** processes, four with CUDA graphs on and four with
@@ -5401,23 +5406,33 @@ instead of one, and the cold process still runs **221 s** end to end with **`GPU
 indistinguishable from HEAD. Do not bucket `Lm` to reduce the compile count — any rounding re-creates an
 unwritten tail, which is the fault being fixed.
 
-**What the width buys now that spin 2 has it.** ducc0 transform scoreboard, GPU1, fp64 tables, 5 reps
-(`score_s29_wide_2.log`, versus the same probe at the narrow window in
-`sht_vs_ducc_s29_march_1024_2048_2.log`):
+**What the width buys now that spin 2 has it.** ducc0 transform scoreboard, GPU1, `GM_PREC=fp32`, 5
+reps — the same settings as session 28's table, so the columns are comparable
+(`.qwen/tmp/score_s29_fp32_2.log`):
 
-| nside | dir | ducc0 ms | narrow ms | wide ms | wide speedup |
+| nside | dir | ducc0 ms | GMaster ms | speedup | with the window withheld |
 |---|---|---|---|---|---|
-| 1024 | `map2alm` | 111.4 | 111.1 (1.03x) | **83.0** | **1.34x** |
-| 1024 | `alm2map` | 101.0 | — | **76.6** | **1.32x** |
-| 2048 | `map2alm` | 593.8 | 627.3 (0.97x) | 592.9 | 1.00x (width capped at 64) |
-| 2048 | `alm2map` | 549.2 | — | **476.3** | **1.15x** |
+| 512 | `map2alm` | 27.6 | 8.9 | 3.11x | 3.30x (`score_s28.log`) — table route, width-independent |
+| 512 | `alm2map` | 22.9 | 8.5 | 2.69x | 2.88x (`score_s28.log`) — table route, width-independent |
+| 1024 | `map2alm` | 112.4 | **77.8** | **1.44x** | 1.04x (session 28's correction, in words) |
+| 1024 | `alm2map` | 100.9 | **71.4** | **1.41x** | never logged at fp32 narrow |
+| 2048 | `map2alm` | 599.3 | 573.7 | 1.04x | 1.03x (`score_s28.log`) — capped at 64 either way |
+| 2048 | `alm2map` | 557.0 | **457.7** | **1.22x** | ~1.09x (session 28's correction, in words) |
 
-`rel alm` is unchanged by the width (3.6e-05 at 1024, 6.0e-05 at 2048). The 512 spin-2 row reads
-**0.83x / 0.62x** here against session 28's 3.30x / 2.88x — that is **table precision, not the width**:
-this run came up `table precision: fp64` and `session 28's was fp32`, and the two differ ~3.5x at that
-size (the same 512 cell was 33.0 ms at fp64 vs 9.2 ms at fp32); the fp32 re-run is
-`.qwen/tmp/score_s29_fp32_{2,0}.log`. Take the fp32 columns for cross-session comparison, the fp64
-columns for narrow-vs-wide.
+`rel alm` is unchanged by the width (3.7e-05 at 1024, 6.1e-05 at 2048, 3.2e-07 at 512). The same probe at
+the *narrow* polarised window in fp64 (`sht_vs_ducc_s29_march_1024_2048_2.log`: 111.1 ms = 1.03x at 1024
+`map2alm`) against the same fp64 setting wide (`score_s29_wide_2.log`: 83.0 ms = 1.34x) is the
+within-precision version of the same 1.3x. **Read the fp32 columns for cross-session comparison and the
+fp64 ones for narrow-vs-wide**: `sht_vs_ducc.py` defaults to `GM_PREC=fp64`, which roughly triples the
+512 spin-2 cell (33.0 ms vs 8.9 ms) by declining the resident slice, and an fp64 run is how I briefly
+mistook that for a regression.
+
+**Spin 0 is unchanged, which is the regression check that mattered** — the trim also rewrote
+`_forward_fold_impl`, and `score_s29_fp32_0.log` against session 28's fp32 spin-0 block gives
+`map2alm` **4.4 / 28.1 / 292.0 ms** at 512/1024/2048 against **4.3 / 28.1 / 299.1**, and `alm2map`
+**4.9 / 30.3 / 288.2** against **4.8 / 30.2 / 286.9**. Same cell, same precision, within run-to-run
+noise; `rel alm` identical (3.7e-07 / 3.6e-07 / 6.9e-05).
+
 
 **Pipeline, nside 1024 spin 2, cold processes** (the same table as above, clock column): HEAD narrow
 TOTAL 1439 / 1430 ms with `field` 616 / 613; HEAD wide 1316 / 1316 with `field` 507 / 506 and `nan`;
