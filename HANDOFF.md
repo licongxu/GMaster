@@ -6181,4 +6181,55 @@ warp-issue rate with every per-degree cut measured at 1-5 %; and the memory-boun
 all is ~309 GB at Nside 2048 in float32 against a 96 GB device. Everything left at 2048+ is a 1-2x affair,
 and the only multipliers on this board that qualify as massive are the fp32 cells between 256 and 1024.
 
+## Addendum 10 (session 29c): the float64 band is the *accurate* route and the slow one — the ~1e-6 the
+## shipped default carries at Nside >= 1024 is the march's, not fp32's
+
+Addendum 9's ceiling argument assumed the memory-bound theta band, if it could ever be afforded at float64,
+would be the fast route. It is affordable, it was measured, and it is the opposite: **it is the accurate
+route and the slow one.** That re-attributes the error of the shipped default and closes the last
+accuracy-neutral speed idea.
+
+**The pool was the blocker, and it is raisable.** `_MATRIX_BAND_BUDGET` is a hard-coded 40 GiB, commented as
+"what makes the float32 Nside 1024 analysis band engage on this box's 71.2 GiB pool", and the float64 band at
+the same Nside is 73.5 GiB. `XLA_PYTHON_CLIENT_MEM_FRACTION=0.95` moves
+that pool to **90.2 GiB** — a 75 GiB `jnp.zeros` that raises `RESOURCE_EXHAUSTED` at the default fraction
+succeeds at 0.95 — so with `GM_BAND_BUDGET_GIB=80` the float64 band is built and dispatched
+(`.qwen/tmp/bandbudget_s29.py`, one process per arm, `.qwen/tmp/bandbudget_s29.log`):
+
+| arm | TOTAL ref→GMaster | ratio | `field` | `GPUpeak` | `rel dCl` |
+|---|---|---|---|---|---|
+| 1024 s0 fp64, 40 GiB budget (default) | 1750 → 947 ms | **1.85x** | 500 → 358 | 0.9 GiB | 8.43e-07 |
+| 1024 s0 fp64, 90 GiB pool, 80 GiB budget | 1767 → **2374 ms** | **0.74x** | 503 → 1071 | 74.5 GiB | **2.23e-12** |
+| 1024 s2 fp64, 90 GiB pool, 80 GiB budget | 3284 → 1970 ms | 1.67x | 934 → 333 | 77.0 GiB | 3.51e-06 |
+| 2048 s0 fp64, 90 GiB pool, 88 GiB budget | 10494 → 5557 ms | 1.89x | 2449 → 1932 | 3.7 GiB | 1.38e-06 |
+
+At spin 0 the band route is **2.5x slower than the march and 380x more accurate.** The control at 2048 (band
+582 GiB, declined even at an 88 GiB budget, `GPUpeak 3.7 GiB`) reproduces the board's 1.8x, so this is the
+route itself and not the environment. The baseline arm reproduces the board's 944 ms at 947 ms across
+sessions, so the arms are comparable.
+
+**Why it is slow, and why that is not a layout bug.** Halving the bytes (fp32 at the same geometry: `field`
+204 ms against float64's 1071 ms) buys 5.25x, which storage alone cannot explain. The contraction
+`sum(band × rhs)` is bandwidth-bound when its arithmetic is fp32 and *compute*-bound when it is fp64 on this
+card, where fp64 SIMT is 46:1 below fp32 SIMT; the fp64 band therefore leaves the streaming regime that the
+whole route depends on. `march-is-issue-bound-accumulation-limbs-are-the-cost` and `fp64-roofline-wall` both
+saw the local version of this ("the 4.2x did NOT survive implementation; 2.0x did"); this is the end-to-end
+confirmation, and it is worse than the local measurement suggested.
+
+**What this changes about the accuracy story.** The shipped fp64 default agrees with NaMaster to 8.43e-07 at
+1024 spin 0 and 1.38e-06 at 2048 — and the float64 *band* at the same geometry reaches **2.23e-12**. So
+those ~1e-6 numbers are not storage precision and not NaMaster's: **they are the table-free march**, which
+is a recurrence, not a matrix. Two consequences. (1) Addendum 8/9's line "at 1024 fp32 is more accurate than
+the fp64 default" has a mechanism now — fp32 engages the band, and the band is simply the accurate route;
+the default is neither the fast nor the accurate one at that size. (2) The remaining accuracy work is on the
+march, not on table storage: anything that makes a band affordable *and* bandwidth-bound at float64-equivalent
+accuracy would win on both axes at once, which is why a 2-limb band with float64 accumulation remains the
+right thing to try before any further march tuning — with the caveat already in
+`fp64-roofline-wall` that K-chunked float32 accumulation was measured to cap near 1e-7.
+
+**Closed as of this session:** raising `_MATRIX_BAND_BUDGET` or the XLA pool as a speed lever. It trades
+2-2.5x for accuracy and can drop a 1.85x cell to 0.74x, i.e. below the reference. If it is ever raised for
+accuracy, it must be per-geometry and paired with a route check, never globally.
+
+
 
