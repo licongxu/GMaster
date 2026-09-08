@@ -5644,3 +5644,41 @@ than a throughput problem.
 **Suite after all three commits:** `pytest tests/ -q` on the fixed tree, **152 passed, 3 skipped in
 324.67 s**, exit 0 (`pytest_s29c.log`) — the 146 that passed before plus the six lane-coverage cases.
 
+### Session 29 addendum 2: the theta-tile lever at Nside 4096 is measured dead in both spins, which closes the last untuned knob
+
+`GMASTER_SPIN2_MARCH_TILE` was the one lever HANDOFF still carried as "untouched". At Nside 4096 the
+shipped 256 gives `ntile = ceil(16383/256) = 64`, so the analysis partial slab
+`(mb=64, ntile, L - m0, NC)` float64 is at its largest there and wider tiles have their best possible
+case; the 1024/2048 sweep that chose 256 had varied `warps` with the tile, so 4096 had never had this
+knob measured alone. It has now (`tile4096_s29.log`, `GM_PREC=fp32`, 5 reps, one geometry per process,
+controls 1298-1413 GB/s):
+
+| cell | tile 256 (shipped) | tile 512 | tile 1024 |
+|---|---|---|---|
+| 4096 s2 `map2alm` | **4662.3 ms (0.83x)** | 5822.0 ms (0.65x) | 11426.7 ms (0.33x) |
+| 4096 s2 `alm2map` | **3441.2 ms (1.13x)** | 3419.1 ms (1.11x) | 3426.0 ms (1.10x) |
+| 4096 s0 `map2alm` | **2253.8 ms (0.86x)** | 2446.5 ms (0.77x) | 4571.3 ms (0.41x) |
+| 4096 s0 `alm2map` | 1865.6 ms (1.04x) | 1861.5 ms (1.02x) | 1866.7 ms (1.02x) |
+
+The 256 column is `score_s28_4096.log`, so it is not the same process as the other two — but each of
+those arms re-measures ducc0 in-process, and it lands at 3789.9 / 3767.1 ms (spin 2) and 1894.5 /
+1882.3 ms (spin 0), within 1% of each other and of the session-28 baseline. The analysis degradation is
+therefore the kernel, not the clock: the tile is monotone-worse in both spins, ~25% at 512 and ~2.5x at
+1024. `rel alm` is unchanged at 1.9e-04 (spin 2) and 2.1e-04 (spin 0) across all three, so this is not an
+accuracy-for-speed trade. Synthesis barely moves because it takes its own `_ST` block
+(`GMASTER_SPIN2_MARCH_SYNTH_TILE`), not `_TILE` — that knob remains untuned at 4096 and is the only one
+left of its kind.
+
+One probe artifact to know before reading that log: the `reps=[…]` printed on the `alm2map` rows are the
+**`map2alm`** timings of the same arm (5822 / 11426 / 2446 / 4571 reproduce the row above them), so they
+carry no information about synthesis spread. Read the `GMaster ms` column.
+
+**Consequence for the two remaining losses.** `map2alm` at Nside 4096 — spin 2 0.83x, spin 0 0.86x — is
+now out of launch- and block-shape knobs: the m-window width and its program cap (`march-m-window`
+measurements, session 28), the per-window assembly (`analysis_assembly_ab`, 0.992x/0.981x), the rescale
+limb (1.009x if deleted), the coefficient low limbs (1.031x), the rhs hoist (a bit-identical wash that
+costs 0.8-3.2 GiB of residency), the emit form (0.977x/0.859x), the layout (256/1 optimal), and now the
+theta tile (monotone-worse wider) have all been measured. What is left at that size is the arithmetic
+itself: the march runs the fp64 recurrence on a path an order of magnitude behind the CPU's fp64 rate,
+so closing 0.83x there needs a different recurrence, not another tuning pass.
+
