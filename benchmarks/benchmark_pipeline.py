@@ -106,8 +106,18 @@ if __name__ == "__main__":
         default="fp64",
         help="GMaster table precision; the shipped default is fp64.",
     )
+    parser.add_argument(
+        "--ring-precision",
+        type=str,
+        default="follow",
+        choices=("follow", "fp64", "fp32"),
+        help="azimuthal transform precision independently of the tables.  'follow' is the "
+        "shipped coupling and what every published row used; 'fp64' keeps the map exact "
+        "under fp32 tables, which is the route that passes the suite.",
+    )
     args = parser.parse_args()
     nmt.set_table_precision(args.precision)
+    nmt.set_ring_precision(args.ring_precision)
 
     nside = args.nside
     npix = 12 * nside**2
@@ -119,7 +129,10 @@ if __name__ == "__main__":
     map_q = rng.normal(size=npix)
     map_u = rng.normal(size=npix)
 
-    print(f"nside={nside} precision={args.precision} devices={[str(d) for d in jax.devices()]}")
+    print(
+        f"nside={nside} precision={args.precision} ring={nmt.ring_dtype().__name__} "
+        f"devices={[str(d) for d in jax.devices()]}"
+    )
     for spin in [int(s) for s in args.spins.split(',') if s.strip()]:
         ref_out, ref_times = _run_pipeline(
             reference, nside, spin, 30, args.repeats,
