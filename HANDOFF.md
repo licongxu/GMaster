@@ -5521,3 +5521,90 @@ between this entry and a cross-session table; the two 4096 cells (spin-2 `map2al
 Nside 128 and the `GMASTER_SPIN2_MARCH_TILE` lever are untouched; and `lane_divergence.py` has still
 never had its output written to a log — run it with a redirect before quoting a lane bound.
 
+### Session 29 addendum: the head-zeroing that fixed the NaN did not compile off the `nside ≡ 0 (mod 128)` lattice
+
+Writing the regression guard for the wedge NaN turned up a second bug in the shipped fix, and then
+proved the guard itself was decoration twice over.  Both are worth more than the fix.
+
+**`c095321` cannot compile on a ragged m-window.** Its head-zeroing was one masked block store —
+`plt.store(out_ref.at[row, tile, slice(0, mb), slice(0, NC)], jnp.zeros((mb, NC)), mask=…)` — and the
+Pallas Triton lowering refuses any operation whose array is not a power of two in size:
+
+```
+ValueError: The Pallas Triton lowering currently requires that all operations have array arguments
+and results whose size is a power of 2. Encountered an array of shape (96, 4)
+```
+
+The predicate does not exempt the shape; the `(96, 4)` value array is an operand regardless of the
+mask.  This sat inside a shipped commit because **`L = 3*nside` is a multiple of the 128-row window
+exactly when `nside ≡ 0 (mod 128)`**, so every nside ever exercised produced `mb = 128` and no test in
+the 146-test suite had ever run the march on a window that was not 128 rows.  Nside 32 (`L = 96`) is
+the smallest polarised geometry that reaches a ragged window.  Fixed in `8950a79` by walking one
+`(NC,) = (4,)` lane per `lax.fori_loop` iteration — always a power of two, and `mb` leaves the kernel
+signature entirely.
+
+| whole analysis latitudinal stage, nside 1024, `GM_PREC=fp32` | run 1 | run 2 |
+|---|---|---|
+| masked `(mb, NC)` store, wide | 72.32 ms | 72.28 ms |
+| per-lane loop, wide | 72.98 ms | **72.73 ms** |
+| masked `(mb, NC)` store, narrow (`GMASTER_MARCH_M_BLOCK=64`) | 102.18 ms | 101.55 ms |
+| per-lane loop, narrow | **101.58 ms** | **101.41 ms** |
+
+So the power-of-two-safe form costs under 1% wide and is free narrow (`.qwen/tmp/fixpow2_s29.log`,
+arms `pow2b stage *`).  A `lax.fori_loop` head is not the expensive part: with `m0 = 0` the longest
+head is `mb - 1` lanes, against a `L - nstart` ≈ 2944-lane march per row.
+
+**The guard was decoration twice, and the second time was invisible.**
+
+1. Parametrized on nside 16/32/48 only, `96fcbd1` — the tree with **no** in-kernel zeroing — passed all
+   three cases (`fixpow2_s29.log`, arms `guard shipped` / `guard parent-96fcbd1`, both `3 passed`).
+2. Parametrized on all five with the comparison started at `ell = spin` (the tempting way to reconcile
+   the two routes, since the table route keeps its sub-spin terms), it passed **5/5 on `96fcbd1`**.
+   The sub-spin rows *are* the uninitialized lanes: skipping them discards the only evidence.
+
+Restoring the rows and zeroing the *reference* instead — which is exactly what
+`utils._finish_forward_s2fft` does to both routes in the pipeline — keeps the comparison honest without
+loosening a tolerance.  It also needed `np.array(..., copy=True)`: `np.asarray` of a JAX array returns a
+**read-only** view, so `ref[:2] = 0.0` raises `ValueError: assignment destination is read-only` and the
+whole arm dies for a reason that looks like a test bug (`guard5b`: 5 failed, all on that line).
+
+**And the poisoning does not reproduce in process at all.** With the pool primed with 24 buffers of the
+slab's *own* byte count for both window widths, `96fcbd1` still returns the wedge **exactly zero** —
+3070/3070 lanes at nside 256, 6142/6142 at nside 512, zero non-finite entries in 1.18 M and 4.72 M
+(`.qwen/tmp/poison_prime_s29.log`).  The earlier reading that "nside 256+ is where the poison bites" was
+wrong: those `guard_s29b.log` failures were the convention difference on `ell < spin`, not leaked
+garbage.  The pipeline NaN at nside 1024 needs a cold pool with far more allocation history than a unit
+test builds, so its evidence stays `nan_where.log` (9,440,250 of 9,440,256 alm entries) and the
+process-level trial counts.  The test is renamed `test_spin2_march_analysis_writes_every_lane_it_returns`
+and its docstring says this out loud rather than letting the next reader believe the guard bites.
+
+**Route residual, measured** (`ell >= 2`, `.qwen/tmp/resid_s29.log`, x64, main tree):
+
+| nside | L | max abs diff | scale | max rel (lane-wise) |
+|---|---|---|---|---|
+| 16 | 48 | 9.073e-08 | 2.002e-01 | 2.997e-05 |
+| 32 | 96 | 5.924e-08 | 1.150e-01 | 1.150e-04 |
+| 48 | 144 | 4.528e-08 | 6.806e-02 | 1.017e-04 |
+| 256 | 768 | 2.430e-08 | 1.389e-02 | 2.638e-03 |
+
+The lane-wise relative column is set by near-zero lanes; against the scale the residual is ≤ 1.75e-06,
+which is why the test's `atol = 1e-4 × scale` holds by two decades.  The absolute ~1e-08 is the fp32
+table quantum, not a march error.
+
+**Arms to treat as void, listed so nobody re-reads them as data:** `pow2 stage wide/narrow p1-p2`
+(exit=2 in the same second — `sht_stage_cost.py` does not exist); `guard5 shipped` / `guard5 96fcbd1`
+(the neutered comparison); `guard5b` both trees (the read-only `ValueError`).  Also: a bare
+`python - <<EOF` against this library runs with x64 **off** — every test and benchmark sets
+`jax_enable_x64` itself and `gmaster/__init__.py:101` only warns — and with x64 off XLA canonicalizes
+the slab to `complex64` while an explicit `float64` literal inside the kernel stays float64, so the
+marched route raises on the dtype mismatch.  That is pre-existing (the same float64 literal is in
+`c095321` at line 217), not something `8950a79` introduced, but it does mean the march is an
+x64-on-only path.
+
+**Two shell traps that cost arms this session.** `cd X && setsid nohup bash s.sh > /dev/null 2>&1 &`
+backgrounds the **whole** `cd && …` list, so the foreground shell never changes directory and a later
+relative-path `grep` in the same command reads the wrong file — I concluded a log had been deleted when
+it had not.  And `pkill -TERM -f 'verify_s29h.sh'` matches the `bash -c` wrapper of the killing command
+itself, which killed my own tool call (signal 15) mid-check; use a bracketed pattern
+(`[v]erify_s29h`) for both `pgrep` and `pkill`.
+
