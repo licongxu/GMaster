@@ -5446,6 +5446,23 @@ TOTAL 1439 / 1430 ms with `field` 616 / 613; HEAD wide 1316 / 1316 with `field` 
 **1.10x on the pipeline total and 1.22x on the field build** at this cell, with the accuracy line back
 to 3.69e-06 instead of `nan`.
 
+**Every pipeline cell at the shipped defaults** (`.qwen/tmp/pipe_s29_final.log`, one cold process per
+arm except where two are shown, `GM_PREC` unset, no `GMASTER_*` override, GPU1):
+
+| cell | GMaster TOTAL | `field` | `coupling` | max\|dCl\| | last logged before this |
+|---|---|---|---|---|---|
+| 1024 spin 2 | 1305-1312 ms (8 procs) | 498-504 ms | 357-359 ms | 4.17e-12 (rel 3.69e-06) | 1430-1439 / 613-616 (`pipe_mb_ab.log`, narrow) |
+| 2048 spin 2 | 8840 / 8761 ms | 3679 / 3655 ms | 2685 ms | 3.12e-12 (rel 1.09e-05) | 8964 / 3745 ms (`pipe_s28.log`) |
+| 1024 spin 0 | 996 / 995 ms | 384 / 382 ms | 203 / 202 ms | 8.81e-13 (rel 8.43e-07) | 1012 / 390 ms (`pipe_s28.log`) |
+| 2048 spin 0 | 5932 ms | 2144 ms | 1527 ms | 3.75e-13 (rel 1.38e-06) | 6070 / 2192 ms (`pipe_s28.log`) |
+
+Every `max|dCl|` in that table is finite; no arm in this session produced a NaN. The two spin-2 rows are
+where the width moved anything — 1024 by the analysis window, 2048 only through the synthesis window
+(the analysis stays at 64 there by `_MARCH_GRID_CAP`, and 8761-8840 against 8964 is a 1.4-2.3% move that
+is as consistent with clock spread as with the wider synthesis). Spin 0 is 1.7-2.3% below
+session 28 at three of the four rows; its route was already wide at both nsides, so treat that as clock
+and run-to-run spread, not as a win from this change.
+
 **Shipped widths, read out of the code** (`.qwen/tmp/width_table_s29.py`, CPU-only, no tracing):
 
 | route | 512 | 1024 | 2048 | 4096 |
