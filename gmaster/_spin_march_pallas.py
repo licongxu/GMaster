@@ -630,11 +630,31 @@ def forward_latitudinal_positive(positive, weights, phase, *, L, nside):
 
 # ------------------------------------------------------------------- synthesis: the same row, summed
 _ST = int(os.environ.get("GMASTER_SPIN2_MARCH_SYNTH_TILE", "512"))
+# Spin 0's synthesis march wants a wider theta tile than spin 2's, and the fold is why: it hands the
+# kernel `north = (ntheta+1)//2` rows instead of `ntheta`, so at the spin-2 width a 2048-grid launch
+# is 8 tiles of 512 northern rows and each block re-does its per-window prologue 8 times over half
+# the rows.  Measured against ducc0 in one geometry per process, `GM_PREC=fp32`, 5 reps
+# (`.qwen/tmp/st2048_s29.log`, `.qwen/tmp/st_spin0_s29.log`), spin-0 `alm2map`:
+#   Nside 2048  512 (shipped) 287.4 ms 0.99x | 256 270.0 ms 1.04x | 1024 243.7 ms 1.17x | 2048 401.2 0.71x
+#   Nside 4096  512          1885.1 ms 1.02x | 1024 1745.8 ms 1.10x
+#   Nside 1024  512            31.0 ms 1.73x | 1024  30.7 ms 1.70x | 2048  30.7 ms 1.59x  (flat)
+# Spin 2 at the same geometry goes the other way -- 453.7 ms 1.25x at 512, 508.1 at 256, 524.6 at
+# 1024 -- so the width is per-spin, not global.  Applied only where `north` can still fill four
+# tiles at the wide width, which is exactly the regime measured above; below it (Nside <= 1024,
+# where the widths are indistinguishable) the shipped geometry stands.
+_ST0 = int(os.environ.get("GMASTER_SPIN0_SYNTH_TILE", "1024"))
 _SW = int(os.environ.get("GMASTER_SPIN2_MARCH_SYNTH_WARPS", "4"))
 # `fast` accumulates the contraction in plain float32, `comp` in (value, limb) float32 pairs; see
 # `_accumulate_fast` for the measured cost and error of the difference.
 _ACC = os.environ.get("GMASTER_SPIN2_MARCH_SYNTH_ACC", "fast")
 _ACC_FAST = _ACC != "comp"
+
+
+def _synth_tile(spin, ntheta) -> int:
+    """Theta tile for one synthesis launch; see the `_ST0` note above for why it is per-spin."""
+    if int(spin) == 0 and int(ntheta) >= 4 * _ST0:
+        return _ST0
+    return _ST
 
 
 def _add_pair(hh, lo, ph, pl):
@@ -870,12 +890,13 @@ def _kern_synth(manr, ex0r, xr, xlr, c1r, c0r, cbr, c1lr, c0lr, cblr,
 
 
 def _call_synth(L, ntheta, ntile, mb, spin=SPIN):
-    key = ("synth", int(L), int(ntheta), int(ntile), int(mb), _ST, _SW, int(spin))
+    st = _synth_tile(spin, ntheta)
+    key = ("synth", int(L), int(ntheta), int(ntile), int(mb), st, _SW, int(spin))
     call = _CALLS.get(key)
     if call is None:
         call = jax.jit(pl.pallas_call(
-            partial(_kern_synth, L=L, ntheta=ntheta, chunk=_ST, spin=spin),
-            out_shape=jax.ShapeDtypeStruct((mb, ntile, _ST, 4), jnp.float64),
+            partial(_kern_synth, L=L, ntheta=ntheta, chunk=st, spin=spin),
+            out_shape=jax.ShapeDtypeStruct((mb, ntile, st, 4), jnp.float64),
             grid=(mb, ntile),
             compiler_params=plt.CompilerParams(num_warps=_SW),
             name=f"gmaster_spin{int(spin)}_synth"))
@@ -1019,8 +1040,9 @@ def _inverse_fold_impl(positive, phase, *, L, nside):
     theta = jnp.asarray(utils._stable_thetas(L, nside), dtype=jnp.float64)
     ntheta = theta.shape[0]
     north = (ntheta + 1) // 2
-    ntile = -(-north // _ST)
-    npad = ntile * _ST
+    st0 = _synth_tile(0, north)
+    ntile = -(-north // st0)
+    npad = ntile * st0
     tn = theta[:north]
     x = jnp.cos(tn)
     sh, ch = jnp.sin(tn / 2.0), jnp.cos(tn / 2.0)

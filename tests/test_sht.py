@@ -664,3 +664,34 @@ def test_fused_slab_route_is_bit_identical_to_the_split_route(nside):
                                         L=L, L_work=L)
     np.testing.assert_array_equal(np.asarray(got), np.asarray(ref))
 
+
+@pytest.mark.parametrize("nside", [512, 1024, 2048, 4096, 8192])
+def test_synthesis_tile_is_per_spin_and_still_powers_of_two(nside):
+    """The synthesis launch geometry agrees with the chunk the kernel is compiled against.
+
+    `_inverse_fold_impl` derives `ntile` and `npad` from the tile width and `_call_synth` derives
+    the kernel's `chunk` and its `out_shape` from the same helper, so a divergence between the two
+    would show up as an out-of-bounds or a dropped theta row at a size no in-repo test can reach
+    (the fold only serves Nside >= 2048, where a GPU run costs minutes).  The power-of-two assertion
+    is the Triton lowering rule: every op's array must be a power of two, and the synthesis
+    `out_shape` is `(mb, ntile, chunk, 4)`, so `ntile` has to stay one -- the bug class that shipped
+    once as `Encountered an array of shape (96, 4)` from a ragged m-window.
+
+    The width itself is measured, not guessed: spin 0's synthesis wants 1024 at Nside >= 2048
+    (287.4 -> 243.7 ms at 2048, 1885.1 -> 1745.8 ms at 4096, bit-identical maps) while spin 2 wants
+    512 (453.7 ms at 2048 against 508.1 at 256 and 524.6 at 1024).  See the `_ST0` note in
+    `gmaster/_spin_march_pallas.py`.
+    """
+    from gmaster import _spin_march_pallas as smp
+
+    ntheta = 4 * nside - 1
+    north = (ntheta + 1) // 2
+    st = smp._synth_tile(0, north)
+    ntile = -(-north // st)
+    assert st * ntile >= north > st * (ntile - 1)
+    assert ntile & (ntile - 1) == 0, f"ntile={ntile} is not a power of two"
+    assert st == (smp._ST0 if north >= 4 * smp._ST0 else smp._ST)
+    # Spin 2's generic route takes the shipped width at every size, including the ones where the
+    # spin-0 fold has moved.
+    assert smp._synth_tile(2, ntheta) == smp._ST
+
