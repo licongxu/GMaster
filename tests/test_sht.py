@@ -1,3 +1,5 @@
+import gc
+
 import healpy as hp
 import jax
 import jax.numpy as jnp
@@ -549,6 +551,76 @@ def test_spin2_march_synthesis_matches_the_route_it_replaces(nside):
     np.testing.assert_allclose(new, ref, rtol=0.0, atol=1e-4 * scale)
     # Column 0 is written by neither half of the assembly and the contract asks for a zero there.
     assert not np.any(new[:, 0])
+
+
+@pytest.mark.skipif(not _HAS_NVIDIA_GPU, reason="requires an NVIDIA GPU")
+@pytest.mark.parametrize("nside", [16, 32, 48, 256, 512])
+def test_spin2_march_analysis_writes_every_lane_it_returns(nside):
+    """The marched analysis output is finite and equals the exact route lane for lane.
+
+    `pl.pallas_call`'s `out_shape` buffer arrives with whatever the caching allocator left behind.
+    The analysis march stores one row per order at `ell - m0`, so the `nstart - m0` lanes below
+    `max(m, spin)` belong to no `ell` at all and nothing writes them unless the kernel zeroes them
+    itself.  A driver-side mask over the whole slab is not a substitute: the masked-out orders feed
+    nothing downstream, so the GPU is free to drop the select, and that is how a first-execution-only
+    NaN reached a pipeline at nside 1024 spin 2 with the wide m-window (9,440,250 of 9,440,256 alm
+    entries, `.qwen/tmp/nan_where.log`).
+
+    What this test pins down, demonstrated in both directions:
+
+    * The ragged geometries compile.  Nsides 16 and 32 give `L = 48` and `96`, which are not
+      multiples of the 128-row m-window, so the last window is ragged; a head-zeroing block of
+      `(mb, NC)` on `mb = 96` is not a power of two and the Triton lowering rejects it outright.
+      `c095321` shipped exactly that masked block and this test is what found it — no other test in
+      the 146-test suite has ever run the march on a window that is not 128 rows.
+    * Every lane the routine returns is finite and matches the exact route, including the sub-spin
+      wedge, so a nonzero leak into those lanes fails here.
+
+    What it does *not* do, and was written believing it did: the poisoning does not reproduce in
+    process.  On `96fcbd1`, which has no in-kernel zeroing at all, all five cases pass — and priming
+    the pool with 24 buffers of the slab's own byte count does not change that, every wedge lane still
+    arrives exactly zero at nside 256 and 512 (3070/3070 and 6142/6142,
+    `.qwen/tmp/poison_prime_s29.log`).  The fault that motivated this test needs the pipeline's cold
+    pool at nside 1024, and it stays evidenced by that log and the trial counts, not by this test.
+    The dirt-freeing below is kept because a nonzero leak is still caught, not because it is known to
+    provoke one.
+
+    The `ftm` comes from the pipeline's own ring step rather than a random array because its column
+    layout is `L + m` over `2L` columns, which is what makes the window slices line up.
+    """
+    from gmaster import _spin_march_pallas as march
+
+    lmax = 3 * nside - 1
+    L = lmax + 1
+    rng = np.random.default_rng(5)
+    maps = jnp.asarray(rng.normal(size=12 * nside ** 2) + 1j * rng.normal(size=12 * nside ** 2))
+    ftm = utils._forward_s2fft_ftm(maps, utils._spin_ring_analysis_tables(L, nside),
+                                   L=L, nside=nside, reality=False)
+
+    dirt = [jnp.full(n, np.nan)
+            for n in (1 << 23, 1 << 21, 1 << 19, 1 << 17, 1 << 15, 1 << 13)]
+    for buf in dirt:
+        buf.block_until_ready()
+    dirt = None
+    gc.collect()
+
+    got = np.asarray(march.forward_latitudinal(ftm, L=L, spin=2, nside=nside))
+    assert np.all(np.isfinite(got)), "marched analysis read unwritten slab lanes"
+
+    # Explicit copy: `np.asarray` hands back a read-once view of the JAX buffer, and the zeroing
+    # below would raise `ValueError: assignment destination is read-only`.
+    ref = np.array(utils._forward_latitudinal(ftm, L=L, spin=2, nside=nside,
+                                              reality=False, L_lower=0), copy=True)
+    # Rows `ell < spin` are where an uninitialized lane would land, so they stay in the comparison.
+    # They are also the one place the two routes differ by convention: the march's recurrence starts
+    # at `max(m, spin)` and stores zeros below it, while the table route keeps its sub-spin terms.
+    # The pipeline applies the march's convention to both routes in `_finish_forward_s2fft`, so the
+    # reference is zeroed here rather than the tolerance being loosened.  Measured residual on the
+    # fixed kernel over rows `ell >= 2`: max abs 9.07e-08 / 5.92e-08 / 4.53e-08 / 2.43e-08 at nside
+    # 16 / 32 / 48 / 256 against scales of 2.00e-01 / 1.15e-01 / 6.81e-02 / 1.39e-02
+    # (`.qwen/tmp/resid_s29.log`), so the tolerance below holds by more than an order of magnitude.
+    ref[:2] = 0.0
+    np.testing.assert_allclose(got, ref, rtol=0.0, atol=1e-4 * float(np.max(np.abs(ref))))
 
 
 @pytest.mark.skipif(not _HAS_NVIDIA_GPU, reason="requires an NVIDIA GPU")
