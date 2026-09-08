@@ -554,7 +554,7 @@ def test_spin2_march_synthesis_matches_the_route_it_replaces(nside):
 
 
 @pytest.mark.skipif(not _HAS_NVIDIA_GPU, reason="requires an NVIDIA GPU")
-@pytest.mark.parametrize("nside", [16, 32, 48, 256, 512])
+@pytest.mark.parametrize("nside", [16, 32, 48, 160, 256, 512])
 def test_spin2_march_analysis_writes_every_lane_it_returns(nside):
     """The marched analysis output is finite and equals the exact route lane for lane.
 
@@ -568,11 +568,15 @@ def test_spin2_march_analysis_writes_every_lane_it_returns(nside):
 
     What this test pins down, demonstrated in both directions:
 
-    * The ragged geometries compile.  Nsides 16 and 32 give `L = 48` and `96`, which are not
-      multiples of the 128-row m-window, so the last window is ragged; a head-zeroing block of
-      `(mb, NC)` on `mb = 96` is not a power of two and the Triton lowering rejects it outright.
-      `c095321` shipped exactly that masked block and this test is what found it — no other test in
-      the 146-test suite has ever run the march on a window that is not 128 rows.
+    * The ragged geometries compile.  A window is ragged when `L = 3*nside` is not a multiple of the
+      128-row m-window, and a head-zeroing block of `(mb, NC)` on a ragged `mb` of 48, 80, 96 or 112
+      is not a power of two, which the Triton lowering rejects outright.  `c095321` shipped exactly
+      that masked block, and walking the shipped `_march_windows` decomposition over the lattice
+      (`.qwen/tmp/lattice_s29.py`) shows it could not compile the spin-2 analysis march at nside
+      **16, 32, 80, 112, 160, 416 or 928** — while every power of two from 64 to 4096 decomposes into
+      128-row windows and was clean.  That is why the 146-test suite never saw it, and why nside 160
+      is in this list alongside the tiny cases: it is a production-sized odd footprint, not a unit-test
+      size.
     * Every lane the routine returns is finite and matches the exact route, including the sub-spin
       wedge, so a nonzero leak into those lanes fails here.
 
