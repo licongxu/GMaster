@@ -437,6 +437,34 @@ def _march_windows(L, ntile, spin):
     return ss._windows(L, mb)
 
 
+def _synth_windows(L, ntile, spin):
+    """The m-windows of one synthesis launch: as wide as the program ceiling still allows.
+
+    The law measured for `_march_windows` is about programs per launch, not about the window itself
+    (every win was at <= 2048 programs, every loss at 4096), and this route is the one marched route
+    with room: `_ST0` leaves it 4 theta tiles at nside 2048 and 8 at 4096, where the analysis has 16
+    and 32.  So the window is grown to fill the ceiling (`cap // ntile`, rounded down to a power of
+    two, capped at `_MARCH_M_SYNTH0_MAX`) instead of stopping at 128.  Measured against ducc0, spin-0
+    `alm2map`, fp32, 5 reps, one geometry per process (`.qwen/tmp/swin_s29.log`, and the 4096 point
+    twice over in `.qwen/tmp/s29y.log`): **2048 223.5 ms / 1.36x against 246.3 ms / 1.24x shipped**
+    and **4096 1643.5 ms / 1.20x against 1740.0 ms / 1.14x**, with `rel alm` digit-for-digit unchanged
+    (6.9e-05 / 2.1e-04) because the window only groups independent m-lanes into one launch.  Nside
+    1024 is identical either way (30.2 ms), and Nside 512 -- the only geometry with fewer than four
+    theta tiles, so a 512-wide launch is only 1024 programs -- loses 0.3 ms (4.6 -> 4.9), which is
+    why the rule stops there.  The analysis route keeps `_march_windows`: growing its window past the
+    ceiling does not widen anything, it trips the fallback to `_M_BLOCK` and costs 1.37x at 2048.
+    """
+    from gmaster import _spin_slice as ss
+
+    if int(spin) != 0 or int(ntile) < 4:
+        return _march_windows(L, ntile, spin)
+    mb = min(ss._MARCH_M_SYNTH0_MAX, max(ss._MARCH_M_BLOCK, _MARCH_GRID_CAP // max(int(ntile), 1)))
+    mb = 1 << (int(mb).bit_length() - 1)          # the Triton lowering wants powers of two
+    if mb * ntile > _MARCH_GRID_CAP:
+        mb = ss._M_BLOCK
+    return ss._windows(L, mb)
+
+
 @partial(jax.jit, static_argnames=("L", "spin", "nside"))
 def _forward_impl(ftm, *, L, spin, nside):
     from gmaster import _spin_slice as ss
@@ -1055,7 +1083,7 @@ def _inverse_fold_impl(positive, phase, *, L, nside):
     norm = jnp.sqrt((2.0 * jnp.arange(L, dtype=jnp.float64) + 1.0) / (4.0 * jnp.pi))
     alm = positive * norm[:, None]
     dirs, mirs = [], []
-    for (m0, m1, lo) in _march_windows(L, ntile, 0):
+    for (m0, m1, lo) in _synth_windows(L, ntile, 0):
         mb = m1 - m0
         ms = m0 + jnp.arange(mb)
         g = _window_geometry(m0, mb, x, sh, ch, L, npad, spin=0)

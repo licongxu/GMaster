@@ -695,3 +695,58 @@ def test_synthesis_tile_is_per_spin_and_still_powers_of_two(nside):
     # spin-0 fold has moved.
     assert smp._synth_tile(2, ntheta) == smp._ST
 
+
+@pytest.mark.parametrize("nside", [512, 1024, 2048, 4096, 8192])
+def test_synth_order_window_fills_the_launch_ceiling(nside):
+    """The synthesis order window is grown toward `_MARCH_GRID_CAP` and never past it.
+
+    Every win and loss of the marched routes' order window turned out to be about programs per
+    launch, not about the width (`_march_windows`: wins at <= 2048 programs, losses at 4096).  The
+    folded spin-0 synthesis is the one route with room to fill the ceiling -- `_ST0` leaves it 4
+    theta tiles at Nside 2048 and 8 at 4096 while the analysis has 16 and 32 -- and doing so is worth
+    5% on the largest cell (spin-0 `alm2map` at 4096: 1740.0 ms / 1.14x -> 1650.3 ms / 1.20x,
+    `.qwen/tmp/s29y.log`, `.qwen/tmp/swin_s29.log`).
+
+    The second half is the trap this guard exists for: raising the *global* `GMASTER_MARCH_M_BLOCK`
+    does not widen the analysis, it pushes `mb * ntile` over the ceiling, which silently drops the
+    route to `_M_BLOCK` = 64 and costs 1.37x there (the 256 arm at Nside 2048 read 405.3 ms, the
+    64-window value, not a 256-window one).  So the synthesis width must be independent of the
+    analysis windows, and this asserts that at every size.
+    """
+    from gmaster import _spin_march_pallas as smp
+    from gmaster import _spin_slice as ss
+
+    L = 3 * nside - 1
+    north = (4 * nside - 1 + 1) // 2
+    ntile = -(-north // smp._synth_tile(0, north))
+    win = smp._synth_windows(L, ntile, 0)
+    if ntile < 4:
+        # Below four theta tiles the wider window loses (Nside 512: 4.6 -> 4.9 ms), so the route
+        # falls back to the shipped analysis rule verbatim rather than filling the ceiling.
+        assert win == smp._march_windows(L, ntile, 0)
+        return
+    widths = {m1 - m0 for m0, m1, _ in win}
+    assert len(widths) == 2 or len(widths) == 1      # full windows plus at most one truncated tail
+    mb = max(widths)
+    assert mb & (mb - 1) == 0, f"mb={mb} is not a power of two (Triton lowering)"
+    assert mb >= ss._MARCH_M_BLOCK
+    assert mb * ntile <= smp._MARCH_GRID_CAP
+    # As close to the ceiling as a power of two gets, unless the cap on the width itself binds.
+    assert mb == ss._MARCH_M_SYNTH0_MAX or 2 * mb * ntile > smp._MARCH_GRID_CAP
+    # Coverage: every order 0..L-1 in exactly one window.
+    assert [m0 for m0, _, _ in win] == list(range(0, L, mb))
+    assert win[-1][1] == L
+
+    # Spin 2 synthesis is the analysis rule verbatim, at every size.
+    assert smp._synth_windows(L, ntile, 2) == smp._march_windows(L, ntile, 2)
+
+    # The analysis windows do not move when the synthesis ceiling moves -- the failure mode that made
+    # an earlier "256 is worse" measurement actually measure 64.
+    before = smp._march_windows(L, ntile, 0)
+    orig = ss._MARCH_M_SYNTH0_MAX
+    try:
+        ss._MARCH_M_SYNTH0_MAX = 4096
+        assert smp._march_windows(L, ntile, 0) == before
+    finally:
+        ss._MARCH_M_SYNTH0_MAX = orig
+
