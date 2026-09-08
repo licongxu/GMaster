@@ -5748,3 +5748,60 @@ the two use sites of the width against each other and keeps `ntile` a power of t
 lowering rule from addendum 1, asserted at sizes the suite cannot afford to run on a GPU. Suite:
 **157 passed, 3 skipped in 343.41 s** (`pytest_s29d.log`).
 
+### Session 29 addendum 4 — the post-change board, the synthesis warp count confirmed, and a measurement incident that produced 0.02x rows
+
+**The authoritative shipped-default fp32 board after `9d5648a`** (`GM_PREC=fp32`, 5 reps, one geometry
+per process, ducc0 re-measured inside every arm, bandwidth controls 1279-1437 GB/s,
+`.qwen/tmp/s29z.log` stage `BOARD`; the small end is `.qwen/tmp/small_s29.log`, 20 reps):
+
+| nside | spin | ducc0 m2a / a2m ms | GMaster m2a / a2m ms | ratio m2a / a2m | rel alm |
+|---|---|---|---|---|---|
+| 32 | 0 | 0.1 / 0.1 | 0.1 / 0.1 | 1.00x / 1.21x | 1.4e-07 |
+| 64 | 0 | 0.4 / 0.4 | 0.3 / 0.2 | 1.62x / 1.66x | 2.1e-07 |
+| 128 | 0 | 0.7 / 0.6 | 0.7 / 0.7 | 1.13x / **0.93x** | 2.5e-07 |
+| 256 | 0 | 2.2 / 1.4 | 1.2 / 1.2 | 1.89x / 1.19x | 2.7e-07 |
+| 512 | 0 | 14.9 / 11.8 | 4.3 / 4.6 | 3.45x / 2.55x | 3.7e-07 |
+| 1024 | 0 | 61.4 / 56.2 | 28.1 / 30.2 | 2.18x / 1.86x | 3.6e-07 |
+| 2048 | 0 | 317.1 / 304.4 | 294.7 / 246.3 | 1.08x / **1.24x** | 6.9e-05 |
+| 4096 | 0 | 1968.4 / 1984.0 | 2219.1 / 1740.0 | **0.89x** / **1.14x** | 2.1e-04 |
+| 32 | 2 | 0.2 / 0.2 | 0.2 / 0.2 | 0.99x / 0.85x | 2.5e-07 |
+| 64 | 2 | 0.5 / 0.4 | 0.3 / 0.3 | 1.73x / 1.61x | 2.7e-07 |
+| 128 | 2 | 1.4 / 0.9 | 0.5 / 0.5 | 2.99x / 1.84x | 3.5e-07 |
+| 256 | 2 | 4.5 / 2.7 | 1.4 / 1.5 | 3.20x / 1.78x | 3.2e-07 |
+| 512 | 2 | 28.0 / 24.6 | 9.2 / 8.7 | 3.04x / 2.83x | 3.2e-07 |
+| 1024 | 2 | 120.7 / 108.1 | 77.8 / 71.0 | 1.55x / 1.52x | 3.7e-05 |
+| 2048 | 2 | 641.7 / 606.6 | 574.6 / 457.7 | 1.12x / **1.33x** | 6.1e-05 |
+| 4096 | 2 | 3911.2 / 3923.2 | 4574.3 / 3423.8 | **0.86x** / **1.15x** | 1.9e-04 |
+
+Every cell from Nside 64 up is above ducc0 except the two `map2alm` cells at 4096 (0.86-0.89x) and
+spin-0 `alm2map` at Nside 128 (0.93x, 0.7 vs 0.6 ms, launch-bound); Nside 32 is parity in both spins at
+the timer's resolution. The four spin-0 synthesis cells at 2048/4096 and the spin-2 synthesis cells are
+where addendum 3's tile change shows up: 2048 `alm2map` 0.99x → **1.24x**, 4096 1.02x → **1.14x**.
+
+**`_SW` (synthesis warps, shipped 4) is confirmed optimal at the new tile width, and the drop-off is
+steep** (`s29z.log` stage `SW`, Nside 2048 `alm2map`, all four arms at `_ST0` = 1024 for spin 0):
+
+| warps | spin 0 ms / vs ducc0 | spin 2 ms / vs ducc0 |
+|---|---|---|
+| 1 | 1522.1 / 0.20x | — |
+| 2 | 383.0 / 0.78x | 526.2 / 1.14x |
+| **4 (shipped)** | **246.3 / 1.24x** | **457.7 / 1.33x** |
+| 8 | 254.2 / 1.20x | 469.3 / 1.27x |
+
+A 1024-lane tile with one warp is 1024 lanes over 32 threads, and the cost is not gradual — 6.2x worse
+than four warps — so if the tile width is ever touched again, re-check `_SW` in the same sweep; the
+two knobs are one occupancy decision, not two.
+
+**A measurement incident, recorded because the bad rows looked like results.** The session ran several
+`.qwen/tmp/*_s29.sh` probe scripts that each polled `wait_free` (GPU1 < 2000 MiB) and waited on
+*another* script's `DONE` marker. Two waiters passed the memory check in the same window before either
+had allocated, and a duplicated launcher of an already-finished script joined them — three processes on
+a 97 GiB card. The rows were not noisy, they were **different routes** (pool downgrade → the generic
+fallback of session 22's trap): Nside 512 spin-2 `alm2map` printed **1296.2 ms (0.02x)** against the
+8.7 ms above, Nside 1024 spin 0 printed **123.2 / 161.8 ms (0.47x / 0.33x)**, one arm died `exit=1`, and
+the contended arms also inflated the ducc0 column (spin-0 2048 `alm2map` baseline read 346.9 ms against
+its 304 ms). **Those numbers are retired; the table above replaces them.** The fix is structural, not
+polite: all of the remaining session measurement runs in **one driver, `.qwen/tmp/s29z.sh`, arms in a
+sequential loop inside one process**, never a fleet of marker-waiting scripts, and the first row of any
+new board is checked against the previous session's absolute ms before an hour is spent on it.
+

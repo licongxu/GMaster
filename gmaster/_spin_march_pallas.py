@@ -634,15 +634,21 @@ _ST = int(os.environ.get("GMASTER_SPIN2_MARCH_SYNTH_TILE", "512"))
 # kernel `north = (ntheta+1)//2` rows instead of `ntheta`, so at the spin-2 width a 2048-grid launch
 # is 8 tiles of 512 northern rows and each block re-does its per-window prologue 8 times over half
 # the rows.  Measured against ducc0 in one geometry per process, `GM_PREC=fp32`, 5 reps
-# (`.qwen/tmp/st2048_s29.log`, `.qwen/tmp/st_spin0_s29.log`), spin-0 `alm2map`:
+# (`.qwen/tmp/st2048_s29.log`, `.qwen/tmp/st_spin0_s29.log`, `.qwen/tmp/default_s29.log`), spin-0
+# `alm2map`:
 #   Nside 2048  512 (shipped) 287.4 ms 0.99x | 256 270.0 ms 1.04x | 1024 243.7 ms 1.17x | 2048 401.2 0.71x
-#   Nside 4096  512          1885.1 ms 1.02x | 1024 1745.8 ms 1.10x
+#   Nside 4096  512          1885.1 ms 1.02x | 1024 1745.8 ms 1.10x | 2048 3186.5 ms 0.61x
 #   Nside 1024  512            31.0 ms 1.73x | 1024  30.7 ms 1.70x | 2048  30.7 ms 1.59x  (flat)
 # Spin 2 at the same geometry goes the other way -- 453.7 ms 1.25x at 512, 508.1 at 256, 524.6 at
 # 1024 -- so the width is per-spin, not global.  Applied only where `north` can still fill four
 # tiles at the wide width, which is exactly the regime measured above; below it (Nside <= 1024,
 # where the widths are indistinguishable) the shipped geometry stands.
 _ST0 = int(os.environ.get("GMASTER_SPIN0_SYNTH_TILE", "1024"))
+# Warps per synthesis block.  Re-measured at the shipped tile widths, Nside 2048 `alm2map`
+# (`.qwen/tmp/s29z.log` stage `SW`; the 4-warp row is the default arm of stage `BOARD`): spin 0 gives
+# 1522.1 ms (1 warp), 383.0 (2), **246.3 (4)**, 254.2 (8); spin 2 gives 526.2 (2), **457.7 (4)**.
+# The one-warp arm is 6x the four-warp one -- a 1024-lane tile over 32 lanes is an occupancy cliff,
+# not a slope -- so this knob and `_ST`/`_ST0` are one decision and must be swept together.
 _SW = int(os.environ.get("GMASTER_SPIN2_MARCH_SYNTH_WARPS", "4"))
 # `fast` accumulates the contraction in plain float32, `comp` in (value, limb) float32 pairs; see
 # `_accumulate_fast` for the measured cost and error of the difference.
