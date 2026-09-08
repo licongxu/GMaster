@@ -5777,6 +5777,8 @@ Every cell from Nside 64 up is above ducc0 except the two `map2alm` cells at 409
 spin-0 `alm2map` at Nside 128 (0.93x, 0.7 vs 0.6 ms, launch-bound); Nside 32 is parity in both spins at
 the timer's resolution. The four spin-0 synthesis cells at 2048/4096 and the spin-2 synthesis cells are
 where addendum 3's tile change shows up: 2048 `alm2map` 0.99x → **1.24x**, 4096 1.02x → **1.14x**.
+**Superseded for two rows:** the spin-0 2048 and 4096 `alm2map` cells are 215.6 ms / **1.40x** and
+1649.2 ms / **1.19x** after addendum 5's order window; everything else in this table still stands.
 
 **`_SW` (synthesis warps, shipped 4) is confirmed optimal at the new tile width, and the drop-off is
 steep** (`s29z.log` stage `SW`, Nside 2048 `alm2map`, all four arms at `_ST0` = 1024 for spin 0):
@@ -5804,4 +5806,82 @@ its 304 ms). **Those numbers are retired; the table above replaces them.** The f
 polite: all of the remaining session measurement runs in **one driver, `.qwen/tmp/s29z.sh`, arms in a
 sequential loop inside one process**, never a fleet of marker-waiting scripts, and the first row of any
 new board is checked against the previous session's absolute ms before an hour is spent on it.
+
+### Session 29 addendum 5 — the synthesis order window now fills the launch ceiling: spin-0 `alm2map` 1.24x → 1.40x at 2048, 1.14x → 1.19x at 4096
+
+**A probe that looked like a wash was hiding a win, because the knob it turned meant something
+different in the two directions.** The probe set the *global* `GMASTER_MARCH_M_BLOCK=256`
+(`.qwen/tmp/s29y.log`): spin-0 `alm2map` at 4096 got 5% faster (1650.3 vs 1740.0 ms) while `map2alm` at
+2048 got 37% slower (405.3 vs 294.7 ms), which reads as "wider windows are bad for analysis, good for
+synthesis, ship nothing". The reason it is not that is the ceiling in `_march_windows` — `mb` is taken
+and then dropped to `_M_BLOCK` = 64 if `mb * ntile > _MARCH_GRID_CAP` — and the analysis has four to
+eight times as many theta tiles as the synthesis. Printed directly on CPU (`.qwen/tmp/synth_window_check_s29.py`):
+
+| Nside | analysis tiles | window at `mb` 128 | window at `mb` 256 | synthesis tiles | window at 128 | window at 256 |
+|---|---|---|---|---|---|---|
+| 2048 | 16 | 128, 48 launches | **64, 96 launches** | 4 | 128, 48 launches | 256, 24 launches |
+| 4096 | 32 | 64, 192 launches | 64, 192 launches | 8 | 128, 96 launches | 256, 48 launches |
+
+So the 2048 "loss" never measured a 256-wide analysis window at all: it measured **64 with twice the
+launches**, which is 1.37x and matches session 28's independent 64-vs-128 number (419.42 vs 312.04 ms)
+and the earlier "256 is worse than 128, 316.0 vs 300.8 ms" line in the `_MARCH_M_BLOCK` comment. The
+global knob cannot widen the analysis at any size where it matters, and it was the only knob of its kind.
+
+**The change is `_synth_windows` (`gmaster/_spin_march_pallas.py`), used only by `_inverse_fold_impl`.**
+It grows the folded spin-0 synthesis window to fill the ceiling — the largest power of two that is at
+most `GMASTER_MARCH_M_SYNTH0_MAX` (new, 512) and at most `_MARCH_GRID_CAP // ntile` — and it applies
+only from four theta tiles up. Every other route keeps `_march_windows` verbatim: the analysis at both
+sizes and the whole polarised synthesis are already at their ceiling-optimal width by that same rule.
+
+Spin-0 `alm2map`, `GM_PREC=fp32`, 5 reps, one geometry per process, ducc0 in the same process
+(`.qwen/tmp/swin_s29.log` for the widths, `.qwen/tmp/swinf_s29.log` for the shipped default):
+
+| Nside | tiles | window | launches | ms before | ms now | ratio before → now |
+|---|---|---|---|---|---|---|
+| 512 | 2 | 128 (gate holds it there) | 12 → 12 | 4.6 | 4.4 | route unchanged; run-to-run 4.3-4.6 ms |
+| 1024 | 4 | 512 | 24 → 6 | 30.2 | 30.2 | 1.86x (unchanged) |
+| 2048 | 4 | 512 | 48 → 12 | 246.3 | **215.6** | 1.24x → **1.40x** |
+| 4096 | 8 | 256 | 96 → 48 | 1740.0 | **1649.2** | 1.14x → **1.19x** |
+
+`rel alm` is **digit-for-digit unchanged** in every row (3.7e-07 / 3.6e-07 / 6.9e-05 / 2.1e-04) and
+`map2alm` did not move (293-295 ms at 2048, 2211 at 4096), as neither is supposed to: the window only
+groups independent m-lanes into one launch, so no value and no summation order changes. Reproduced
+three times at 4096 (1650.3, 1670.6, 1649.2) and twice at 2048 (217.2, 215.6). The gate exists because
+the one geometry with fewer than four tiles loses 0.3 ms from it (512: 4.9-5.0 ms ungated against
+4.4-4.6 gated). Spin-2 controls are untouched: 512 **9.2 / 8.7 ms**, 2048 **571.6 / 452.9 ms**.
+
+**End to end, where the 3 synthesis passes inside `NmtField(n_iter=3)` carry it**
+(`.qwen/tmp/pipe2_s29.log`, `python -m benchmarks.benchmark_pipeline --nside 2048 --spins 0,2 --repeats 3`,
+medians of 3, NaMaster CPU as the reference in the same process):
+
+| arm | NaMaster TOTAL | GMaster TOTAL | ratio | `field` | `coupling` | `coupled_cell` | rel `dCl` |
+|---|---|---|---|---|---|---|---|
+| 2048 spin 0, before this addendum | 10593 ms | 5646 ms | 1.9x | 2012 | 1520 | 0 (302x) | 1.38e-06 |
+| **2048 spin 0, shipped** | 10593 ms | **5487 ms** | **1.9x** | **1929** | 1527 | 0 (287x) | **1.38e-06** |
+| 2048 spin 2 (control) | 18413 ms | 8549 ms | 2.2x | 3659 | 2674 | 2 (267x) | 1.09e-05 |
+
+**What is left of this knob: nothing.** Both analysis routes now sit at the width their own tile count
+allows (128 at 2048, 64 at 4096), spin 2's synthesis overflows the ceiling at 256 for any Nside ≥ 1024,
+and the theta tiles are measured two-sided optima in both directions (addenda 1, 3, and the `_SW` table
+above). The remaining sub-1x cells are `map2alm` at Nside 4096 (0.88x spin 0, 0.86x spin 2 — needs a
+different recurrence, not another block), spin-0 `alm2map` at Nside 128 (0.93x, launch-bound), and
+Nside 32 at parity. Suite on the shipped default: **162 passed, 3 skipped in 351.53 s**
+(`.qwen/tmp/pytest_s29e.log`), the 157 of addendum 4 plus the 5 geometry cases of
+`tests/test_sht.py::test_synth_order_window_fills_the_launch_ceiling`; re-run on the committed tree,
+**162 passed, 3 skipped in 349.61 s** (`.qwen/tmp/pytest_s29f.log`).
+
+**The last table the contention period left unread: spin-2 `_ST` at Nside 4096** (stage `ST4096S2` of the
+clean sequential driver, `.qwen/tmp/s29z.log` 08:18-08:40, 5 reps, controls 1335-1457 GB/s, ducc0
+3924.6-3950.1 ms across the three arms so the baseline itself is stable):
+
+| `_ST` | `alm2map` ms | vs ducc0 | `map2alm` ms (unaffected) |
+|---|---|---|---|
+| **512 (shipped)** | **3466.4** | **1.14x** | 4584.4 (0.86x) |
+| 1024 | 3890.0 | 1.02x | 4575.5 (0.86x) |
+| 2048 | 7060.8 | 0.56x | 4575.2 (0.86x) |
+
+One-sided, exactly like the spin-0 case of addendum 3: past 512 the polarised synthesis tile only loses,
+and 2048 is 2x worse — a 2048-lane row cannot hold its theta reduction in `_SW` = 4 warps. So `_ST` = 512
+is confirmed at the largest measured geometry, and the tile family (`_TILE`, `_ST`, `_ST0`, `_SW`) is
+closed in every direction it has been probed.
 
