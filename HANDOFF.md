@@ -6317,6 +6317,45 @@ fp32 tables engage the band and the band is the accurate route (addendum 10). Th
 3e-6 are both spin 2 with a table-free or triangle-limited route, so they are the march. That leaves exactly
 one accuracy target and one speed target, and they are the same object.
 
+**The recommended route across the whole board** (`fp32` tables + `complex128` rings; `.qwen/tmp/
+ringprec_small_s29.log` with `REPEATS=9` below 256 and `REPEATS=3` above, `REPEATS=1` at 4096, and the
+256-2048 rows from the two logs above):
+
+```text
+ 32 0   3 ms (0.99x)  rel=1.92e-14     1024 0   678 ms (2.55x)  rel=5.60e-08
+ 32 2   4 ms (0.90x)  rel=5.23e-09     1024 2  1127 ms (2.88x)  rel=3.46e-06
+ 64 0   6 ms (1.47x)  rel=5.90e-14     2048 0  5543 ms (1.85x)  rel=1.38e-06
+ 64 2   5 ms (2.30x)  rel=8.29e-09     2048 2  8456 ms (2.17x)  rel=1.09e-05
+128 0  12 ms (1.61x)  rel=1.08e-13     4096 0 41990 ms (1.73x)  rel=1.41e-06 GPUpeak=15.0GiB
+128 2  11 ms (3.47x)  rel=9.50e-09
+256 0  22 ms (5.82x)  rel=6.48e-09
+256 2  36 ms (5.44x)  rel=3.22e-08
+512 0 104 ms (3.66x)  rel=7.17e-09
+512 2 160 ms (5.42x)  rel=3.56e-07
+```
+
+Below 128 the totals are 3-12 ms and dispatch-bound, and the spin-0 cells there sit at 1.0-1.6x; that is
+`jit-boundaries-are-the-small-n-cost`, not something this flag changes.
+
+**The 4096 control retires addendum 9's memory claim.** Addendum 9 read `fp64 41944 ms / GPUpeak 15.0 GiB`
+against `fp32 41322 ms / GPUpeak 7.5 GiB` and concluded that float32 halves the device footprint "for 1.5 %
+of the time, because the tables are refused in *both* precisions". The two halves of that sentence were
+contradictory — refused tables cannot account for 7.5 GiB. With the third arm measured, the tables are
+indeed irrelevant at 4096 and the footprint belongs entirely to the azimuthal buffers:
+
+| Nside 4096 spin 0 | TOTAL | `GPUpeak` | `rel dCl` |
+|---|---|---|---|
+| fp64 tables, fp64 rings (default) | 72347 → 41944 ms (1.7x) | 15.0 GiB | 1.41e-06 |
+| fp32 tables, fp32 rings (follow) | 73008 → 41322 ms (1.8x) | 7.5 GiB | 1.20e-06 |
+| fp32 tables, fp64 rings | 72495 → 41990 ms (1.73x) | **15.0 GiB** | **1.41e-06** |
+
+The third arm is the shipped default's number, not the fp32 row's: at the top end the ring buffers *are* the
+memory story and the ring dtype *is* the accuracy story, while table precision does literally nothing. So the
+capacity lever at 4096 is `set_ring_precision("fp32")`, and nothing else — which is worth knowing precisely
+because it is the one place where the cheap azimuthal transform buys bytes rather than the 5 % of time it buys
+everywhere else.
+
+
 
 
 
