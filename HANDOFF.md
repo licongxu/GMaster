@@ -6355,6 +6355,58 @@ capacity lever at 4096 is `set_ring_precision("fp32")`, and nothing else — whi
 because it is the one place where the cheap azimuthal transform buys bytes rather than the 5 % of time it buys
 everywhere else.
 
+**See addendum 12: three of the ratio columns in the table above are inflated.** The absolute milliseconds are
+confirmed to ±5 % by the repo's own tool; the `x` values at 256 spin 0, 512 spin 0 and 512 spin 2 are not.
+
+## Addendum 12 (session 29e): the probe's reference column was cold, so three board ratios were inflated —
+## here is the recommended route measured with `benchmarks/benchmark_pipeline.py`, which is the only
+## instrument this file should quote board rows from
+
+`.qwen/tmp/ringprec_s29.py` runs the NaMaster reference first, in a cold process, and then GMaster. Every
+ratio it prints therefore divides a first-measurement reference by a warm GMaster. `benchmark_pipeline.py`
+builds the reference and the module in the same process with the same repeat count, and it is what every
+board row in addenda 8-10 came from. Re-scoring the recommended route with it (`.qwen/tmp/board_cli_s29.log`,
+`.qwen/tmp/board_cli_2048_s29.log`, both precisions in the same invocation, `REPEATS=5` at 256/512 and `2-3`
+above) gives:
+
+| Nside | spin | shipped fp64 | fp32 tables + fp64 rings | what the flag buys | addendum-11b ratio |
+|---|---|---|---|---|---|
+| 256 | 0 | 60 → 29 ms (2.1x) | 59 → 21 ms (**2.9x**) | 1.38x | 5.82x — inflated |
+| 256 | 2 | 154 → 54 ms (2.8x) | 157 → 27 ms (**5.8x**) | 2.00x | 5.44x — close |
+| 512 | 0 | 312 → 163 ms (1.9x) | 313 → 101 ms (**3.1x**) | 1.61x | 3.66x — inflated |
+| 512 | 2 | 683 → 345 ms (2.0x) | 675 → 158 ms (**4.3x**) | 2.18x | 5.42x — inflated |
+| 1024 | 0 | 1669 → 940 ms (1.8x) | 1677 → 677 ms (**2.5x**) | 1.39x | 2.55x — confirmed |
+| 1024 | 2 | 3143 → 1258 ms (2.5x) | 3141 → 1124 ms (**2.8x**) | 1.12x | 2.88x — confirmed |
+| 2048 | 0 | 10494 → 5535 ms (1.8x)\* | 10305 → 5485 ms (**1.9x**) | 1.01x | 1.85x — confirmed |
+| 2048 | 2 | 18222 → 8448 ms (2.1x)\* | 18028 → 8436 ms (**2.1x**) | 1.00x | 2.17x — confirmed |
+
+\* the 2048 fp64 column is the addendum-8 board — this session ran only the fp32+exact-rings arm there, so
+its reference column is a different invocation and the 2048 "what the flag buys" figures are the weakest
+comparison in the table.
+
+GMaster's own milliseconds agree between the two instruments to within 5 % at every shared cell (22 vs 21,
+104 vs 101, 160 vs 158, 678 vs 677, 1127 vs 1124), which is the point: **the probe's device numbers were
+right and only its ratios were wrong**, because the thing it measured cold was the reference. The accuracy
+column is unaffected — `rel dCl` is identical in both tools at every cell (6.48e-09, 3.22e-08, 7.17e-09,
+3.56e-07, 5.60e-08, 3.46e-06, 1.38e-06, 1.09e-05).
+
+**What this changes about the claim.** The multiplier from holding the azimuthal stage open is not uniform: it
+is ~2x at the spin-2 mid cells (256 and 512), 1.4-1.6x at the spin-0 mid cells, 1.12x at 1024 spin 2, and
+**1.00-1.01x at 2048**, where the tables are refused and the ring stage is the only thing the flag can
+touch. Addendum 11's "0-12 % cost" was measured the other way round (exact rings as the baseline) and is
+still true; what was missing is that against the *fp64 default* the same route is a 1.0-2.2x win, not the
+2.5-5.8x the probe's ratio column implied for the mid cells.
+
+**A practical rule for this repo:** quote ratios only from `benchmarks/benchmark_pipeline.py`, which times
+both modules under one invocation. A probe is fine for absolute GMaster milliseconds, `GPUpeak` and route
+engagement — those were all correct — but any ratio from a script that measures the reference exactly once
+in a cold process is inflated by the reference's own first-call cost, which at Nside 256 was 2x.
+
+**Closes the deferred Nside 4096 spin-2 cell.** Measured `peakRSS=91.1GB` at Nside 2048 spin 2, where the
+host has to hold the 7-block spin-2 coupling matrix; Nside 4096 quadruples the matrix at fixed block count
+and doubles `lmax`, which is beyond this box's 376 GB even before the reference's own copy. Not attempted,
+and no number is claimed for it.
+
 
 
 

@@ -240,6 +240,17 @@ the float32 chirp tables cast the *pixels* too, so a float32 session analyzed th
 itself in float32. Held to `complex128` the whole suite passes — **164 passed, 3 skipped**,
 the same result as the default float64 run — for 0-12 % of the pipeline wall clock.
 
+The pipeline benchmark takes the same flag, and this is what it scores against NaMaster in
+one process: **2.9x / 5.8x** (spin 0 / spin 2) at `Nside=256`, **3.1x / 4.3x** at 512 and
+**2.5x / 2.8x** at 1024, where the shipped fp64 default scores 2.1x / 2.8x, 1.9x / 2.0x and
+1.8x / 2.5x. At 2048 the tables are refused in either precision and the route is worth
+1.00-1.01x over the default.
+
+```bash
+python benchmarks/benchmark_pipeline.py --nside 512 --spins 0,2 \
+  --precision fp32 --ring-precision fp64
+```
+
 While float32 tables are live, `numpy.testing.assert_allclose` is held to a floor of
 **2e-6 of the compared quantity** (its own `max|desired|`, not a fixed absolute), which is
 about the size of the float32 table's representation error and is stated relative because a
