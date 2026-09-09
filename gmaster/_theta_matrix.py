@@ -236,6 +236,14 @@ def _band(geometry):
                         f"({type(exc).__name__}: {str(exc)[:200]}); this band is "
                         "being built with the scan builder instead", stacklevel=2)
                     pair = builder(m0, mb, store.name)
+                if not hasattr(pair[0], "block_until_ready"):
+                    # The emitter route builds without `ensure_compile_time_eval`, so
+                    # inside an outer trace its blocks come back as tracers.  Decline
+                    # here rather than at the drain below, which raises
+                    # `AttributeError: 'block_until_ready' is not available on traced
+                    # array` and takes the whole call down instead of falling back to
+                    # the fused kernel the way a gradient path does.
+                    return None
                 even.append(pair[0])
                 odd.append(pair[1])
                 # A cached executable pins a copy of the buffers it produced, so a
@@ -485,6 +493,21 @@ def _synth_band(geometry):
             slab.block_until_ready()
     _SYNTH_CACHE[geometry] = (groups, ELL_CONTIG)
     return groups, ELL_CONTIG
+
+
+def warm(nside, L):
+    """Build the band and its synthesis layout now, and say whether they are concrete.
+
+    A traced program can *read* the band but cannot *build* it: both builders drain
+    their caches with `block_until_ready` and decline under a trace, so a geometry
+    first touched inside one silently takes the fused fp64 kernel -- the worst cell
+    in the repo -- inside a program that was traced precisely to be fast.  Callers
+    that are about to trace therefore ask this first; the build happens here, at top
+    level, exactly as it would have happened on the op-by-op route.  Called inside a
+    trace it degrades to ``False``, which is the correct answer there.
+    """
+    geometry = band_geometry(nside, L)
+    return _band(geometry) is not None and _synth_band(geometry) is not None
 
 
 def _contract_ell(slab, rhs):

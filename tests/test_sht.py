@@ -665,6 +665,67 @@ def test_fused_slab_route_is_bit_identical_to_the_split_route(nside):
     np.testing.assert_array_equal(np.asarray(got), np.asarray(ref))
 
 
+@pytest.mark.skipif(not _HAS_NVIDIA_GPU, reason="requires an NVIDIA GPU")
+@pytest.mark.parametrize("nside", [128, 256])
+def test_traced_refinement_route_is_bit_identical_to_op_by_op(nside):
+    """Tracing the scalar refinement loop may change the dispatch count and nothing else.
+
+    The two cores are the same seven passes cut at a different number of jit
+    boundaries, so equality is exact rather than tolerance-based: measured
+    `rel = 0.000e+00` at Nside 256 (`.qwen/tmp/traceidentity_s32.py`) for a 9.4 %
+    end-to-end win (`.qwen/tmp/tracepipe_s32.log`).  Asserting `L <= _PALLAS_TRACED_MAX_L`
+    pins the gate from both sides -- Nside 512 was measured 17 % *slower* on the traced
+    route and must not be moved onto it, and Nside 256 must not quietly fall back to
+    op-by-op because the Legendre band stopped being hoistable.
+    """
+    lmax = 3 * nside - 1
+    L = lmax + 1
+    npix = 12 * nside ** 2
+    assert L <= utils._PALLAS_TRACED_MAX_L
+    rng = np.random.default_rng(11)
+    maps = jnp.asarray(rng.normal(size=(1, npix)))
+    ell, order = utils._ell_order_arrays(lmax)
+
+    # The gate's own condition: the band must be concrete device buffers before a
+    # program is allowed to read it.
+    assert utils._trace_route_ready(nside, L)
+
+    ref = np.asarray(utils._map2alm_core_pallas_eager(
+        maps, ell, order, nside=nside, L=L, L_work=L, n_iter=3, spin=0))
+    got = np.asarray(utils._map2alm_core_pallas_traced(
+        maps, ell, order, nside=nside, L=L, L_work=L, n_iter=3, spin=0))
+    np.testing.assert_array_equal(got, ref)
+
+
+@pytest.mark.skipif(not _HAS_NVIDIA_GPU, reason="requires an NVIDIA GPU")
+def test_band_build_declines_inside_a_trace_instead_of_raising():
+    """A geometry first touched under `jax.grad` must transform, not die on `block_until_ready`.
+
+    `_theta_matrix._band` drains its build caches with `slab.block_until_ready()` so
+    that a cached executable cannot pin the block it produced; under a trace that
+    raises `AttributeError: 'block_until_ready' is not available on traced array` and
+    takes the whole call down (`.qwen/tmp/s24_256_0.log`, the reason the traced gate sat
+    at Nside 128 for five sessions).  The builders now decline, the transform takes the
+    fused kernel, and the gradient still comes back finite.
+    """
+    nside = 64
+    lmax = 3 * nside - 1
+    L = lmax + 1
+    npix = 12 * nside ** 2
+    rng = np.random.default_rng(13)
+    ell, order = utils._ell_order_arrays(lmax)
+    _theta_matrix.release()
+
+    def scalar(maps_in):
+        return jnp.sum(jnp.abs(utils._map2alm_core_pallas(
+            maps_in[None, :], ell, order, nside=nside, L=L, L_work=L, n_iter=0,
+            spin=0)))
+
+    grad = np.asarray(jax.grad(scalar)(jnp.asarray(rng.normal(size=npix))))
+    assert np.all(np.isfinite(grad))
+    assert float(np.max(np.abs(grad))) > 0.0
+
+
 @pytest.mark.parametrize("nside", [512, 1024, 2048, 4096, 8192])
 def test_synthesis_tile_is_per_spin_and_still_powers_of_two(nside):
     """The synthesis launch geometry agrees with the chunk the kernel is compiled against.

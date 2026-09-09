@@ -817,13 +817,38 @@ def _pallas_block_size(nside):
 
 
 # Above this working bandlimit the refinement loop runs op-by-op instead of as
-# one traced program; see `_map2alm_core_pallas` for the measured crossover.  384 is Nside 128, the
-# largest size the single program is safe at: the Legendre band engages at Nside 256 (1.22x / 1.30x on
-# the traced route, `.qwen/tmp/spin0_traced.log`), and `_theta_matrix._band` clears its build caches
-# with `slab.block_until_ready()` every `_BUILD_CLEAR_EVERY` blocks, which raises
-# `AttributeError: 'block_until_ready' is not available on traced array float32[160, 64, 512]` when the
-# geometry is first built inside an outer trace (`.qwen/tmp/s24_256_0.log`).
-_PALLAS_TRACED_MAX_L = 384
+# one traced program.  768 is Nside 256: with the band hoisted out of the trace by
+# `_trace_route_ready`, one program over the refinement loop is bit-identical
+# (rel 0.000e+00, `.qwen/tmp/traceidentity_s32.py`) and 9.4 % faster end to end at
+# that size -- 13.737 -> 12.442 ms, field 7.243 -> 6.378 ms
+# (`.qwen/tmp/tracepipe_s32.log`).  It does not extend: the same arm at Nside 512
+# (gate 1536) is 17 % *slower*, 68.407 -> 80.283 ms, with a 4.69 GiB band inside the
+# program instead of the 0.61 GiB one it carries here.  Before the hoist the gate
+# could not move at all -- the band build inside an outer trace raised
+# `AttributeError: 'block_until_ready' is not available on traced array
+# float32[160, 64, 512]` (`.qwen/tmp/s24_256_0.log`).
+_PALLAS_TRACED_MAX_L = 768
+
+
+def _trace_route_ready(nside, L_work):
+    """Whether the single-program refinement route can see its tables at this size.
+
+    The Legendre band is built outside a trace or not at all (`_theta_matrix._band`
+    drains its build caches with `block_until_ready` and declines under one), so a
+    geometry first touched inside a traced program silently takes the fused fp64
+    on-the-fly kernel inside the very program that was traced to be fast.  The band
+    is therefore built here, at top level, before the route is chosen -- so a
+    program never carries a table build, which XLA would then re-run on every call.
+    """
+    if L_work > _PALLAS_TRACED_MAX_L:
+        return False
+    if not _prefer_theta_band(nside, L_work, 0):
+        # No band is in this program's future (too big, an m-split, or the folded
+        # march serves it), so there is nothing to hoist and tracing is safe.
+        return True
+    from . import _theta_matrix
+
+    return _theta_matrix.warm(nside, L_work)
 
 
 def _use_multi_gpu_pallas(L, values):
@@ -1785,7 +1810,7 @@ _alm2map_core_pallas_traced = jax.jit(
 
 def _alm2map_core_pallas(alm, *, nside, L, L_work, spin=0):
     """Synthesis, traced whole below `_PALLAS_TRACED_MAX_L` (see `_map2alm_core_pallas`)."""
-    core = (_alm2map_core_pallas_traced if L_work <= _PALLAS_TRACED_MAX_L
+    core = (_alm2map_core_pallas_traced if _trace_route_ready(nside, L_work)
             else _alm2map_core_pallas_eager)
     return core(alm, nside=nside, L=L, L_work=L_work, spin=spin)
 
@@ -1880,12 +1905,12 @@ def _map2alm_core_pallas(
     bandlimit is the whole cost: at Nside 128 the op-by-op route takes 1.058 ms for a 196608-pixel map
     whose device work is 0.333 ms, so one program over the same body is 3.17x faster with bit-identical
     output -- 1.96x on the inverse, and 2.18x / 1.77x with two refinement iterations
-    (`.qwen/tmp/spin0_traced.log`, `.qwen/tmp/spin0_traced_it2.log`).  Nside 256 measured faster traced
-    too (1.22x / 1.30x) but cannot be traced at all while the Legendre band engages there, and Nside
-    512 and 1024 are level to 1.02x either way, so the crossover sits at Nside 128.  It was previously
-    256, which left Nside 128 -- the one small spin-0 cell that lost to ducc0 -- on the op-by-op route.
+    (`.qwen/tmp/spin0_traced.log`, `.qwen/tmp/spin0_traced_it2.log`).  The gate used to stop at Nside 128
+    because the Legendre band cannot be built inside a trace; now that `_trace_route_ready` builds it
+    first, Nside 256 takes the single program too (9.4 % on the pipeline, bit-identical alms) and Nside
+    512 is measurably worse without it -- see `_PALLAS_TRACED_MAX_L`.
     """
-    core = (_map2alm_core_pallas_traced if L_work <= _PALLAS_TRACED_MAX_L
+    core = (_map2alm_core_pallas_traced if _trace_route_ready(nside, L_work)
             else _map2alm_core_pallas_eager)
     return core(maps, ell, order, nside=nside, L=L, L_work=L_work,
                 n_iter=n_iter, spin=spin)
