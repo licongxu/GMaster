@@ -20,6 +20,7 @@ def _restore_precision():
     yield
     utils.set_table_precision("fp64")
     utils.set_ring_precision("follow")
+    nmt.set_coupling_precision("fp64")
     _theta_matrix.release()
     _spin_slice.clear_cache()
 
@@ -39,6 +40,8 @@ def test_unknown_precision_is_rejected():
         utils.set_table_precision("fp16")
     with pytest.raises(KeyError):
         utils.set_ring_precision("fp16")
+    with pytest.raises(KeyError):
+        nmt.set_coupling_precision("fp16")
 
 
 def test_ring_precision_follows_the_tables_only_while_it_follows():
@@ -223,3 +226,44 @@ def test_float32_tables_keep_the_coupling_matrix(spin):
     fp32 = pipeline()
     scale = max(float(np.max(np.abs(fp64))), 1e-300)
     assert float(np.max(np.abs(fp32 - fp64))) / scale < 1e-6
+
+
+def test_float32_coupling_quadrature_keeps_the_cells():
+    """The quadrature's operand precision is opt-in and it really does switch.
+
+    Each of the two contractions in `_general_coupling_matrix_quadrature` is 115.9 GFLOP at
+    lmax 3071 and runs at 1.76 TFLOP/s in float64 -- 94 % of this card's fp64 roofline -- so
+    float32 operands are worth 34.3x there (`.qwen/tmp/coupling_prec_1024c_s29.log`), at a cost
+    of rel 2.1e-06 of the matrix.  On the full pipeline (`.qwen/tmp/coupling_board_s29.log`)
+    that is 335 -> 91 ms of the Nside 1024 spin-2 coupling and the decoupled Cls still agree
+    with pymaster to 3.2e-06, the same as float64, because at fp32 tables the error budget is
+    set by the tables.  Against float64 tables the matrix itself is what moves, so that is
+    what is pinned here.
+    """
+    lmax = 95
+    rng = np.random.default_rng(7)
+    ell = np.arange(lmax + 1)
+    pcl = np.exp(-ell / 60.0) * (1.0 + 0.1 * rng.normal(size=ell.size))
+
+    def matrix():
+        return np.asarray(nmt.get_general_coupling_matrix(pcl, 2, 2, 2, 2, parity="both"))
+
+    nmt.set_coupling_precision("fp64")
+    jax.clear_caches()
+    fp64 = matrix()
+
+    nmt.set_coupling_precision("fp32")
+    # The flag is read while tracing, so a program compiled by an earlier test in this process
+    # would otherwise keep its float64 operands and this would pass without testing anything.
+    jax.clear_caches()
+    fp32 = matrix()
+
+    nmt.set_coupling_precision("fp64")
+    jax.clear_caches()
+
+    scale = float(np.max(np.abs(fp64)))
+    rel = float(np.max(np.abs(fp32 - fp64))) / scale
+    # Exactly zero here means the switch was ignored, not that it was accurate.
+    assert rel > 0.0
+    assert rel < 1e-4
+

@@ -1,5 +1,6 @@
 """Pseudo-spectrum operations."""
 
+import os
 from functools import lru_cache, partial
 
 import jax
@@ -10,6 +11,31 @@ from scipy.special import roots_legendre
 
 from .bins import NmtBin, NmtBinFlat
 from .utils import alm2map, map2alm
+
+# Operand precision of the two big contractions in the coupling-matrix quadrature.  Each is
+# 115.9 GFLOP at lmax 3071 and the float64 form runs at 1.76 TFLOP/s, i.e. 94 % of this card's fp64
+# roofline, so float32 operands are 34.3x there (`.qwen/tmp/coupling_prec_1024c_s29.log`) at a cost
+# of rel 2.1e-06 of the matrix.  The agreement bar here is float64
+# (`tests/test_workspaces.py` holds the MCM to `atol=2e-14`), so fp64 stays the default and this is
+# opt-in: `GMASTER_COUPLING_PRECISION=fp32`.
+_COUPLING_F32 = os.environ.get("GMASTER_COUPLING_PRECISION", "fp64") == "fp32"
+
+
+def set_coupling_precision(name):
+    """Choose the operand precision of the coupling-matrix quadrature.
+
+    Must be called before the first coupling build: the flag is consulted while tracing, so an
+    already-compiled program keeps the precision it was traced with (``jax.clear_caches()`` after
+    the call if any coupling matrix has already been built in this process).
+    """
+    global _COUPLING_F32
+    if name not in ("fp64", "fp32"):
+        raise KeyError("GMaster coupling precision must be 'fp64' or 'fp32'")
+    _COUPLING_F32 = name == "fp32"
+
+
+def coupling_precision():
+    return "fp32" if _COUPLING_F32 else "fp64"
 
 
 @partial(jax.jit, static_argnames="lmax")
@@ -316,13 +342,23 @@ def _general_coupling_matrix_quadrature(
         (2 * mask_ell + 1) * mask_cls[: lmax_mask + 1] / (4 * jnp.pi)
     )
     column_factor = 2 * jnp.arange(lmax + 1) + 1
+    first_l = first.T.astype(jnp.float32) if _COUPLING_F32 else first.T
+    second_l = second.astype(jnp.float32) if _COUPLING_F32 else second
+    weights_l = weights.astype(jnp.float32) if _COUPLING_F32 else weights
 
     def integrate(correlation):
-        return (
-            (first.T * (weights * correlation)) @ second
-            * column_factor[None]
-            / 2
-        )
+        if _COUPLING_F32:
+            # `HIGHEST` keeps the products off the tf32 units: at DEFAULT the same call is another
+            # 1.7x faster and the matrix error grows from 2.1e-06 to 5.5e-04.
+            left = first_l * (weights_l * correlation.astype(jnp.float32))
+            return (
+                jnp.matmul(left, second_l, precision=jax.lax.Precision.HIGHEST)
+                .astype(jnp.float64)
+                * column_factor[None]
+                / 2
+            )
+        left = first_l * (weights * correlation)
+        return left @ second_l * column_factor[None] / 2
 
     total = integrate(mask @ coefficients)
     mask_sign = jnp.where(mask_ell % 2, -1, 1)

@@ -45,9 +45,11 @@ from .workspaces import (
     compute_coupled_cell,
     compute_coupled_cell_flat,
     compute_full_master,
+    coupling_precision,
     deprojection_bias,
     get_general_coupling_matrix,
     get_master_coefficients,
+    set_coupling_precision,
     uncorr_noise_deprojection_bias,
 )
 from .workspaces_flat import (
@@ -75,6 +77,7 @@ __all__ = [
     "compute_coupled_cell_flat",
     "compute_full_master",
     "compute_full_master_flat",
+    "coupling_precision",
     "deprojection_bias",
     "deprojection_bias_flat",
     "get_general_coupling_matrix",
@@ -88,6 +91,7 @@ __all__ = [
     "get_default_params",
     "mask_apodization",
     "mask_apodization_flat",
+    "set_coupling_precision",
     "set_n_iter_default",
     "set_sht_calculator",
     "set_ring_precision",
