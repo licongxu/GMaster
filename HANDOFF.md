@@ -6638,6 +6638,77 @@ improved GMaster's own milliseconds at every Nside from 32 to 2048. When adding 
 test it *through a jit boundary* first — `utils.NmtAlmInfo` is constructed inside traced bodies, and a cache
 that holds a tracer fails a third of the suite while looking perfect on every benchmark in the repo.
 
+## Addendum 16 (session 29i): the `field` stage is not host work either — it is `2*n_iter + 1` latitudinal
+### passes, measured linear, with nothing left to delete in Python
+
+`git diff` is empty for this addendum; it records a negative result that closes an avenue.
+
+**Why it looked promising.** After addenda 14/15 the `field` stage became the largest GMaster block below
+2048 (Nside 128 spin 0: 5 ms of an 11 ms total, only ~1.0-1.2x ahead of the reference while `coupling` is
+3-15x ahead) and `.qwen/tmp/field_stage_s29.py` reported it as 4.753 ms blocked / 4.058 ms enqueue with
+**exactly one** jit entry costing 0.187 ms. cProfile then put 3.86 ms in `dispatch.py:apply_primitive`
+(600 calls / 150 constructions = 4 per field, ~0.97 ms each) with no gmaster frame underneath — the exact
+signature of the eager scatter chain that addendum 14 removed from `workspaces.py`.
+
+**It is not host work.** Statement-level timing (`.qwen/tmp/field_stmts_s29.py`, Nside 128 spin 0, 200 reps,
+warm): every eager statement in `NmtField.__init__` is tiny — `jnp.asarray(mask)` 0.004 ms,
+`jnp.asarray([maps])` 0.030 ms, `reform_map` 0.0001/0.031 ms, `jnp.ones(lmax+1)` 0.078 ms,
+`NmtAlmInfo(lmax)` 0.002 ms (the addendum-15 cache), `NmtMapInfo` 0.021 ms, `maps * mask[None,:]` 0.051 ms —
+while `map2alm(..., n_iter=3)` alone is **4.404 ms**, i.e. 93 % of the constructor, with
+`enqueue == blocked` to the microsecond. The four `apply_primitive` frames are the allocator waiting on
+in-flight device work, not submission cost; `device_only = blocked - enqueue` is 0.7 ms here only because the
+loop has already absorbed the rest.
+
+**The decisive test** (`.qwen/tmp/field_niter_s29.py`): `map2alm` runs `1 + 2*n_iter` latitudinal passes, so a
+fixed host cost is flat in `n_iter` and transform work is linear in it.
+
+| n_iter | passes=1+2n | Nside 128 ms | per pass | Nside 256 ms | per pass |
+|---|---|---|---|---|---|
+| 0 | 1 | 0.966 | 0.966 | 0.993 | 0.993 |
+| 1 | 3 | 2.053 | 0.684 | 2.793 | 0.931 |
+| 2 | 5 | 3.302 | 0.660 | 4.589 | 0.918 |
+| 3 | 7 | 4.462 | 0.637 | 6.459 | 0.923 |
+| 4 | 9 | 5.729 | 0.637 | 8.306 | 0.923 |
+
+Linear to within 3 % with slope ≈ 0.63 ms/pass at 128 and 0.92 ms/pass at 256, and `enqueue == blocked` at
+every point. So the `field` stage is 7 real fp64 latitudinal transforms at the throughput the SHT kernels
+already deliver; the only levers are per-pass kernel throughput (the documented 0.85 TFLOP/s SIMT / band
+route wall) or the pass count itself, and `n_iter` is NaMaster's Richardson parameter — lowering it from the
+shared default of 3 changes the estimator, so it is not a free win.
+
+**How to apply:** do not look for construction work in `field.py` again; the four-primitive signature that
+looked like addendum 14 is allocator back-pressure behind the transform. The remaining sub-3x cells
+(1024 spin 0 2.8x, 2048 2.0x/2.1x) and the 1.8x at 128 spin 0 are all *device-bound transform* cells, and
+the pass count is fixed by the algorithm.
+
+**One lead, and it is a re-derivation of a wall this project already knows.**
+`_PALLAS_TRACED_MAX_L = 384` (`gmaster/utils.py:826`) puts
+Nside 128 (`lmax = 3*nside-1 = 383`, `L = 384`, exactly at the constant) on the one-program route and Nside
+256 (`L = 768`) on the op-by-op route (17 jit entries), even though the `_map2alm_core_pallas` docstring
+records the traced body being **1.22x / 1.30x** faster on the same work. Raising the constant is not stale
+config — it fails to compile. Running the same probe with
+`GM_TRACED_MAX_L=769` (`.qwen/tmp/traced_ab_256_traced.log`, separate process from the baseline
+`.qwen/tmp/traced_ab_256_base.log`, since one process compiles one plan) dies during tracing with
+`operation a:f64[] = log 2.0:f64[]` originating at `gmaster/_band_pallas.py:177:40 (build_pair)`.
+**This document already established the reason** — "Spin 0: the traced/eager crossover was stale
+(`a043d91`)", HANDOFF.md:4430-4452, session 24, `.qwen/tmp/s24_256_0.log`:
+`_theta_matrix._band` calls `slab.block_until_ready()` every `_BUILD_CLEAR_EVERY` blocks to hold the
+band-build peak at one table plus one block, and a concrete-buffer test sits *after* that loop, so a band
+geometry first built inside an outer `jax.jit` raises
+`AttributeError: The 'block_until_ready' method is not available on traced array`. Guarding the drain is the
+wrong fix — XLA folds no constant subtree here, so a guarded band would rebuild on every call, which is
+slower than the op-by-op route the gate exists to keep. Hoisting the band out of the jit and passing it as an
+array argument is the only remaining shape, and it lands in the argument-byte accounting instead
+(`jit-argument-byte-limit`); treat it as a refactor with a known bad precedent, not a constant change.
+Baseline Nside 256 spin 0 for anyone who does attempt it: 1.086 / 3.033 / 4.648 / 6.444 / 8.294 ms at
+n_iter = 0…4.
+
+Also noted while reading: `gmaster/utils.py:2145` carries an `if False:` guard around a second
+`_map2alm_core_pallas_multi_gpu` call — pre-existing dead branch, left alone here.
+
+
+
+
 
 
 
