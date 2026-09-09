@@ -7603,6 +7603,19 @@ ring stage is wider than the ring stage's own operands, and the transpose of `ch
 latitudinal stage's boundary agree with the ring stage's width (a `custom_vjp` that casts the
 cotangent, or keeping one width end to end), not touch the chirp-Z.
 
+**8. Control above the gate, and why today's board rows read low.** `Nside=512` and `1024` are above
+`_PALLAS_TRACED_MAX_L` for both codes' `L_work`, so the route there cannot have moved; the control run
+confirms it by agreeing with the float probe to the millisecond. Today's harness rows
+(`boardbig_s32.log`, fp32 tables, fp64 rings, coupling fp32, repeats 5) are 512 spin 0 **345 → 68 ms
+(5.0x)**, 512 spin 2 `723 → 117 ms (6.2x)`, 1024 spin 0 `1780 → 470 ms (3.8x)`, 1024 spin 2
+`3358 → 855 ms (3.9x)` — below the published 5.7x/6.8x/4.1x/4.1x. The difference is entirely in the
+reference column: GMaster's 512 spin-0 time today is 68 ms in the harness and **68.407 ms** in the
+independent float probe from earlier in the same session (`tracepipe_s32.log`, gate-384 arm), so our
+own cost did not change, while the reference would have had to read ~388 ms rather than 345 ms to give
+the published 5.7x. This is the rule in addendum 23 §4 working as intended: at these sizes the ratio is
+a two-code quantity and only GMaster's milliseconds are comparable across sessions.
+
+
 
 
 
