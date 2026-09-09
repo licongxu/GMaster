@@ -7242,5 +7242,68 @@ product-tree, fp32 rings) loses on accuracy or gradients. A large-Nside win beyo
 transform-kernel problem with a stated roofline, not a scheduling problem; the next attempt should start
 from the march's issue budget at `(2048, 6143)`, which is the single largest number in the repo.
 
+## Addendum 24 (session 31): the fp32 coupling knob is free at Nside 4096 and takes the largest scorable cell from 1.7x to 2.3x; the CPU backend turns out to be a working accuracy oracle
+
+**1. `GMASTER_COUPLING_PRECISION=fp32` scored at the top of the board for the first time.** Two arms, same
+box, same session, `benchmarks/benchmark_pipeline.py --nside 4096 --spins 0 --precision fp32 --repeats 1`
+(`.qwen/tmp/board4096_s31.log`); the knob shipped in addendum 21 had only ever been measured at Nside ≤ 1024.
+
+| coupling | pymaster TOTAL | GMaster TOTAL | ratio | `field` | `mask` | `coupling` | `coupled_cell` | `decouple` | `rel` |
+|---|---|---|---|---|---|---|---|---|---|
+| fp64 (default) | 73686 | 42345 | 1.7x | 14749 | 14781 | 12764 | 2 | 2 | 1.20e-06 |
+| fp32 | 74287 | **32945** | **2.3x** | 14722 | 15033 | **3189** | 2 | 2 | 1.24e-06 |
+
+All milliseconds. The stage is **4.0x** faster (12764 → 3189 ms) and the whole cell **1.285x** faster, at a
+3 % change in `rel` — against a reference whose own identical column drifts 0.9 % between the two arms
+(73686 vs 74287 ms), so the accuracy cost is inside the noise of the instrument. `peakRSS=49.3 GB` and
+`GPUpeak=8.8 GiB` are unchanged, so this is not a capacity trade either.
+
+**2. The 4096 cell now has the same shape as 2048.** Its two transform stages are 14722 + 15033 = **29755 ms
+of a 32945 ms TOTAL (90 %)**; the coupling stage fell from 30 % of the cell to 9.7 %. The zero-coupling
+ceiling is `74287 / 29755` = **2.50x** and the shipped cell is **2.3x**, i.e. **92 % of ceiling** — the same
+87-94 % band as the 1024/2048 cells in addendum 23 §3. There is no fifth stage left to squeeze:
+`coupled_cell` and `decouple` are 2 ms each. Everything above 2.50x at this geometry has to come from the
+14 latitudinal passes at `L = 12287` on the marched route, which is where the band's 2315.6 GiB
+(addendum 23 §4) leaves us.
+
+**3. A real library defect, found by running the pipeline on the CPU backend.** `jax.local_devices()[0]
+.memory_stats()` **returns `None`** on the CPU backend rather than raising, and `_spin_slice._pool_headroom`
+only guarded the raising case:
+
+```python
+stats = jax.local_devices()[0].memory_stats()
+except Exception:
+    return float("inf")
+pool = stats.get("pool_bytes") or 0   # AttributeError: 'NoneType' object has no attribute 'get'
+```
+
+The documented contract of that helper is "+inf when the device won't say", and a backend that answers
+`None` *is* a device that won't say — so every spin-s field whose Wigner-d triangle fell under the slab
+budget raised `AttributeError` out of `slabs_for` on any platform without allocator statistics. Fixed in
+`30ca957` with `or {}` plus `test_pool_headroom_survives_a_backend_without_allocator_stats` (both the
+`None` and the raising shape).
+
+**4. The CPU backend is a usable accuracy oracle.** With that fixed, `JAX_PLATFORMS=cpu` runs the whole
+MASTER pipeline with no CUDA context, and reproduces `pymaster` exactly at Nside 64 spin 2
+(`.qwen/tmp/cpubspin2_s31.log`): decoupled bandpowers agree to **1.1e-10 with fp64 tables and 1.1e-06 with
+fp32 tables**, per column, worst cell. The Pallas kernels are gated out there, so the geometry falls
+through to the table/latitudinal reference implementations — which means an accuracy question about a
+route the 96 GiB card cannot hold can now be answered at small size, even though a *timing* question
+cannot (7.8 s of pipeline time for one nside-64 spin-2 pipeline on 16 threads).
+
+**5. Two probe traps that made that correct transform print `FAIL`.** Both are worth internalising because
+they produced confident verdicts on statistics that could not have meant anything:
+
+* `NmtBin.from_lmax_linear(lmax, nlb)` takes a bin **width**, not a bin count —
+  `bins.py::_linear_bands` is `bpws = (ell - 2) // nlb` and drops a trailing partial band. At
+  `lmax = 191, nlb = 30` the decoupled array is `(4, 6)`: **four rows**. The invariant compared the head
+  fifth of one column with its tail and printed `1.984` — sampling noise on four numbers, not a wedge.
+  Print `cl.shape[0]` before trusting any flatness statistic.
+* A spin-2 pair under a unit mask returns **6 columns**, not `EE/BB/EB`, and all six are flat at
+  ≈1.2e-4 for white noise (`4*pi/(lmax+1)^2` scale, not 1). A `|EB|/max < 0.15` leakage test therefore
+  reads 0.91 on a transform that agrees with NaMaster to 1e-10. The invariant that does transfer is
+  finiteness plus per-column-median flatness across the row axis, which is what the probe now checks
+  (`worst column-median deviation from flat = 0.076`, PASS).
+
 
 

@@ -274,7 +274,11 @@ the scalar build for 1.9e-07 (its accumulator stays float64). On the board, TOTA
 essentially unmoved (`rel dCl` 1.34e-07 → 2.04e-07 spin 0 and 3.22e-06 → 3.21e-06 spin 2 at 1024). Below
 `Nside=256` the coupling stage is sub-millisecond and the switch changes nothing. It is opt-in and
 defaults to float64, since the suite holds `get_coupling_matrix()` to `atol=2e-14` against float64
-tables.
+tables. At the top of the board it is worth most: at `Nside=4096` spin 0 (`lmax=12287`) the stage goes
+12764 → 3189 ms and the cell from **1.7x to 2.3x**, for a `rel dCl` of 1.20e-06 → 1.24e-06 — inside the
+0.9 % run-to-run drift of the reference's own column, and with unchanged peak memory (49.3 GB host,
+8.8 GiB device). Its `TOTAL` is then 90 % the two transform stages, and 2.50x is what a free coupling,
+free cell and free decoupling would buy there.
 
 The benchmark also reports a `mask` stage: a field's mask `a_lm` are computed lazily (as in NaMaster),
 by a second spin-0 analysis at the **same** `lmax` and the same `n_iter` (`lmax_mask` defaults to
