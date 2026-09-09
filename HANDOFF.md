@@ -6554,6 +6554,91 @@ Cache on content via the resident `_np` arrays, cap the cache with `clear()`, an
 across commits with a dumped-array A/B, because a same-process A/B cannot separate this change from XLA's own
 fusion differences.
 
+## Addendum 15 (session 29h): every `NmtField` rebuilt 387 `np.arange`s it already had —
+### and caching them broke 34 tests that neither the benchmark nor the perf A/B could see
+
+`gmaster/utils.py` (+21), `tests/test_utils.py` (+37). Commit `41f28bc`.
+
+**Attribution.** With the binning scatters gone (addendum 14), the field constructor was the largest remaining
+host block. cProfile of a warm `NmtField` at Nside 64 spin 2 put `NmtAlmInfo.__init__` at **1.15 ms of the
+1.66 ms** constructor: **387 `np.arange` calls** (one per `m` in
+`np.concatenate([np.arange(mm, lmax + 1) for mm in m])`) plus **0.65 ms of `device_put`**, paid again for every
+field and every repeat. The arrays are a pure function of `lmax`.
+
+**Change.** `_alm_index_arrays(lmax, m)` caches the `(ell, order)` pair per `lmax` in a module-level dict
+capped at 64 M elements with `clear()` on overflow; `NmtAlmInfo.__init__` ends with
+`self._ell, self._m = _alm_index_arrays(self.lmax, m)`. Same objects, so values are identical by construction.
+
+**The incident.** The first version cached unconditionally and the suite went to **34 failures**
+(`jax.errors.UnexpectedTracerError` raised at `gmaster/utils.py:2318`, across `test_catalog`, `test_field`,
+`test_workspaces`, `test_covariance`). `gmaster/utils.py` constructs `NmtAlmInfo` *inside* traced bodies at
+several sites, so the dict captured a `Tracer` on the first traced call and handed that dead tracer back to
+every later clean call. The fix is to build it, hand it back, and refuse the store while tracing:
+
+```python
+from jax.core import Tracer          # clean import in jax 0.10.0 under -W error::DeprecationWarning
+if isinstance(cached[0], Tracer) or isinstance(cached[1], Tracer):
+    return cached
+```
+
+**Neither the benchmark nor the perf A/B showed any of it.** `benchmarks/benchmark_pipeline.py` and
+`.qwen/tmp/almcache_ab_s29.py` were both green and both looked like a win while a third of the suite was
+failing — nothing in the benchmark path takes a gradient or jits a field constructor. For a module-level
+cache in this package the suite *is* the correctness check; it cannot be inferred from a perf probe.
+
+**Measured saving** (`.qwen/tmp/almcache_ab_final_s29.py`: cached and uncached alternating in one process,
+order-swapped so it is not a cold→warm artefact, `n_iter=3` so each field builds the pair three times):
+
+| Nside | spin | uncached ms | cached ms | saved ms |
+|---|---|---|---|---|
+| 32 | 0 | 0.805 / 0.807 | 0.792 / 0.792 | 0.014 |
+| 32 | 2 | 1.248 / 0.995 | 0.883 / 0.854 | 0.253 |
+| 64 | 0 | 1.700 / 1.700 | 1.650 / 1.661 | 0.045 |
+| 64 | 2 | 1.095 / 1.080 | 0.828 / 0.831 | 0.258 |
+| 128 | 0 | 4.870 / 4.860 | 4.641 / 4.720 | 0.184 |
+| 128 | 2 | 2.760 / 2.763 | 2.697 / 2.696 | 0.065 |
+| 256 | 0 | 7.575 / 7.710 | 6.239 / 6.201 | 1.422 |
+| 256 | 2 | 10.933 / 10.929 | 10.793 / 10.793 | 0.137 |
+
+Positive in 8/8 cells, with the biggest single saving (1.42 ms) at Nside 256 spin 0. The pair holds
+`(lmax+1)(lmax+2)` elements in total, so the redundant build is 1.18 M elements and 9.4 MB of int64
+`device_put` per field at Nside 256 (`lmax=767`) and 37.7 M elements at Nside 2048 (`lmax=6143`); the saving
+grows with `lmax`, which is why it also shows up in the 512-2048 rows below.
+
+**Board after both host caches** — fp32 tables + fp64 rings, `.qwen/tmp/board_small_final_s29.log` (Nside
+32-256) and `.qwen/tmp/board_large_almcache_s29.log` (Nside 512-2048), both `CUDA_VISIBLE_DEVICES=1`:
+
+| Nside | spin 0 pym→gm | ratio | rel dCl | spin 2 pym→gm | ratio | rel dCl |
+|---|---|---|---|---|---|---|
+| 32 | 2 → 2 ms | 1.0x | 1.9e-14 | 4 → 2 ms | **1.8x** | 5.2e-09 |
+| 64 | 9 → 4 ms | **2.2x** | 5.9e-14 | 14 → 4 ms | **3.8x** | 8.3e-09 |
+| 128 | 20 → 11 ms | **1.8x** | 1.1e-13 | 38 → 10 ms | **3.9x** | 9.5e-09 |
+| 256 | 61 → 19 ms | **3.2x** | 6.5e-09 | 164 → 25 ms | **6.6x** | 3.2e-08 |
+| 512 | 347 → 94 ms | **3.7x** | 7.2e-09 | 705 → 151 ms | **4.7x** | 3.6e-07 |
+| 1024 | 1782 → 648 ms | **2.8x** | 5.6e-08 | 3317 → 1099 ms | **3.0x** | 3.5e-06 |
+| 2048 | 10602 → 5395 ms | **2.0x** | 1.4e-06 | 17887 → 8356 ms | **2.1x** | 1.1e-05 |
+
+At Nside 32 spin 0 the reference read 2 ms here and 4 ms in the pre-cache run, so the 1.0x is pymaster being
+fast on a two-millisecond measurement, not GMaster slowing down — GMaster's own number was 2 ms in both runs.
+Comparing GMaster milliseconds before and after this change at identical settings, **every large cell
+improved**: 512 s0 101→94, 512 s2 157→151, 1024 s0 677→648, 1024 s2 1122→1099, 2048 s0 5482→5395,
+2048 s2 8447→8356, with `rel dCl` bit-identical in all six and peak RSS unchanged (91.0 vs 91.1 GB at 2048).
+Shipped fp64 default, `.qwen/tmp/board_default_almcache_s29.log`: **1.5x / 1.4x** at 32, **1.7x / 3.2x** at
+64, **1.8x / 3.2x** at 128, **2.5x / 3.1x** at 256.
+
+Two permanent tests: `test_alm_index_arrays_are_cached_by_lmax` (same `lmax` returns the identical object, a
+different `lmax` does not, values equal an explicit numpy build, `NmtAlmInfo` holds the cached pair) and
+`test_alm_index_cache_never_holds_a_tracer` (jits a `NmtAlmInfo(6)` construction, asserts the result is
+finite, asserts no `Tracer` survives in the cache, then asserts the same `lmax` caches cleanly outside the
+trace). Full suite: **168 passed, 3 skipped in 330.51 s** on the shipped default and **168 passed, 3 skipped
+in 343.51 s** on `--gm-precision=fp32 --gm-ring-precision=fp64`.
+
+**How to apply:** the two host caches together took Nside 32 spin 2 coupling from 2.14 ms to 0.31 ms and
+improved GMaster's own milliseconds at every Nside from 32 to 2048. When adding any module-level cache here,
+test it *through a jit boundary* first — `utils.NmtAlmInfo` is constructed inside traced bodies, and a cache
+that holds a tracer fails a third of the suite while looking perfect on every benchmark in the repo.
+
+
 
 
 
