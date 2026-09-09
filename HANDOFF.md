@@ -6868,3 +6868,77 @@ a blocked form has to reproduce inside a matmul. That is the work item; nothing 
 
 
 
+
+---
+
+## Addendum 19 (session 29k): deleting every limb from the analysis march buys 1.004x at Nside 1024, and the spin-2 `field` stage is now fully accounted for by the marched kernels
+
+Two things happened, one about the kernel and one about the instruments used to look at it. Both are
+negative results, and both close a direction that had looked open at the start of this session.
+
+**1. A total limb ablation of `_kern.degree` is the ceiling on removing arithmetic from the analysis
+march, and the ceiling is nothing.** A compile-time knob (`GMASTER_SPIN2_MARCH_LIMB=off`) was added to
+`gmaster/_spin_march_pallas.py` that evaluates the three-term step in plain float32 —
+
+```
+nxt = (c1*x + c0)*ch - cb*ph
+```
+
+— deleting the product residuals, the cosine limb, the two coefficient low limbs (`c1l`, `c0l`, `cbl`)
+and the accumulator limb at once. That is strictly more than the 1.031x coefficient-limb cut recorded
+in addendum-style notes before it, so its timing is an upper bound on what any op-count removal in
+that kernel can return. One process per arm (`_LIMB` is read at import time), GPU1 after waiting for
+the card to fall below 1 GiB, medians of 5 (`.qwen/tmp/limb_ab_all_s29.log`):
+
+| Nside | limbs on | limbs off | ratio | rel alm (off vs on) |
+|---|---|---|---|---|
+| 256 | 3.56 ms | 3.22 ms | 1.106x | 2.04e-04 |
+| 512 | 15.64 ms | 13.28 ms | 1.178x | 9.49e-04 |
+| 1024 | 74.02 ms | 73.69 ms | **1.004x** | 1.76e-03 |
+
+The synthesis arm came back `max|off-on| = 0.000e+00` at every size, because the synthesis march is a
+different kernel whose accumulate is already uncompensated (`_ACC = "fast"`) — the knob never touched
+it. So the *analysis* march, the one that dominates the spin-2 `field` stage, does not care how many
+floating-point operations its recurrence performs: at the size that matters the whole ablation is
+0.4 % against a 1.8e-03 alm error. This is the strongest form of the "warp-issue-bound" verdict — the
+45-op recurrence step is already hidden behind issue latency, and the only lever left is *work
+decomposition*, not arithmetic. **The change was reverted unshipped**; nothing in `gmaster/` differs
+from `54a19d5` as a result of this session.
+
+**2. The spin-2 `field` stage has no hidden overhead: 481.7 of its 540 ms is the science transform.**
+Measured with the benchmark's own blocking helper and the benchmark's own input form (flat `npix`
+arrays inside a list), Nside 1024, fp32 tables, GPU1, medians of 5
+(`.qwen/tmp/fieldbudget1024_s29.log`):
+
+```
+science map2alm n_iter=0     79.73 ms
+science map2alm n_iter=1    240.34 ms
+science map2alm n_iter=3    481.71 ms   => ~121 ms per Richardson iteration
+```
+
+The marginal 121 ms is one analysis plus one synthesis, and the isolated marched kernels cost 74.02 +
+63.01 = 137 ms for the same pair — within 12 % of the in-situ marginal. Addendum 16's pass-count
+verdict (`1 + 2*n_iter` latitudinal ops, `field` = the transform) therefore survives at Nside 1024
+spin 2, where the board's `field 859->540 ms (2x)` is the weakest stage ratio on the board: 89 % of
+that stage is marched latitudinal work, ~11 % is the mask transform and bookkeeping. There is no
+construction cost left to find there, and addendum 18's `1/167`-of-GEMM figure is what has to move.
+
+**3. How the probe lied for two hours, in case anyone reuses one.** The numbers above disagree by
+3-700x with what the same session measured an hour earlier, and both earlier instruments were wrong
+in ways that produced confident output:
+
+- a drain that starts from `getattr(result, "__dict__", None)` and harvests children **never blocks a
+  plain `jax.Array`** (an Array's `__dict__` is empty). It reported the spin-2 `map2alm` above at
+  **1.4 ms**. The `jax.tree.map(..., is_leaf=hasattr(x,"block_until_ready"))` pass in
+  `benchmarks/benchmark_pipeline.py::_block` is the part that catches arrays; the `__dict__` walk is
+  only the addition that catches `NmtField`/`NmtWorkspace`.
+- feeding `map2alm` a **ring-padded `(ntheta, 4*nside)`** array instead of the flat `npix` form is
+  silently a different XLA program: **656 ms against 65.8 ms** at Nside 1024 spin 0, no error, no
+  shape complaint. Every isolated-transform figure taken in the padded form (including an "analysis
+  alone = 3.2 s at 2048" that made the field stage look impossible) measured a route the pipeline does
+  not run.
+- a `jax.jit(...)` built *inside* the timed lambda retraces on every rep; hoist it out.
+
+The detector that caught all three is free: **a subset cannot cost more than its superset.** Print
+`max|probe_alm - field.alm| / max|field.alm|` (it must be `0.000e+00`) and compare the isolated stage
+against the shipped stage before believing either.
