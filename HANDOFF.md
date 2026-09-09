@@ -7163,6 +7163,28 @@ tables, medians of 5 (1024) / 3 (2048); `.qwen/tmp/maskl1024_s31.log`, `.qwen/tm
 | 1024 | 2 | marched (slice refused) | 83.29 / 111.35 | **1.34x** | 73.94 / 102.74 | **1.39x** | 3.06e-05 |
 | 2048 | 0 | folded march (band refused) | 309.52 / 300.28 | **0.97x** | 226.52 / 288.23 | **1.27x** | 7.83e-05 |
 | 2048 | 2 | marched (slice refused) | 574.90 / 607.01 | **1.06x** | 478.62 / 573.63 | **1.20x** | 5.53e-05 |
+| 1024 | 0 | *control `L=2*lmax`, band refused* | 226.89 / 151.39 | 0.67x | 144.52 / 150.17 | 1.04x | 6.21e-05 |
+| 1024 | 2 | *control `L=2*lmax`, slice refused* | 310.31 / 300.50 | 0.97x | 263.81 / 299.02 | 1.13x | 7.58e-05 |
+
+**The cost of refusing a table, measured rather than inferred.** Forcing the march at an order where the band
+*does* fit (`GMASTER_SPIN0_MARCH=1`, Nside 1024 spin 0, `.qwen/tmp/maskl1024s0_march_s31.log`) gives the same
+full pass on both routes:
+
+| `L` | route | `map2alm` gm / ducc | ratio | `alm2map` gm / ducc | ratio |
+|---|---|---|---|---|---|
+| 3071 | band (shipped) | 28.72 / 62.24 ms | **2.17x** | 30.87 / 57.27 | **1.86x** |
+| 3071 | march forced | 62.02 / 58.93 ms | **0.95x** | 37.56 / 52.96 | 1.41x |
+| 6142 | march (only option) | 218.92 / 146.15 ms | **0.67x** | 137.81 / 149.42 | 1.08x |
+
+Three things follow. (1) The band is worth **2.16x on the analysis pass** and 1.22x on the synthesis pass, and
+it is the difference between beating ducc0 (2.17x) and losing to it (0.95x) at this cell — propagated through
+`4 x map2alm + 3 x alm2map`, the `field` stage would be 361 ms instead of 203, i.e. the float32 table route is
+worth ~1.8x on the whole Nside-1024 spin-0 cell. (2) The march is **superlinear** in the order: 62.02 ->
+218.92 ms is 3.53x for 2x `L` (ducc0 takes the same step in 2.48x), so the deeper a geometry is pushed past
+the table limit, the worse the route switch gets. (3) Every Nside where a table cannot exist is a cell where
+the reference C code is still competitive — which is exactly what the two 2048 rows show. (The `L=6142` row is
+a second process measuring the configuration the control row above already reached by auto-selection —
+218.92 vs 226.89 ms, 3.6 % run-to-run, ducc 146.15 vs 151.39 — so the two agree.)
 
 The stage model falls straight out of it: `4 x map2alm + 3 x alm2map` reproduces the board's `field`
 column to 0.3 % at 2048 spin 0 (1918 predicted vs 1913 measured) and 2.5 % at 2048 spin 2 (3736 vs 3832).
