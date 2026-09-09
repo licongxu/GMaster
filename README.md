@@ -237,13 +237,15 @@ before every test, so a module that restores the default cannot silently move th
 of the run back to float64. `--gm-ring-precision` then controls the azimuthal transforms
 independently, which matters because `set_table_precision` used to drag them down with it:
 the float32 chirp tables cast the *pixels* too, so a float32 session analyzed the map
-itself in float32. Held to `complex128` the whole suite passes — **164 passed, 3 skipped**,
+itself in float32. Held to `complex128` the whole suite passes — **166 passed, 3 skipped**,
 the same result as the default float64 run — for 0-12 % of the pipeline wall clock.
 
 The pipeline benchmark takes the same flag, and this is what it scores against NaMaster in
-one process: **2.9x / 5.8x** (spin 0 / spin 2) at `Nside=256`, **3.1x / 4.3x** at 512 and
-**2.5x / 2.8x** at 1024, where the shipped fp64 default scores 2.1x / 2.8x, 1.9x / 2.0x and
-1.8x / 2.5x. At 2048 the tables are refused in either precision and the route is worth
+one process (spin 0 / spin 2): **1.5x / 1.9x** at `Nside=32`, **1.6x / 3.4x** at 64,
+**1.6x / 3.7x** at 128, **3.1x / 6.0x** at 256, **3.2x / 4.4x** at 512, **2.5x / 2.8x** at
+1024 and **1.9x / 2.1x** at 2048. The shipped fp64 default scores 2.1x / 2.8x, 1.9x / 2.0x
+and 1.8x / 2.5x at 256/512/1024 (measured before the binning-operator caches landed, so read
+those as a floor). At 2048 the tables are refused in either precision and the route is worth
 1.00-1.01x over the default.
 
 ```bash

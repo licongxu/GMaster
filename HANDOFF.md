@@ -6407,6 +6407,153 @@ host has to hold the 7-block spin-2 coupling matrix; Nside 4096 quadruples the m
 and doubles `lmax`, which is beyond this box's 376 GB even before the reference's own copy. Not attempted,
 and no number is claimed for it.
 
+## Addendum 13 (session 29f): the Nside ≤ 128 cells are not slow, they are *submitted* — 2.05 ms of coupling
+## at Nside 32 is host work, and 0.00 ms of it is device time
+
+Every previous session explained the small-`Nside` weakness as "dispatch-bound" by analogy. It is now
+measured, and the number is bigger than the analogy suggested. `benchmarks/benchmark_pipeline.py` with
+`--repeats 40-60` and the recommended route (`.qwen/tmp/` runs, fp32 tables + `complex128` rings):
+
+```text
+nside=32  spin=0: TOTAL 4->3ms (1.3x)  | field 2->1ms  coupling 0->2ms  GPUpeak=0.0GiB
+nside=64  spin=0: TOTAL 9->5ms (1.9x)  | field 2->2ms  coupling 1->2ms  GPUpeak=0.0GiB
+nside=128 spin=0: TOTAL 20->12ms (1.6x)| field 7->5ms  coupling 3->2ms  GPUpeak=0.0GiB
+nside=128 spin=2: TOTAL 38->11ms (3.6x)| field 10->3ms coupling 15->2ms GPUpeak=0.4GiB
+```
+
+The coupling stage is **flat at 2 ms from Nside 32 to 128** while the reference moves 0.4 → 3 ms across the
+same range, which is why spin-0 ratios there read 1.3-1.9x and the coupling cell alone reads `0x`. Flat in a
+16x range of data means a fixed cost; `.qwen/tmp/enqueue_floor_s29.py` separates which side owns it:
+
+```text
+nside=32 reps=30 ring=complex128 | enqueue median=2.05ms p90=2.29ms
+                                | blocked median=2.04ms p90=2.09ms
+                                | device-only estimate=0.00ms
+```
+
+Blocked equals enqueue to within noise, so the GPU is never the constraint — the device finishes before the
+host stops submitting. `.qwen/tmp/dispatch_unit_s29.py` prices the unit:
+
+```text
+one-dispatch enqueue median=0.020ms p90=0.023ms | ten-op fused program=0.019ms
+=> Nside-32 coupling 2.05ms is about 105 dispatch-equivalents
+```
+
+So `compute_coupling_matrix` at small `Nside` costs roughly **105 XLA submissions at 20 µs each**, and a
+ten-operation fused program costs exactly the same 0.019 ms as a one-operation one — fusion on this stack is
+free at the dispatch level, the entire cost is the count. The two candidate fixes therefore have opposite
+shapes: reducing the *number* of submissions inside the coupling-matrix builder (or capturing the small
+geometries as a CUDA graph) attacks ~105 × 20 µs and could take Nside 32 from 1.3x to several-x; making the
+kernels themselves faster attacks 0.00 ms and buys nothing. Nothing in addenda 8-12 touched this, because
+every lever tried there was a GPU-side one.
+
+**Corrected the same session — "105 dispatch-equivalents" is a price ratio, not a count, and the count is 3.**
+`.qwen/tmp/jitcall_count_s29.py` wraps every `PjitFunction` reachable from `gmaster.workspaces` and
+`gmaster.utils` and counts entries per call:
+
+```text
+nside=32 reps=20 wall/call=2.14ms | jit entries/call=3.0 across 3 distinct functions
+    1x  0.04ms  gmaster.workspaces._compute_coupled_cell
+    1x  0.02ms  gmaster.workspaces._coupling_matrix_tt
+    1x  0.02ms  gmaster.workspaces._assemble_mcm
+```
+
+Three jit entries cost **0.08 ms** of the 2.14 ms, so ~2 ms is eager work *between* the jits, not jit entries.
+`.qwen/tmp/cprofile_coupling_s29.py 32 300` names it: of the 2.25 ms call, `_postprocess` owns **1.92 ms** and
+`_binning_operators` owns **1.42 ms** of that, with 600 `array_methods.set` / `_scatter_update` calls
+(2 per call) at 0.360 s — i.e. **two eager `.at[].set()` scatters ≈ 1.2 ms**, the trap this repo already
+documents elsewhere (indexed scatter ≈ 1500x slower than pad+concatenate). Both operators are a pure function
+of the binning scheme and were being rebuilt on every single call.
+
+Two things checked and found *not* to be the cause, so they should not be re-examined: the pipeline's
+un-staged work is the mask analysis in both implementations (`get_mask_alms` runs under
+`compute_coupling_matrix`, and the stage split caches it away from `t_coupling`), and the iteration counts
+match the reference exactly — `NaMaster/pymaster/utils.py:66-67` sets `n_iter_default = 3` and
+`n_iter_mask_default = 3`, identical to `gmaster/utils.py:31-32`. There is no hidden 7-passes-vs-1 asymmetry
+to reclaim.
+
+**How to apply:** the small-`Nside` gap is a host-side task with a measured target (3 jit entries worth
+0.08 ms plus ~2 ms of eager `numpy`-operator construction, dominated by two scatters) and a measured ceiling
+(0.00 ms of device work). Profile the builder's *eager* op count before editing it; do not re-tune kernels for
+Nside ≤ 128, and do not re-derive the `n_iter` question. Addendum 14 is what was done about it.
+
+## Addendum 14 (session 29g): the two binning scatters and nine eager bindings were 1.83 ms of the 2.14 ms
+## Nside-32 coupling call — caching them takes the call to 0.31 ms and Nside 32 spin 0 from 0.7x to 1.5x
+
+`gmaster/workspaces.py` only. Two changes, both host-side, neither touching a kernel:
+
+1. **`_binning_operators` is memoised** on exact bin content (`n_bands`, `lmax`, and the `tobytes()` of
+   `_bpws_np/_ells_np/_weights_np/_f_ell_np`). The `_np` host copies are the key deliberately: they are
+   already resident, so hashing costs no device synchronisation, and they are exact — two different `NmtBin`
+   objects with equal bands share one entry, `update_bins` with a different scheme misses and rebuilds.
+   Capped at 8 entries with a `clear()` (an LRU would keep the entry alive; these are `jax` arrays, and a
+   pinned entry pins device memory — see the executable-pins-its-outputs note).
+2. **`_postprocess`'s nine remaining eager bindings became one jit.** The `eye(ncls)` kron-expansions are
+   content-keyed too (`_expanded_binning_operators`, 4 entries), and `repeat`+`multiply`+both projections
+   moved into `_banded_operators`, jitted with `ncls`/`norm_type` static. `jnp.linalg.solve` was deliberately
+   left eager — it is one dispatch, and moving it inside the jit would trade a `SingularMatrixError` for
+   silent NaNs on a rank-deficient banded matrix.
+
+Measured effect on the call itself (`nside=32`, unprofiled wall/call):
+
+```text
+before this addendum            wall/call=2.14ms   (_postprocess 1.92ms, _binning_operators 1.42ms)
+after change 1 (scatters)       wall/call=0.67ms   (_postprocess 0.57ms)
+after change 2 (fused tail)     wall/call=0.31ms   (_postprocess 0.075ms)
+```
+
+6.9x on `compute_coupling_matrix` at Nside 32, from deleting work rather than moving it. The pipeline ratio
+moves less than the stage does because at these sizes the total is only 2-5 ms; `benchmarks/benchmark_pipeline.py
+--spins 0,2 --precision fp32 --ring-precision fp64 --repeats 15`, run twice — once with the change and once
+with `git stash push -- gmaster/workspaces.py` — same tool, same box, GPU1:
+
+```text
+Nside spin  baseline ref->gm (ratio)     now ref->gm (ratio)
+   32   0    2  -> 3 ms (0.7x)            4  -> 2 ms (1.5x)
+   32   2    4  -> 4 ms (0.9x)            5  -> 2 ms (1.9x)
+   64   0    7  -> 6 ms (1.3x)            8  -> 5 ms (1.6x)
+   64   2    15 -> 5 ms (3.0x)            14 -> 4 ms (3.4x)
+  128   0    19 -> 13 ms (1.5x)           19 -> 12 ms (1.6x)
+  128   2    39 -> 10 ms (3.7x)           40 -> 11 ms (3.7x)
+  256   0    60 -> 20 ms (2.9x)           61 -> 20 ms (3.1x)
+  256   2    161-> 27 ms (5.9x)           160-> 27 ms (6.0x)
+```
+
+Read the GMaster column, not the ratio, at Nside ≤ 64: the pymaster reference itself jitters ±10% between runs
+there (`2 ms` vs `4 ms` at Nside 32 spin 0 across these two invocations), which is also why Nside 128 spin 2
+reads 10 → 11 ms — its GMaster stage times are unchanged and the reference moved. The two cells that were
+genuinely *losing* (Nside 32, 0.7x and 0.9x) are now 1.5x and 1.9x.
+
+Nothing regressed above 256, and the accuracy columns are bit-for-bit the published ones:
+
+```text
+ 512  s0 326 -> 101ms (3.2x) rel=7.17e-09 | s2 685 -> 157ms (4.4x) rel=3.56e-07  GPUpeak 9.6/29.6GiB
+1024  s0 1702-> 677ms (2.5x) rel=5.60e-08 | s2 3182->1122ms (2.8x) rel=3.46e-06  GPUpeak 37.8/40.2GiB
+2048  s0 10413->5482ms (1.9x) rel=1.38e-06 | s2 17896->8447ms (2.1x) rel=1.09e-05 peakRSS=91.1GB
+```
+
+**Correctness bar.** The change is value-preserving, checked across commits rather than in-process:
+`.qwen/tmp/binning_dump_s29.py` dumps `bpws` and `mcm_binned` for 36 workspaces (Nside 32/64/128, spin 0 and
+polarised, 30- and 15-band, plus the `update_bins`, `update_beams` and `update_coupling_matrix` paths) to
+`.npz`; run once with the change, once with `gmaster/workspaces.py` stashed, compare offline. Worst relative
+difference over all 36 arrays **5.97e-16**, on `n32_s0_b15_bpws`; the `update_*` paths (the ones a cache could
+silently get wrong) are ≤ 4.7e-16. The FKP branch is exact: `mcm_binned` equals `wawb*eye` to `0.0`, and the
+jitted `one_sided` matches an independent numpy float64 reconstruction to 3-6e-16. For scale, `mcm` itself is
+**non-deterministic on this box**: four repeats of the identical code at Nside 128 differ by rel
+`6.9e-20 / 1.1e-18 / 8.6e-21`, so exact equality was never an available bar and 1e-16 is the floor.
+Two permanent regression tests landed with the change — `test_binning_caches_are_keyed_on_band_content`
+(equal-content `NmtBin`s hit one entry, a different scheme misses it, and both cached pairs equal a numpy
+build exactly) and `test_bandpower_operators_are_rebuilt_when_bins_change` (`update_bins` to a different band
+count changes the window shape and matches a freshly built workspace to 1e-12). Full suite on the shipped
+default: **166 passed, 3 skipped in 331.54 s** (the same code without those two tests scored 164 passed,
+3 skipped in 322.25 s).
+
+**How to apply:** at small `Nside` the host cost is object construction, not submission count — look for
+`jnp.zeros(...).at[...].set(...)` and `eye`/`kron` built per call before reaching for jits or CUDA graphs.
+Cache on content via the resident `_np` arrays, cap the cache with `clear()`, and prove value preservation
+across commits with a dumped-array A/B, because a same-process A/B cannot separate this change from XLA's own
+fusion differences.
+
 
 
 
