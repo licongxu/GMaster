@@ -7,7 +7,7 @@ import pytest
 jax.config.update("jax_enable_x64", True)
 
 import gmaster as nmt
-from gmaster import _spin_slice, _theta_matrix, utils
+from gmaster import _spin_slice, _theta_matrix, utils, workspaces
 
 _HAS_NVIDIA_GPU = any(
     device.platform == "gpu" and "NVIDIA" in device.device_kind.upper()
@@ -266,4 +266,40 @@ def test_float32_coupling_quadrature_keeps_the_cells():
     # Exactly zero here means the switch was ignored, not that it was accurate.
     assert rel > 0.0
     assert rel < 1e-4
+
+
+def test_float32_scalar_coupling_keeps_the_matrix():
+    """The same switch covers the scalar build, which has no `dot` in it at all.
+
+    `_coupling_matrix_tt` is five table lookups and a few elementwise operations over ~n^3/3
+    elements, so there is no contraction to put on tensor units and operand width is the only
+    lever it has: 9.42x at lmax 1535 (23.48 -> 2.49 ms) and 7.51x at lmax 3071
+    (159.05 -> 21.19 ms) for rel 1.885e-07 (`.qwen/tmp/ttknob_s30.log`).  That is an order of
+    magnitude better than the polarised arm above because the log-cumsum table and the offset
+    accumulator stay float64 and only the per-term products are rounded.
+    """
+    lmax = 127
+    rng = np.random.default_rng(17)
+    ell = np.arange(2 * lmax + 1)
+    pcl = np.exp(-ell / 90.0) * (1.0 + 0.1 * rng.normal(size=ell.size))
+
+    def matrix():
+        return np.asarray(workspaces._coupling_matrix_tt(jnp.asarray(pcl), lmax=lmax))
+
+    nmt.set_coupling_precision("fp64")
+    jax.clear_caches()
+    fp64 = matrix()
+
+    nmt.set_coupling_precision("fp32")
+    jax.clear_caches()
+    fp32 = matrix()
+
+    nmt.set_coupling_precision("fp64")
+    jax.clear_caches()
+
+    scale = float(np.max(np.abs(fp64)))
+    rel = float(np.max(np.abs(fp32 - fp64))) / scale
+    assert rel > 0.0
+    assert rel < 1e-5
+
 

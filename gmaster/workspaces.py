@@ -12,17 +12,25 @@ from scipy.special import roots_legendre
 from .bins import NmtBin, NmtBinFlat
 from .utils import alm2map, map2alm
 
-# Operand precision of the two big contractions in the coupling-matrix quadrature.  Each is
-# 115.9 GFLOP at lmax 3071 and the float64 form runs at 1.76 TFLOP/s, i.e. 94 % of this card's fp64
-# roofline, so float32 operands are 34.3x there (`.qwen/tmp/coupling_prec_1024c_s29.log`) at a cost
-# of rel 2.1e-06 of the matrix.  The agreement bar here is float64
-# (`tests/test_workspaces.py` holds the MCM to `atol=2e-14`), so fp64 stays the default and this is
-# opt-in: `GMASTER_COUPLING_PRECISION=fp32`.
+# Operand precision of the coupling-matrix builders.  The polarised quadrature is two
+# contractions of 115.9 GFLOP each at lmax 3071, and the float64 form runs at 1.76 TFLOP/s, i.e.
+# 94 % of this card's fp64 roofline, so float32 operands are 34.3x there
+# (`.qwen/tmp/coupling_prec_1024c_s29.log`) at a cost of rel 2.1e-06 of the matrix.  The scalar
+# builder `_coupling_matrix_tt` has no dot at all -- five table lookups and a few elementwise ops
+# over ~n^3/3 elements -- and is worth 7.5-9.4x for rel 1.9e-07
+# (`.qwen/tmp/ttknob_s30.log`), since only its per-term products are rounded.  The agreement bar
+# here is float64 (`tests/test_workspaces.py` holds the MCM to `atol=2e-14`), so fp64 stays the
+# default and this is opt-in: `GMASTER_COUPLING_PRECISION=fp32`.
 _COUPLING_F32 = os.environ.get("GMASTER_COUPLING_PRECISION", "fp64") == "fp32"
 
 
 def set_coupling_precision(name):
-    """Choose the operand precision of the coupling-matrix quadrature.
+    """Choose the operand precision of the coupling-matrix builders.
+
+    Covers both the polarised quadrature (`_general_coupling_matrix_quadrature`, which sets the
+    operand width of its two large contractions) and the scalar build (`_coupling_matrix_tt`,
+    which rounds its lookup tables and per-term products while keeping the log-cumsum table and
+    the offset accumulator in float64).
 
     Must be called before the first coupling build: the flag is consulted while tracing, so an
     already-compiled program keeps the precision it was traced with (``jax.clear_caches()`` after
@@ -150,7 +158,25 @@ def _coupling_matrix_tt(window_cls, *, lmax):
     at ``o0`` can only touch the sub-matrix ``[o0:, o0:]``: chunking visits
     ~n^3/3 elements instead of n^3.  Measured 3.0-3.6x over the per-offset loop
     at lmax 383/767/1535 (10.05 -> 3.23 ms at lmax 767), values agreeing to 1e-16.
+
+    The block body is five table lookups and a few elementwise ops over ~n^3/3
+    elements, so it has no `dot` to move onto tensor units; its cost is the
+    elementwise pass itself, and the only lever on that is the operand width.
+    Under :func:`set_coupling_precision` ("fp32") the lookup tables and the term
+    are float32 while the log-cumsum table and the offset accumulator stay
+    float64, which is worth 9.42x at lmax 1535 (23.48 -> 2.49 ms) and 7.51x at
+    lmax 3071 (159.05 -> 21.19 ms) for rel 1.885e-07 of the matrix
+    (`.qwen/tmp/ttknob_s30.log`).  Chunk width is not a lever: 8 and 32 both
+    measured slower than the shipped 16 at lmax 1535 (27.03/27.42 ms,
+    `.qwen/tmp/tt1535_s30.log`).
     """
+    element_dtype = jnp.float32 if _COUPLING_F32 else window_cls.dtype
+    # The accumulator keeps float64 even in the float32 arm: a row of a block sums
+    # up to `lmax` terms, and rounding that partial in float32 would put the error
+    # in the sum rather than in the products.
+    accumulator_dtype = jnp.float64 if _COUPLING_F32 else window_cls.dtype
+    table_dtype = jnp.float64 if _COUPLING_F32 else window_cls.dtype
+
     n_ell = lmax + 1
     multipoles = jnp.arange(n_ell)
     row = multipoles[:, None]
@@ -158,14 +184,16 @@ def _coupling_matrix_tt(window_cls, *, lmax):
     lower = jnp.minimum(row, column)
     upper = jnp.maximum(row, column)
 
-    p = jnp.arange(1, 2 * lmax + 1, dtype=window_cls.dtype)
+    p = jnp.arange(1, 2 * lmax + 1, dtype=table_dtype)
     log_g = jnp.concatenate(
-        [jnp.zeros(1, dtype=window_cls.dtype), jnp.cumsum(jnp.log((p - 0.5) / p))]
+        [jnp.zeros(1, dtype=table_dtype), jnp.cumsum(jnp.log((p - 0.5) / p))]
     )
-    g = jnp.exp(log_g)
-    mask_power = window_cls * (2 * jnp.arange(2 * lmax + 1) + 1) / (4 * jnp.pi)
+    g = jnp.exp(log_g).astype(element_dtype)
+    mask_power = (
+        window_cls * (2 * jnp.arange(2 * lmax + 1) + 1) / (4 * jnp.pi)
+    ).astype(element_dtype)
 
-    matrix = jnp.zeros((n_ell, n_ell), dtype=window_cls.dtype)
+    matrix = jnp.zeros((n_ell, n_ell), dtype=accumulator_dtype)
     for o0 in range(0, n_ell, _OFFSET_CHUNK):
         offs = jnp.arange(o0, min(o0 + _OFFSET_CHUNK, n_ell))[:, None, None]
         low = lower[o0:, o0:]
