@@ -750,3 +750,26 @@ def test_synth_order_window_fills_the_launch_ceiling(nside):
     finally:
         ss._MARCH_M_SYNTH0_MAX = orig
 
+
+def test_pool_headroom_survives_a_backend_without_allocator_stats(monkeypatch):
+    """A backend that returns `None` from `memory_stats()` must mean "unbounded", not crash.
+
+    `_pool_headroom` guards the Wigner-d layout build and documents "+inf when the device won't
+    say", but it only caught a *raising* backend.  `jax.local_devices()[0].memory_stats()` returns
+    `None` on the CPU backend instead of raising, so the very next line (`stats.get("pool_bytes")`)
+    raised `AttributeError: 'NoneType' object has no attribute 'get'` out of `slabs_for`.
+    """
+    from gmaster import _spin_slice as ss
+
+    class _Silent:
+        def memory_stats(self):
+            return None
+
+    class _Raises:
+        def memory_stats(self):
+            raise RuntimeError("no statistics here")
+
+    for device in (_Silent(), _Raises()):
+        monkeypatch.setattr(jax, "local_devices", lambda: [device])
+        assert ss._pool_headroom() == float("inf")
+

@@ -479,7 +479,10 @@ def _blocked(array):
 def _pool_headroom():
     """Bytes free in the active JAX pool, or +inf when the device won't say."""
     try:
-        stats = jax.local_devices()[0].memory_stats()
+        # The CPU backend reports no allocator statistics at all and returns None rather than
+        # raising, which used to take down every spin-s transform on such a platform: the budget
+        # check below is the first thing to touch the returned object.
+        stats = jax.local_devices()[0].memory_stats() or {}
     except Exception:  # pragma: no cover - backend without statistics
         return float("inf")
     pool = stats.get("pool_bytes") or 0
