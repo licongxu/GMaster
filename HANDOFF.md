@@ -7582,6 +7582,28 @@ march is cubic against `ducc0`'s 6.3x-per-doubling — and none of that is reach
 boundaries. A future attacker should read "documented dead" in this file as "someone hit an error here"
 and check whether the error was the measurement or just the door.
 
+**7. The hoist's own regression, and what the fp32-ring AD failure actually is.** The first version of
+`warm()` guarded `_band` against building under a trace but not `_synth_band`, whose
+transpose-then-drain raised `AttributeError: block_until_ready ... on traced array` for *any* caller
+that traced through the route dispatcher — `jax.jit`, `jax.eval_shape` and `jax.grad` all died on the
+raw cores at **every** ring precision, not just fp32 (`cztstage_s32.py`, run before the fix:
+`map2alm core` / `alm2map core` → `FORWARD FAILS AttributeError`). The shipped pipeline never traced
+through the dispatcher, so the suite stayed green while a supported entry point was broken; fixed in
+`a13a155` by the same concrete-buffer test `_band` already used, with `warm()` now reporting residency
+rather than intent, and pinned by `test_no_tracer_can_enter_the_table_caches`. Suite after the fix:
+**175 passed, 3 skipped** in both the default and the `--gm-precision=fp32 --gm-ring-precision=fp64`
+configurations (`suite2_s32.log`, 6:40 each).
+
+The same probe pinned down the disclosed fp32-ring gradient limitation, which is *not* what its
+one-line description suggests. The ring chirp-Z is fine on its own: transposed with a `complex64`
+cotangent it returns a `float64` gradient. `_fused_forward_sht` is where the graph widens — its primal
+is `complex128` even when its input rings are `complex64` — so the cotangent that comes back into the
+ring stage is wider than the ring stage's own operands, and the transpose of `chirp_out * convolution`
+(`utils.py:1118`) is the first `mul` that cannot hold mixed widths. Any fix therefore has to make the
+latitudinal stage's boundary agree with the ring stage's width (a `custom_vjp` that casts the
+cotangent, or keeping one width end to end), not touch the chirp-Z.
+
+
 
 
 

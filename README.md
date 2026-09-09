@@ -244,8 +244,12 @@ the same result as the default float64 run. Measured against it on the whole boa
 at 1.3-1.6e-07; it is therefore not the default, and it is still **forward-only** — with fp32 rings the
 gradient of the scalar transform raises
 `lax.mul requires arguments to have the same dtypes, got complex64, complex128` in the polar chirp-Z
-(`gmaster/utils.py:1093`), which is the one suite failure there
-(**1 failed, 167 passed, 3 skipped**). What it does buy cheaply is memory: at `Nside=2048` spin 2 the
+(`gmaster/utils.py:1118`), which is the one suite failure there
+(**1 failed, 167 passed, 3 skipped**). The chirp-Z is not the culprit: transposed on its own with a
+`complex64` cotangent it gradients cleanly, and it is `_fused_forward_sht` whose primal widens to
+`complex128` while its input rings stay `complex64`, so the cotangent re-entering the ring stage is
+wider than the ring stage's operands (HANDOFF addendum 26 §7). A fix belongs at that boundary, not in
+the transform. What fp32 rings do buy cheaply is memory: at `Nside=2048` spin 2 the
 run's peak RSS falls from 91.0 GB to 58.8 GB.
 
 The pipeline benchmark takes the same flag, and this is what it scores against NaMaster in
