@@ -238,7 +238,15 @@ of the run back to float64. `--gm-ring-precision` then controls the azimuthal tr
 independently, which matters because `set_table_precision` used to drag them down with it:
 the float32 chirp tables cast the *pixels* too, so a float32 session analyzed the map
 itself in float32. Held to `complex128` the whole suite passes — **168 passed, 3 skipped**,
-the same result as the default float64 run — for 0-12 % of the pipeline wall clock.
+the same result as the default float64 run. Measured against it on the whole board
+(`--ring-precision fp32`), letting the rings fall to `complex64` saves 3 % of wall at `Nside=2048` and
+10-16 % at 128-256, leaves spin-2 accuracy untouched (`rel dCl` 3.46e-06 → 3.22e-06 at 1024) and puts spin 0
+at 1.3-1.6e-07; it is therefore not the default, and it is still **forward-only** — with fp32 rings the
+gradient of the scalar transform raises
+`lax.mul requires arguments to have the same dtypes, got complex64, complex128` in the polar chirp-Z
+(`gmaster/utils.py:1093`), which is the one suite failure there
+(**1 failed, 167 passed, 3 skipped**). What it does buy cheaply is memory: at `Nside=2048` spin 2 the
+run's peak RSS falls from 91.0 GB to 58.8 GB.
 
 The pipeline benchmark takes the same flag, and this is what it scores against NaMaster in
 one process (spin 0 / spin 2): **2.2x / 3.8x** at `Nside=64`, **1.8x / 3.9x** at 128,

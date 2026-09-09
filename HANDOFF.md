@@ -6706,6 +6706,109 @@ n_iter = 0…4.
 Also noted while reading: `gmaster/utils.py:2145` carries an `if False:` guard around a second
 `_map2alm_core_pallas_multi_gpu` call — pre-existing dead branch, left alone here.
 
+## Addendum 17 (session 29j): the board's `field` and `coupling` columns measured host submission, and
+## letting the rings follow float32 tables is a 3–16 % board that `jax.grad` refuses
+
+Two results, one of which changes how every stage column in this document should be read.
+
+**1. `NmtField` and `NmtWorkspace` are not pytrees, so `_block` never reached their arrays.**
+`benchmarks/benchmark_pipeline.py::_block` walks the returned value with
+`jax.tree.map(..., is_leaf=lambda x: hasattr(x, "block_until_ready"))`. A plain Python object with no
+`block_until_ready` is a *childless leaf* to that walk — it is neither descended into nor blocked. Every
+stage whose callable returns one of those two objects (`_make_field`, `fresh_coupling`) was therefore timed
+as **enqueue only**. The distortion is invisible at Nside 128 and grotesque at 1024 and above:
+
+| cell | column as published | column with the fix | true ratio |
+|---|---|---|---|
+| 1024 spin 0 | `coupling 775->1ms (996x)` | `coupling 773->202ms` | **3.8x** |
+| 1024 spin 2 | `field 912->2ms (477x)` | `field 859->540ms` | **1.6x** |
+| 2048 spin 0 | `coupling 5549->2ms (2362x)` | ~3.4 s of queued work | **~1.6x** |
+| 128 spin 0 | `field 6->5ms (1x)` | `field 8->5ms` | unchanged |
+
+This was **not** a surprise — item 1 of the project's probe-trap notes has said "returning a wrapper object
+defeats the blocking call" since 2026-09-03, and the board kept publishing those columns for six days
+anyway. What is new here is the fix, not the diagnosis.
+
+Fixed in `1c26511` by draining `__dict__` (one level of dict/tuple/list) after the pytree walk; the
+reference objects hold numpy arrays, so it is a no-op for `pymaster` and **every `TOTAL` in this document
+stands unchanged** — those block on a real array. Re-measured with the fix
+(`.qwen/tmp/blockfix_1024_s29.log`): Nside 1024 spin 0 `TOTAL 1733->647ms (2.7x) | field 484->224ms |
+coupling 773->202ms | coupled_cell 21->0ms`, spin 2 `TOTAL 3176->1098ms (2.9x) | field 859->540ms |
+coupling 1806->335ms`.
+
+**How to apply:** the stage columns written before `1c26511` are host-side for `field` and `coupling` —
+quote them as "submitted", not "computed". They still do not sum to `TOTAL` after the fix either (224+202
+= 426 of 647 at 1024 spin 0): the per-stage loop reuses one warm `f` and `bins`, while `full_pipeline`
+constructs a new field *and* a new workspace inside every sample, so the residual is per-repeat
+construction that belongs to no column. `TOTAL` is the only comparable number. The consequence for the
+route map is that **the weakest stage at 1024 spin 2 is `field` (540 ms, 49 % of the cell, 1.6x)**, which
+is marched spin-2 latitudinal work — not the coupling matrix the old column pretended was already won.
+
+**2. `set_ring_precision("fp32")` measured on the whole board, and why the published route keeps
+`complex128` rings.** The `ring_dtype` docstring promises "~4.5x cheaper" azimuthal transforms and the
+README priced it as "0-12 % of the pipeline wall clock", but no row of the board had actually been taken
+with `--ring-precision fp32` since the fp32-table route was published, so the weakest cells carried an
+unpriced knob.
+GMaster wall clock, fp64 rings → fp32 rings, with the `rel dCl` against `pymaster` for both:
+
+| Nside | spin | fp64 rings | fp32 rings | Δ | rel dCl fp64 → fp32 |
+|---|---|---|---|---|---|
+| 32 | 0 | 2 ms | 2 ms | 0 | 1.90e-14 → 3.93e-08 |
+| 32 | 2 | 2 ms | 2 ms | 0 | 5.23e-09 → 4.05e-08 |
+| 64 | 0 | 4 ms | 4 ms | 0 | 5.94e-14 → 4.39e-08 |
+| 64 | 2 | 4 ms | 3 ms | −25 % | 8.29e-09 → 1.09e-07 |
+| 128 | 0 | 11 ms | 10 ms | −9 % | 1.08e-13 → 4.26e-08 |
+| 128 | 2 | 10 ms | 9 ms | −10 % | 9.50e-09 → 1.40e-07 |
+| 256 | 0 | 19 ms | 16 ms | −16 % | 6.48e-09 → 1.41e-07 |
+| 256 | 2 | 25 ms | 22 ms | −12 % | 3.22e-08 → 1.19e-07 |
+| 512 | 0 | 94 ms | 85 ms | −10 % | 7.17e-09 → 1.60e-07 |
+| 512 | 2 | 151 ms | 137 ms | −9 % | 3.56e-07 → 3.12e-07 |
+| 1024 | 0 | 648 ms | 606 ms | −6 % | 5.60e-08 → 1.34e-07 |
+| 1024 | 2 | 1099 ms | 1044 ms | −5 % | 3.46e-06 → 3.22e-06 |
+| 2048 | 0 | 5395 ms | 5215 ms | −3 % | 1.38e-06 → 1.44e-06 |
+| 2048 | 2 | 8356 ms | 8124 ms | −3 % | 1.09e-05 → 1.09e-05 |
+
+(`.qwen/tmp/board_rings_fp32_s29.log`, `.qwen/tmp/board_small_rings_fp32_s29b.log`,
+`.qwen/tmp/board_2048_rings_fp32_s29b.log` against `board_small_final_s29.log` /
+`board_large_almcache_s29.log`.) The accuracy story is better than the README's warning implies: **spin 2
+does not move at all** (3.46e-06 → 3.22e-06 at 1024, 1.09e-05 → 1.09e-05 at 2048 — its error is table and
+truncation error, not the azimuthal stage), and spin 0 lands at 1.3–1.6e-07, four to five orders inside
+the estimator's own 9–13 % truncation floor. The gain, however, is 3–16 % of wall and shrinks exactly
+where the board is weakest: at 2048 it is 3 %, which is why it is not the lever the sub-3x cells were
+waiting for.
+
+**The gate, and it is a dtype bug rather than a precision failure.**
+`python -m pytest -q tests --gm-precision=fp32 --gm-ring-precision=fp32` is
+**1 failed, 167 passed, 3 skipped in 340.67 s** (`.qwen/tmp/suite_fp32rings_s29.log`; the same suite with
+`--gm-ring-precision=fp64` is 168 passed). The failure is
+`tests/test_sht.py::test_fused_scalar_transform_gradients_match_generic_jax`:
+
+```
+gmaster/utils.py:1093:  cap_out = chirp_out * convolution[:, width - 1 : width - 1 + L]
+TypeError: lax.mul requires arguments to have the same dtypes, got complex64, complex128
+```
+
+The alms accumulate in float64, so the cotangent that reaches the ring CZT during `jax.grad` is
+`complex128` while the chirp tables are `complex64`; `lax.mul` refuses. Nothing was wrong with the
+*forward* accuracy — the flag is simply unimplemented on the autodiff path. Casting at the primal
+multiply does not help, because the mismatch is inside the transpose rule operating on the closed-over
+table, not at that line; a `custom_jvp` that widens the table to the tangent's dtype would. Not taken:
+~5 % is not worth putting a custom derivative rule into the hottest path in the library, with the fp64
+route's performance then needing re-measurement. **`set_ring_precision("fp32")` is a forward-only knob.**
+
+**The number actually worth keeping from this measurement is a host-memory one.** At Nside 2048 spin 2,
+`peakRSS` falls **91.0 GB → 58.8 GB** and `GPUpeak` 13.4 → 8.4 GiB, because
+`_forward_ring_fft_positive` casts the *pixels* to the chirp's real dtype (`utils.py:1080`) and the whole
+host staging of the polarised map becomes float32. Nside 4096 spin 2 is blocked on capacity, not on
+arithmetic, so if that cell is ever attempted this is the first 35 % of the RSS to spend.
+
+**Measurement hygiene note.** The first small-`Nside` fp32-ring pass
+(`.qwen/tmp/board_small_rings_fp32_s29.log`) ran while an unrelated `pytest` held 73.6 GiB of GPU1
+(pid 1724605) and printed a 12-deep XLA allocation-retry cascade (`Failed to allocate 71.21GiB …
+22.35GiB`). Those rows were discarded and the cells re-run clean (`*_s29b.log`). Check
+`nvidia-smi --query-compute-apps` before trusting a small-`Nside` cell — a co-tenant does not have to be
+on the same card to slow the host.
+
 
 
 
