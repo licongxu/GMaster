@@ -488,6 +488,13 @@ def _synth_band(geometry):
         gc.collect()
         _SYNTH_CACHE[geometry] = (band, THETA_CONTIG)
         return band, THETA_CONTIG
+    if not all(hasattr(slab, "block_until_ready") for group in groups
+               for slab in group):
+        # Same concrete-buffer test as `_band`: under a trace the transpose is a
+        # tracer, so hand back the analysis layout and cache nothing.  Caching a
+        # tracer here is the `UnexpectedTracerError` that Session 5j recorded, and
+        # the drain below would raise `AttributeError` before it got that far.
+        return band, THETA_CONTIG
     for group in groups:
         for slab in group:
             slab.block_until_ready()
@@ -503,11 +510,20 @@ def warm(nside, L):
     first touched inside one silently takes the fused fp64 kernel -- the worst cell
     in the repo -- inside a program that was traced precisely to be fast.  Callers
     that are about to trace therefore ask this first; the build happens here, at top
-    level, exactly as it would have happened on the op-by-op route.  Called inside a
-    trace it degrades to ``False``, which is the correct answer there.
+    level, exactly as it would have happened on the op-by-op route.
+
+    The answer is residency, not intent: each builder caches a geometry only once its
+    slabs are concrete, so after the calls below `geometry in _SYNTH_CACHE` is exactly
+    "a program may read these buffers".  Called inside a trace the builders decline,
+    nothing is cached, and this returns False -- which is the correct answer there.
     """
     geometry = band_geometry(nside, L)
-    return _band(geometry) is not None and _synth_band(geometry) is not None
+    if _band(geometry) is None:
+        return False
+    if geometry in _SYNTH_CACHE:
+        return True
+    _synth_band(geometry)
+    return geometry in _SYNTH_CACHE
 
 
 def _contract_ell(slab, rhs):

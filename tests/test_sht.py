@@ -726,6 +726,38 @@ def test_band_build_declines_inside_a_trace_instead_of_raising():
     assert float(np.max(np.abs(grad))) > 0.0
 
 
+@pytest.mark.skipif(not _HAS_NVIDIA_GPU, reason="requires an NVIDIA GPU")
+def test_no_tracer_can_enter_the_table_caches():
+    """Tracing the route dispatcher must neither raise nor leave a tracer in a cache.
+
+    `_trace_route_ready` builds the Legendre band and its synthesis layout at top
+    level, so it is also reachable *during* somebody else's trace (`jax.jit`,
+    `jax.eval_shape`, `jax.grad`).  Both builders then have to decline: a cached
+    tracer is the `UnexpectedTracerError` of Session 5j, and an uncached one means
+    the concrete-buffer drain raises `AttributeError` inside the caller's trace --
+    which is exactly how a first version of the hoist failed, on a path the pipeline
+    itself never walks.
+    """
+    nside = 64
+    L = 3 * nside
+    _theta_matrix.release()
+
+    out = jax.jit(lambda x: (utils._trace_route_ready(nside, L), x * 2.0)[1])(
+        jnp.ones(4))
+    np.testing.assert_allclose(np.asarray(out), 2.0)
+
+    # Whatever the trace did, the same geometry must still build cleanly at top
+    # level -- a decline that leaves the caches unusable is as bad as a crash.
+    assert _theta_matrix.warm(nside, L)
+    cached = [slab for groups in _theta_matrix._BAND_CACHE.values()
+              for group in groups for slab in group]
+    cached += [slab for groups, _ in _theta_matrix._SYNTH_CACHE.values()
+               for group in groups for slab in group]
+    assert cached, "the geometry should have been built eagerly by the dispatcher"
+    for slab in cached:
+        assert hasattr(slab, "block_until_ready")
+
+
 @pytest.mark.parametrize("nside", [512, 1024, 2048, 4096, 8192])
 def test_synthesis_tile_is_per_spin_and_still_powers_of_two(nside):
     """The synthesis launch geometry agrees with the chunk the kernel is compiled against.
