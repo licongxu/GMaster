@@ -54,6 +54,44 @@ def test_synfast_spherical_is_reproducible_and_correlated():
         nmt.synfast_spherical(2, bad, [0, 2], seed=2, lmax=lmax)
 
 
+def test_alm_index_arrays_are_cached_by_lmax():
+    lmax = 4
+    m = np.arange(lmax + 1)
+    first = utils._alm_index_arrays(lmax, m)
+    assert utils._alm_index_arrays(lmax, m) is first
+    assert utils._alm_index_arrays(lmax + 2, np.arange(lmax + 3)) is not first
+
+    np.testing.assert_array_equal(
+        np.asarray(first[0]), np.concatenate([np.arange(i, lmax + 1) for i in m])
+    )
+    np.testing.assert_array_equal(np.asarray(first[1]), np.repeat(m, lmax + 1 - m))
+
+    info = utils.NmtAlmInfo(lmax)
+    assert info._ell is first[0]
+    assert info._m is first[1]
+
+
+def test_alm_index_cache_never_holds_a_tracer():
+    from jax.core import Tracer
+
+    lmax = 6
+
+    @jax.jit
+    def build_inside(x):
+        info = utils.NmtAlmInfo(lmax)
+        return x + info._m.sum() + info._ell.sum()
+
+    assert jnp.isfinite(build_inside(jnp.asarray(0.0)))
+    assert all(
+        not isinstance(array, Tracer)
+        for pair in utils._ALM_INDEX_CACHE.values()
+        for array in pair
+    )
+    # The traced lmax is still usable outside the trace and caches cleanly there.
+    outside = utils.NmtAlmInfo(lmax)
+    assert utils._ALM_INDEX_CACHE[lmax] == (outside._ell, outside._m)
+
+
 def test_default_parameters_control_new_fields():
     original = nmt.get_default_params()
     try:

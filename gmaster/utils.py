@@ -6,6 +6,7 @@ from functools import lru_cache, partial
 import jax
 import jax.numpy as jnp
 import numpy as np
+from jax.core import Tracer
 from s2fft.sampling import s2_samples
 from s2fft.recursions import turok_jax
 from s2fft.transforms import _ftm_flm_primitive
@@ -497,6 +498,35 @@ class NmtMapInfo:
         return int(np.pi / min(self.d_theta, self.d_phi))
 
 
+# `ell`/`m` are a pure function of lmax, but building them costs lmax+1 numpy.arange calls
+# plus a device_put per construction, and `NmtField` builds two per field: 1.15 ms of the
+# 1.66 ms constructor at Nside 64.  The budget is in elements because at Nside 2048 a single
+# pair is 38M of them.
+_ALM_INDEX_BUDGET = 64_000_000
+_ALM_INDEX_CACHE: dict = {}
+_ALM_INDEX_ELEMENTS = 0
+
+
+def _alm_index_arrays(lmax, m):
+    global _ALM_INDEX_ELEMENTS
+    cached = _ALM_INDEX_CACHE.get(lmax)
+    if cached is not None:
+        return cached
+    ell = np.concatenate([np.arange(mm, lmax + 1) for mm in m])
+    order = np.repeat(m, lmax + 1 - m)
+    cached = (jnp.asarray(ell), jnp.asarray(order))
+    if isinstance(cached[0], Tracer) or isinstance(cached[1], Tracer):
+        # Several helpers build an `NmtAlmInfo` inside a trace; a tracer in a
+        # module-level cache surfaces later as an UnexpectedTracerError.
+        return cached
+    if _ALM_INDEX_ELEMENTS + 2 * len(ell) > _ALM_INDEX_BUDGET:
+        _ALM_INDEX_CACHE.clear()
+        _ALM_INDEX_ELEMENTS = 0
+    _ALM_INDEX_CACHE[lmax] = cached
+    _ALM_INDEX_ELEMENTS += 2 * len(ell)
+    return cached
+
+
 class NmtAlmInfo:
     """Description of Healpy-packed spherical-harmonic coefficients."""
 
@@ -506,10 +536,7 @@ class NmtAlmInfo:
         m = np.arange(self.mmax + 1)
         self.mstart = (m * (2 * self.lmax + 1 - m) // 2).astype(np.uint64)
         self.nelem = (self.lmax + 1) * (self.lmax + 2) // 2
-        ell = np.concatenate([np.arange(mm, self.lmax + 1) for mm in m])
-        order = np.repeat(m, self.lmax + 1 - m)
-        self._ell = jnp.asarray(ell)
-        self._m = jnp.asarray(order)
+        self._ell, self._m = _alm_index_arrays(self.lmax, m)
 
     def __eq__(self, other):
         return isinstance(other, NmtAlmInfo) and self.lmax == other.lmax
