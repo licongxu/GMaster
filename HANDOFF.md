@@ -7000,3 +7000,67 @@ the `field` stage (3835 ms) dominates and only the quadrature moved. The remaini
 Richardson pass count (`1 + 2*n_iter` latitudinal ops, algorithmic), the spin-0 threej recurrence, and
 the work decomposition of the marched kernels.
 
+## Addendum 21 (session 30): the scalar coupling build is operand-width bound too, and the same knob now covers both spins
+
+Addendum 20 closed spin 0 with the sentence "temperature coupling goes through `_coupling_matrix_tt`,
+an element-wise offset-blocked threej recurrence, which contains no large `dot` at all". That is true
+and it is also the reason the conclusion drawn from it was wrong: a build with no `dot` is not stuck at
+an fp64 *GEMM* ceiling, it is stuck at the width of its elementwise temporaries, and that is equally
+changeable.
+
+**1. The measurement.** `_coupling_matrix_tt` evaluates, per block of `_OFFSET_CHUNK = 16` offsets,
+
+```
+term = mp[min(up-low+2o, 2L)] * g[up-low+o] * g[o] * g[max(low-o,0)] / (g[up+o] * (2(up+o)+1))
+```
+
+over `[o0:, o0:]` — five table lookups and a handful of elementwise ops over ~n³/3 elements, 9.7e9 of
+them at `lmax = 3071`. Two hypotheses were on the table: five gathers producing ~six `(chunk, m, m)`
+temporaries (⇒ restructure the lookups, keep fp64), or the elementwise pass itself (⇒ change the
+operand width, don't touch the structure). A chunk-width sweep settles it against restructuring
+(`.qwen/tmp/tt1535_s30.log`, lmax 1535): the shipped 16 costs 21.62 ms, chunk 8 costs 27.03 ms and
+chunk 32 costs 27.42 ms — the temporary shape is already at a local optimum, so a factored form that
+turns two of the five lookups into vector slices has nothing to win. Casting the operands to float32
+in the same program costs **2.22 ms**.
+
+**2. Shipped form and what it is worth.** The float32 arm keeps the `log`-cumsum table and the offset
+accumulator in float64 and rounds only the lookup tables and the per-term products, which is a full
+order of magnitude more accurate than the crude all-float32 probe:
+
+| lmax | float64 | float32 | speedup | rel (of `max|matrix|`) |
+|---|---|---|---|---|
+| 1535 | 23.48 ms | 2.49 ms | **9.42x** | 1.885e-07 |
+| 3071 | 159.05 ms | 21.19 ms | **7.51x** | 1.885e-07 |
+
+(`.qwen/tmp/ttknob_s30.log`. The crude probe's 2.2e-06 vs the shipped 1.885e-07 is entirely the
+accumulator: summing up to `lmax` partials in float32 put the error in the sum rather than the
+products.)
+
+**3. Whole board, both builders under the one knob** (`--precision fp32` tables, GPU1, 5 repeats,
+one process per cell, `.qwen/tmp/coupling_board_s30.log`; TOTAL is the full `NmtField` + coupling +
+coupled cell + decouple pipeline against `pymaster` in the same process):
+
+| Nside | spin | coupling | TOTAL fp64 → fp32 | vs NaMaster | rel dCl |
+|---|---|---|---|---|---|
+| 512 | 0 | 32 → **3 ms** | 88 → **60 ms** | 4.0x → **5.7x** | 1.60e-07 → 1.88e-07 |
+| 512 | 2 | 50 → **15 ms** | 139 → **106 ms** | 5.3x → **6.8x** | 3.12e-07 → 4.95e-07 |
+| 1024 | 0 | 203 → **24 ms** | 605 → **427 ms** | 2.9x → **4.1x** | 1.34e-07 → 2.04e-07 |
+| 1024 | 2 | 335 → **91 ms** | 1038 → **793 ms** | 3.2x → **4.1x** | 3.22e-06 → 3.21e-06 |
+| 2048 | 0 | 1519 → **365 ms** | 5221 → **4203 ms** | 2.0x → **2.5x** | 1.44e-06 → 1.43e-06 |
+| 2048 | 2 | 2594 → **665 ms** | 8387 → **6459 ms** | 2.2x → **2.8x** | 1.09e-05 → 1.11e-05 |
+
+`GMASTER_COUPLING_PRECISION=fp32` is now worth 1.24-1.47x end to end in **both** spins at every size
+measured, and the scalar arm costs less accuracy than the polarised one (2.04e-07 vs 3.21e-06 at
+Nside 1024) — the spin-0 `rel dCl` is still set by the fp32 *tables*, not by the coupling. Float64
+remains the default and the suite is unchanged by it;
+`tests/test_table_precision.py::test_float32_scalar_coupling_keeps_the_matrix` pins the scalar matrix
+move and, like its polarised sibling, asserts `rel > 0` so an ignored switch cannot pass.
+
+**4. The general lesson for the remaining stages.** "No large `dot`" is not a roofline verdict. Before
+a stage is declared locked, ask which of the three it is: contraction-bound (the quadrature: 94 % of
+the fp64 GEMM ceiling, operand width was the only lever and it paid 34x), elementwise-bound (the scalar
+build: 9.4x from the same lever, no restructuring needed), or issue-bound (the analysis march: addendum
+19 showed a *total* limb ablation is 1.004x, so neither width of arithmetic nor op count moves it and
+only work decomposition can).
+
+

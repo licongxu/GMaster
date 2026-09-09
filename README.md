@@ -262,19 +262,18 @@ python benchmarks/benchmark_pipeline.py --nside 512 --spins 0,2 \
   --precision fp32 --ring-precision fp64
 ```
 
-The polarised coupling matrix has a precision switch of its own, because its quadrature is the one
-contraction in the pipeline that sits directly on a hardware roofline: `(first.T * (w*corr)) @ second`
-is 115.9 GFLOP per integrate at `lmax=3071` and the float64 form runs at 1.76 TFLOP/s, **94 % of this
-card's 1.88 TFLOP/s fp64 ceiling**. `GMASTER_COUPLING_PRECISION=fp32`
-(or `nmt.set_coupling_precision("fp32")`, read back with `nmt.coupling_precision()`) puts the operands
-on the float32 units at `Precision.HIGHEST` — 34.3x on the quadrature for a matrix error of 2.1e-06 of
-its largest cell, which is under the error a float32-table run already carries. On the board that is
-spin-2 `coupling 335 → 91 ms` and **TOTAL 1038 → 792 ms (3.1x → 4.1x)** at `Nside=1024`,
-**2605 → 664 ms** and **8475 → 6458 ms (2.2x → 2.8x)** at 2048, with the decoupled Cls unchanged
-(`rel dCl` 3.22e-06 → 3.21e-06 at 1024, 1.09e-05 → 1.11e-05 at 2048). It is opt-in and defaults to
-float64, since the suite holds `get_coupling_matrix()` to `atol=2e-14` against float64 tables. Spin 0
-does not change at all: temperature coupling is an element-wise threej recurrence
-(`_coupling_matrix_tt`), not a `dot`.
+The coupling matrix has a precision switch of its own, because both of its builders are width-bound:
+the polarised quadrature's contraction is 115.9 GFLOP at `lmax=3071` and runs at 1.76 TFLOP/s in
+float64, **94 % of this card's 1.88 TFLOP/s fp64 ceiling**, while the scalar build is five table
+lookups and a few elementwise ops over ~n³/3 elements with no `dot` in it at all.
+`GMASTER_COUPLING_PRECISION=fp32` (or `nmt.set_coupling_precision("fp32")`, read back with
+`nmt.coupling_precision()`) is worth 34.3x on the contraction for a matrix error of 2.1e-06 and 9.4x on
+the scalar build for 1.9e-07 (its accumulator stays float64). On the board, TOTAL against NaMaster
+(spin 0 / spin 2): **4.0x / 5.3x → 5.7x / 6.8x** at `Nside=512`, **2.9x / 3.2x → 4.1x / 4.1x** at 1024
+and **2.0x / 2.2x → 2.5x / 2.8x** at 2048, with the decoupled Cls essentially unmoved
+(`rel dCl` 1.34e-07 → 2.04e-07 spin 0 and 3.22e-06 → 3.21e-06 spin 2 at 1024). It is opt-in and
+defaults to float64, since the suite holds `get_coupling_matrix()` to `atol=2e-14` against float64
+tables.
 
 While float32 tables are live, `numpy.testing.assert_allclose` is held to a floor of
 **2e-6 of the compared quantity** (its own `max|desired|`, not a fixed absolute), which is
