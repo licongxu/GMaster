@@ -7504,5 +7504,84 @@ whole stage (12 764 → 3 189 ms at 4096 spin 0) already proves the stage is qua
 since the banded part is dtype-independent. Worth doing only as part of something else; on its own it
 is one cell moving 2.8x → 3.0x for a change to the numerically central function of the estimator.
 
+---
+
+## Addendum 26 (session 32): the traced-route gate was filed dead for a crash, not a measurement — hoisting the Legendre band out of the trace buys 9.4 % at `Nside=256` spin 0, and stops 2.5x short of buying 512
+
+**1. A closed lever that was never closed by data.** Addendum 23 §5 lists "`_PALLAS_TRACED_MAX_L` raises
+documented dead" among the closed levers. What session 24 actually recorded was different: raising the
+gate to 768 *crashed* — `_theta_matrix._band` drains its build caches with `slab.block_until_ready()`
+every `_BUILD_CLEAR_EVERY` m-blocks, and a band geometry first built inside an outer trace hands back
+tracers, so the call died with `AttributeError: 'block_until_ready' is not available on traced array
+float32[160, 64, 512]` (`.qwen/tmp/s24_256_0.log`). An implementation wall was written into the lever
+list as though it were a throughput measurement, and the 1.22x/1.30x traced win that session 24 had
+already measured at Nside 256 was left on the table for eight sessions.
+
+**2. The fix is a build order, not an algorithm.** A traced program can *read* the band but must never
+*build* it (XLA folds no constant subtree here, so a build inside a program is re-run on every call).
+So the build moves outside:
+
+- `_theta_matrix.warm(nside, L)` builds the analysis band and its synthesis layout at top level and
+  returns whether both are concrete device buffers.
+- `utils._trace_route_ready(nside, L_work)` is what the two refinement dispatchers now ask instead of
+  `L_work <= _PALLAS_TRACED_MAX_L`: above the gate no; where no band is in the program's future
+  (too big, an m-split, or the folded march serves it) yes; otherwise it warms and reports.
+- `_band` now declines on the first tracer block instead of raising at the drain, so a geometry first
+  touched under `jax.grad` takes the fused kernel and still returns a gradient.
+
+Because the predicate builds eagerly, the very first call at a geometry already gets the single program;
+there is no "op-by-op first to warm the cache" phase.
+
+**3. It is free on accuracy and worth 9.4 % at the size it was measured for.** The two cores are the
+same seven passes cut at a different number of jit boundaries, and they agree exactly:
+`.qwen/tmp/traceidentity_s32.py` reports **route identity rel = 0.000e+00** at Nside 256, a finite
+gradient through a released geometry, and the dispatcher's output bit-identical to the op-by-op loop
+after `_theta_matrix.release()`. Float timings (`.qwen/tmp/tracepipe_s32.py`, which calls the harness's
+own `_run_pipeline` for the GMaster column so the stage boundaries are the published ones, medians of
+9, one process per arm because a jit cache key does not contain a module constant):
+
+| Nside | gate | route taken | `field` | `mask` | `coupling` | TOTAL |
+|---|---|---|---|---|---|---|
+| 128 | 384 (was) | traced 52/52 | 1.755 | 1.519 | 0.502 | **3.627** |
+| 128 | 768 | traced 52/52 | 1.764 | 1.352 | 0.495 | **3.558** |
+| 256 | 384 (was) | op-by-op 52/52 | 7.243 | 6.110 | 0.744 | **13.737** |
+| 256 | **768 (now)** | traced 52/52 | **6.378** | **5.540** | 0.783 | **12.442** |
+| 512 | 384 (was) | op-by-op 52/52 | 33.815 | 31.960 | 3.344 | **68.407** |
+| 512 | 1536 (rejected) | traced 52/52 | 40.109 | 37.657 | 3.700 | **80.283** |
+
+Milliseconds. The 128 pair is the control — both arms trace there, and they agree to 1.9 %, which is
+the probe's own noise floor. **Nside 256 is 9.4 % faster with the single program** (field −11.9 %,
+mask −9.3 %, the two transform stages being 96 % of that cell); **Nside 512 is 17.4 % slower** and is
+left on op-by-op, with a 4.69 GiB band inside the program against the 0.61 GiB one that 256 carries.
+So the crossover that session 24 placed at 128 was really a wall at 128, and it sits at 256 now: the
+gate is `_PALLAS_TRACED_MAX_L = 768`.
+
+**4. What it costs, and what it does not change.** Peak host RSS at 256 goes from 5.0 GB to **15.1 GB**
+(the high-water mark during the traced program's compile — device peak is unchanged at 4.2 GiB), in
+both spins, because the mask analysis is a spin-0 transform and is what gets traced. Spin 2 itself is
+untouched: `_use_pallas_sht` does not admit spin 2, and the A/B confirms it — 21 ms with the gate at
+384 and **21 ms** at 768, `rel dCl` 1.35e-07 in both (`spin2gate_s32.log`). The board row does not move
+in the harness's own print: `Nside=256` spin 0 reads 63 → 13 ms (5.0x) at repeats 9 either way
+(`board256_s32.log`), because the harness prints integer milliseconds and the win is 1.3 ms. Quote the
+float column above, not a new ratio. Note also what that log shows about the reference at this size:
+the same geometry measured 135 ms, 159 ms and 163 ms in three runs today, so a spin-2 ratio at Nside
+256 is worth roughly ±15 % and the published 8.8x sits near the top of that band — at these sizes
+compare GMaster's milliseconds, as addendum 23 §4 already says.
+
+**5. Verification.** `python -m pytest tests/ -q` on GPU1: **174 passed, 3 skipped** in 6:40
+(`.qwen/tmp/suite_s32.log`). Two tests ship with the change:
+`test_traced_refinement_route_is_bit_identical_to_op_by_op` (Nside 128, 256 — exact equality plus
+`assert L <= _PALLAS_TRACED_MAX_L`, so the gate cannot be widened to 512 or narrowed away silently) and
+`test_band_build_declines_inside_a_trace_instead_of_raising` (a released geometry under `jax.grad` must
+return a finite gradient, which is the crash that kept this lever dead).
+
+**6. Where this leaves the lever list.** One entry in the closed-lever map was wrong and is now
+shipped; nothing else in it changed. The objective's remaining gap is still where addendum 25 put it —
+the latitudinal kernel at `Nside >= 4096`, where the analysis pass is 0.86-0.88x of `ducc0` and the
+march is cubic against `ducc0`'s 6.3x-per-doubling — and none of that is reachable through route
+boundaries. A future attacker should read "documented dead" in this file as "someone hit an error here"
+and check whether the error was the measurement or just the door.
+
+
 
 

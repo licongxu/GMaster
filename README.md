@@ -257,6 +257,12 @@ reference itself varies 2-5 ms run to run). The shipped fp64 default scores 1.5x
 32, 1.7x / 3.2x at 64, 1.8x / 3.2x at 128 and 2.5x / 3.1x at 256. At 2048 the
 tables are refused in either precision and the route is worth 1.00-1.01x over the default.
 
+The scalar refinement loop runs as one XLA program up to `lmax = 767` (`_PALLAS_TRACED_MAX_L`), which
+is `Nside=256`; the Legendre band is built at top level before that route is chosen, because a traced
+program may read the band but must never build it. That is worth 13.74 → 12.44 ms (9.4 %) at
+`Nside=256` spin 0 with bit-identical alms and costs ~10 GB of peak host RSS during the compile;
+`Nside=512` is 17 % *slower* as one program and is left op-by-op (HANDOFF addendum 26).
+
 ```bash
 python benchmarks/benchmark_pipeline.py --nside 512 --spins 0,2 \
   --precision fp32 --ring-precision fp64
