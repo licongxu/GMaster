@@ -269,11 +269,18 @@ lookups and a few elementwise ops over ~n³/3 elements with no `dot` in it at al
 `GMASTER_COUPLING_PRECISION=fp32` (or `nmt.set_coupling_precision("fp32")`, read back with
 `nmt.coupling_precision()`) is worth 34.3x on the contraction for a matrix error of 2.1e-06 and 9.4x on
 the scalar build for 1.9e-07 (its accumulator stays float64). On the board, TOTAL against NaMaster
-(spin 0 / spin 2): **4.0x / 5.3x → 5.7x / 6.8x** at `Nside=512`, **2.9x / 3.2x → 4.1x / 4.1x** at 1024
-and **2.0x / 2.2x → 2.5x / 2.8x** at 2048, with the decoupled Cls essentially unmoved
-(`rel dCl` 1.34e-07 → 2.04e-07 spin 0 and 3.22e-06 → 3.21e-06 spin 2 at 1024). It is opt-in and
+(spin 0 / spin 2): **3.7x / 7.4x → 5.0x / 8.8x** at `Nside=256`, **4.0x / 5.3x → 5.7x / 6.8x** at 512,
+**2.9x / 3.2x → 4.1x / 4.1x** at 1024 and **2.0x / 2.2x → 2.5x / 2.8x** at 2048, with the decoupled Cls
+essentially unmoved (`rel dCl` 1.34e-07 → 2.04e-07 spin 0 and 3.22e-06 → 3.21e-06 spin 2 at 1024). Below
+`Nside=256` the coupling stage is sub-millisecond and the switch changes nothing. It is opt-in and
 defaults to float64, since the suite holds `get_coupling_matrix()` to `atol=2e-14` against float64
 tables.
+
+The benchmark also reports a `mask` stage: a field's mask `a_lm` are computed lazily (as in NaMaster),
+by an analysis at `lmax_mask = 2*lmax` with `n_iter_mask` iterations, so the work lands in `TOTAL` but
+in no stage column unless it is measured on a fresh field. It is worth naming — at `Nside=2048` spin 0
+it is 1855 ms of a 4210 ms pipeline, i.e. as much again as the science transform, and with it the
+columns add up to the total.
 
 While float32 tables are live, `numpy.testing.assert_allclose` is held to a floor of
 **2e-6 of the compared quantity** (its own `max|desired|`, not a fixed absolute), which is

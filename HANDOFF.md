@@ -7063,4 +7063,70 @@ build: 9.4x from the same lever, no restructuring needed), or issue-bound (the a
 19 showed a *total* limb ablation is 1.004x, so neither width of arithmetic nor op count moves it and
 only work decomposition can).
 
+## Addendum 22 (session 30): the board's columns summed to 55 % of its TOTAL, and the missing 44 % is the mask's lazy analysis at `lmax_mask = 2*lmax`
+
+After addendum 21 the Nside 2048 spin-0 row read `field 1913 + coupling 365 + coupled_cell 0 +
+decouple 1 = 2279 ms` against `TOTAL 4203 ms`. That gap is not slack in the timing: it is real GPU
+work that no column reported, and it is as large as the science transform.
+
+**1. It is the field's lazy mask analysis.** `benchmarks/benchmark_pipeline.py` times every stage
+against a **shared, already-built** field but times `TOTAL` on a **fresh field per repeat**, so
+anything the field caches lazily shows up only in `TOTAL`. NaMaster documents the behaviour itself —
+`pymaster/field.py::get_mask_alms` says *"in most cases, the mask a_lm are not computed when
+generating the field. When calling this function for the first time ... they will be (which may be a
+slow operation)"* — and GMaster matches it. Splitting a fresh-field pipeline into its four candidates
+(GPU1, medians of 3, fp32 tables, fp32 coupling, `.qwen/tmp/maskstage_s30.log`; marginal = the
+incremental cost over the line above):
+
+| Nside | ctor | +`get_mask_alms()` | +`pcl_mask` | +MCM build | total pipeline |
+|---|---|---|---|---|---|
+| 1024 | 203.5 | **403.7** (+200.2) | 403.5 (−0.2) | 425.7 (+22.2) | 425.7 |
+| 2048 | 1846.8 | **3701.7** (+1854.9) | 3726.4 (+24.7) | 4192.0 (+465.6) | 4209.9 |
+
+The mask analysis is **200 ms of 426 at Nside 1024 and 1855 ms of 4210 at Nside 2048 — 44 % of the
+spin-0 pipeline**, and `pcl_mask` itself is free (−0.2 ms / 24.7 ms). A shared-field probe confirms the
+mechanism directly (`.qwen/tmp/coldstage_s30.log`): the coupling call costs 23.4 ms warm and
+**425.2 ms cold** at Nside 1024, and `cell_cold` is exactly `ctor`, i.e. the shared field was absorbing
+the whole transform.
+
+**2. It is required work, at parity with the reference, so it is not a free win.** The analysis is a
+spin-0 `map2alm` at `lmax_mask = 2*lmax` (6142 at Nside 1024, 12286 at 2048) with `n_iter_mask`
+compensating iterations, and `n_iter_mask_default = 3` in *both* codes (`gmaster/utils.py:33`,
+`pymaster/field.py:117-118` via `ut.nmt_params.n_iter_mask_default`). Cutting it is cutting an
+algorithm the reference also runs; the Legendre band that would carry it is 146 GiB at `L=6142` and
+581 GiB at `L=12286`, so neither size is a band candidate either. It is now a *named* target rather
+than a phantom, which is the whole point.
+
+**3. The instrument is fixed.** `benchmarks/benchmark_pipeline.py` has a `mask` column — a fresh
+field plus `get_mask_alms()`, minus the construction — so the columns add up to `TOTAL`
+(Nside 256 spin 2: `field 10 + mask 5 + coupling 3 = 18 = TOTAL`). The spin-0 row that motivated this
+now reads `field 6 + mask 6 + coupling 1` at 256 instead of `field 7 + coupling 1` against a 12 ms
+total.
+
+**4. Small-Nside board with both coupling arms** (fp32 tables, 15 repeats, `.qwen/tmp/small_board_s30.log`;
+below Nside 128 the reference column itself swings 2-5 ms, so compare GMaster's ms, not the ratio):
+
+| Nside | GMaster ms spin 0 fp64→fp32 | GMaster ms spin 2 fp64→fp32 | ratio spin 0 | ratio spin 2 |
+|---|---|---|---|---|
+| 32 | 2 → 2 | 2 → 2 | 1.8x → 2.0x | 2.2x → 2.1x |
+| 64 | 4 → 4 | 3 → 3 | 2.4x → 1.8x | 4.1x → 5.0x |
+| 128 | 11 → 11 | 9 → 9 | 1.8x → 1.8x | 4.0x → 4.3x |
+| 256 | 17 → **12** | 23 → **19** | 3.7x → **5.0x** | 7.4x → **8.8x** |
+
+The coupling stage is sub-millisecond below Nside 256, so the knob does nothing there and the residual
+gap to NaMaster at 32-128 is dispatch/jit-boundary work, not coupling.
+
+**5. State of the objective and the closed-lever map.** With `--precision fp32` plus
+`GMASTER_COUPLING_PRECISION=fp32` the pipeline scores **5.0x / 8.8x** at 256, **5.7x / 6.8x** at 512,
+**4.1x / 4.1x** at 1024 and **2.5x / 2.8x** at 2048 (spin 0 / spin 2), against a float64-coupling board
+of 3.7/7.4, 4.0/5.3, 2.9/3.2 and 2.0/2.2. What remains after this, in decreasing size, is: the science
+latitudinal transform (`field`, now the largest single object again), the lazy mask analysis at
+`2*lmax` (44 % of spin 0 at 2048, algorithmically required), and the Richardson pass count. Each is
+closed by measurement rather than opinion — issue-bound march (addendum 19), band-width roofline at
+1471 GB/s for spin 0 where the band fits (addendum 20 §3), `n_iter_mask` being the reference's own
+default (this addendum), fp32 rings breaking the transform's gradient, the blocked/matmul recurrences
+hitting the fp64 dynamic-range wall, and `_PALLAS_TRACED_MAX_L` raises documented dead. A new
+attacker should start from the `mask` and `field` columns, not from the coupling.
+
+
 
