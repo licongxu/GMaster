@@ -25,6 +25,14 @@ def _block(result):
     ``hasattr(result, "block_until_ready")`` check skips them entirely and the
     sample measures only the host-side enqueue. Walking the pytree container is
     what makes the stage numbers add up to the end-to-end total.
+
+    Neither ``NmtField`` nor ``NmtWorkspace`` is a registered pytree, so the walk
+    above hands them back as a single childless leaf and their stages silently
+    measured enqueue only: Nside 2048 spin 0 reported ``coupling 5525->2ms
+    (2350x)`` while the same work inside the blocked ``TOTAL`` was ~3.4 s
+    (``.qwen/tmp/board_2048_rings_fp32_s29b.log``). Their arrays are reached
+    through ``__dict__`` instead, one level of dict/tuple/list included. The
+    reference objects hold numpy arrays, for which this is a no-op.
     """
     jax.tree.map(
         lambda leaf: leaf.block_until_ready()
@@ -32,6 +40,18 @@ def _block(result):
         result,
         is_leaf=lambda x: hasattr(x, "block_until_ready"),
     )
+    pending = [getattr(result, "__dict__", None)]
+    arrays = []
+    while pending:
+        for value in (pending.pop() or {}).values():
+            if hasattr(value, "block_until_ready"):
+                arrays.append(value)
+            elif isinstance(value, dict):
+                pending.append(value)
+            elif isinstance(value, (list, tuple)):
+                pending.append({i: v for i, v in enumerate(value)})
+    for array in arrays:
+        array.block_until_ready()
 
 
 def _timed(function, repeats):
