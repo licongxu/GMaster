@@ -86,6 +86,20 @@ def _run_pipeline(module, nside, spin, nlb, repeats, mask, maps_t, maps_q, maps_
         repeats,
     )[1]
 
+    # A field's mask alms are lazy in both codes (NaMaster's own `get_mask_alms` docstring says
+    # "in most cases ... are not computed when generating the field ... which may be a slow
+    # operation"), and the analysis is at `lmax_mask = 2*lmax` with `n_iter_mask` iterations, so
+    # it costs about as much as the science stage that hides it. Timing a fresh field and
+    # subtracting the construction measures its marginal cost; on a shared field it is cached and
+    # every column would report zero. At Nside 2048 spin 0 this marginal is 1855 ms against a
+    # 4210 ms TOTAL (`.qwen/tmp/maskstage_s30.log`).
+    t_mask = _timed(
+        lambda: _make_field(
+            module, mask, maps_t, maps_q, maps_u, spin
+        ).get_mask_alms(),
+        repeats,
+    )[1] - t_field
+
     def fresh_coupling():
         ww = module.NmtWorkspace()
         ww.compute_coupling_matrix(f, f, bins)
@@ -105,6 +119,7 @@ def _run_pipeline(module, nside, spin, nlb, repeats, mask, maps_t, maps_q, maps_
     _, t_total = _timed(full_pipeline, repeats)
     times = {
         "field": t_field,
+        "mask": max(t_mask, 0.0),
         "coupling": t_coupling,
         "coupled_cell": t_coupled_cell,
         "decouple": t_decouple,
@@ -165,7 +180,7 @@ if __name__ == "__main__":
         )
         diff = float(np.max(np.abs(np.asarray(gm_out) - np.asarray(ref_out))))
         scale = float(np.max(np.abs(ref_out))) or 1.0
-        stages = ("field", "coupling", "coupled_cell", "decouple")
+        stages = ("field", "mask", "coupling", "coupled_cell", "decouple")
         line = "  ".join(
             f"{s} {ref_times[s]*1e3:.0f}->{gm_times[s]*1e3:.0f}ms "
             f"({ref_times[s]/max(gm_times[s], 1e-12):.0f}x)"
