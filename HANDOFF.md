@@ -6942,3 +6942,61 @@ in ways that produced confident output:
 The detector that caught all three is free: **a subset cannot cost more than its superset.** Print
 `max|probe_alm - field.alm| / max|field.alm|` (it must be `0.000e+00`) and compare the isolated stage
 against the shipped stage before believing either.
+
+## Addendum 20 (session 29l): the coupling quadrature runs at 94 % of the fp64 roofline, float32 operands buy 34.3x there, and it is shipped as an opt-in
+
+After addendum 19 closed the last arithmetic lever in the transform, the only stage left that sits on a
+hardware roofline *whose operand width is changeable* is the coupling matrix. This one paid.
+
+**1. The quadrature contraction is exactly at the fp64 ceiling.** `_general_coupling_matrix_quadrature`
+evaluates `integrate(correlation) = (first.T * (weights*correlation)) @ second` with
+`order = (2*lmax + lmax_mask)//2 + 1 = 6143` nodes at `lmax = 3071`, i.e. **115.9 GFLOP per integrate**
+and two integrates per call. Measured on GPU1 (`.qwen/tmp/coupling_prec_1024c_s29.log`):
+
+| arm | time | speedup | rel diff vs shipped (of `max|matrix|`) |
+|---|---|---|---|
+| float64 (shipped) | 131.46 ms | 1.000x | — |
+| float32, `Precision.HIGHEST` (no tf32) | 3.83 ms | **34.292x** | 2.076e-06 |
+| float32, `Precision.DEFAULT` (tf32 allowed) | 2.23 ms | 59.061x | 5.463e-04 |
+
+115.9 GFLOP in 131.46 ms is **1.76 TFLOP/s against the 1.88 TFLOP/s fp64 ceiling** measured for this
+card (memory: two-sided machine roofline) — 94 %, with nothing left in scheduling. The tf32 arm is
+another 1.7x but its 5.5e-04 matrix error is not a pseudo-`C_ell` error anyone can publish, so the
+shipped route is `HIGHEST`. The obvious free lunch — float32 operands with a float64 accumulator — is
+simply not a product this backend offers: `jnp.matmul(..., preferred_element_type=jnp.float64)` on
+float32 inputs dies with `INTERNAL: Unexpected GEMM dtype: f32 f32 f64`, and this JAX build has no
+matmul-precision emulation flag beyond `jax_default_matmul_precision`.
+
+**2. End to end (`--precision fp32` tables, GPU1, 5 repeats, `.qwen/tmp/coupling_board_s29.log`; spin 2
+rows, since only the polarised path reaches the quadrature):**
+
+| Nside | coupling fp64 → fp32 | TOTAL fp64 → fp32 | vs NaMaster fp64 → fp32 | rel dCl fp64 → fp32 |
+|---|---|---|---|---|
+| 512 | 50 → **15 ms** | 140 → **106 ms** | 5.1x → **6.8x** | 3.12e-07 → 4.95e-07 |
+| 1024 | 335 → **91 ms** | 1038 → **792 ms** | 3.1x → **4.1x** | 3.22e-06 → **3.21e-06** |
+| 2048 | 2605 → **664 ms** | 8475 → **6458 ms** | 2.2x → **2.8x** | 1.09e-05 → 1.11e-05 |
+
+**3. Spin 0 is untouched, and that is an algorithm fact, not a broken knob.** Every spin-0 row in that
+log is bit-identical between the arms (`rel=1.60e-07` at 512, `1.34e-07` at 1024, `1.44e-06` at 2048,
+same `max|dCl|` to the last digit). Temperature coupling goes through `_coupling_matrix_tt`, an
+element-wise offset-blocked threej recurrence (`_OFFSET_CHUNK`), which contains no large `dot` at all.
+The lever is therefore polarised-only, and the spin-0 coupling columns on the board
+(`202 ms` at 1024, `1519 ms` at 2048) are still an open target of a different kind.
+
+**4. Why a 2.1e-06 matrix error buys back the same decoupled Cls.** At fp32 tables the pipeline's error
+budget is already 3.2e-06 at Nside 1024, set by the tables and the rings; the quadrature's 2.076e-06
+*relative to `max|matrix|`* lands under that floor, so `rel dCl` does not move at all. Against float64
+tables it would: `tests/test_workspaces.py` and `tests/test_car.py` hold `get_coupling_matrix()` to
+`atol=2e-14`. Hence **opt-in** — `GMASTER_COUPLING_PRECISION=fp32` or `nmt.set_coupling_precision("fp32")`,
+with `nmt.coupling_precision()` to read it — and float64 remains the default, so the shipped suite is
+unaffected. `tests/test_table_precision.py::test_float32_coupling_quadrature_keeps_the_cells` pins the
+matrix move and asserts `rel > 0` as well as `rel < 1e-4`, because the flag is consulted while tracing
+and an ignored switch would look exactly like a perfect one.
+
+**5. What this does not buy.** At Nside 1024 spin 2 the stage split is now `field 501 ms`,
+`coupling 91 ms` — the transform is 63 % of the pipeline and is back to being the only large object,
+where addendum 19 proved op-count removal is worth 1.004x. At 2048 the coupling is still 664 ms because
+the `field` stage (3835 ms) dominates and only the quadrature moved. The remaining levers are unchanged:
+Richardson pass count (`1 + 2*n_iter` latitudinal ops, algorithmic), the spin-0 threej recurrence, and
+the work decomposition of the marched kernels.
+
