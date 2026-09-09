@@ -6809,6 +6809,57 @@ arithmetic, so if that cell is ever attempted this is the first 35 % of the RSS 
 `nvidia-smi --query-compute-apps` before trusting a small-`Nside` cell — a co-tenant does not have to be
 on the same card to slow the host.
 
+## Addendum 18 (session 29j): the table-free latitudinal step runs at 0.6 % of this card's own fp32 matmul
+## rate, and that gap — not any roofline — is the whole remaining board
+
+Two ideas were closed by measurement/reading today, and closing them puts a number on what is left.
+
+**The pi-theta fold cannot be pushed further.** `_spin_march_pallas._forward_impl` (`:471-512`) already
+builds a four-channel RHS — `direct.real, direct.imag, mirror.real, mirror.imag` from
+`rev = ftm[::-1]` — so **one marched `|m|` lane feeds both `+m` and `-m`**, and `_spin_slice._build`
+already stores only `m >= 0` for the same reason. That leaves the flop count unchanged by construction:
+`L` marched orders x `ntheta` rows x 2 channels is exactly the `2L x ntheta` products of the unfolded
+route; the fold buys table bytes, never MACs. Spin 0's antipodal fold is the one that halves *rows*
+(`north = (ntheta+1)//2`), and it can only do that because negative orders there come from the real-map
+symmetry instead of a mirror channel (`forward_latitudinal_positive`'s docstring says the route "needs no
+mirror channel"). **A folded spin-2 kernel that halves flops does not exist.**
+
+**What the table-free step is actually worth, against a control in the same process.** Nside 1024, fp32
+tables, GPU1, medians of 5, `.qwen/tmp/spin2_ceiling_1024b_s29.log` (`spin0_macs = north * L(L+1)/2`,
+spin-2 `macs = ntheta * L(L+1)/2 * 2`):
+
+| op | median | counted MACs | rate | vs the 8192 fp32 GEMM |
+|---|---|---|---|---|
+| fp32 GEMM 4096 (control) | 0.92 ms | — | **149 TFLOP/s** | 0.83x |
+| fp32 GEMM 8192 (control) | 6.15 ms | — | **179 TFLOP/s** | 1.00x |
+| spin-2 marched analysis | 72.27 ms | 38.63 G | **1.07 TFLOP/s** | **1/167** |
+| spin-2 marched synthesis | 63.26 ms | 38.63 G | **1.22 TFLOP/s** | 1/146 |
+| spin-0 folded analysis | 54.99 ms | 9.66 G | **0.35 TFLOP/s** | **1/511** |
+
+This is the honest answer to "is the march at a roofline?". It is not. It sustains **0.6 % of the fp32
+matmul rate the same card delivers on the same clock**, and 0.2 % for the spin-0 fold. The reason is
+recorded elsewhere and unchanged here: the kernel generates a Wigner-d row and accumulates it, so a
+`(m, ell, theta)` triple costs an entire recurrence step of warp issues rather than one FMA, and the tile
+and warp sweeps put the kernel at ~100 % of warp-issue already. Every per-degree bookkeeping cut measured
+so far is 1-5 % (`analysis_emit_cost`, `analysis_coeflimb`, `analysis_geom_cost`, `analysis_emit_form`),
+which is exactly what one expects when the deficit is two orders of magnitude.
+
+**Read the spin-0 row with care: at Nside 1024 spin 0 the march is not the shipped route.** The fp32
+Legendre band engages there (36.7 GiB under the 40 GiB gate), and the pipeline's own per-op cost is
+`field 484->224 ms` over 7 passes = 32 ms/op, better than the 55 ms measured above. The marched spin-0
+route is what serves **Nside 2048**, where the band is refused — and `55 ms x 8 = 440 ms` per op against
+the board's `field 2393->1837 ms` over ~4 analysis ops is consistent. So the number that matters for the
+weakest cell on the board is the **511x** one.
+
+**The prize, stated so a future session can price a rewrite.** If the degree recurrence were evaluated in
+matmul-shaped work and reached even 5 % of the control GEMM (7-9 TFLOP/s), the Nside 2048 spin-0 field
+stage would fall from 1837 ms to roughly 200 ms and that cell from 2.0x to ~6x; the same rewrite on spin 2
+takes 1024 spin 2 from 2.9x to ~5x. Everything else this session could find — 3 % here, 16 % there, one
+dtype-blocked precision knob — is noise against that. The known blocker is range, not arithmetic: the
+blocked 2x2 degree-block prefix attempt (`blocked-recurrence-wall`) died at `m ~ L/2` on fp64 dynamic
+range, and the march already carries `2**-3000`-scale emissions through an exponent-tracking scheme that
+a blocked form has to reproduce inside a matmul. That is the work item; nothing smaller on this board is.
+
 
 
 
