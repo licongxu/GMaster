@@ -964,7 +964,12 @@ def _expanded_binning_operators(bins, ncls):
 @partial(jax.jit, static_argnames=("ncls", "norm_type"))
 def _banded_operators(mcm, beam1, beam2, output, theory, wawb, *, ncls, norm_type):
     beam = jnp.repeat(beam1 * beam2, ncls)
-    one_sided = output @ (mcm * beam[None, :])
+    # The beam scales columns of the mode-coupling matrix, and a column scaling commutes past a
+    # left matmul, so it is applied after the contraction instead of before it.  Written the other
+    # way XLA has to materialise `mcm * beam` before the dot: a second full copy of the largest
+    # tensor in the stage (18.0 GiB for the polarised matrix at Nside 4096, where the very next
+    # allocation is what fails -- `.qwen/tmp/s2_4096_s31.log`).
+    one_sided = (output @ mcm) * beam[None, :]
     if norm_type:
         mcm_binned = wawb * jnp.eye(output.shape[0])
     else:
