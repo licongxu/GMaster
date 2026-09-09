@@ -7166,9 +7166,10 @@ tables, medians of 5 (1024) / 3 (2048); `.qwen/tmp/maskl1024_s31.log`, `.qwen/tm
 
 The stage model falls straight out of it: `4 x map2alm + 3 x alm2map` reproduces the board's `field`
 column to 0.3 % at 2048 spin 0 (1918 predicted vs 1913 measured) and 2.5 % at 2048 spin 2 (3736 vs 3832).
-**Where a resident table exists GMaster runs 1.9-2.2x faster than the reference C code; where it does not,
-1.20-1.39x at Nside 1024 and 0.97-1.27x at 2048.** That is the whole remaining board: the analysis pass at
-2048 spin 0 is at parity with ducc0.
+**Where the Legendre band exists (Nside 1024 spin 0) GMaster runs 2.17x/1.86x faster than the reference C
+code; on the marched routes it runs 1.34x/1.39x at Nside 1024 and 1.06x/1.20x (spin 2) and 0.97x/1.27x
+(spin 0) at 2048.** The analysis pass at 2048 spin 0 is at parity with ducc0, and that — not the coupling —
+is the whole remaining board.
 
 **3. What the board is worth, given (2).** Masking the numbers from addendum 22's split into the two
 transform groups (field + mask, both logged) gives the score the pipeline would post if the coupling
@@ -7207,13 +7208,17 @@ as measured-dead, not untried-by-principle.
 **5. Where that leaves the objective.** The estimator's transform work is 14 passes; the pass count is
 NaMaster's `n_iter` (parity, and the estimator's own truncation error is 9-13 %, so it cannot be traded
 away), and per-pass throughput is either *stream* the `(m, ell, theta)` Legendre/Wigner triangle at the
-card's 1471 GB/s ceiling (1.9-2.2x over ducc0, only possible while it fits: Nside <= 1024 spin 0, <= 512
-spin 2) or *generate* it in the march (0.97-1.39x, arithmetic already at ~80 % of the fp64 SIMT ceiling
-and shown insensitive to limb deletion, addendum 19). Between those two lies fp32-class arithmetic, which
-every route tried so far (dfp32 beyond `L~192`, tf32, blocked product-tree, fp32 rings) loses on accuracy
-or gradients. A large-Nside win beyond ~2.8x is therefore a transform-kernel problem with a stated roofline,
-not a scheduling problem; the next attempt should start from the march's issue budget at `(2048, 6143)`,
-which is the single largest number in the repo.
+card's 1471 GB/s ceiling or *generate* it in the march. Streaming is the fast route where it fits — that is
+Nside ≤ 1024 spin 0 and ≤ 512 spin 2 at fp32 table storage, and the 2.17x/1.86x in the table above is what
+it buys. Generating is what is left everywhere else, and it is not arithmetic-bound: the folded march at
+Nside 1024 spin 0 counts **351.3 GFLOP/s** and the spin-2 march **1065.9 GFLOP/s** (`.qwen/tmp/
+spin2_ceiling_1024b_s29.log`), i.e. 19 % and 57 % of this card's 1.88 TFLOP/s fp64 ceiling and 0.2-0.6 % of
+its 178 TFLOP/s fp32 matmul rate (addendum 18) — while deleting every limb from the analysis march buys
+1.004x (addendum 19). So the march is issue/latency-bound well below both roofs, and fp32-class arithmetic
+sits between it and the ceiling, which every route tried so far (dfp32 beyond `L~192`, tf32, blocked
+product-tree, fp32 rings) loses on accuracy or gradients. A large-Nside win beyond ~2.8x is therefore a
+transform-kernel problem with a stated roofline, not a scheduling problem; the next attempt should start
+from the march's issue budget at `(2048, 6143)`, which is the single largest number in the repo.
 
 
 
