@@ -88,11 +88,12 @@ def _run_pipeline(module, nside, spin, nlb, repeats, mask, maps_t, maps_q, maps_
 
     # A field's mask alms are lazy in both codes (NaMaster's own `get_mask_alms` docstring says
     # "in most cases ... are not computed when generating the field ... which may be a slow
-    # operation"), and the analysis is at `lmax_mask = 2*lmax` with `n_iter_mask` iterations, so
-    # it costs about as much as the science stage that hides it. Timing a fresh field and
-    # subtracting the construction measures its marginal cost; on a shared field it is cached and
-    # every column would report zero. At Nside 2048 spin 0 this marginal is 1855 ms against a
-    # 4210 ms TOTAL (`.qwen/tmp/maskstage_s30.log`).
+    # operation"). `lmax_mask` defaults to `minfo.get_lmax()` in both libraries and the workspace
+    # does not enlarge it (`.qwen/tmp/lmaxmask_s31.log`), so this is a second spin-0 transform at
+    # the same order and the same `n_iter` as the science stage -- which is why it costs 1.00x of
+    # it. Timing a fresh field and subtracting the construction measures its marginal cost; on a
+    # shared field it is cached and every column would report zero. At Nside 2048 spin 0 this
+    # marginal is 1855 ms against a 4210 ms TOTAL (`.qwen/tmp/maskstage_s30.log`).
     t_mask = _timed(
         lambda: _make_field(
             module, mask, maps_t, maps_q, maps_u, spin

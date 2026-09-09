@@ -7089,13 +7089,12 @@ mechanism directly (`.qwen/tmp/coldstage_s30.log`): the coupling call costs 23.4
 **425.2 ms cold** at Nside 1024, and `cell_cold` is exactly `ctor`, i.e. the shared field was absorbing
 the whole transform.
 
-**2. It is required work, at parity with the reference, so it is not a free win.** The analysis is a
-spin-0 `map2alm` at `lmax_mask = 2*lmax` (6142 at Nside 1024, 12286 at 2048) with `n_iter_mask`
-compensating iterations, and `n_iter_mask_default = 3` in *both* codes (`gmaster/utils.py:33`,
-`pymaster/field.py:117-118` via `ut.nmt_params.n_iter_mask_default`). Cutting it is cutting an
-algorithm the reference also runs; the Legendre band that would carry it is 146 GiB at `L=6142` and
-581 GiB at `L=12286`, so neither size is a band candidate either. It is now a *named* target rather
-than a phantom, which is the whole point.
+**2. It is required work, at parity with the reference, so it is not a free win.** `n_iter_mask_default = 3`
+in *both* codes (`gmaster/utils.py:33`, `pymaster/field.py:117-118` via `ut.nmt_params.n_iter_mask_default`),
+so cutting it is cutting an algorithm the reference also runs. *This paragraph originally claimed the
+analysis runs at `lmax_mask = 2*lmax`; that was wrong and is corrected in addendum 23 — `lmax_mask` equals
+`lmax` in both codes, which is precisely why the stage costs 1.00x the science transform rather than twice
+it.* It is now a *named* target rather than a phantom, which is the whole point.
 
 **3. The instrument is fixed.** `benchmarks/benchmark_pipeline.py` has a `mask` column — a fresh
 field plus `get_mask_alms()`, minus the construction — so the columns add up to `TOTAL`
@@ -7120,13 +7119,101 @@ gap to NaMaster at 32-128 is dispatch/jit-boundary work, not coupling.
 `GMASTER_COUPLING_PRECISION=fp32` the pipeline scores **5.0x / 8.8x** at 256, **5.7x / 6.8x** at 512,
 **4.1x / 4.1x** at 1024 and **2.5x / 2.8x** at 2048 (spin 0 / spin 2), against a float64-coupling board
 of 3.7/7.4, 4.0/5.3, 2.9/3.2 and 2.0/2.2. What remains after this, in decreasing size, is: the science
-latitudinal transform (`field`, now the largest single object again), the lazy mask analysis at
-`2*lmax` (44 % of spin 0 at 2048, algorithmically required), and the Richardson pass count. Each is
-closed by measurement rather than opinion — issue-bound march (addendum 19), band-width roofline at
-1471 GB/s for spin 0 where the band fits (addendum 20 §3), `n_iter_mask` being the reference's own
-default (this addendum), fp32 rings breaking the transform's gradient, the blocked/matmul recurrences
-hitting the fp64 dynamic-range wall, and `_PALLAS_TRACED_MAX_L` raises documented dead. A new
-attacker should start from the `mask` and `field` columns, not from the coupling.
+latitudinal transform (`field`, now the largest single object again), the lazy mask analysis (a second,
+equal-sized spin-0 transform — 44 % of spin 0 at 2048, algorithmically required), and the Richardson pass
+count. Each is closed by measurement rather than opinion — issue-bound march (addendum 19), band-width
+roofline at 1471 GB/s for spin 0 where the band fits (addendum 20 §3), `n_iter_mask` being the reference's
+own default (this addendum), fp32 rings breaking the transform's gradient, the blocked/matmul recurrences
+hitting the fp64 dynamic-range wall, and `_PALLAS_TRACED_MAX_L` raises documented dead. A new attacker
+should start from the `mask` and `field` columns, not from the coupling. *(Addendum 23 supersedes the last
+sentence: those two columns are one transform counted twice, and both are now scored per pass against the
+reference C code — the board is already at 87-94 % of its zero-coupling-cost ceiling.)*
+
+## Addendum 23 (session 31): the `mask` column is the same transform as `field`, the board is at 87-94 % of its zero-coupling ceiling, and the wall is per-pass throughput against ducc0
+
+Addendum 22 named the right stage and got its size wrong in a way that would have sent the next attacker
+chasing a phantom. This addendum corrects it, scores the transform per pass against the reference C code
+for the first time, and turns "attack the field column" into arithmetic.
+
+**1. `lmax_mask == lmax` in both codes — verified, not inferred.** `pymaster/field.py:184-185` and
+`gmaster/field.py:78` both default `lmax_mask` to `minfo.get_lmax()` (`= 3*nside-1`), and
+`compute_coupling_matrix` does not enlarge it. Printed live at Nside 128 in both libraries, before and
+after the mode-coupling matrix (`.qwen/tmp/lmaxmask_s31.log`):
+
+```text
+pymaster  lmax=383 ctor(lmax, lmax_mask, n_iter_mask)=(383, 383, 3) after-MCM=(383, 383, 3)
+gmaster   lmax=383 ctor(lmax, lmax_mask, n_iter_mask)=(383, 383, 3) after-MCM=(383, 383, 3)
+```
+
+So the mask stage is a **second, equal-sized spin-0 transform** — same `lmax`, same `n_iter=3`, different
+map — which is exactly why it measured 1854.9 ms against a 1846.8 ms science stage at Nside 2048
+(`.qwen/tmp/maskstage_s30.log`). A transform at twice the harmonic bandwidth cannot cost 1.00x; the
+`2*lmax` story was wrong. The pipeline therefore does **14 latitudinal passes at `lmax`** (4 analysis + 3
+synthesis for the field, 4 + 3 for the mask), not 7 at `lmax` plus 7 at `2*lmax`.
+
+**2. Per pass against the exact ducc0 call pymaster issues.** Every earlier scoreboard compared whole
+pipelines; this calls `pymaster.utils._map2alm_ducc0` / `_alm2map_ducc0` (i.e.
+`ducc0.sht.experimental.adjoint_synthesis`/`synthesis` with pymaster's own `_ducc_kwargs`) against
+`gmaster.utils.map2alm`/`alm2map` at `n_iter=0`, so one sample is one pass on each side. GPU1, fp32
+tables, medians of 5 (1024) / 3 (2048); `.qwen/tmp/maskl1024_s31.log`, `.qwen/tmp/maskl2048_s31.log`.
+
+| Nside | spin | route (GMaster) | `map2alm` gm / ducc | ratio | `alm2map` gm / ducc | ratio | rel alm |
+|---|---|---|---|---|---|---|---|
+| 1024 | 0 | Legendre band | 28.72 / 62.24 ms | **2.17x** | 30.87 / 57.27 | **1.86x** | 3.42e-07 |
+| 1024 | 2 | marched (slice refused) | 83.29 / 111.35 | **1.34x** | 73.94 / 102.74 | **1.39x** | 3.06e-05 |
+| 2048 | 0 | folded march (band refused) | 309.52 / 300.28 | **0.97x** | 226.52 / 288.23 | **1.27x** | 7.83e-05 |
+| 2048 | 2 | marched (slice refused) | 574.90 / 607.01 | **1.06x** | 478.62 / 573.63 | **1.20x** | 5.53e-05 |
+
+The stage model falls straight out of it: `4 x map2alm + 3 x alm2map` reproduces the board's `field`
+column to 0.3 % at 2048 spin 0 (1918 predicted vs 1913 measured) and 2.5 % at 2048 spin 2 (3736 vs 3832).
+**Where a resident table exists GMaster runs 1.9-2.2x faster than the reference C code; where it does not,
+1.20-1.39x at Nside 1024 and 0.97-1.27x at 2048.** That is the whole remaining board: the analysis pass at
+2048 spin 0 is at parity with ducc0.
+
+**3. What the board is worth, given (2).** Masking the numbers from addendum 22's split into the two
+transform groups (field + mask, both logged) gives the score the pipeline would post if the coupling
+matrix and the coupled cell were *free*:
+
+| Nside | spin | field + mask | pymaster TOTAL | zero-coupling ceiling | shipped | % of ceiling |
+|---|---|---|---|---|---|---|
+| 1024 | 0 | 203 + 200 | 1748 | 4.34x | **4.1x** | 94 % |
+| 1024 | 2 | 501 + 200 | 3289 | 4.69x | **4.1x** | 87 % |
+| 2048 | 0 | 1913 + 1855 | 10534 | 2.74x | **2.5x** | 91 % |
+| 2048 | 2 | 3832 + 1855 | 18011 | 3.17x | **2.8x** | 88 % |
+
+The coupling stage that every session from 29l to 30 was still halving (34x, then 9.4x) is now worth the
+last 6-13 % of each cell. **No large-Nside cell can be made "massive" by anything that is not the
+transform itself** — at 2048 spin 0 even a free coupling, free cell and free decoupling yields 2.74x,
+because the reference spends only ~40 % of its wall clock on the same 14 passes.
+
+**4. Why the band cannot rescue 2048 (bytes, not knobs).** `_theta_matrix.band_bytes` (BLOCK=64, computed
+this session) for the geometry the estimator actually uses:
+
+| Nside, `lmax` | fp32 | fp64 |
+|---|---|---|
+| 512, 1535 | 4.7 GiB | 9.4 |
+| 1024, 3071 | 36.7 | 73.5 |
+| 2048, 6143 | **290.9** | 581.8 |
+| 4096, 12287 | 2315.6 | 4631.2 |
+
+against a 96 GB device. A *partial* band is the only variant that fits: covering a fraction `f` of the
+triangle costs `f x 290.9 GiB`, so a generous 55 GiB pool buys `f <= 0.19`. At the measured band advantage
+at this geometry (28.72 ms banded vs 54.99 ms marched at Nside 1024 spin 0,
+`.qwen/tmp/spin2_ceiling_1024b_s29.log`) that is a 1.10x stage gain — 4203 ms -> 3854 ms, **2.73x instead
+of 2.5x** — for a hybrid dispatch that partitions every latitudinal call between the band program and the
+march program, keeps two output assemblies consistent, and passes the suite in both precisions. Recorded
+as measured-dead, not untried-by-principle.
+
+**5. Where that leaves the objective.** The estimator's transform work is 14 passes; the pass count is
+NaMaster's `n_iter` (parity, and the estimator's own truncation error is 9-13 %, so it cannot be traded
+away), and per-pass throughput is either *stream* the `(m, ell, theta)` Legendre/Wigner triangle at the
+card's 1471 GB/s ceiling (1.9-2.2x over ducc0, only possible while it fits: Nside <= 1024 spin 0, <= 512
+spin 2) or *generate* it in the march (0.97-1.39x, arithmetic already at ~80 % of the fp64 SIMT ceiling
+and shown insensitive to limb deletion, addendum 19). Between those two lies fp32-class arithmetic, which
+every route tried so far (dfp32 beyond `L~192`, tf32, blocked product-tree, fp32 rings) loses on accuracy
+or gradients. A large-Nside win beyond ~2.8x is therefore a transform-kernel problem with a stated roofline,
+not a scheduling problem; the next attempt should start from the march's issue budget at `(2048, 6143)`,
+which is the single largest number in the repo.
 
 
 

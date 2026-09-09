@@ -277,10 +277,15 @@ defaults to float64, since the suite holds `get_coupling_matrix()` to `atol=2e-1
 tables.
 
 The benchmark also reports a `mask` stage: a field's mask `a_lm` are computed lazily (as in NaMaster),
-by an analysis at `lmax_mask = 2*lmax` with `n_iter_mask` iterations, so the work lands in `TOTAL` but
-in no stage column unless it is measured on a fresh field. It is worth naming — at `Nside=2048` spin 0
-it is 1855 ms of a 4210 ms pipeline, i.e. as much again as the science transform, and with it the
-columns add up to the total.
+by a second spin-0 analysis at the **same** `lmax` and the same `n_iter` (`lmax_mask` defaults to
+`minfo.get_lmax()` in both codes), so the work lands in `TOTAL` but in no stage column unless it is
+measured on a fresh field. It is worth naming — at `Nside=2048` spin 0 it is 1855 ms of a 4210 ms
+pipeline, i.e. as much again as the science transform, and with it the columns add up to the total. The
+estimator therefore runs 14 latitudinal passes per call, and per pass it runs 1.9-2.2x faster than the
+ducc0 C code `pymaster` calls where a transform table fits the device (`Nside<=1024` spin 0, `<=512`
+spin 2) and 0.97-1.39x where no such table can exist; with both transform groups counted, the large
+`Nside` cells already score 87-94 % of what they could if the coupling matrix, the coupled cell and the
+decoupling were free (2.74x at `Nside=2048` spin 0, 3.17x at spin 2).
 
 While float32 tables are live, `numpy.testing.assert_allclose` is held to a floor of
 **2e-6 of the compared quantity** (its own `max|desired|`, not a fixed absolute), which is
