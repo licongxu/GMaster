@@ -7348,7 +7348,30 @@ the C extension with the GIL dropped. The obvious candidate is a 32-bit index: t
 The intermediate control would be `Nside=3072` spin 2 (3.06e9, across the boundary), and it cannot be
 run: `pymaster` rejects non-power-of-two pixelizations with `ValueError: Something is wrong with your
 input arrays` (`ref3072_s31.log`, `NaMaster/pymaster/utils.py:272`) — the wall recorded in
-`project/large-nside-wall`. The mechanism therefore stays a candidate, not a finding.
+`project/large-nside-wall`.
+
+The element-count axis can be moved directly instead of the pixelization, and it says the crash follows
+element count, not the polar code path. `.qwen/tmp/refcross_s31.py` builds both fields at `Nside=4096`
+in one clean process (no JAX import) and calls `compute_coupling_matrix` twice — first the cross-spectrum
+`f0 x f2` (`ncls=2`, `4 * (lmax+1)**2` = **6.04e8 elements**, under 2^31), then the auto-spectrum
+`f2 x f2` (`ncls=6`, **5.44e9**, 2.5x past it) — `refcross4096_s31.log`:
+
+```text
+MARK compute_coupling_matrix cross 0x2 returned  114700 ms   RSS 24.2 GB
+MARK NmtWorkspace() for auto 2x2 (ncls=6, 5.436e+09 elements)  10 ms   RSS 19.6 GB
+Segmentation fault (core dumped)                                        exit=139
+```
+
+The spin-2 field, its mask alms and the calling sequence are identical in the two calls; the only thing
+that moves is how many matrix elements the geometry asks for, and the small-matrix call completes. A
+32-bit index is therefore no longer a bare guess — the failure has a threshold in
+`ncls**2 * (lmax+1)**2` somewhere between 6.0e8 and 5.4e9, which brackets where 2^31 elements would sit
+for a 4-byte index, and it is the last threshold before the crash. It is still not *proven* to be the
+index width (the segfault has no frame and the reference cannot be bisected from here), but it is now a
+measured threshold with one surviving candidate rather than a candidate mechanism alone. A useful number
+falls out of the call that does survive: at `Nside=4096` the reference spends **114.7 s** to build a
+*cross* coupling matrix, against GMaster's 3.19 s for a full spin-0 one at the same `Nside`
+(`board4096_s31.log`).
 
 GMaster cannot build that geometry either, and for a different reason: `NmtField(mask, maps, n_iter=3,
 spin=2)` at `lmax = 12287` fails with `RESOURCE_EXHAUSTED` at pool 0.75 and with `Failed to load in-memory
