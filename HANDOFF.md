@@ -7305,5 +7305,181 @@ they produced confident verdicts on statistics that could not have meant anythin
   finiteness plus per-column-median flatness across the row axis, which is what the probe now checks
   (`worst column-median deviation from flat = 0.076`, PASS).
 
+## Addendum 25 (session 31): the board's reference column survives a clean-process rerun to 0.06 %, Nside 4096 spin 2 segfaults the reference rather than exhausting it, and the per-pass ladder says the latitudinal kernel is at CPU parity at the top of the board
+
+**1. The reference column is not contaminated by sharing a process with JAX.** Every ratio in this
+repo comes from `benchmarks/benchmark_pipeline.py`, which builds both codes in one process. That has
+always been defended on the grounds that a *cold* reference inflates a ratio; the untested half is
+whether sharing the other way — a CPU code running beside a JAX runtime holding a CUDA context, host
+staging threads and multi-GiB `from_dlpack` copies — makes the reference slow and therefore makes the
+ratio a lie at the top of the board. It does not. `.qwen/tmp/refonly_s31.py` imports `pymaster` and
+nothing else (no `jax`, no CUDA context), copies `_make_field`, the marginal-`mask` trick, the
+`NmtBin.from_lmax_linear(3*nside-1, 30)` and the per-stage medians out of the harness, and reproduces
+its reference column to:
+
+| geometry | harness reference TOTAL | alone in a process | difference |
+|---|---|---|---|
+| `Nside=2048` spin 0 | ~10 525 ms (implied by the published 2.5x) | **10 605 ms** | 0.8 % |
+| `Nside=2048` spin 2 | 18 467 ms (`HANDOFF:5124`) | **18 513 ms** | 0.25 % |
+| `Nside=4096` spin 0 | 73 686 / 74 287 ms (`board4096_s31.log`) | **73 730 ms** | **0.06 %** |
+
+At 4096 the stage split agrees too: alone `field 15560 mask 15577 coupling 42058 coupled_cell 530`
+against the harness's `field 14937 mask 14607 coupling 43230 coupled_cell 535`. The 2.3x in addendum 24
+is a real ratio between two codes, not an artefact of the harness.
+
+**2. `Nside=4096` spin 2 does not run out of memory in the reference — it segfaults inside the
+mode-coupling matrix.** `.qwen/tmp/refstage_s31.py` runs the same pipeline one flushed `MARK` line per
+stage (`refstage4096s2_s31.log`):
+
+```text
+MARK start nside=4096 spin=2 npix=201326592 lmax=12287   RSS 0.1 GB
+MARK arrays built   RSS 4.6 GB
+MARK NmtField returned  31146 ms   RSS 11.7 GB
+MARK get_mask_alms returned  15227 ms   RSS 12.7 GB
+MARK NmtWorkspace() constructed  0 ms   RSS 12.7 GB
+Segmentation fault (core dumped)                                        exit=139
+```
+
+So the reference's *transforms* are fine there (46.4 s of host work for field plus mask alms); what dies
+is `compute_coupling_matrix`, at 12.7 GB RSS on a box with 294 GB free — it is not an allocation failure.
+`PYTHONFAULTHANDLER=1` prints `Fatal Python error: Segmentation fault` with no Python frame, i.e. inside
+the C extension with the GIL dropped. The obvious candidate is a 32-bit index: the spin-2 matrix is
+`ncls**2 * (lmax+1)**2` = **5.43e9 elements**, past 2^31, while `Nside=2048` (1.36e9) builds it in 10.4 s.
+The intermediate control would be `Nside=3072` spin 2 (3.06e9, across the boundary), and it cannot be
+run: `pymaster` rejects non-power-of-two pixelizations with `ValueError: Something is wrong with your
+input arrays` (`ref3072_s31.log`, `NaMaster/pymaster/utils.py:272`) — the wall recorded in
+`project/large-nside-wall`. The mechanism therefore stays a candidate, not a finding.
+
+GMaster cannot build that geometry either, and for a different reason: `NmtField(mask, maps, n_iter=3,
+spin=2)` at `lmax = 12287` fails with `RESOURCE_EXHAUSTED` at pool 0.75 and with `Failed to load in-memory
+CUBIN … CUDA_ERROR_OUT_OF_MEMORY` at pool 0.95, at 44–77 GB of host RSS — **the wall is the 96 GiB device
+pool, not the 376 GB of host RAM that addendum 12 blamed**. So the honest summary of the largest cell is
+a tie of a different kind: the reference's transforms cost 46.4 s of host work and its coupling matrix
+cannot be indexed; GMaster's transforms cost 4.7 s of device work per pass and its field stage cannot be
+allocated. What is scoreable there is one latitudinal pass, which is §3.
+
+**3. The per-pass ladder, both codes, 1024 → 4096.** `ducc0` 0.39.1 on 192 cores from
+`.qwen/tmp/ducc_only.py` in a process with no JAX import (`.qwen/tmp/ducc4096_s31.log`,
+`.qwen/tmp/ducc_ladder_s31.log`); GMaster fp32 tables on GPU1, warm and drained medians of 3
+(`.qwen/tmp/seq4096c_s31.log` spin 2, `.qwen/tmp/s0pass4096_s31.log` spin 0, both printed with the
+stage result handed to `stamp()` so they are device time and not enqueue):
+
+| Nside | spin | `map2alm` ducc0 | `map2alm` GMaster | ratio | `alm2map` ducc0 | `alm2map` GMaster | ratio |
+|---|---|---|---|---|---|---|---|
+| 1024 | 0 | 63.9 | **28** | **2.28x** | 57.7 | **31** | **1.86x** |
+| 2048 | 0 | 310.3 | **299** | 1.04x | 305.4 | **219** | **1.40x** |
+| 4096 | 0 | 2019.8 | **2285** | **0.88x** | 2024.1 | **1747** | 1.16x |
+| 1024 | 2 | 116.8 | **84** | **1.39x** | 106.5 | **74** | **1.44x** |
+| 2048 | 2 | 645.1 | 598 | 1.08x | 610.0 | 475 | 1.28x |
+| 4096 | 2 | 4048.6 | **4687** | **0.86x** | 4045.7 | **3553** | 1.14x |
+
+Milliseconds for one latitudinal pass at `lmax = 3*nside-1` (`map2alm` with `n_iter=0`, so one pass
+and nothing else: no ring weighting loop, no templates, no workspace). The GMaster column is
+`.qwen/tmp/ladder_gm_s31.log` (1024, 2048) and `.qwen/tmp/s0pass4096_s31.log` /
+`.qwen/tmp/seq4096c_s31.log` (4096); the ducc0 column is `.qwen/tmp/ducc_ladder_s31.log` and
+`.qwen/tmp/ducc4096_s31.log`. The 1024 spin-0 row reproduces addendum 23's 2.17x/1.86x on a different
+probe, and the 4096 spin-2 row reproduces `.qwen/tmp/score_n4096_spin2.log` from 2026-09-07 (0.84x /
+1.09x) to within 2 %, which is the only reason to trust numbers this expensive.
+
+**The shape of the table is the finding.** The synthesis pass beats `ducc0` at every size and in both
+spins (1.14–1.44x). The analysis pass wins at 1024, is at parity at 2048 (1.04x / 1.08x), and goes
+under water at 4096 (0.88x / 0.86x). One crossover, same geometry, both spins.
+
+**4. The exponent, not the constant, is what the top of the board is losing.** Doubling `Nside`
+multiplies the `(m, ell, theta)` triple count by exactly 8. GMaster's analysis march pays **7.84x**
+(598 → 4687 ms at spin 2) and **7.64x** (299 → 2285 at spin 0) — cubic, exactly its structural cost —
+while `ducc0` pays **6.28x** at spin 2 (645.1 → 4048.6 ms) and **6.51x** at spin 0 (310.3 → 2019.8),
+because it recurses along the ring instead of building the Wigner-d row. A win built on a cubic term
+decays by ~1.25x per doubling and inverts between 2048 and 4096. The synthesis march is cubic too
+(475 → 3553 = 7.48x spin 2, 219 → 1747 = 7.98x spin 0) and still wins at 4096 purely on its constant —
+which is the same fact the addendum 23 route table shows at 2048, extended one size up. Consequences
+worth stating plainly:
+
+* the 2.3x at `Nside=4096` spin 0 is **not** the latitudinal kernel beating `ducc0` — per pass it is
+  0.88x on analysis and 1.16x on synthesis. It is the coupling stage (42 058 ms reference vs 3 189 ms,
+  13x) plus `coupled_cell` (530 ms vs 2 ms), which is exactly what addendum 24 §2 measured and what
+  the 2.50x zero-coupling ceiling prices;
+* every per-degree cut already tried (limbs, emit rescale, coefficient limbs, assembly form,
+  contraction form, all in `project/march-is-issue-bound-accumulation-limbs-are-the-cost`) is 1–5 %,
+  because the march is at 0.6 % of the fp32 matmul rate the same card sustains. Closing a cubic against
+  a sub-cubic opponent is a route change, not an optimisation;
+* the last untested tuning parameter was the analysis kernel's block shape. It is now measured, and it
+  is at the bottom of its curve.
+
+**5. Analysis block-shape sweep: the shipped geometry is the optimum, in both directions, for both
+spins.** `GMASTER_SPIN2_MARCH_TILE=256`, `GMASTER_SPIN2_MARCH_WARPS=1` (`_spin_march_pallas.py:56-57`,
+consumed at `:311`) had only ever been swept for the *synthesis* kernel (`:679-683`, which records
+1 → 4 warps as a 6x cliff there and ships `num_warps=4` at `:938`). Nside 2048, fp32 tables, one
+process per arm (both constants are read at import), medians of 3, `rel alm` against the shipped arm
+in every line (`.qwen/tmp/tilesw_s31.log`, `.qwen/tmp/tilesw1_s31.log`, `.qwen/tmp/tilesw2_s31.log`):
+
+| TILE (WARPS=1) | spin 2 ms | spin 0 ms | | WARPS (TILE=256) | spin 2 ms |
+|---|---|---|---|---|---|
+| 128 | 1238.88 | 545.07 | | 1 (shipped) | **598.08** |
+| **256 (shipped)** | **598.08** | **299.34** | | 2 | 1309.91 |
+| 512 | 752.19 | 313.41 | | 4 | 2085.58 |
+| 1024 | 1418.71 | 1027.25 | | 8 | 3901.38 |
+| 2048 | 5701.12 | — | | | |
+
+Every arm's alm agrees with the shipped arm to 1.0–1.1e-07 relative, so nothing here is an accuracy
+trade — the geometry is free, and it is already at its minimum. Warp count costs time close to linearly
+(the analysis launch is `grid=(mb, ntile)` of one-warp blocks and Pallas splits the fixed `chunk`
+across the added warps rather than widening the work), and tile width costs superlinearly above 256
+(x1.26, x2.37, x9.53) and sublinearly below it (x2.07 at 128). `TILE=192` is not expressible at all:
+`ValueError: The Pallas Triton lowering currently requires that all operations have array arguments
+and results whose size is a power of 2. Encountered an array of shape (192,)` — so 256 is not just the
+best sampled value, it is the only power-of-two neighbour pair (128/512) with a minimum at 256.
+**There is no block-shape win left in the analysis march; anything further is a different work
+decomposition.**
+
+**6. The first accuracy numbers at `Nside=4096`, where no reference pipeline exists to compare cells
+against.** `.qwen/tmp/maskl_s31.py` compares the transform's own `alm` array against `ducc0`'s on the
+same maps — the only accuracy statement available at a geometry where `pymaster` cannot build a
+workspace (§2). `MASKL_ARM=science`, fp32 tables, complex64 rings:
+
+| Nside | spin | route | `rel alm` vs `ducc0` | source |
+|---|---|---|---|---|
+| 1024 | 0 | Legendre band | 3.42e-07 | addendum 23 §1 |
+| 2048 | 0 | folded march | 7.83e-05 | addendum 23 §1 |
+| 4096 | 0 | folded march | **1.57e-04** | `.qwen/tmp/s0pass4096_s31.log` |
+| 4096 | 2 | marched analysis | **1.73e-04** | `.qwen/tmp/maskl4096s2_s31.log` |
+
+The same runs re-score the passes inside one process (`map2alm 0.84x/0.85x`, `alm2map 1.10x/1.11x`),
+agreeing with §3's separate probes to 1 %. The marched routes' error grows 4.7x from 1024 to 4096 —
+the fp32 accumulate reaching across a 4x longer row, not a new failure mode. For scale, the spin-2
+analysis march ships at **3.7e-05** against `ducc0` at `Nside=1024` and the synthesis march ships
+against a **1.9e-04** max / 6.37e-06 rms envelope (`project/spin2-anchored-jacobi-march`); 4096 lands
+at 1.7e-04, i.e. the same size as an envelope the repo already accepts, and 4.7x its own 1024 value.
+It is nonetheless the number to quote if anyone asks what `Nside=4096` costs in accuracy, because
+there is no cell-level answer at that geometry in either code.
+
+**7. The coupling stage is quadrature, not assembly: measured split, and the note it kills.** Notes
+this session have been carrying "blocks-based `one_sided` assembly, removing the
+`(ncls*(lmax+1))**2` materialisation" as the last structural lever, priced from the byte counts in
+`_banded_operators`. `.qwen/tmp/coupsplit_s31.py` wraps every module-level name
+`compute_coupling_matrix` looks up and times them inside one warmed call, `Nside=2048` spin 2, fp32
+tables and `GMASTER_COUPLING_PRECISION=fp32` (median of 3):
+
+```text
+  compute_coupling_matrix (whole)             651.6 ms
+  _banded_operators                           550.8 ms      <- 85 % of the stage
+  _coupling_matrices_spin2                     94.4 ms      (of which quadrature 91.4)
+  _assemble_mcm                                 7.9 ms
+  _expanded_binning_operators                   0.3 ms
+```
+
+So the dense assembly of the operator is **7.9 ms of a 651 ms stage** — a blocks-based rewrite of it
+could not recover anything, and the idea is retired. What *is* left in the stage is
+`_banded_operators`, whose two dense contractions (`output @ mcm` and `one_sided @ theory`) run
+against binning matrices that are 0.5 % non-zero: at this geometry `output` holds 4.5e7 entries of
+which 36 900 are non-zero, so the row contraction alone does ~1200x the multiply-adds it needs, and a
+contiguous-band reshape-and-sum (exact, because the discarded entries are exact zeros) or
+`jax.ops.segment_sum` — the latter is already what `bins._bin_cell` uses — would make it memory-bound
+at ~10 ms. Priced against the cells, that is **~540 ms of the 6.6 s `Nside=2048` spin-2 cell (8 %),
+~1.4 % at 1024 spin 2, ~0.2 % at 4096 spin 0**: the 4x that `GMASTER_COUPLING_PRECISION=fp32` buys the
+whole stage (12 764 → 3 189 ms at 4096 spin 0) already proves the stage is quadrature-dominated there,
+since the banded part is dtype-independent. Worth doing only as part of something else; on its own it
+is one cell moving 2.8x → 3.0x for a change to the numerically central function of the estimator.
+
 
 

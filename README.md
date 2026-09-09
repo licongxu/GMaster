@@ -287,9 +287,15 @@ measured on a fresh field. It is worth naming — at `Nside=2048` spin 0 it is 1
 pipeline, i.e. as much again as the science transform, and with it the columns add up to the total. The
 estimator therefore runs 14 latitudinal passes per call; per pass GMaster is **2.17x** (analysis) and
 **1.86x** (synthesis) faster than the ducc0 C code `pymaster` calls where the Legendre band fits
-(`Nside=1024` spin 0) and 0.97-1.39x on the table-free routes. With both transform groups counted, the
-large `Nside` cells already score 87-94 % of what they could if the coupling matrix, the coupled cell and
-the decoupling were free (2.74x at `Nside=2048` spin 0, 3.17x at spin 2).
+(`Nside=1024` spin 0) and 0.97-1.39x on the table-free routes. The full per-pass ladder, both spins,
+1024→4096 is in HANDOFF addendum 25 §3, and its shape matters when quoting the top of the board: the
+synthesis pass wins at every size (1.14-1.44x), the analysis pass wins at 1024, ties at 2048, and falls
+below `ducc0` at 4096 (0.86x spin 2, 0.88x spin 0), because the Wigner-d march is cubic in `Nside` where
+`ducc0` pays 6.3x per doubling. The `Nside=4096` cell is therefore **2.3x on the strength of its algebra
+stages** (`coupling` 42058 → 3189 ms, `coupled_cell` 530 → 2 ms), not of its kernels. With both transform
+groups counted, the large `Nside` cells already score 87-94 % of what they could if the coupling matrix,
+the coupled cell and the decoupling were free (2.74x at `Nside=2048` spin 0, 3.17x at spin 2, 2.50x at
+`Nside=4096` spin 0).
 
 While float32 tables are live, `numpy.testing.assert_allclose` is held to a floor of
 **2e-6 of the compared quantity** (its own `max|desired|`, not a fixed absolute), which is
