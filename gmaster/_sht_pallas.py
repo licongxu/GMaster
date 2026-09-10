@@ -1030,17 +1030,29 @@ def _scalar_spin_synthesis_latitudinal(
 
 
 
-@partial(jax.custom_vjp, nondiff_argnums=(4, 5, 6))
+@partial(jax.custom_vjp, nondiff_argnums=(4, 5, 6, 7))
 def _scalar_forward_adjoint(
-    positive_ftm, theta, weights, phase, L, block_size, m_start
+    positive_ftm, theta, weights, phase, L, block_size, m_start, operand_dtype
 ):
+    """Analysis latitudinal stage with the synthesis kernel as its own transpose.
+
+    `operand_dtype` exists because the kernel accumulates and stores in float64
+    whatever element type it is handed, while its transpose runs the float64
+    synthesis kernel and therefore returns float64.  With
+    `set_ring_precision("fp32")` the azimuthal stage hands this stage a
+    complex64 `positive_ftm`, and an uncast float64 cotangent reaching that
+    stage trips JAX's bilinear transpose rule
+    (`lax.mul requires arguments to have the same dtypes, got complex64,
+    complex128` at `utils._forward_ring_fft_positive`).  Casting back to the
+    operand's type is what an explicit boundary cast would have inserted.
+    """
     return _scalar_forward_latitudinal_impl(
         positive_ftm, theta, weights, phase, L, block_size, m_start
     )
 
 
 def _scalar_forward_fwd(
-    positive_ftm, theta, weights, phase, L, block_size, m_start
+    positive_ftm, theta, weights, phase, L, block_size, m_start, operand_dtype
 ):
     result = _scalar_forward_latitudinal_impl(
         positive_ftm, theta, weights, phase, L, block_size, m_start
@@ -1048,12 +1060,12 @@ def _scalar_forward_fwd(
     return result, (theta, weights, phase)
 
 
-def _scalar_forward_bwd(L, block_size, m_start, residual, cotangent):
+def _scalar_forward_bwd(L, block_size, m_start, operand_dtype, residual, cotangent):
     theta, weights, phase = residual
     return (
         _scalar_inverse_latitudinal_impl(
             cotangent, theta, weights, phase, L, block_size, m_start
-        ),
+        ).astype(operand_dtype),
         jnp.zeros_like(theta),
         jnp.zeros_like(weights),
         jnp.zeros_like(phase),
@@ -1063,9 +1075,9 @@ def _scalar_forward_bwd(L, block_size, m_start, residual, cotangent):
 _scalar_forward_adjoint.defvjp(_scalar_forward_fwd, _scalar_forward_bwd)
 
 
-@partial(jax.custom_vjp, nondiff_argnums=(4, 5, 6))
+@partial(jax.custom_vjp, nondiff_argnums=(4, 5, 6, 7))
 def _scalar_inverse_adjoint(
-    positive_alm, theta, weights, phase, L, block_size, m_start
+    positive_alm, theta, weights, phase, L, block_size, m_start, operand_dtype
 ):
     return _scalar_inverse_latitudinal_impl(
         positive_alm, theta, weights, phase, L, block_size, m_start
@@ -1073,7 +1085,7 @@ def _scalar_inverse_adjoint(
 
 
 def _scalar_inverse_fwd(
-    positive_alm, theta, weights, phase, L, block_size, m_start
+    positive_alm, theta, weights, phase, L, block_size, m_start, operand_dtype
 ):
     result = _scalar_inverse_latitudinal_impl(
         positive_alm, theta, weights, phase, L, block_size, m_start
@@ -1081,12 +1093,12 @@ def _scalar_inverse_fwd(
     return result, (theta, weights, phase)
 
 
-def _scalar_inverse_bwd(L, block_size, m_start, residual, cotangent):
+def _scalar_inverse_bwd(L, block_size, m_start, operand_dtype, residual, cotangent):
     theta, weights, phase = residual
     return (
         _scalar_forward_latitudinal_impl(
             cotangent, theta, weights, phase, L, block_size, m_start
-        ),
+        ).astype(operand_dtype),
         jnp.zeros_like(theta),
         jnp.zeros_like(weights),
         jnp.zeros_like(phase),
@@ -1110,7 +1122,8 @@ def scalar_forward_latitudinal(
     weights = jnp.ones_like(theta) if weights is None else weights
     phase = jnp.zeros_like(theta) if phase is None else phase
     return _scalar_forward_adjoint(
-        positive_ftm, theta, weights, phase, L, block_size, m_start
+        positive_ftm, theta, weights, phase, L, block_size, m_start,
+        positive_ftm.dtype,
     )
 
 
@@ -1128,5 +1141,6 @@ def scalar_inverse_latitudinal(
     weights = jnp.ones_like(theta) if weights is None else weights
     phase = jnp.zeros_like(theta) if phase is None else phase
     return _scalar_inverse_adjoint(
-        positive_alm, theta, weights, phase, L, block_size, m_start
+        positive_alm, theta, weights, phase, L, block_size, m_start,
+        positive_alm.dtype,
     )

@@ -849,6 +849,88 @@ def test_marched_pair_shares_one_recurrence(monkeypatch, nside):
             np.asarray(got), ref, rtol=0.0, atol=1e-4 * float(np.max(np.abs(ref))))
 
 
+def test_paired_fold_footprint_grows_with_the_geometry():
+    """The pair gate's byte estimate is monotone, so it can only refuse the large sizes.
+
+    The estimate is a sum of `L * ntheta`-scale terms, and a formula slip that made it fall
+    with Nside would refuse the small geometries that the pairing actually wins on.
+    """
+    sizes = [utils._spin_march.fold_pair_bytes(n, 3 * n)
+             for n in (256, 512, 1024, 2048, 3072, 4096)]
+    assert all(a < b for a, b in zip(sizes, sizes[1:]))
+
+
+@pytest.mark.skipif(not _HAS_NVIDIA_GPU, reason="requires an NVIDIA GPU")
+@pytest.mark.parametrize("nside, fits", [(512, True), (1024, True), (2048, True),
+                                         (3072, False), (4096, False)])
+def test_paired_fold_gate_sides_at_the_measured_sizes(monkeypatch, nside, fits):
+    """The pairing is offered where it has been measured to run and withheld where it has not.
+
+    Nside 2048 is the end-to-end win (4558 -> 3961 ms, GPU peak 4.3 GiB,
+    `.qwen/tmp/pairrun_s34.log`); Nside 4096 is a measured crash --
+    `RESOURCE_EXHAUSTED: Out of memory while trying to allocate 8.15GiB` inside this box's
+    71.2 GiB pool, while the same geometry as two separate calls runs in 33.62 s at a
+    16.3 GiB peak (`.qwen/tmp/pairrun_4096_s34.log`).  A refusal returns the caller to those
+    two calls, so the gate costs nothing but the pairing.
+
+    Both measurements were made with the azimuthal stage in float64, which is the shipped
+    coupling, and the estimate is that footprint regardless of `set_ring_precision`, so these
+    verdicts are the same in an fp32-ring session (where they are conservative).
+    """
+    monkeypatch.setenv("GMASTER_SPIN0_MARCH", "1")
+    assert utils._spin_march.fold_pair_fits(nside, 3 * nside) is fits
+    assert utils._march_pair_route(nside, 3 * nside) is fits
+
+
+@pytest.mark.skipif(not _HAS_NVIDIA_GPU, reason="requires an NVIDIA GPU")
+def test_latitudinal_adjoint_hands_back_the_operand_dtype():
+    """The analysis VJP's cotangent has the operand's element type, not the kernel's.
+
+    The latitudinal kernel accumulates in float64 whatever it is handed and its transpose
+    runs the float64 synthesis kernel, so without a cast at the adjoint boundary a
+    `set_ring_precision("fp32")` session hands the azimuthal stage a complex128 cotangent
+    for a complex64 primal and reverse mode dies inside the chirp-Z multiply
+    (`lax.mul requires arguments to have the same dtypes`).  That is what
+    `test_fused_scalar_transform_gradients_match_generic_jax` hits under
+    `--gm-ring-precision fp32`; this pins the boundary itself.
+    """
+    original = utils.nmt_params.ring_precision
+    try:
+        utils.set_ring_precision("fp32")
+        nside = 16
+        L = 3 * nside
+        theta, weights, phase = utils._pallas_parameters(L, nside)
+        ftm = jnp.ones((4 * nside - 1, L), dtype=jnp.complex64)
+
+        def stage(x):
+            return utils.scalar_forward_latitudinal(
+                x, theta, weights, phase, L=L,
+                block_size=utils._pallas_block_size(nside))
+
+        out, vjp = jax.vjp(stage, ftm)
+        assert out.dtype == jnp.complex128
+        cotangent, = vjp(jnp.ones_like(out))
+        assert cotangent.dtype == ftm.dtype
+    finally:
+        utils.set_ring_precision(original)
+
+
+@pytest.mark.skipif(not _HAS_NVIDIA_GPU, reason="requires an NVIDIA GPU")
+def test_paired_fold_declines_when_the_gate_refuses(monkeypatch):
+    """A refused pair leaves the caller the two-call path rather than an allocation failure."""
+    monkeypatch.setattr(utils._spin_march, "_PAIR_POOL_FACTOR", 10 ** 9)
+    monkeypatch.setenv("GMASTER_SPIN0_MARCH", "1")
+    nside = 64
+    L = 3 * nside
+    npix = 12 * nside ** 2
+    assert utils._spin_march.fold_requested(nside, L) is True
+    assert utils._march_pair_route(nside, L) is False
+    minfo = nmt.NmtMapInfo(None, (npix,))
+    ainfo = nmt.NmtAlmInfo(L - 1)
+    maps = jnp.asarray(np.zeros((1, npix)))
+    assert utils.map2alm_pair(maps, maps, minfo, ainfo, n_iter=1) is None
+
+
 @pytest.mark.parametrize("nside", [512, 1024, 2048, 4096, 8192])
 def test_synthesis_tile_is_per_spin_and_still_powers_of_two(nside):
     """The synthesis launch geometry agrees with the chunk the kernel is compiled against.

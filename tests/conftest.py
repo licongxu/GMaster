@@ -61,11 +61,21 @@ def pytest_addoption(parser):
 def _floored_assert_allclose(actual, desired, *args, **kwargs):
     from gmaster import nmt_params
 
-    if nmt_params.table_dtype == "fp32":
+    if nmt_params.table_dtype == "fp32" or nmt_params.ring_precision == "fp32":
         # A fixed absolute bar is meaningless across this suite's scales: transform
         # parities compare O(1) ring sums while a decoupled Cl is O(1e-12), and 2e-6
         # absolute would be vacuous for the latter.  The floor is 2e-6 *of the compared
         # quantity*, so it says the same thing everywhere: agree to two parts per million.
+        #
+        # The ring precision joins the condition because a float32 azimuthal stage is the
+        # same kind of licence.  The generic s2fft path does not read it at all -- its alms
+        # and its gradients are bit-identical between `set_ring_precision("fp64")` and
+        # `"fp32"` (`.qwen/tmp/ad_probe2_s35.log`) -- so an fp32-ring parity test compares a
+        # float32-ringed GMaster against a float64 reference and can only agree to the
+        # ring's own rounding: measured 3.5e-07 of scale on the analysis gradient and
+        # 1.7e-07 on the synthesis, against 2.5e-13 with float64 rings.  The fused
+        # float32-ring gradient is as close to the exact one as its own forward transform
+        # is, which is what the floor says.
         scale = float(np.max(np.abs(np.asarray(desired))))
         kwargs["atol"] = max(float(kwargs.get("atol", 0.0) or 0.0), FP32_ATOL * scale)
     return _REAL_ASSERT_ALLCLOSE(actual, desired, *args, **kwargs)
