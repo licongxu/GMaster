@@ -8374,3 +8374,45 @@ alms exactly once — but it means the honest field comparison at that geometry 
 **3554 ms (both transforms, fused) vs 2550 + 2452 = 5002 ms (ducc0's two passes) = 1.41x**, not
 the `1x` printed beside the field column.  Anyone chasing the spin-0 field must therefore compare
 against 5002 ms, not 2550 ms, and knows the fused pair is already worth ~0.75 of two calls there.
+
+### 13. Closing statement on the standing bar, so nobody has to re-derive the ceiling
+
+The objective on the table is "beat NaMaster massively, all spins, all Nsides".  This session's
+clean, single-tenant, shipped-default board is `.qwen/tmp/s35_board_clean.log`; its `TOTAL` column
+is the only quotable end-to-end number (stage columns are marginals and, per §12, not the same
+scope as NaMaster's for spin 0):
+
+| Nside | spin 0 | spin 2 |
+|---|---|---|
+| 64 | 7 → 2 ms **3.1x** | 15 → 3 ms **4.5x** |
+| 128 | 21 → 6 ms **3.6x** | 46 → 11 ms **4.2x** |
+| 256 | 62 → 25 ms **2.4x** | 151 → 54 ms **2.8x** |
+| 512 | 342 → 165 ms **2.1x** | 714 → 335 ms **2.1x** |
+| 1024 | 1767 → 699 ms **2.5x** | 3338 → 1233 ms **2.7x** |
+| 2048 | 10629 → 5185 ms **2.0x** | 18503 → 8703 ms **2.1x** |
+
+Against that bar the honest verdict is **not met above Nside 256**, and §11–§12 say exactly why
+the gap cannot be closed by anything that has been tried:
+
+- the field stage is `1 + 2·n_iter = 7` latitudinal passes, and a warmed single pass of the
+  shipped route is **1.03–1.44x** ducc0 (`Nside ≥ 1024`, both spins; spin-0 analysis is
+  0.92–0.97x, the one reversed cell).  A field-dominated cell therefore cannot exceed ~1.4x from
+  throughput alone, and the 2.0–2.7x that is on the board already comes from the non-transform
+  stages (coupling 3.5–11x, `coupled_cell` 186–330x);
+- the two ways to buy more than a pass margin are precision, not kernels: the opt-in fp32 table
+  route and the opt-in fp32 coupling contraction, documented in addenda 8, 9 and 24.  They are
+  opt-in because the shipped default keeps NaMaster's fp64 contract, and they are the only cells
+  where the board reaches 3–5x at large `Nside`;
+- what would be needed to beat the pass margin at fp64 is a latitudinal contraction that runs at
+  tensor-core throughput with fp64-equivalent accuracy.  Every route to that has been measured and
+  refused — the precision ladder in the addenda around session 22 (six failed ways), the
+  DFP32 kernel (accurate only to `L ≈ 192`), the table-free generators (addendum 18, 0.6 % of the
+  card's own fp32 matmul but unusable for the shipped band sizes), and the fp64 band at `Nside
+  1024` (73.5 GiB against a 71.2 GiB pool).  A future session that wants "massive" at 1024+ should
+  treat that as the single open problem, not re-sweep block sizes, channels, folds or layout.
+
+Everything else this session touched is finished: the polarised refinement loop is one program
+below `L_work 1536` (addendum 30 §2–§7), the generic-route version of the same trace is priced and
+refused (§10), the anchored-Jacobi march is shown to be scoped against a route that no longer ships
+(addendum 31 §1), and this §11–§13 is the transform-vs-pipeline accounting that was missing from
+every earlier scoreboard.
