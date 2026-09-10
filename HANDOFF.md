@@ -7862,3 +7862,157 @@ one than the bytes.
 
 
 
+## Addendum 29 — the float32-ring gradient boundary is closed, and what the knob is worth now that it ships
+
+Addendum 26 §7 recorded `set_ring_precision("fp32")` as **a forward-only knob**: reverse
+mode raised `lax.mul requires arguments to have the same dtypes, got complex64,
+complex128` inside the polar chirp-Z, that line was named as the failure, and the note
+concluded the fix "belongs at that boundary".  It did, and the boundary was not the
+chirp-Z.  The knob now gradients, the whole suite passes with it, and the record here is
+the fix, the measurement of what it buys, and the second thing that got closed on the way
+(a paired fold at `Nside=4096` that does not fit and now says so instead of dying).
+
+**1. Root cause: an adjoint owes the operand its own dtype.** The latitudinal stage is a
+Pallas kernel that accumulates and stores in float64 *whatever element type it is handed*,
+and its transpose is the float64 synthesis kernel.  With fp64 rings that coincidence is
+invisible — operand and cotangent are both complex128.  With `set_ring_precision("fp32")`
+the azimuthal stage hands it a `complex64` ftm, the transpose still returns float64, and
+the cotangent re-entering the ring stage is wider than the ring stage's own operands, so
+the multiply that consumes it cannot lower.  The error message names a line that is
+perfectly typed; the producer is three frames upstream.
+
+Both scalar adjoints in `gmaster/_sht_pallas.py` now cast the operand-side cotangent
+(`_scalar_forward_bwd`/`_scalar_inverse_bwd` take the operand dtype as a
+`nondiff_argnums` static — a dtype cannot be a `custom_vjp` residual, JAX rejects
+non-array residuals) and return `.astype(operand_dtype)`.  That is exactly the boundary
+cast an explicit cast would have inserted.  The primal was left alone deliberately:
+widening the ftm to float64 would double the largest array in the pipeline at the largest
+geometry, and the largest geometry is precisely what the fp32 ring stage exists to relieve.
+The agreement between the forward and backward march is free for a structural reason that
+is worth writing down: the synthesis kernel marches *the same untransposed rows* and moves
+the plane fold from the input side to the output side, so the transpose of the fold-marched
+analysis kernel is the existing synthesis kernel rather than a second derivation.
+
+**2. Validating it against a reference that cannot share the bug.** The parity test's
+reference is the `jax-generic` s2fft calculator, and that calculator is
+**ring-precision-blind**: `ring_dtype()` is consulted only by the four ring-table builders
+(`_ring_analysis_tables`, `_ring_synthesis_tables` and the spin twins), and
+`set_sht_calculator("jax-generic")` bypasses all of them (`_spin_slabs` returns
+`(None, None)`, `_use_pallas_sht` excludes it).  Measured directly
+(`.qwen/tmp/ring_blind_s35.log`): the generic alms and the generic gradient are
+**bit-identical** between an fp64-ring and an fp32-ring session (`max|d| = 0.000e+00` on
+both) while the session's ring dtype prints `complex64` — the knob has no effect on the arm
+the fused path is scored against.  The same fact shows up in the gradient probe: the
+fused-vs-generic discrepancy in an fp32-ring session (3.50e-07 of ‖grad‖) is numerically
+identical to the fused-fp32ring-vs-fused-fp64ring discrepancy in the same run.  A
+ring-relaxed test is therefore not comparing two float32 pipelines; it is comparing a
+float32-ringed GMaster against a float64 reference, and its honest bar is the ring's own
+rounding.  That is why the relaxation went into `tests/conftest.py`'s existing
+two-parts-per-million floor (which already existed for fp32 tables and now also fires for
+fp32 rings) rather than into a per-test `atol` — no assertion in `tests/test_sht.py` was
+touched.
+
+Numbers from the same probe, `Nside=16`, `L=48` (`.qwen/tmp/ad_probe2_s35.log`):
+| session | check | result |
+|---|---|---|
+| fp64 rings | `<grad,v>` vs central difference (analysis) | **1.77e-11** relative |
+| fp64 rings | fused grad vs generic-path grad (analysis) | **2.50e-13** |
+| fp32 rings | fused grad vs **its own fp64-ring** grad | **3.50e-07** analysis, **1.74e-07** synthesis |
+
+i.e. the fp32-ring gradient differs from the fp64-ring gradient by the azimuthal stage's
+rounding and nothing the adjoint adds.  The finite-difference arm is quoted only for the
+fp64 session: across a float32 pipeline the cancellation floor swamps it (the same probe's
+fp32 FD reads 1.09e-02 relative, and its synthesis arm is meaningless in both sessions
+because the perturbation direction is not scale-matched — do not reuse that arm).
+
+**3. What the knob is actually worth** (`.qwen/tmp/ring_payoff_s35.log`, tables fp64 = the
+shipped default, `ring=follow` vs `ring=fp32`, same process pair, `repeats=2` at 512-2048):
+
+| Nside | spin | `follow` TOTAL | `fp32` TOTAL | wall | peak RSS | GPU peak | `rel dCl` follow → fp32 |
+|---|---|---|---|---|---|---|---|
+| 512 | 0 | 164 ms | **160 ms** | −2 % | 5.7 GB | 19.0 → 18.9 GiB | 1.71e-12 → 1.04e-07 |
+| 512 | 2 | 340 ms | **327 ms** | −4 % | 7.5 GB | 57.5 → 57.4 GiB | 3.56e-07 → 3.57e-07 |
+| 1024 | 0 | 698 ms | **656 ms** | −6 % | 7.7 GB | 1.1 → 0.6 GiB | 6.41e-07 → 7.55e-07 |
+| 1024 | 2 | 1231 ms | **1169 ms** | −5 % | 27.0 → **18.9 GB** | 3.6 → **2.2 GiB** | 3.69e-06 → 3.45e-06 |
+| 2048 | 0 | 4803 ms | **4634 ms** | −4 % | 17.1 GB | 4.3 → **2.3 GiB** | 1.29e-06 → 1.28e-06 |
+| 2048 | 2 | 8694 ms | **8457 ms** | −3 % | 91.1 → **58.8 GB** | 13.5 → **8.2 GiB** | 1.09e-05 → 1.09e-05 |
+
+The wall saving is 2-6 %, which is small and consistent with the addendum-26 measurement
+(3 % at 2048) — the azimuthal stage is not where the fused pipeline spends its time.  The
+memory is the product: 30 % of peak host RSS at 1024 spin 2, 35 % at 2048 spin 2 (landing
+on 58.8 GB, the exact number addendum 26 predicted for it), and a third of the GPU pool at
+2048 spin 2.  Spin-2 accuracy is untouched, spin 0 moves to ~1e-07.  It remains
+**not the default**; what changed is that it can now be turned on in a pipeline that
+gradients, which is the case it was recommended for and could not serve.
+
+**3b. `Nside=4096` is on the board in both ring precisions** (same log, `repeats=1`,
+`lmax=12287`, coupling left at float64):
+
+| ring | TOTAL | vs pymaster | field + mask | coupling | GPU peak | `rel dCl` |
+|---|---|---|---|---|---|---|
+| `complex128` | 42908 ms | 1.7x | 15001 + 15194 = 30.2 s | 12742 ms | 16.3 GiB | 1.41e-06 |
+| `complex64` | **42058 ms** | 1.7x | 14515 + 14793 = 29.3 s | 12748 ms | **8.8 GiB** | 1.20e-06 |
+
+Two readings. The device peak **halves** (16.3 → 8.8 GiB) for 2 % of the wall, which is the
+session-29d attribution confirmed at the top of the board — the large-`Nside` footprint is
+azimuthal buffers, and this is the only knob that touches them. And the stage split says
+what 4096 is made of: 72 % of GMaster's 42 s is the two unpaired field/mask latitudinal
+passes, which run at **1.0x** against `ducc0` (their NaMaster counterparts are 15536 and
+14958 ms), while the entire win at this size comes from coupling algebra.  With
+`GMASTER_COUPLING_PRECISION=fp32` the same geometry is 33456 ms (**2.2x**, §4); the paired
+march that would attack the 29 s half is exactly what the pool refuses (§4), so **4096 spin
+0 is now bounded by the fold's footprint, not by the reference's speed**.
+
+**4. The paired fold at 4096 does not fit, and now declines instead of dying.**
+`.qwen/tmp/pairrun_4096_s34.log` runs the field+mask analysis over one marched program at
+`Nside=4096` and gets
+`RESOURCE_EXHAUSTED: Out of memory while trying to allocate 8.15GiB` inside the 71.2 GiB
+pool, while the same geometry as two separate calls completes with a 16.3 GiB peak.  The
+analytic live set is 33.0 GiB, so the shortfall is peak allocation, not footprint: the fold
+puts both maps' azimuthal stages, both rhs blocks and one *unrolled* window loop into a
+single XLA program.  `_spin_march.fold_pair_fits` now demands the geometry from
+`fold_pair_bytes` and refuses above a quarter of `jax.devices()[0].memory_stats()`'s
+`bytes_limit` (the factor is peak/footprint for a program that materialises its own copies;
+it is set to 4 and calibrated on the two points on record — 2048, which ran there at a
+4.3 GiB peak, and 4096, which died):
+
+| Nside | 512 | 1024 | 2048 | 3072 | 4096 |
+|---|---|---|---|---|---|
+| estimate | 0.52 GiB | 2.06 | 8.25 | 18.56 | 33.00 |
+| ×4 vs 71.2 GiB pool | pass | pass | **pass** | refuse | refuse |
+
+`utils._march_pair_route` ANDs it with `fold_requested`, so the caller sees `None` and takes
+the two-call path — the arm that already scores 2.2x at 4096 (`.qwen/tmp/s35_checks.log`:
+`TOTAL 73538->33456ms (2.2x) | rel=1.42e-06 | peakRSS=49.3GB GPUpeak=16.3GiB`).  The byte
+estimate is deliberately **not** ring-aware: its only calibration point is an fp64-ring
+crash, so an fp32-ring session declines one size earlier than it strictly needs to.  That
+conservatism is a recorded choice, not an oversight, and `test_paired_fold_gate_sides_at_the_measured_sizes`
+pins the five verdicts so a future ring-aware estimate has to be justified against the test
+rather than silently widening the route.
+
+**5. Verification.** Default suite **193 passed, 3 skipped** in 460 s
+(`.qwen/tmp/s35_verify.log` §4), up from 185 by the five gate tests and the two AD tests.
+New tests: `test_latitudinal_adjoint_hands_back_the_operand_dtype` (the regression itself —
+`jax.vjp` through `scalar_forward_latitudinal` with a `complex64` ftm asserts the cotangent
+dtype equals the operand dtype, which fails with the exact `lax.mul` error before the fix),
+`test_paired_fold_footprint_grows_with_the_geometry`,
+`test_paired_fold_gate_sides_at_the_measured_sizes`, `test_paired_fold_declines_when_the_gate_refuses`
+(monkeypatches the factor to 1e9 and asserts both the route and `map2alm_pair` refuse), and
+the conftest floor extension.  At `--gm-ring-precision fp32` the **whole suite is green**:
+193 passed, 3 skipped in 467.36 s (`.qwen/tmp/s35_after.log`), the same counts as the
+default float64-ring run in the same chain — the config addendum 26 recorded as
+"1 failed, 167 passed" and called a forward-only knob passes end to end.  The targeted set
+(`-k "paired_fold or latitudinal_adjoint or pair"`) is **13 passed** at both precisions
+(30.6 s default, 28.9 s with `complex64` rings).
+
+**6. Two lessons, one of them a reversal.**
+(a) An adjoint must hand back the operand's dtype.  If a kernel is dtype-generic on the way
+in and dtype-fixed on the way out, its transpose is wrong for every operand narrower than
+its accumulator, and the message will name whichever downstream op first multiplies the two
+— never the kernel.  When a dtype error appears three frames from a `custom_vjp`, read the
+bwd rule first.
+(b) "Forward-only" is a claim about an implementation, not a measurement.  Addendum 26 §7
+wrote the knob off twice in one sentence, and the barrier was four characters of `.astype`
+in two functions.  Before a lever goes into the closed column, ask what the failure message
+would have to say if the blamed component were really the problem — here the chirp-Z was
+blamed for a cotangent that was never its input.

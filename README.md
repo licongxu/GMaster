@@ -237,20 +237,34 @@ before every test, so a module that restores the default cannot silently move th
 of the run back to float64. `--gm-ring-precision` then controls the azimuthal transforms
 independently, which matters because `set_table_precision` used to drag them down with it:
 the float32 chirp tables cast the *pixels* too, so a float32 session analyzed the map
-itself in float32. Held to `complex128` the whole suite passes — **168 passed, 3 skipped**,
-the same result as the default float64 run. Measured against it on the whole board
-(`--ring-precision fp32`), letting the rings fall to `complex64` saves 3 % of wall at `Nside=2048` and
-10-16 % at 128-256, leaves spin-2 accuracy untouched (`rel dCl` 3.46e-06 → 3.22e-06 at 1024) and puts spin 0
-at 1.3-1.6e-07; it is therefore not the default, and it is still **forward-only** — with fp32 rings the
-gradient of the scalar transform raises
+itself in float32. Held to `complex128` the whole suite passes — **193 passed, 3 skipped** — the same counts as
+the default float64 run.
+Measured against it on the whole board with the shipped fp64 tables (`--ring-precision fp32`),
+letting the rings fall to `complex64` costs 2-6 % of wall (698 → 656 ms at `Nside=1024` spin 0,
+164 → 160 ms at 512 spin 0, 8694 → 8457 ms at 2048 spin 2), leaves spin-2 accuracy untouched
+(`rel dCl` 3.69e-06 → 3.45e-06 at 1024, 1.09e-05 both ways at 2048) and puts spin 0 at ~1e-07; it
+is therefore not the default. What it buys is memory, and it buys it at both ends: peak host RSS
+falls 27.0 → 18.9 GB at `Nside=1024` spin 2 and 91.1 → 58.8 GB at 2048 spin 2, the device peak
+3.6 → 2.2 GiB and 13.5 → 8.2 GiB there (HANDOFF addendum 29).
+
+The knob used to be **forward-only**, and the recorded diagnosis was wrong. With fp32 rings the
+gradient of the scalar transform raised
 `lax.mul requires arguments to have the same dtypes, got complex64, complex128` in the polar chirp-Z
-(`gmaster/utils.py:1118`), which is the one suite failure there
-(**1 failed, 167 passed, 3 skipped**). The chirp-Z is not the culprit: transposed on its own with a
-`complex64` cotangent it gradients cleanly, and it is `_fused_forward_sht` whose primal widens to
-`complex128` while its input rings stay `complex64`, so the cotangent re-entering the ring stage is
-wider than the ring stage's operands (HANDOFF addendum 26 §7). A fix belongs at that boundary, not in
-the transform. What fp32 rings do buy cheaply is memory: at `Nside=2048` spin 2 the
-run's peak RSS falls from 91.0 GB to 58.8 GB.
+and the chirp-Z was blamed. The producer is the latitudinal stage: the kernel accumulates and stores
+in float64 whatever element type it is handed and its transpose is the float64 synthesis kernel, so
+a `complex64` operand got a `complex128` cotangent back and the first op downstream that multiplied
+the two failed to lower. Both scalar adjoints in `gmaster/_sht_pallas.py` now cast the cotangent to
+the operand's dtype, which is the boundary the note asked for and costs the forward pass nothing;
+the float32-ring gradient then differs from the float64-ring gradient by the azimuthal stage's own
+rounding (3.50e-07 analysis, 1.74e-07 synthesis) and nothing the adjoint adds, verified against a
+central difference to 1.77e-11 with exact rings. The gradient parity test passes under
+`--gm-ring-precision fp32` on the suite's existing two-parts-per-million floor, and the whole
+suite now passes with `complex64` rings too — **193 passed, 3 skipped**, the same counts as the
+default run. When quoting that
+test, remember its reference is ring-precision-blind: `ring_dtype()` is read only by the four
+ring-table builders, and `sht_calculator="jax-generic"` bypasses all of them, so a ring-relaxed
+parity result is always a float32-ringed transform against a float64 reference (the generic alms
+and gradients are bit-identical between the two ring precisions).
 
 The pipeline benchmark takes the same flag, and this is what it scores against NaMaster in
 one process (spin 0 / spin 2): **2.2x / 3.8x** at `Nside=64`, **1.8x / 3.9x** at 128,
@@ -286,7 +300,13 @@ pairing this one is not bit-identical: widening the emit block reassociates the 
 paired route's error against the fp64 band is the march's own error unchanged (`2.03e-04` either
 way). The route is declined, never raised, for `lite`
 fields, template/catalog/flat/anisotropic fields, a differing `lmax_mask` or `n_iter_mask`, or a spin-2
-field whose mask is spin 0. Consequence for the benchmark: the `mask` column is now ~0 at spin 0
+field whose mask is spin 0. It is also declined on memory: the fold doubles the one object a paired
+program cannot split, and at `Nside=4096` that raised `RESOURCE_EXHAUSTED` (8.15 GiB short inside the
+71.2 GiB pool) where the same geometry as two separate calls completes with a 16.3 GiB peak, so
+`fold_pair_fits` demands the footprint from the geometry and refuses above a quarter of the device pool
+— pass at 512/1024/2048, refuse at 3072/4096 here — leaving the two-call path, which is the arm that
+scores **2.2x** at 4096 (`73538 → 33456 ms`, `rel dCl` 1.42e-06). Consequence for the benchmark: the
+`mask` column is now ~0 at spin 0
 because the work moved into `field`, which is the expected reading, not a vanished stage. The spin-0
 `TOTAL`s in the two paragraphs above and below predate this; with both precision switches on, the
 fused board is **7.5x / 6.7x / 6.8x / 4.8x** at `Nside=128/256/512/1024` and **2.7x** at 2048
@@ -311,9 +331,12 @@ essentially unmoved (`rel dCl` 1.34e-07 → 2.04e-07 spin 0 and 3.22e-06 → 3.2
 defaults to float64, since the suite holds `get_coupling_matrix()` to `atol=2e-14` against float64
 tables. At the top of the board it is worth most: at `Nside=4096` spin 0 (`lmax=12287`) the stage goes
 12764 → 3189 ms and the cell from **1.7x to 2.3x**, for a `rel dCl` of 1.20e-06 → 1.24e-06 — inside the
-0.9 % run-to-run drift of the reference's own column, and with unchanged peak memory (49.3 GB host,
-8.8 GiB device). Its `TOTAL` is then 90 % the two transform stages, and 2.50x is what a free coupling,
-free cell and free decoupling would buy there.
+0.9 % run-to-run drift of the reference's own column. The 8.8 GiB device peak on that row belongs to
+*float32 rings*, not to the coupling switch: the same geometry measures 16.3 GiB with `complex128`
+rings and coupling `fp32`, and 8.8 GiB once the rings drop to `complex64`, with host RSS 49.3 GB either
+way (HANDOFF addendum 29 §3b). Its `TOTAL` is then 90 % the two transform stages, and 2.50x is what a
+free coupling, free cell and free decoupling would buy there — stages that run at 1.0x against `ducc0`,
+and which the paired march that would share them is refused by the device pool at this size.
 
 The benchmark also reports a `mask` stage: a field's mask `a_lm` are computed lazily (as in NaMaster),
 by a second spin-0 analysis at the **same** `lmax` and the same `n_iter` (`lmax_mask` defaults to
