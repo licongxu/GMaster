@@ -8336,3 +8336,41 @@ dispatch, not memory, and not the precision switches.  That is the same wall add
 per-pass ladder and the march's issue-bound attribution describe; §10 above says the trace route
 around it is closed, and addendum 31 §1 says the table-free generator idea was priced against a
 baseline that no longer exists.
+
+### 12. Completing that parity table for spin 0, and the one accounting trap in the spin-0 field column
+
+The missing `Nside=2048` spin-0 arm of `benchmarks/benchmark_sht.py` did not fit 1400 s either
+(`.qwen/tmp/s35_sht_2048s0.log` is empty; the script compiles `jax` and `jax-generic` for the same
+geometry in one process before printing anything), so the two spin-0 rows below come from a lean
+probe that runs only the shipped route and the installed ducc0, with the same warmed protocol and
+the same input conventions as the script (`.qwen/tmp/parity_s0_s35.py`, GPU1, defaults, 5 repeats):
+
+| Nside | spin | ours analysis | ducc0 | vs ducc0 | ours synthesis | ducc0 | vs ducc0 | accuracy max/rel |
+|---|---|---|---|---|---|---|---|---|
+| 1024 | 0 | 0.0653 s | 0.0597 s | **0.915x** | 0.0418 s | 0.0531 s | **1.271x** | 1.70e-07/4.52e-05, 1.57e+00/2.36e-04 |
+| 2048 | 0 | 0.3073 s | 0.2994 s | **0.974x** | 0.2311 s | 0.2937 s | **1.271x** | 1.47e-07/7.20e-05, 1.11e+01/8.19e-04 |
+
+`vs ducc0` is ducc-time/our-time, so **above 1.0 we are faster** — the same convention as the
+`vs NMT` column of `benchmark_sht.py`.  The accuracy pairs are (analysis, synthesis) and are the
+same quantities as the script's own `max/rel` columns; the 1024 spin-0 row reproduces the script's
+`.qwen/tmp/s35_sht_large.log` numbers to the printed digit (1.70e-07/4.52e-05 and
+1.57e+00/2.36e-04), which is what licenses using the probe for the 2048 row.
+
+**So the shipped transform is 1.03–1.44x faster than the CPU code on every warmed single pass
+measured at Nside ≥ 1024, and 0.92–0.97x on spin-0 analysis** (the one direction-reversed cell).
+Read together with §11 this closes the question of where the end-to-end ratios come from:
+
+- a pipeline cell dominated by the field stage cannot exceed the per-pass margin, so 1.4x at
+  `Nside=2048` spin 0 and 2.1x at spin 2 are close to the ceiling of the current transform;
+- the cells that are already massive (coupling 3.5–11x, `coupled_cell` 186–330x) are massive
+  because they are *not* transform-throughput-bound.
+
+**The spin-0 field column is not the same scope as NaMaster's** (`benchmarks/benchmark_pipeline.py`
+lines 89–102 time the mask alms as `timed(field + get_mask_alms) − timed(field)`).  GMaster
+computes them eagerly inside the field through the fused pair (`field.py`, the `map2alm_pair`
+branch), so its marginal is ~0 and the board shows `mask 14 ms` where NaMaster shows `mask 2452 ms`
+at `Nside=2048` spin 0.  That is fair at the TOTAL level — both codes' totals contain the mask
+alms exactly once — but it means the honest field comparison at that geometry is
+**3554 ms (both transforms, fused) vs 2550 + 2452 = 5002 ms (ducc0's two passes) = 1.41x**, not
+the `1x` printed beside the field column.  Anyone chasing the spin-0 field must therefore compare
+against 5002 ms, not 2550 ms, and knows the fused pair is already worth ~0.75 of two calls there.
