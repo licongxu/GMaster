@@ -1665,8 +1665,11 @@ def _map2alm_once_slab(maps, ell, order, *, spin, nside, L, L_work, slab):
     is small enough to ride the boundary.  Run as three jits with an eager gather afterwards the call
     cost 1.700 / 1.944 ms at Nside 64 / 128 whatever the map size, because `plus[ell, L_work-1+order]`
     and its parity conjugate are dispatched op by op; fused it is 0.215 and 0.765 ms (7.91x, 2.54x)
-    with bit-identical output (`.qwen/tmp/slab_fuse2.log`).  Nside 512 is past the fuse gate: there
-    the slab is 19 GiB and XLA counts it against the pool of a boundary that also carries the maps.
+    with bit-identical output (`.qwen/tmp/slab_fuse2.log`).  Above the gate fusion is not merely
+    impossible, it is unwanted: forcing it on an 18.74 GiB slab at Nside 512 costs 34.414 -> 38.175 ms
+    per analysis call and 5.075 -> 5.420 ms on the 2.44 GiB slab at Nside 256, with the result unchanged
+    to every printed digit (`.qwen/tmp/s35_slabgate.log`).  The gate therefore keeps the split path for
+    throughput, not because the boundary would refuse.
     """
     tables = _spin_ring_analysis_tables(
         L_work, nside,

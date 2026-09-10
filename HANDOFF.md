@@ -6796,6 +6796,12 @@ table, not at that line; a `custom_jvp` that widens the table to the tangent's d
 ~5 % is not worth putting a custom derivative rule into the hottest path in the library, with the fp64
 route's performance then needing re-measurement. **`set_ring_precision("fp32")` is a forward-only knob.**
 
+(*Superseded by addendum 29.* The mismatch was never inside a transpose rule operating on the
+closed-over table, and no `custom_jvp` was needed: the latitudinal kernel accumulates in float64
+whatever element type it is handed, so with `complex64` rings its adjoint returned a wider cotangent
+than its operand. Casting the cotangent on the operand side in the two scalar adjoints closes it at
+zero forward cost, and the suite passes with `complex64` rings.)
+
 **The number actually worth keeping from this measurement is a host-memory one.** At Nside 2048 spin 2,
 `peakRSS` falls **91.0 GB → 58.8 GB** and `GPUpeak` 13.4 → 8.4 GiB, because
 `_forward_ring_fft_positive` casts the *pixels* to the chirp's real dtype (`utils.py:1080`) and the whole
@@ -7963,6 +7969,14 @@ passes, which run at **1.0x** against `ducc0` (their NaMaster counterparts are 1
 march that would attack the 29 s half is exactly what the pool refuses (§4), so **4096 spin
 0 is now bounded by the fold's footprint, not by the reference's speed**.
 
+With every switch on — `--precision fp32 --ring-precision fp32` and
+`GMASTER_COUPLING_PRECISION=fp32`, `.qwen/tmp/s35_4096all.log` — the cell is
+**72945 → 32520 ms (2.2x)**: field 14461 + mask 14833 = 29.3 s, which is **90 % of the
+`TOTAL`**, coupling 3185 ms (13x), `rel dCl` 1.24e-06, peak RSS 49.3 GB, device peak
+**8.8 GiB**.  Three separate statements from one row: the device peak belongs to the rings,
+the ratio belongs to the coupling algebra, and the wall belongs to the two unpaired
+latitudinal stages that run at ducc0 parity.
+
 **4. The paired fold at 4096 does not fit, and now declines instead of dying.**
 `.qwen/tmp/pairrun_4096_s34.log` runs the field+mask analysis over one marched program at
 `Nside=4096` and gets
@@ -8004,6 +8018,23 @@ default float64-ring run in the same chain — the config addendum 26 recorded a
 "1 failed, 167 passed" and called a forward-only knob passes end to end.  The targeted set
 (`-k "paired_fold or latitudinal_adjoint or pair"`) is **13 passed** at both precisions
 (30.6 s default, 28.9 s with `complex64` rings).
+
+**5b. The analysis fuse gate is right — for a different reason than its docstring gave.**
+`_map2alm_once_slab` fuses only while the Wigner slab is `<= _SLAB_FUSE_MAX_BYTES` (4 GiB)
+while `_alm2map_core_slab` fuses unconditionally, and the asymmetry had never been priced: the
+docstring claimed the boundary could not carry a 19 GiB slab.  Forcing fusion with a 64 GiB
+gate, one process per arm, `.qwen/tmp/s35_slabgate.log`:
+
+| Nside | analysis slab | split | fused |
+|---|---|---|---|
+| 256 | 2.44 GiB | **5.075 ms** | 5.420 ms |
+| 512 | 18.74 GiB | **34.414 ms** | 38.175 ms |
+
+Fusion is 6.8 % and 10.9 % *slower* respectively and the returned alm is identical to every
+printed digit, so the gate is a throughput choice and the 512 case never hit an XLA capacity
+wall at all.  (`gpu_peak` prints `nan` because `memory_stats()` on this JAX build has no
+`bytes_peak` key — the peak has to be read from the benchmark harness, not from a probe.)
+The docstring now says what the measurement says.
 
 **6. Two lessons, one of them a reversal.**
 (a) An adjoint must hand back the operand's dtype.  If a kernel is dtype-generic on the way
