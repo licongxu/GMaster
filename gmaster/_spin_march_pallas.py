@@ -555,6 +555,58 @@ def fold_requested(nside, L) -> bool:
     return on_gpu and not utils._prefer_theta_band(nside, L, 0)
 
 
+# Demand the paired fold may put on the allocator, judged against the device pool.  The two
+# measured points are Nside 2048, which runs (`.qwen/tmp/pairrun_s34.log`: 4558 -> 3961 ms, GPU
+# peak 4.3 GiB), and Nside 4096, which does not (`.qwen/tmp/pairrun_4096_s34.log`:
+# `RESOURCE_EXHAUSTED: Out of memory while trying to allocate 8.15GiB` inside a 71.2 GiB pool,
+# while the same geometry run as two separate calls completes with a 16.3 GiB peak).
+_PAIR_POOL_FACTOR = 4
+
+
+def fold_pair_bytes(nside, L) -> int:
+    """Analytic live set of one folded march over two right-hand sides, in bytes.
+
+    Each term is a temporary `_fold_analyze` builds: the shared `p2phi` plane, the per-map
+    fold (`folded`, its two gathered halves and the stacked fp32 channels), the concatenated
+    rhs block, the widest kernel slab (`min(128, L)` m-rows, the first window being the long
+    one), the fp64 per-window partials the assembly consumes, and the two assembled alms.
+    It is a scale estimate for a gate, not a scheduler's answer -- see `fold_pair_fits`.
+    The fold planes are counted at 16 bytes even under `set_ring_precision("fp32")`, because
+    the crash this gate is calibrated against (`.qwen/tmp/pairrun_4096_s34.log`) was measured
+    with the azimuthal stage in float64 and that is the only footprint on record; a float32-ring
+    session therefore declines the pair one size earlier than it strictly needs to.
+    """
+    ntheta = 4 * nside - 2
+    north = (ntheta + 1) // 2
+    ntile = -(-north // _TILE)
+    nc = NC * 2
+    phase = L * ntheta * 16
+    per_map = L * ntheta * 16 + 2 * (L * north * 16) + L * north * 4 * NC
+    rhs = L * (ntile * _TILE) * 4 * nc
+    slab = min(128, L) * ntile * L * nc * 8
+    partials = nc * 8 * L * L // 2
+    alms = 2 * L * L * 16
+    return phase + 2 * per_map + rhs + slab + partials + alms
+
+
+def fold_pair_fits(nside, L) -> bool:
+    """True when this device's pool can be asked to hold the paired fold.
+
+    Pairing puts both maps' azimuthal stages, both rhs blocks and one unrolled window loop
+    into a single XLA program, so the allocator's peak is well above the analytic live set --
+    at Nside 4096 the estimate is 33.0 GiB and the run still died on an 8.15 GiB request with
+    the rest of the pipeline resident, i.e. the peak ran at more than twice the estimate.
+    Demanding `4x` free is what makes the two measured points come out right, and it leaves a
+    larger pool able to take the size back rather than hard-coding a Nside.  A device with no
+    pool accounting (`memory_stats()` returns None, which is what CPU does) is unlimited.
+    """
+    stats = jax.devices()[0].memory_stats()
+    limit = stats.get("bytes_limit") if stats else None
+    if not limit:
+        return True
+    return fold_pair_bytes(nside, L) * _PAIR_POOL_FACTOR <= limit
+
+
 def fold_synth_requested(nside, L) -> bool:
     """True when the folded spin-0 march should serve a synthesis latitudinal call.
 

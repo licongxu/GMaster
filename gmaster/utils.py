@@ -1873,8 +1873,16 @@ def _march_pair_route(nside, L_work):
     not paired here: the marched synthesis kernel keeps per-lane accumulators and per-degree
     coefficient loads, both of which scale with the number of maps, so it has no shared reduction
     tree to widen and a second map would double the part that costs.
+
+    The last clause is a memory limit, not a speed one.  At Nside 4096 the paired program dies in
+    the allocator -- `RESOURCE_EXHAUSTED: Out of memory while trying to allocate 8.15GiB` inside the
+    71.2 GiB pool -- where the same geometry run as two separate calls completes in 33.62 s against
+    NaMaster's 74.11 s (`rel dCl` 1.42e-06) with a 16.3 GiB GPU peak
+    (`.qwen/tmp/pairrun_4096_s34.log`).  `fold_pair_fits` refuses it, and the two calls the caller
+    then makes are the arm that works.
     """
-    return _spin_march.fold_requested(nside, L_work)
+    return (_spin_march.fold_requested(nside, L_work)
+            and _spin_march.fold_pair_fits(nside, L_work))
 
 
 def _map2alm_pair_once_pallas(maps_a, maps_b, ell, order, *, nside, L_work, march_pair):
