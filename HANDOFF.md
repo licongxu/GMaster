@@ -8026,6 +8026,19 @@ is ever timed*, so float32 rings cannot unlock it.  Scoring that geometry needs 
 replaced (the per-pass `ducc0` ladder of addendum 25 §3, where 4096 spin 2 accuracy is already
 measured at `rel alm` 1.73e-04) or its element count reduced — not a precision switch.
 
+**4c. And GMaster's own 4096 spin-2 field still does not materialise with the rings in
+float32.** Run alone, no `pymaster` imported, `set_table_precision("fp32")` +
+`set_ring_precision("fp32")`, the field stage dies the same way session 31 recorded it for
+float64 rings: after a 2 m 05 s compile of `jit__map2alm_iteration`,
+`RESOURCE_EXHAUSTED: Failed to load in-memory CUBIN …: CUDA_ERROR_OUT_OF_MEMORY`
+(`.qwen/tmp/n4096_gm_spin2_s35.py`, `.qwen/tmp/n4096_gm_spin2_s35.log`), with the process
+resident at ~81 GiB on the card at the time.  Half-size data does not rescue the geometry
+because the allocation that finally refuses is the *executable load*: by then the pool holds
+the pass's own buffers, and the residue is what the cubin needs.  So the storage knobs are
+the wrong lever for this cell in both directions — the reference dies on element count
+(§4b) and our field dies on the pool-plus-cubin residue, which is the failure mode
+addendum 24 warned grows when the pool fraction is pushed up.
+
 **5. Verification.** Default suite **193 passed, 3 skipped** in 460 s
 (`.qwen/tmp/s35_verify.log` §4), up from 185 by the five gate tests and the two AD tests.
 New tests: `test_latitudinal_adjoint_hands_back_the_operand_dtype` (the regression itself —
@@ -8069,3 +8082,9 @@ wrote the knob off twice in one sentence, and the barrier was four characters of
 in two functions.  Before a lever goes into the closed column, ask what the failure message
 would have to say if the blamed component were really the problem — here the chirp-Z was
 blamed for a cotangent that was never its input.
+(c) A benchmark row that is missing with an *empty* log is a native crash, and this repo has
+usually already written it up.  The 4096 spin-2 arm's header-then-exit cost a stage-by-stage
+bisect to discover a segfault that addendum 25 §2 had characterised three sessions earlier
+(element count past 2**31, not memory).  The distinguishing signature — no traceback, exit
+139, identical under every one of our precision switches because the reference reads none —
+should have pointed at "grep HANDOFF for this geometry" before any probing.
