@@ -8229,16 +8229,21 @@ that ends the slab route cannot be the reason here:
 
 ```
 nside=1024 slab=no
-nside=1024 shipped (eager loop): cold=57777.5 ms warm=536.305 ms
-nside=1024 traced  (one program): cold=47093.4 ms warm=605.792 ms
-nside=1024 tables=fp64 max|d|=0.000e+00 bit_identical=True ratio=1.130
+nside=1024 shipped (eager loop): cold=63217.8 ms warm=533.623 ms
+nside=1024 traced  (one program): cold=53424.5 ms warm=605.083 ms
+nside=1024 tables=fp64 max|d|=0.000e+00 bit_identical=True ratio=1.134
 ```
 
-(`.qwen/tmp/s35_b3bis.log`.)  Bit-identical and 13 % slower.  Removing the same six boundaries
-that paid on the slab route costs here, which is the honest boundary of §9(a): the trace is not a
-universal good, it is a trade of boundary cost against scheduling quality, and on the generic
-s2fft route the scheduler was already doing better with the boundaries in place.  This route is
-*not* traced; nothing in `gmaster/` changed for `Nside>=1024` in this addendum.
+(`.qwen/tmp/s35_b3bis_clean.log`, single tenant.)  An earlier arm of the same probe
+(`.qwen/tmp/s35_b3bis.log`) gave 536.305 / 605.792 ms and ratio 1.130 with another process
+sharing the card — the verdict agrees to 0.4 %, but the clean run is the one to quote, and the
+same overlap is what made one row of `benchmarks/benchmark_pipeline.py --nside 64 --spins 2`
+report a 3.8 s `mask` stage that no clean run reproduces.  Bit-identical and 13 % slower.
+Removing the same six boundaries that paid on the slab route costs here, which is the honest
+boundary of §9(a): the trace is not a universal good, it is a trade of boundary cost against
+scheduling quality, and on the generic s2fft route the scheduler was already doing better with
+the boundaries in place.  This route is *not* traced; nothing in `gmaster/` changed for
+`Nside>=1024` in this addendum.
 
 For scale, the same probe's eager arm (536.305 ms for the seven-pass analysis) is 61 % of the
 `Nside=1024` spin-2 `TOTAL` of 1231 ms, and the stage split there is field 539 ms / mask 357 ms /
