@@ -5,6 +5,13 @@ import pytest
 jax.config.update("jax_enable_x64", True)
 
 import gmaster as nmt
+import gmaster.field as field_module
+
+
+_HAS_NVIDIA_GPU = any(
+    device.platform == "gpu" and "NVIDIA" in device.device_kind.upper()
+    for device in jax.devices()
+)
 
 
 def test_standard_fields_and_coupled_spectra_match_namaster():
@@ -180,3 +187,88 @@ def test_mask_only_lite_and_invalid_options():
             lmax=7,
             lmax_mask=7,
         )
+
+
+@pytest.mark.skipif(not _HAS_NVIDIA_GPU, reason="requires an NVIDIA GPU")
+def test_scalar_field_shares_one_band_between_field_and_mask():
+    """A scalar field's own analysis and its mask analysis are one fused pass.
+
+    `nmt_params.n_iter_default` and `nmt_params.n_iter_mask_default` are both 3 here
+    and in NaMaster and `lmax_mask` defaults to `lmax`, so a field built the way a
+    pipeline builds one carries two independent spin-0 transforms of identical shape
+    over the same Legendre band; `NmtField` now runs them together for 0.53-0.68x of
+    the price of the two (`utils.map2alm_pair`), which is why `alm_mask` is populated
+    by the constructor and the benchmark's `mask` column has gone to ~0.  The mask
+    alms must be the ones the lazy route would have produced, and `alm` the one it
+    always produced -- measured bit-identical on both halves, with the decoupled cell
+    agreeing to 6.5e-16 (`.qwen/tmp/pairverify_s33.log`).  Both iteration counts are
+    passed explicitly because the fusion needs them equal; giving only `n_iter` makes
+    the mask transform a different transform, and the next test asserts that case
+    falls back rather than silently changing the answer.
+    """
+    rng = np.random.default_rng(31)
+    nside = 16
+    npix = 12 * nside ** 2
+    mask = rng.uniform(0.2, 1.0, npix)
+    maps = rng.normal(size=(1, npix))
+
+    fused = nmt.NmtField(mask, maps, n_iter=2, n_iter_mask=2)
+    assert fused.alm_mask is not None, "the fused route should have computed it"
+    assert fused.alm_mask.ndim == 1, "get_mask_alms returns one unpacked row"
+
+    monkeypatched = {}
+
+    def decline(*args, **kwargs):
+        monkeypatched["called"] = True
+        return None
+
+    original = field_module.map2alm_pair
+    field_module.map2alm_pair = decline
+    try:
+        plain = nmt.NmtField(mask, maps, n_iter=2, n_iter_mask=2)
+    finally:
+        field_module.map2alm_pair = original
+    assert monkeypatched.get("called"), "the route must be consulted at all"
+    assert plain.alm_mask is None, "with the route declined the alms stay lazy"
+
+    np.testing.assert_array_equal(
+        np.asarray(fused.get_alms()), np.asarray(plain.get_alms()))
+    np.testing.assert_array_equal(
+        np.asarray(fused.get_mask_alms()), np.asarray(plain.get_mask_alms()))
+
+
+@pytest.mark.skipif(not _HAS_NVIDIA_GPU, reason="requires an NVIDIA GPU")
+@pytest.mark.parametrize("option", ["n_iter_mask", "lmax_mask", "spin", "lite"])
+def test_mask_fusion_needs_two_transforms_of_the_same_shape(option):
+    """Anything that makes the mask's transform differ must fall back cleanly.
+
+    The fusion is only valid when both halves are the same transform of the same
+    geometry, so a differing `n_iter_mask` or `lmax_mask`, a spin-2 field (whose
+    mask is spin 0 against a spin-2 field) and a `lite` field all have to take the
+    old lazy route -- and still return the mask alms the lazy route returns.
+    """
+    rng = np.random.default_rng(37)
+    nside = 16
+    lmax = 3 * nside - 1
+    npix = 12 * nside ** 2
+    mask = rng.uniform(0.2, 1.0, npix)
+    kwargs = {"n_iter": 2, "n_iter_mask": 2, "lmax": lmax}
+    maps = rng.normal(size=(1, npix))
+    if option == "n_iter_mask":
+        kwargs["n_iter_mask"] = 1
+    elif option == "lmax_mask":
+        kwargs["lmax_mask"] = lmax - 4
+    elif option == "spin":
+        maps = rng.normal(size=(2, npix))
+        kwargs["spin"] = 2
+    else:
+        kwargs["lite"] = True
+
+    field = nmt.NmtField(mask, maps, **kwargs)
+    assert field.alm_mask is None, f"{option} must not fuse"
+    ref = nmt.map2alm(
+        np.asarray(mask)[None, :], 0, field.minfo, field.ainfo_mask,
+        n_iter=field.n_iter_mask,
+    )
+    np.testing.assert_array_equal(
+        np.asarray(field.get_mask_alms()), np.asarray(ref)[0])

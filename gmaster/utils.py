@@ -21,7 +21,12 @@ from ._sht_pallas import (
 from ._sht_dfp32 import scalar_forward_latitudinal_dfp32
 from ._theta_matrix import band_bytes as _theta_band_bytes
 from ._theta_matrix import inverse_latitudinal as _theta_matrix_inverse_latitudinal
+from ._theta_matrix import (
+    inverse_latitudinal_pair as _theta_matrix_inverse_latitudinal_pair,
+)
 from ._theta_matrix import positive_latitudinal as _theta_matrix_latitudinal
+from ._theta_matrix import positive_latitudinal_pair as _theta_matrix_latitudinal_pair
+from ._theta_matrix import synth_pair_ready as _theta_matrix_synth_pair_ready
 from . import _spin_march_pallas as _spin_march
 from . import _spin_slice
 
@@ -1815,6 +1820,147 @@ def _alm2map_core_pallas(alm, *, nside, L, L_work, spin=0):
     return core(alm, nside=nside, L=L, L_work=L_work, spin=spin)
 
 
+def _shared_band_route(nside, L_work):
+    """Which stages of two same-geometry spin-0 transforms may share one band.
+
+    Returns ``(analysis, synthesis)``.  The MASTER pipeline runs exactly such a
+    pair -- a field's `n_iter` Richardson passes and, inside
+    `compute_coupling_matrix`, its mask's `n_iter_mask` passes, both spin 0 at
+    `lmax_mask == lmax` -- and at Nside 256 that pair is 11.918 ms of a 12.442 ms
+    pipeline (`.qwen/tmp/tracepipe_s32.log`).  Both passes stream the same
+    resident band, so one program can serve both: measured 0.55x/0.56x/0.53x of
+    two separate calls at Nside 256/512/1024 for the analysis and 0.68x/0.63x for
+    the synthesis, outputs bit-identical (`.qwen/tmp/pairsettle_s33.log`,
+    `.qwen/tmp/pairsettle_s33_big.log`).
+
+    The gate is the band's own: no march may be serving these geometries (a
+    forced `GMASTER_SPIN0_MARCH=1` would otherwise silently get the band here and
+    the march on the single route), the band must fit, and it must be concrete --
+    so `warm` builds it here, at top level, rather than inside a trace.  The
+    synthesis half answers separately because the contiguous re-layout is what
+    makes a second right-hand side cheap; with the copy refused the pair costs
+    4.19x instead (`_theta_matrix.inverse_latitudinal_pair`).
+    """
+    if not _prefer_theta_band(nside, L_work, 0):
+        return (False, False)
+    if (_spin_march.fold_requested(nside, L_work)
+            or _spin_march.fold_synth_requested(nside, L_work)):
+        return (False, False)
+    from . import _theta_matrix
+
+    if not _theta_matrix.warm(nside, L_work):
+        return (False, False)
+    return (True, _theta_matrix_synth_pair_ready(nside, L_work))
+
+
+def _map2alm_pair_once_pallas(maps_a, maps_b, ell, order, *, nside, L_work):
+    """Two scalar analyses, one ring FFT per map and one sweep of the band.
+
+    The azimuthal stage is per-map work and is done twice; only the latitudinal
+    contraction is shared, which is where the bytes are.
+    """
+    ftm_a = _forward_ring_fft_positive(
+        maps_a[0],
+        _ring_analysis_tables(
+            L_work, nside,
+            getattr(maps_a, "device", None) or getattr(maps_a[0], "device", None)),
+        L=L_work, nside=nside,
+    )
+    ftm_b = _forward_ring_fft_positive(
+        maps_b[0],
+        _ring_analysis_tables(
+            L_work, nside,
+            getattr(maps_b, "device", None) or getattr(maps_b[0], "device", None)),
+        L=L_work, nside=nside,
+    )
+    theta = _stable_thetas(L_work, nside)
+    weights = quadrature_jax.quad_weights_transform(L_work, "healpix", nside)
+    phase = -healpix_ffts.p2phi_rings_jax(jnp.arange(len(theta)), nside)
+    positive_a, positive_b = _theta_matrix_latitudinal_pair(
+        ftm_a, ftm_b, L=L_work, nside=nside, weights=weights, phase=phase)
+    return positive_a[ell, order][None, :], positive_b[ell, order][None, :]
+
+
+def _alm2map_core_pallas_pair_eager(alm_a, alm_b, *, nside, L, L_work):
+    """Two scalar syntheses over one sweep of the synthesis band."""
+    theta = _stable_thetas(L_work, nside)
+    phase = healpix_ffts.p2phi_rings_jax(jnp.arange(len(theta)), nside)
+    ftm_a, ftm_b = _theta_matrix_inverse_latitudinal_pair(
+        _positive_alm(alm_a[0], L=L, L_work=L_work),
+        _positive_alm(alm_b[0], L=L, L_work=L_work),
+        L=L_work, nside=nside, weights=jnp.ones_like(theta), phase=phase)
+    return (
+        jnp.real(_finish_inverse_pallas(ftm_a, L=L_work, nside=nside))[None, :],
+        jnp.real(_finish_inverse_pallas(ftm_b, L=L_work, nside=nside))[None, :],
+    )
+
+
+def _map2alm_core_pallas_pair_eager(
+    maps_a, maps_b, ell, order, *, nside, L, L_work, n_iter, pair_synth
+):
+    """Two Richardson recursions stepping in lockstep over one band.
+
+    The recursions are independent -- each refines its own alms against its own
+    map -- so they can share a pass even though neither can be batched internally.
+    `pair_synth` is static because whether this geometry's synthesis band may be
+    shared is decided before any trace, and a traced program must not branch on a
+    table cache.
+    """
+    alm_a, alm_b = _map2alm_pair_once_pallas(
+        maps_a, maps_b, ell, order, nside=nside, L_work=L_work
+    )
+    for _ in range(n_iter):
+        if pair_synth:
+            synth_a, synth_b = _alm2map_core_pallas_pair(
+                alm_a, alm_b, nside=nside, L=L, L_work=L_work
+            )
+        else:
+            synth_a = _alm2map_core_pallas(
+                alm_a, nside=nside, L=L, L_work=L_work, spin=0
+            )
+            synth_b = _alm2map_core_pallas(
+                alm_b, nside=nside, L=L, L_work=L_work, spin=0
+            )
+        delta_a, delta_b = _map2alm_pair_once_pallas(
+            synth_a - maps_a, synth_b - maps_b, ell, order,
+            nside=nside, L_work=L_work,
+        )
+        alm_a -= delta_a
+        alm_b -= delta_b
+    return alm_a, alm_b
+
+
+_alm2map_core_pallas_pair_traced = jax.jit(
+    _alm2map_core_pallas_pair_eager, static_argnames=("nside", "L", "L_work")
+)
+
+_map2alm_core_pallas_pair_traced = jax.jit(
+    _map2alm_core_pallas_pair_eager,
+    static_argnames=("nside", "L", "L_work", "n_iter", "pair_synth"),
+)
+
+
+def _alm2map_core_pallas_pair(alm_a, alm_b, *, nside, L, L_work):
+    """Paired synthesis, traced on the same condition as the paired analysis."""
+    core = (_alm2map_core_pallas_pair_traced if _trace_route_ready(nside, L_work)
+            else _alm2map_core_pallas_pair_eager)
+    return core(alm_a, alm_b, nside=nside, L=L, L_work=L_work)
+
+
+def _map2alm_core_pallas_pair(
+    maps_a, maps_b, ell, order, *, nside, L, L_work, n_iter, pair_synth
+):
+    """Paired analysis, traced whole below `_PALLAS_TRACED_MAX_L`.
+
+    Same condition as the single route, for the same reason: tracing removes host
+    dispatch, which pays up to `_PALLAS_TRACED_MAX_L` and costs 17 % above it.
+    """
+    core = (_map2alm_core_pallas_pair_traced if _trace_route_ready(nside, L_work)
+            else _map2alm_core_pallas_pair_eager)
+    return core(maps_a, maps_b, ell, order, nside=nside, L=L, L_work=L_work,
+                n_iter=n_iter, pair_synth=pair_synth)
+
+
 @lru_cache(maxsize=32)
 def _ell_order_arrays(lmax):
     ell = np.arange(lmax + 1)[None, :]
@@ -2239,6 +2385,43 @@ def map2alm(map, spin, map_info, alm_info, *, n_iter):
         L=L,
         L_work=L_work,
         n_iter=int(n_iter),
+    )
+
+
+def map2alm_pair(map_a, map_b, map_info, alm_info, *, n_iter):
+    """Two spin-0 analyses that share one pass over the Legendre band, or None.
+
+    `map_a` and `map_b` are both ``(1, npix)`` and are analysed against the same
+    `alm_info` with the same `n_iter`.  The two transforms are independent; the
+    only reason to run them together is that the band they stream is the largest
+    thing either one touches, so one program can serve both for 0.53-0.68x of the
+    price of two (`_shared_band_route`).  Returns `(alm_a, alm_b)`, or None when
+    this geometry cannot share -- the caller then makes two ordinary `map2alm`
+    calls, which is exactly what a None here preserves.
+
+    Both halves come out eagerly, so a caller that needs only one of them pays for
+    both; that second transform costs about a tenth of the first here against the
+    full price of a separate call, and it is the trade `NmtField` makes on behalf
+    of the pipeline that always needs both.
+    """
+    maps_a = jnp.asarray(map_a)
+    maps_b = jnp.asarray(map_b)
+    if (maps_a.ndim != 2 or maps_a.shape != (1, map_info.npix)
+            or maps_b.shape != (1, map_info.npix)):
+        raise ValueError("shared-band pair expects two (1, npix) spin-0 maps")
+    if not map_info.is_healpix:
+        return None
+    L = alm_info.lmax + 1
+    L_work = L
+    if not _use_pallas_sht(L_work, 0) or _use_multi_gpu_pallas(L_work, maps_a):
+        return None
+    analysis, pair_synth = _shared_band_route(map_info.nside, L_work)
+    if not analysis:
+        return None
+    return _map2alm_core_pallas_pair(
+        maps_a, maps_b, alm_info._ell, alm_info._m,
+        nside=map_info.nside, L=L, L_work=L_work, n_iter=int(n_iter),
+        pair_synth=pair_synth,
     )
 
 

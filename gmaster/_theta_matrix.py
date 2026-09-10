@@ -353,6 +353,20 @@ def _contract_theta(slab, chan):
     return jnp.stack([re.astype(jnp.float64), im.astype(jnp.float64)], axis=-1)
 
 
+def _assemble_blocks(even_accs, odd_accs, widths, L):
+    """Interleave the two parity groups back into contiguous ``ell`` order."""
+    blocks = []
+    for m0, w, even_acc, odd_acc in zip(range(0, L, BLOCK), widths, even_accs,
+                                        odd_accs):
+        rows = L - m0
+        odd_acc = jnp.pad(odd_acc, ((0, even_acc.shape[0] - odd_acc.shape[0]),
+                                    (0, 0), (0, 0)))
+        block = jnp.stack([even_acc, odd_acc], axis=1).reshape(
+            2 * even_acc.shape[0], w, 2)[:rows]
+        blocks.append(jnp.pad(block[..., 0] + 1j * block[..., 1], ((m0, 0), (0, 0))))
+    return jnp.concatenate(blocks, axis=1)
+
+
 @partial(jax.jit, static_argnames=("L", "widths"))
 def _transform(slabs_even, slabs_odd, ftm_pos, weights, phase, *, L, widths):
     ntheta = weights.shape[0]
@@ -375,17 +389,7 @@ def _transform(slabs_even, slabs_odd, ftm_pos, weights, phase, *, L, widths):
         accs.append([_contract_theta(slab, rhs2[m0:m0 + w])
                      for m0, w, slab in zip(range(0, L, BLOCK), widths, group)])
     even_accs, odd_accs = accs
-    blocks = []
-    for m0, w, even_acc, odd_acc in zip(range(0, L, BLOCK), widths, even_accs,
-                                        odd_accs):
-        rows = L - m0
-        # Interleave the two parity groups back into contiguous ell order.
-        odd_acc = jnp.pad(odd_acc, ((0, even_acc.shape[0] - odd_acc.shape[0]),
-                                    (0, 0), (0, 0)))
-        block = jnp.stack([even_acc, odd_acc], axis=1).reshape(
-            2 * even_acc.shape[0], w, 2)[:rows]
-        blocks.append(jnp.pad(block[..., 0] + 1j * block[..., 1], ((m0, 0), (0, 0))))
-    return jnp.concatenate(blocks, axis=1)
+    return _assemble_blocks(even_accs, odd_accs, widths, L)
 
 
 def positive_latitudinal(positive, *, L, nside, weights, phase):
@@ -411,6 +415,88 @@ def forward_latitudinal(ftm, *, L, nside, theta, weights, phase):
     """`positive_latitudinal` taking the full FFT map, for the existing probes."""
     return positive_latitudinal(ftm[:, L:], L=L, nside=nside, weights=weights,
                                 phase=phase)
+
+
+def _contract_theta_pair(slab, chan_a, chan_b):
+    """`_contract_theta` for two right-hand sides over one read of `slab`.
+
+    Four accumulators instead of two, in the same tuple reduce, for the same
+    reason and with the same caveat about spelling.  Measured against two
+    separate `_transform` calls on the resident band
+    (`.qwen/tmp/pairsettle_s33.log`, fp32 tables, outputs bit-identical to the
+    separate calls, rel 0.00e+00): two maps cost 0.55x/0.56x/0.53x of what two
+    calls cost at Nside 256/512/1024 (1.217 -> 0.673, 7.450 -> 4.136,
+    52.954 -> 28.144 ms) and 0.86x at Nside 128, where the stage is too small
+    to be bandwidth-bound.  The slab is the traffic and the second map is
+    arithmetic the card already has spare -- the same balance the isolated
+    m-block probe found (`.qwen/tmp/multi_rhs_contract.log`: 4 right-hand sides
+    cost +5 %).
+    """
+    chan_a = lax.convert_element_type(chan_a, slab.dtype)
+    chan_b = lax.convert_element_type(chan_b, slab.dtype)
+    zero = jnp.zeros((), slab.dtype)
+    acc = lax.reduce(
+        (slab * chan_a[None, :, :, 0], slab * chan_a[None, :, :, 1],
+         slab * chan_b[None, :, :, 0], slab * chan_b[None, :, :, 1]),
+        (zero, zero, zero, zero),
+        lambda x, y: (x[0] + y[0], x[1] + y[1], x[2] + y[2], x[3] + y[3]), (2,))
+    return (jnp.stack([acc[0].astype(jnp.float64), acc[1].astype(jnp.float64)],
+                      axis=-1),
+            jnp.stack([acc[2].astype(jnp.float64), acc[3].astype(jnp.float64)],
+                      axis=-1))
+
+
+@partial(jax.jit, static_argnames=("L", "widths"))
+def _transform_pair(slabs_even, slabs_odd, ftm_a, ftm_b, weights, phase, *,
+                    L, widths):
+    """`_transform` for two maps: one sweep of the band serves both.
+
+    Everything that depends on the map (the ring fold, the parity combination,
+    the interleaved assembly) is still done twice; only the slab read is shared,
+    which is the whole point -- this is a bandwidth program, not a work-sharing
+    one.
+    """
+    ntheta = weights.shape[0]
+    north = (ntheta + 1) // 2
+    m = jnp.arange(L, dtype=jnp.float64)[:, None]
+    jn = jnp.arange(north)
+    partner = ntheta - 1 - jn
+    sign = 1.0 - 2.0 * jnp.bitwise_and(jnp.arange(L), 1).astype(jnp.float64)
+    rhs = {}
+    for tag, ftm_pos in (("a", ftm_a), ("b", ftm_b)):
+        folded = ftm_pos.T * weights[None, :] * jnp.exp(1j * (m * phase[None, :]))
+        north_rhs = folded[:, jn]
+        south_rhs = jnp.where(partner == jn, 0.0, folded[:, partner])
+        for delta, parity in ((1.0, "even"), (-1.0, "odd")):
+            combined = north_rhs + delta * sign[:, None] * south_rhs
+            rhs[tag + parity] = jnp.stack([combined.real, combined.imag], axis=-1)
+    accs = ([], [], [], [])
+    even_a, odd_a, even_b, odd_b = accs
+    for parity, group in (("even", slabs_even), ("odd", slabs_odd)):
+        for m0, w, slab in zip(range(0, L, BLOCK), widths, group):
+            out_a, out_b = _contract_theta_pair(slab, rhs["a" + parity][m0:m0 + w],
+                                                rhs["b" + parity][m0:m0 + w])
+            (even_a if parity == "even" else odd_a).append(out_a)
+            (even_b if parity == "even" else odd_b).append(out_b)
+    return (_assemble_blocks(even_a, odd_a, widths, L),
+            _assemble_blocks(even_b, odd_b, widths, L))
+
+
+def positive_latitudinal_pair(positive_a, positive_b, *, L, nside, weights, phase):
+    """Two positive-m analysis theta transforms from one pass over the band.
+
+    Returns `(alm_a, alm_b)`, or None if the band is not resident as concrete
+    device buffers -- the same decline and for the same reasons as
+    `positive_latitudinal`, so a caller can fall back to two separate calls.
+    """
+    assert BLOCK % 2 == 0, "the parity split assumes an even m-block"
+    band = _band(band_geometry(nside, L))
+    if band is None:
+        return None
+    return _transform_pair(band[0], band[1], positive_a, positive_b, weights,
+                           phase, L=L,
+                           widths=tuple(min(BLOCK, L - m0)
+                                        for m0 in range(0, L, BLOCK)))
 
 
 _SYNTH_CACHE = {}
@@ -526,6 +612,19 @@ def warm(nside, L):
     return geometry in _SYNTH_CACHE
 
 
+def synth_pair_ready(nside, L):
+    """Whether two syntheses can share this geometry's band, after `warm`.
+
+    Sharing needs the contiguous re-layout: with the copy refused and the reduce
+    strided, a second right-hand side costs 4.19x rather than saving anything
+    (`inverse_latitudinal_pair`).  Asking after `warm` keeps the answer about
+    residency rather than intent, and a cache miss here means the caller should
+    pair the analysis and run the two syntheses apart.
+    """
+    cached = _SYNTH_CACHE.get(band_geometry(nside, L))
+    return cached is not None and cached[1] == ELL_CONTIG
+
+
 def _contract_ell(slab, rhs):
     """``acc[m, j] = sum_e slab[m, j, e] * rhs[m, e]``, reducing the ell axis.
 
@@ -630,3 +729,82 @@ def inverse_latitudinal(positive_alm, *, L, nside, weights, phase):
     return _inverse(slabs_even, slabs_odd, jnp.asarray(positive_alm),
                     weights, phase, L=L, strided=strided,
                     widths=tuple(min(BLOCK, L - m0) for m0 in range(0, L, BLOCK)))
+
+
+def _contract_ell_pair(slab, rhs_a, rhs_b):
+    """`_contract_ell` for two right-hand sides over one read of `slab`.
+
+    Contiguous-`ell` layout only; see `inverse_latitudinal_pair` for why the
+    strided twin is not offered.
+    """
+    re_a = lax.convert_element_type(rhs_a.real, slab.dtype)
+    im_a = lax.convert_element_type(rhs_a.imag, slab.dtype)
+    re_b = lax.convert_element_type(rhs_b.real, slab.dtype)
+    im_b = lax.convert_element_type(rhs_b.imag, slab.dtype)
+    zero = jnp.zeros((), slab.dtype)
+    acc = lax.reduce((slab * re_a[:, None, :], slab * im_a[:, None, :],
+                      slab * re_b[:, None, :], slab * im_b[:, None, :]),
+                     (zero,) * 4,
+                     lambda x, y: (x[0] + y[0], x[1] + y[1],
+                                   x[2] + y[2], x[3] + y[3]), (2,))
+    return (acc[0].astype(jnp.float64) + 1j * acc[1].astype(jnp.float64),
+            acc[2].astype(jnp.float64) + 1j * acc[3].astype(jnp.float64))
+
+
+@partial(jax.jit, static_argnames=("L", "widths"))
+def _inverse_pair(slabs_even, slabs_odd, alm_a, alm_b, weights, phase, *, L,
+                  widths):
+    """`_inverse` for two sets of alms over one pass over the synthesis band."""
+    north = slabs_even[0].shape[1]
+    m = jnp.arange(L, dtype=jnp.float64)[:, None]
+    sign = 1.0 - 2.0 * jnp.bitwise_and(jnp.arange(L), 1).astype(jnp.float64)
+    north_factor = weights[:north] * jnp.exp(1j * (m * phase[:north]))
+    south_factor = (
+        jnp.flip(weights)[: north - 1]
+        * jnp.exp(1j * (m * jnp.flip(phase)[: north - 1]))
+    )
+    north_a, south_a, north_b, south_b = [], [], [], []
+    for m0, w, even, odd in zip(range(0, L, BLOCK), widths, slabs_even, slabs_odd):
+        rhs_even_a = alm_a[m0::2, m0:m0 + w].T
+        rhs_odd_a = alm_a[m0 + 1::2, m0:m0 + w].T
+        rhs_even_b = alm_b[m0::2, m0:m0 + w].T
+        rhs_odd_b = alm_b[m0 + 1::2, m0:m0 + w].T
+        acc_e_a, acc_e_b = _contract_ell_pair(even, rhs_even_a, rhs_even_b)
+        acc_o_a, acc_o_b = _contract_ell_pair(odd, rhs_odd_a, rhs_odd_b)
+        block_sign = (1.0 if m0 % 2 == 0 else -1.0) * sign[m0:m0 + w]
+        for acc_e, acc_o, nlist, slist in ((acc_e_a, acc_o_a, north_a, south_a),
+                                           (acc_e_b, acc_o_b, north_b, south_b)):
+            nlist.append((acc_e + acc_o) * north_factor[m0:m0 + w])
+            slist.append(((acc_e - acc_o)[:, :north - 1] * block_sign[:, None])
+                         * south_factor[m0:m0 + w])
+    outs = []
+    for nlist, slist in ((north_a, south_a), (north_b, south_b)):
+        north_vals = jnp.concatenate(nlist, axis=0)   # (L, north)
+        south_vals = jnp.concatenate(slist, axis=0)   # (L, north - 1)
+        outs.append(jnp.transpose(jnp.concatenate(
+            [north_vals, jnp.flip(south_vals, axis=1)], axis=1)))
+    return outs[0], outs[1]
+
+
+def inverse_latitudinal_pair(positive_alm_a, positive_alm_b, *, L, nside,
+                             weights, phase):
+    """Two positive-m synthesis theta transforms from one pass over the band.
+
+    Returns `(ftm_a, ftm_b)`, or None when the pair cannot be served: the band
+    being absent, or its synthesis copy having been refused.  The refusal on the
+    strided layout is a measurement, not a convenience -- with the reduced axis
+    leading, four accumulators cost 4.19x what two separate strided calls cost
+    at Nside 1024 (58.285 -> 244.251 ms, `.qwen/tmp/pairsettle_s33_big.log`),
+    where with the contiguous layout the same pair costs 0.63x of them at
+    Nside 512 (8.483 -> 5.321 ms).  A strided gather has no spare bandwidth to
+    lend, so the second map is pure overhead.
+    """
+    assert BLOCK % 2 == 0, "the parity split assumes an even m-block"
+    geometry = band_geometry(nside, L)
+    synth = _synth_band(geometry)
+    if synth is None or synth[1] == THETA_CONTIG:
+        return None
+    return _inverse_pair(synth[0][0], synth[0][1], jnp.asarray(positive_alm_a),
+                         jnp.asarray(positive_alm_b), weights, phase, L=L,
+                         widths=tuple(min(BLOCK, L - m0)
+                                      for m0 in range(0, L, BLOCK)))

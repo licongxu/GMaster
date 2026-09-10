@@ -758,6 +758,58 @@ def test_no_tracer_can_enter_the_table_caches():
         assert hasattr(slab, "block_until_ready")
 
 
+@pytest.mark.skipif(not _HAS_NVIDIA_GPU, reason="requires an NVIDIA GPU")
+@pytest.mark.parametrize("nside", [64, 128])
+def test_shared_band_pair_is_bit_identical_to_two_transforms(nside):
+    """Two spin-0 analyses over one band must be the two analyses, exactly.
+
+    The pair runs both Richardson recursions in lockstep so each latitudinal
+    contraction serves two maps for one read of the Legendre band.  Every operand
+    of either transform is unchanged -- same ring FFT per map, same band, same
+    accumulation order per channel -- so the assertion is equality, not tolerance,
+    and it is the same equality measured on the isolated programs at Nside
+    128-1024 (`.qwen/tmp/pairsettle_s33.log`, rel 0.00e+00) and end to end through
+    a field and a coupling matrix (`.qwen/tmp/pairverify_s33.log`).  Asserting the
+    route is engaged first keeps a silent decline from making the test vacuous.
+    """
+    lmax = 3 * nside - 1
+    L = lmax + 1
+    npix = 12 * nside ** 2
+    assert utils._shared_band_route(nside, L)[0]
+    minfo = nmt.NmtMapInfo(None, (npix,))
+    ainfo = nmt.NmtAlmInfo(lmax)
+    rng = np.random.default_rng(23)
+    maps_a = jnp.asarray(rng.normal(size=(1, npix)))
+    maps_b = jnp.asarray(rng.normal(size=(1, npix)))
+
+    pair = utils.map2alm_pair(maps_a, maps_b, minfo, ainfo, n_iter=3)
+    assert pair is not None
+    for maps, got in ((maps_a, pair[0]), (maps_b, pair[1])):
+        ref = np.asarray(nmt.map2alm(maps, 0, minfo, ainfo, n_iter=3))
+        np.testing.assert_array_equal(np.asarray(got), ref)
+
+
+@pytest.mark.skipif(not _HAS_NVIDIA_GPU, reason="requires an NVIDIA GPU")
+def test_shared_band_pair_declines_with_the_band(monkeypatch):
+    """No band, no pair: the caller must be able to fall back to two `map2alm` calls.
+
+    `map2alm_pair` returning None is the whole fallback contract -- the field
+    constructor treats it as "do what you did before" -- so it has to refuse for
+    every reason the band route refuses, including the budget.  A pair that pressed
+    on here would be asking for the fused fp64 kernel twice.
+    """
+    nside = 64
+    L = 3 * nside
+    npix = 12 * nside ** 2
+    minfo = nmt.NmtMapInfo(None, (npix,))
+    ainfo = nmt.NmtAlmInfo(L - 1)
+    maps = jnp.asarray(np.zeros((1, npix)))
+    assert utils.map2alm_pair(maps, maps, minfo, ainfo, n_iter=1) is not None
+    monkeypatch.setattr(utils, "_MATRIX_BAND_BUDGET", 0)
+    assert utils._shared_band_route(nside, L) == (False, False)
+    assert utils.map2alm_pair(maps, maps, minfo, ainfo, n_iter=1) is None
+
+
 @pytest.mark.parametrize("nside", [512, 1024, 2048, 4096, 8192])
 def test_synthesis_tile_is_per_spin_and_still_powers_of_two(nside):
     """The synthesis launch geometry agrees with the chunk the kernel is compiled against.
