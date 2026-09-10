@@ -7747,6 +7747,116 @@ remaining shared-band work at 1024 is the three synthesis passes, blocked on the
 holding it needs 2×36.7 GiB of band plus `_SYNTH_RESERVE` against a 73.4 GiB pool, which is the
 `_synth_band` capacity argument, not a kernel problem.
 
+---
+
+## Addendum 28 (session 34): the sentence "the march regenerates its values, so there is no shared
+operand" is backwards — regenerating is the expensive operand, and pairing on it takes Nside 2048
+spin 0 from 2.4x to 2.7x
+
+**1. The sentence, and why it was backwards.** Addendum 27 §7, written nine hours earlier: *"Nside ≥
+2048 spin 0 has no band to share … and the march regenerates its values per pass, so there is no
+shared operand there."* The band pairing shares **bytes**: two maps reading one resident table. The
+march has no bytes, but it regenerates a Legendre row for every `(m, theta, ell)` triple, and that
+regeneration is the cost. A second map does not need a second row. Read the other way, the absence of
+a table is the reason the march pairs *better in kind* than the band does — the shared operand is
+generated work rather than memory, and nothing about it depends on the map.
+
+The seam was already in the kernel. `_spin_march_pallas._kern` ends its degree step with
+
+```python
+parts = jnp.sum(val[:, None] * r, axis=0) * (sc * sgn)
+```
+
+where `r` is an `(chunk, NC)` block holding the four channels of one map (direct re/im, ring-reversed
+mirror re/im) and `val` is the marched row rescaled into range. `val` is a function of the triple
+alone. `NC` became a kernel parameter `nc`; two maps now occupy channels `0:4` and `4:8` of one
+block, one `_fold_analyze([...])` serves either count, and the rhs is one `(L, npad, nc)` slab built
+once as before. `forward_latitudinal_positive_pair` is the new entry; `map2alm_pair` asks the band
+first and the march second, so the pair route exists wherever a single transform would run.
+
+**2. Marginal cost.** Isolated latitudinal step, one process per size, GPU1, medians of 5 (3 at
+2048), inputs random complex `(4·Nside−1, L)` blocks like the real ring-FFT output
+(`.qwen/tmp/marchpair_512.log`, `marchpair_1024.log`, `marchpair_2048.log`):
+
+| Nside | route | one march | two calls | one pair | pair ÷ two calls | pair ÷ one march |
+|---|---|---|---|---|---|---|
+| 512 | march (forced) | 13.90 ms | 26.81 ms | 13.10 ms | **0.489** | 0.943 |
+| 1024 | march (forced) | 59.04 ms | 109.19 ms | 55.02 ms | **0.504** | 0.932 |
+| 2048 | march (live) | 289.90 ms | 578.36 ms | 435.00 ms | **0.752** | 1.501 |
+
+At 512 a second map is free — the pair costs *less* than one of the two marches it replaces. By 2048
+it costs half a march again, because two things besides the recurrence double with the map: the
+emit's fp64 partial slab (`(mb, ntile, L−m0, nc)`) and the fp32 rhs. That is the whole trend in the
+table, and it says where the next byte-level cut on this kernel is (the partial slab, not the math).
+Device peak at 2048 is 8.82 GiB for the probe, 4.1 → 4.3 GiB in the pipeline.
+
+**3. Accuracy, since this route cannot be bit-identical.** Widening the emit block from 4 to 8
+channels changes Triton's reduction tree over `chunk`, so the first map's answer moves: 1.23e-07 /
+1.25e-07 / 1.30e-07 relative against the single march at the three sizes, and 3.9e-07 (Nside 64) /
+4.4e-06 (256) through `map2alm` at `n_iter=3` (`.qwen/tmp/marchpairwire_s34.log`). That number is
+meaningless without a denominator, so it was measured against something that is not the march: at
+Nside 512 the fp64 band still exists, and `|paired − band| = 2.03e-04` (max abs 8.406e-08) against
+`|single − band| = 2.03e-04` (8.405e-08). Pairing neither helps nor hurts; the march's own fp32-lane
+error is two orders larger than the reassociation. `pair(a, 0)`'s second half is exactly zero, which
+is the check that the channel slicing is right rather than merely accurate. End to end the harness's
+own comparison against pymaster at Nside 2048 spin 0 reads `rel dCl` **1.40e-06 split → 1.35e-06
+fused** — the fused arm is a hair better, and both are inside the reference's run-to-run drift.
+
+**4. End to end** (`.qwen/tmp/pairrun_s34.log`, harness untouched, one process per arm, `GM_PAIR=split`
+replacing `field.map2alm_pair` with a decliner, fp32 tables + fp64 rings + `GMASTER_COUPLING_PRECISION=fp32`):
+
+| Nside | arm | TOTAL | vs pymaster | field + mask | `rel dCl` |
+|---|---|---|---|---|---|
+| 2048 | split | 4558 ms | **2.4x** | 2072 + 2085 = 4157 ms | 1.40e-06 |
+| 2048 | fused | **3961 ms** | **2.7x** | 3562 + 14 = 3576 ms | 1.35e-06 |
+| 1024 | split | 470 ms | 3.8x | 224 + 224 = 448 ms | 1.27e-07 |
+| 1024 | fused | **378 ms** | **4.6x** | 356 + 0 = 356 ms | 1.27e-07 |
+
+The 2048 saving is 581 ms against the 573 ms the isolated probe predicts (4 paired analysis steps ×
+143.4 ms), which is the arithmetic crossing rather than a coincidence of the same run. The 1024 row is
+the band route from addendum 27 and is quoted here because it reproduces that session's 469.8 → 377.5
+within 1 %, which is the check that nothing on the band side moved.
+
+**5. The synthesis is not paired, and probably cannot be.** The pipeline still runs six marched
+synthesis passes per field+mask pair at ≥ 2048, so it is the obvious next candidate, and `_kern_synth`
+is structurally different: it keeps **per-lane** accumulators (`a_r`, `b_r` for the direct sum and
+another pair for the mirror, each `(chunk,)` float32 with `chunk = _ST0 = 1024` for spin 0) and loads
+eight per-degree coefficient arrays per map. Both of those scale with the number of maps, so there is
+no shared tree to widen — a second map doubles the accumulating state and the coefficient loads
+instead of joining a reduction that is already running. Counting ops puts the paired cost at ≥ 1.4x of
+one march, and at `_ST0 = 1024` the state is already ~64 fp32/thread with one map, so the likely
+outcome is spills rather than a win. Not attempted. Anyone who does should price a narrower `_ST0`
+for the paired arm first; the recurrence-sharing argument that made this addendum work does not
+transfer, because the synthesis kernel does not reduce theta inside the degree loop.
+
+**6. Route table after this change.**
+
+| geometry | analysis single | analysis pair | synthesis single | synthesis pair |
+|---|---|---|---|---|
+| band fits (≤ 1024 at fp32) | band | band — bit-identical, 0.53–0.56 | band | band if `ELL_CONTIG`, 0.63–0.68 |
+| band refused (≥ 2048) | fold march | fold march — 0.752, reassociation only | fold march | not pairable (§5) |
+| `GMASTER_SPIN0_MARCH=1` | fold march | fold march | fold march | not pairable |
+
+`map2alm_pair` now returns None only when **neither** source serves: refusing the band budget alone no
+longer refuses the pair, which is why `test_shared_band_pair_declines_with_the_band` became
+`test_shared_band_pair_declines_when_no_route_serves` and has to shut the march off too. The new
+`test_marched_pair_shares_one_recurrence` forces the march at Nside 64/128 and asserts a tolerance
+(1e-4 of the alms' own scale) instead of equality, with the measured reassociation two orders below it.
+
+**7. Verification.** `185 passed, 3 skipped` on the default-config suite (`.qwen/tmp/suite_s34.log`),
+up from 183 by the two new march-pair parameters; the band-pair parity tests still assert exact
+equality and still pass, which is the check that `_forward_fold_impl` → `_fold_analyze([...])` did not
+disturb the single route.
+
+**8. The lesson, which is the second one of this shape in two sessions.** Addendum 26's census said
+the field stage had nothing to batch; addendum 27 found it had two transforms of one geometry. This
+addendum's parent sentence said the pairing needed a shared *operand* and concluded there was none at
+≥ 2048. Both times the closure was a description of the implementation, not a measurement of the
+cost, and both times the cost breakdown said otherwise. Before accepting "there is nothing to share",
+ask what the kernel actually spends its time on — if it spends it recomputing something that does not
+depend on the input in question, that recomputation is the shared operand, and it is usually a bigger
+one than the bytes.
+
 
 
 

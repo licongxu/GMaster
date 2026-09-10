@@ -276,13 +276,21 @@ Measured in one process with the fusion forced to decline as the control arm, sp
 3.757 → 3.061 ms at `Nside=128`, 12.969 → 9.212 ms (**1.41x**) at 256, 68.235 → 50.262 ms (1.36x) at
 512 and 469.817 → 377.517 ms (1.24x) at 1024, with the alms **bit-identical** on both halves and the
 decoupled cell unmoved. Paired synthesis is refused wherever the re-layout is strided (`Nside=1024`
-measured 4.19 *worse* there), so that size pairs the analysis only. Spin 2 and `Nside>=2048` are
-untouched — the latter has no band at all — and the route is declined, never raised, for `lite`
+measured 4.19 *worse* there), so that size pairs the analysis only. Spin 2 is untouched.
+`Nside>=2048` has no band either, but the route that serves it regenerates its Legendre row inside
+the kernel, and that regeneration — not the bytes — is what a pass costs; two maps join one emit
+channel block and share the recurrence, which costs **0.752** of two separate calls at `Nside=2048`
+(435.0 ms against 578.4 ms). On the harness that takes the `Nside=2048` spin-0 cell from 2.4x to
+**2.7x** (4558 → 3961 ms) with its own `rel dCl` going 1.40e-06 → 1.35e-06, so unlike the band
+pairing this one is not bit-identical: widening the emit block reassociates the theta sum, and the
+paired route's error against the fp64 band is the march's own error unchanged (`2.03e-04` either
+way). The route is declined, never raised, for `lite`
 fields, template/catalog/flat/anisotropic fields, a differing `lmax_mask` or `n_iter_mask`, or a spin-2
 field whose mask is spin 0. Consequence for the benchmark: the `mask` column is now ~0 at spin 0
 because the work moved into `field`, which is the expected reading, not a vanished stage. The spin-0
 `TOTAL`s in the two paragraphs above and below predate this; with both precision switches on, the
-fused board is **7.5x / 6.7x / 6.8x / 4.8x** at `Nside=128/256/512/1024` (HANDOFF addendum 27).
+fused board is **7.5x / 6.7x / 6.8x / 4.8x** at `Nside=128/256/512/1024` and **2.7x** at 2048
+(HANDOFF addenda 27 and 28).
 
 ```bash
 python benchmarks/benchmark_pipeline.py --nside 512 --spins 0,2 \
