@@ -7615,6 +7615,138 @@ own cost did not change, while the reference would have had to read ~388 ms rath
 the published 5.7x. This is the rule in addendum 23 §4 working as intended: at these sizes the ratio is
 a two-code quantity and only GMaster's milliseconds are comparable across sessions.
 
+## Addendum 27 (session 33): the batch the census said does not exist is the biggest spin-0 lever on the board — one band read now serves the field and its mask, worth 1.23-1.41x
+
+**1. What was closed, and by what kind of sentence.** Two independent transform groups run inside every
+benchmarked spin-0 pipeline call: `NmtField.__init__` analyses the field over `1 + 2*n_iter` passes, and
+`compute_coupling_matrix` → `get_mask_alms` analyses the mask over the same number. `lmax_mask == lmax`
+and `n_iter_mask == n_iter == 3` by default in this library *and* in NaMaster (addendum 23), so the two
+are the same transform of the same geometry over the same resident Legendre band. That is the textbook
+shape for a shared-operand batch, and the batch was measured feasible in session 10
+(`.qwen/tmp/multi_rhs_contract.log`: 4 right-hand sides cost **+5 %** over one m-block slab, fp32). It
+was nevertheless closed twice, both times by prose rather than by a number:
+
+- `HANDOFF.md:3377-3379` — *"The API is the blocker: `map2alm` accepts exactly `(1, npix)` for spin 0
+  … so there is today no way to hand GMaster two maps that could share one band read."*
+- `HANDOFF.md:6172-6175` — *"There is no unbatched crowd of independent transforms to fold: `map2alm`
+  takes exactly one field … and the only two calls in the pipeline carry different spins at spin 2."*
+
+The second sentence is true at spin 2 and is the one that got generalised. At spin 0 the two calls carry
+the *same* spin — the census's own table (spin 0: field 1 call / 7 passes, coupling 1 call / 7 passes)
+describes precisely the batch its conclusion denies. This is the failure mode addendum 26 §6 describes:
+read a closed lever as "someone hit an obstacle here", and ask whether the obstacle was a measurement or
+just a door. An API sentence is a door.
+
+**2. The settle, on the shipped program rather than a slab.** `.qwen/tmp/pairsettle_s33.py` copies
+`_theta_matrix._transform` and `_inverse` with the tuple reduce widened from two accumulators (re, im of
+one map) to four (two maps), and times one paired program against two separate calls on the resident
+band — per-map work (ring fold, parity combination, interleaved assembly) is deliberately duplicated in
+the paired version, because it really is duplicated in production; only the slab read is shared. fp32
+tables, outputs compared against the separate calls:
+
+```
+nside  dir          two singles   paired   paired/singles   rel
+  128  analysis          0.186      0.159        0.86       0.00e+00
+  128  synth(ell)        0.306      0.293        0.96       0.00e+00
+  256  analysis          1.217      0.673        0.55       0.00e+00
+  256  synth(ell)        1.573      1.074        0.68       0.00e+00
+  512  analysis          7.450      4.136        0.56       0.00e+00
+  512  synth(ell)        8.483      5.321        0.63       0.00e+00
+ 1024  analysis         52.954     28.144        0.53       0.00e+00
+ 1024  synth(theta)     58.285    244.251        4.19       0.00e+00
+```
+
+Bit-identical in every row, which is what a reduce that only gains lanes should be. The last row is the
+one real refusal in the change: at Nside 1024 the synthesis band's contiguous re-layout is declined (two
+copies plus `_SYNTH_RESERVE` exceed the pool, `_synth_band`), and a strided gather has no spare bandwidth
+to lend — four accumulators over it cost **4.19x** what two separate strided calls cost. So
+`inverse_latitudinal_pair` returns None there and the paired core runs its two syntheses apart. The
+analysis half still pairs at 1024, which is where most of that geometry's win comes from.
+
+**3. What shipped.** `_theta_matrix.positive_latitudinal_pair` / `inverse_latitudinal_pair` /
+`synth_pair_ready`; `utils._shared_band_route` (returns `(analysis, synthesis)`; refuses if the band does
+not fit, if the band is not concrete after `warm`, or if either march route is serving the geometry, so a
+forced `GMASTER_SPIN0_MARCH=1` cannot get the band on one route and the march on the other),
+`_map2alm_pair_once_pallas`, `_alm2map_core_pallas_pair_{eager,traced}`,
+`_map2alm_core_pallas_pair_{eager,traced}` and the entry point `utils.map2alm_pair`, which returns None
+whenever it cannot serve and is therefore always fallible from the caller's point of view.
+`NmtField.__init__` consults it for a spin-0 field when `lmax_mask == lmax`, `n_iter_mask == n_iter`, the
+mask is present, the mask is not anisotropic and the field is not `lite`, and puts the second result
+straight into `alm_mask` — the slot `get_mask_alms` would have filled later, sliced to the same unpacked
+row so the two routes are interchangeable. The recursions step in lockstep; each still refines its own
+alms against its own map, so nothing about either Richardson iteration changes.
+
+**4. The A/B, one process per arm** (`.qwen/tmp/pairab_s33.py`, `.qwen/tmp/pairab_s33.log`, fp32 tables,
+fp64 rings, coupling fp32, 11 repeats; the split arm is the shipped code with `map2alm_pair` made to
+decline, i.e. the pre-change route):
+
+```
+nside spin  split TOTAL  fused TOTAL  speedup   field+mask pair: split -> fused
+  128   0        3.757        3.061     1.23x       3.386 ->  2.831
+  256   0       12.969        9.212     1.41x      12.036 ->  8.562
+  512   0       68.235       50.262     1.36x      65.456 -> 46.637
+ 1024   0      469.817      377.517     1.24x     446.656 -> 353.688
+  256   2       20.749       20.646     1.00x      17.940 -> 17.919  (control)
+  512   2      117.712      117.380     1.00x     106.415 -> 106.403  (control)
+```
+
+Spin 2 does not fuse at all — its field is spin 2 and its mask is spin 0, so there is nothing to share,
+and the control arms move by 0.5 % and 0.3 %. The split arm reproduces addendum 26 §8's pre-change
+milliseconds (68.235 against 68), so the A/B is measuring the change and nothing else.
+
+The paired-program numbers in §2 predict these savings almost exactly. At 256, four analysis pairs and
+three synthesis pairs should save `4*(1.217-0.673) + 3*(1.573-1.074) = 3.68 ms`; measured 3.47 ms. At
+1024, where only the analysis pairs, `4*(52.954-28.144) = 99 ms`; measured 93 ms. At 128 the measured
+0.56 ms exceeds the 0.15 ms the band arithmetic predicts, because below `_PALLAS_TRACED_MAX_L` the pair
+is also one traced program instead of two and drops a jit boundary — the addendum-26 effect and this one
+stacking, not the band.
+
+**5. Reading the board after this.** `benchmarks/benchmark_pipeline.py` rows (fp32 tables, fp64 rings,
+`GMASTER_COUPLING_PRECISION=fp32`, 11 repeats; `.qwen/tmp/pairboard_s33.log`): 128 spin 0 `22 → 3 ms
+(7.5x)`, 256 spin 0 `63 → 9 ms (6.7x)`, 512 spin 0 `352 → 52 ms (6.8x)`, 1024 spin 0 `1791 → 377 ms
+(4.8x)`, and the untouched controls 256 spin 2 `165 → 21 ms (7.9x)`, 512 spin 2 `731 → 119 ms (6.1x)`.
+Accuracy against the reference is unchanged by construction (bit-identical alms): `rel dCl` 8.96e-08 /
+7.71e-08 / 9.79e-08 / 1.27e-07, the same fp32-table errors as before the change.
+
+**The `mask` column is now ~0 and that is the expected reading, not a vanished stage.** It is defined in
+the harness as "construct a fresh field, call `get_mask_alms`, subtract the constructor time", and the
+constructor now does that work fused with the field's own transform. The work is inside `field`, not
+gone: the fused `field` column (8.562 ms at 256) is more than the old field column (6.597 ms) by exactly
+the second transform's marginal cost, and the stage sum and the TOTAL both fall by the shared reads.
+What a spin-0 field constructor costs a user who never reaches a coupling matrix went from one transform
+to one-and-a-tenth, because the second map in a paired program costs ~10 % of the first rather than
+100 % — that is the trade being made on a pipeline user's behalf, and it is why the fusion is gated on
+`not lite`: a `lite` field asked not to retain derived state and keeps the lazy route.
+
+**6. Verification.** `test_shared_band_pair_is_bit_identical_to_two_transforms` (Nside 64, 128; asserts
+the route is engaged before comparing, so a silent decline cannot make it vacuous),
+`test_shared_band_pair_declines_with_the_band` (budget closed → `(False, False)` and `map2alm_pair`
+returns None), `test_scalar_field_shares_one_band_between_field_and_mask` (the fused field's `alm` and
+`alm_mask` equal the declined route's, exactly), and
+`test_mask_fusion_needs_two_transforms_of_the_same_shape` (`n_iter_mask`, `lmax_mask`, spin 2, `lite` —
+each falls back and still returns the lazy route's mask alms). End-to-end check
+(`.qwen/tmp/pairverify_s33.py`, `.qwen/tmp/pairverify_s33.log`): field alms and mask alms bit-identical
+to the declined route at Nside 64/128/256, decoupled cell agreeing to 3.2e-16 / 4.9e-16 / 6.5e-16 — the
+coupling path's own float noise, since the alms that feed it are identical.
+
+Two bugs found on the way and worth remembering as shapes, not facts. First, `alm_mask` initially landed
+as a `(1, n)` row because `map2alm_pair` returns `map2alm`'s packing while `get_mask_alms` returns an
+unpacked row; the pipeline still scored `4.9e-16` because the consumers index it, so a shape contract
+between a cached value and a lazily computed one is invisible unless it is asserted (`ndim` is now).
+Second, a test that passed `n_iter=2` without `n_iter_mask` failed to fuse — the correct behaviour, since
+that field's mask transform genuinely differs, and the reason the refusal test now sets both counts and
+varies exactly one dimension per arm.
+
+**7. What this does not touch.** Nside ≥ 2048 spin 0 has no band to share (addendum 23: 290.9 GiB fp32
+against a 96 GB card) and the march regenerates its values per pass, so there is no shared operand
+there; spin 2 at any size has two different spins in its two transform groups; `NmtCatalogField`,
+`NmtFieldFlat` and `field.get_anisotropic_mask_alms` keep their own routes; and `n_iter != n_iter_mask`
+(no longer reachable by the defaults, but reachable by any caller who passes one count and not the other)
+is a genuine two-transform case that falls back whole rather than pairing the shorter prefix. The
+remaining shared-band work at 1024 is the three synthesis passes, blocked on the contiguous re-layout:
+holding it needs 2×36.7 GiB of band plus `_SYNTH_RESERVE` against a 73.4 GiB pool, which is the
+`_synth_band` capacity argument, not a kernel problem.
+
 
 
 

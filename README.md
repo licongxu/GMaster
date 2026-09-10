@@ -267,6 +267,23 @@ program may read the band but must never build it. That is worth 13.74 → 12.44
 `Nside=256` spin 0 with bit-identical alms and costs ~10 GB of peak host RSS during the compile;
 `Nside=512` is 17 % *slower* as one program and is left op-by-op (HANDOFF addendum 26).
 
+A scalar field and its mask are now analysed by *one* program. `lmax_mask` defaults to `lmax` and
+`n_iter_mask` to `n_iter` in both codes, so a field built the way a pipeline builds one carries two
+independent spin-0 transforms of identical geometry over the same resident Legendre band. One
+latitudinal reduction with four accumulators (real and imaginary parts of both maps) serves the pair,
+so the band is read once instead of twice; per-map work is duplicated, only the slab read is shared.
+Measured in one process with the fusion forced to decline as the control arm, spin-0 `TOTAL` goes
+3.757 → 3.061 ms at `Nside=128`, 12.969 → 9.212 ms (**1.41x**) at 256, 68.235 → 50.262 ms (1.36x) at
+512 and 469.817 → 377.517 ms (1.24x) at 1024, with the alms **bit-identical** on both halves and the
+decoupled cell unmoved. Paired synthesis is refused wherever the re-layout is strided (`Nside=1024`
+measured 4.19 *worse* there), so that size pairs the analysis only. Spin 2 and `Nside>=2048` are
+untouched — the latter has no band at all — and the route is declined, never raised, for `lite`
+fields, template/catalog/flat/anisotropic fields, a differing `lmax_mask` or `n_iter_mask`, or a spin-2
+field whose mask is spin 0. Consequence for the benchmark: the `mask` column is now ~0 at spin 0
+because the work moved into `field`, which is the expected reading, not a vanished stage. The spin-0
+`TOTAL`s in the two paragraphs above and below predate this; with both precision switches on, the
+fused board is **7.5x / 6.7x / 6.8x / 4.8x** at `Nside=128/256/512/1024` (HANDOFF addendum 27).
+
 ```bash
 python benchmarks/benchmark_pipeline.py --nside 512 --spins 0,2 \
   --precision fp32 --ring-precision fp64
