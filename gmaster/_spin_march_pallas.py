@@ -201,7 +201,7 @@ def _pow2_f64(d):
 
 
 def _kern(manr, ex0r, xr, xlr, c1r, c0r, cbr, c1lr, c0lr, cblr, lgnr, sgnr, rr, m0_ref, out_ref,
-          *, L, ntheta, chunk, spin=SPIN):
+          *, L, ntheta, chunk, spin=SPIN, nc=NC):
     row = pl.program_id(0)
     tile = pl.program_id(1)
     m0 = plt.load(m0_ref.at[0])
@@ -217,8 +217,8 @@ def _kern(manr, ex0r, xr, xlr, c1r, c0r, cbr, c1lr, c0lr, cblr, lgnr, sgnr, rr, 
     # operation's array to be a power of two in size, and a ragged last window makes `mb` something
     # like 96 (nside 32, L = 96), so a `(mb, NC)` head block fails to compile on those geometries.
     def zero_head(i, carry):
-        plt.store(out_ref.at[row, tile, i, slice(0, NC)],
-                  jnp.zeros((NC,), dtype=jnp.float64))
+        plt.store(out_ref.at[row, tile, i, slice(0, nc)],
+                  jnp.zeros((nc,), dtype=jnp.float64))
         return carry
 
     lax.fori_loop(0, jnp.maximum(nstart - m0, 0), zero_head, ())
@@ -228,7 +228,7 @@ def _kern(manr, ex0r, xr, xlr, c1r, c0r, cbr, c1lr, c0lr, cblr, lgnr, sgnr, rr, 
     ex = ex0
     xv = plt.load(xr.at[t], mask=valid, other=0.0)
     xl = plt.load(xlr.at[t], mask=valid, other=0.0)
-    r = plt.load(rr.at[row, t, slice(0, NC)])
+    r = plt.load(rr.at[row, t, slice(0, nc)])
     mf = m.astype(jnp.float32)
     # P_1^(alpha,beta) = ((alpha+beta+2)/2) cos t + (alpha-beta)/2.  Not `m*cos t + 2`: that seed
     # leaves every ell >= m+1 a few percent off, growing with ell.
@@ -245,7 +245,7 @@ def _kern(manr, ex0r, xr, xlr, c1r, c0r, cbr, c1lr, c0lr, cblr, lgnr, sgnr, rr, 
         val = cur * _pow2((ex - emax).astype(jnp.int32))
         sc = jnp.exp2(emax.astype(jnp.float64) + plt.load(lgnr.at[row, ell]).astype(jnp.float64))
         parts = jnp.sum(val[:, None] * r, axis=0) * (sc * sgn)
-        plt.store(out_ref.at[row, tile, ell - m0, slice(0, NC)], parts.astype(jnp.float64))
+        plt.store(out_ref.at[row, tile, ell - m0, slice(0, nc)], parts.astype(jnp.float64))
 
     def degree(ell, st):
         ph, pl_, ch, cl, ex = st
@@ -297,16 +297,16 @@ def _kern(manr, ex0r, xr, xlr, c1r, c0r, cbr, c1lr, c0lr, cblr, lgnr, sgnr, rr, 
     lax.fori_loop(nstart, L, degree, (zb, zb, man, zb, ex))
 
 
-def _call(L, ntheta, ntile, mb, spin=SPIN, Lm=None):
+def _call(L, ntheta, ntile, mb, spin=SPIN, Lm=None, nc=NC):
     # `Lm` is the slab's ell extent: the window's own range `L - m0`, which is what the row writes
     # (`L - nstart` lanes at index `ell - m0`) plus the head it zeroes.
     Lm = L if Lm is None else Lm
-    key = (int(L), int(ntheta), int(ntile), int(mb), int(Lm), _TILE, _WARPS, int(spin))
+    key = (int(L), int(ntheta), int(ntile), int(mb), int(Lm), _TILE, _WARPS, int(spin), int(nc))
     call = _CALLS.get(key)
     if call is None:
         call = jax.jit(pl.pallas_call(
-            partial(_kern, L=L, ntheta=ntheta, chunk=_TILE, spin=spin),
-            out_shape=jax.ShapeDtypeStruct((mb, ntile, Lm, NC), jnp.float64),
+            partial(_kern, L=L, ntheta=ntheta, chunk=_TILE, spin=spin, nc=nc),
+            out_shape=jax.ShapeDtypeStruct((mb, ntile, Lm, nc), jnp.float64),
             grid=(mb, ntile),
             compiler_params=plt.CompilerParams(num_warps=_WARPS),
             name=f"gmaster_spin{int(spin)}_march"))
@@ -575,11 +575,21 @@ def fold_synth_requested(nside, L) -> bool:
     return on_gpu and not utils._prefer_theta_band(nside, L, 0)
 
 
-@partial(jax.jit, static_argnames=("L", "nside"))
-def _forward_fold_impl(positive, weights, phase, *, L, nside):
-    from gmaster import utils
+def _fold_analyze(positives, weights, phase, *, L, nside):
+    """One folded march contracting any number of scalar right-hand sides.
 
-    positive = jnp.asarray(positive)
+    The expensive part of a marched row is the recurrence, which is a function of the `(m, theta)`
+    triple alone; the right-hand side enters only in the emit, where `NC` channels already fold
+    through a single Triton reduction tree.  Extra maps therefore join that block as channels
+    `4k:4k+4` and add a contraction to a row that is being computed anyway, instead of a second
+    march over the same lane count.
+    """
+    from gmaster import utils
+    from gmaster import _spin_slice as ss
+
+    positives = [jnp.asarray(p) for p in positives]
+    weights = jnp.asarray(weights)
+    phase = jnp.asarray(phase)
     theta = jnp.asarray(utils._stable_thetas(L, nside), dtype=jnp.float64)
     ntheta = theta.shape[0]
     north = (ntheta + 1) // 2
@@ -597,54 +607,67 @@ def _forward_fold_impl(positive, weights, phase, *, L, nside):
     # selected inside it per degree.  This is the same algebra `_theta_matrix._transform` performs;
     # there the row split makes `(-1)**(l+m)` a per-column sign, here the row is marched whole.
     m = jnp.arange(L, dtype=jnp.float64)[:, None]
-    folded = positive.T * weights[None, :] * jnp.exp(1j * (m * phase[None, :]))
+    p2phi = jnp.exp(1j * (m * phase[None, :]))
     jn = jnp.arange(north)
     partner = ntheta - 1 - jn
-    g_north = folded[:, jn]
-    # The equator lane is its own partner and is counted once, matching both the band and the fused
-    # kernel, which skips the south half there.
-    g_part = jnp.where(partner == jn, 0.0, folded[:, partner])
-
-    from gmaster import _spin_slice as ss
 
     # The four channels of the rhs are interleaved on the last axis, so building them per window is
     # a strided store per window: measured 126.9 ms of the 442 ms Nside 2048 `map2alm`, against
     # ~2 ms for the same bytes streamed once (`.qwen/tmp/spin0_fold_rhs_cost_2048b.log` -- neither
     # bandwidth nor the `zeros().at[].set` form is the cost, a concatenate is 1.04x).  So the whole
-    # (L, npad, NC) block is built once and each window slices its own rows out of it.
-    chan_all = jnp.stack([g_north.real, g_north.imag, g_part.real, g_part.imag], axis=-1)
+    # (L, npad, nc) block is built once and each window slices its own rows out of it.
+    chans = []
+    for positive in positives:
+        folded = positive.T * weights[None, :] * p2phi
+        g_north = folded[:, jn]
+        # The equator lane is its own partner and is counted once, matching both the band and the
+        # fused kernel, which skips the south half there.
+        g_part = jnp.where(partner == jn, 0.0, folded[:, partner])
+        chans.append(jnp.stack([g_north.real, g_north.imag,
+                                g_part.real, g_part.imag], axis=-1))
+    nc = NC * len(positives)
+    chan_all = chans[0] if len(chans) == 1 else jnp.concatenate(chans, axis=-1)
     rhs_all = lax.convert_element_type(chan_all, jnp.float32)
     if npad != north:
         rhs_all = jnp.concatenate(
-            [rhs_all, jnp.zeros((L, npad - north, NC), dtype=jnp.float32)], axis=1)
+            [rhs_all, jnp.zeros((L, npad - north, nc), dtype=jnp.float32)], axis=1)
 
-    cols = []
+    cols = [[] for _ in positives]
     norm = jnp.sqrt((2.0 * jnp.arange(L, dtype=jnp.float64) + 1.0) / (4.0 * jnp.pi))
     for (m0, m1, lo) in _march_windows(L, ntile, 0):
         mb = m1 - m0
         g = _window_geometry(m0, mb, x, sh, ch, L, npad, spin=0)
         rhs = rhs_all[m0:m1]
-        parts = _call(L, north, ntile, mb, spin=0, Lm=L - m0)(
-            *g, rhs, jnp.asarray([m0], jnp.int32)).sum(1)      # (mb, L - m0, NC)
+        parts = _call(L, north, ntile, mb, spin=0, Lm=L - m0, nc=nc)(
+            *g, rhs, jnp.asarray([m0], jnp.int32)).sum(1)      # (mb, L - m0, nc)
         ms = m0 + jnp.arange(mb)
         el = m0 + jnp.arange(L - m0)
         # Rows emit from `ell = m` and never below it; the kernel zeroed that head and the mask keeps
         # the assembly independent of it.
-        parts = jnp.where((el[None, :] >= ms[:, None])[..., None], parts, 0.0)
+        keep = (el[None, :] >= ms[:, None])[..., None]
         sgn = 1.0 - 2.0 * ((ms[:, None] + el[None, :]) % 2)
-        # The scalar route's rows are `sqrt((2l+1)/4pi) * d^l_{m0}`, not the bare Wigner row: the
-        # band's `_diagonal_normalization` seed carries the degree factor (measured as a constant
-        # ratio of exactly that over every row and lane, 5.2e-08 at Nside 32), and so does the
-        # fused kernel that shares the seed.  The march closes the form on the bare row, so the
-        # degree factor is applied here rather than inside the kernel, where it would also land on
-        # the spin-2 route -- whose contract deliberately leaves it to `_finish_forward_s2fft`.
-        block = ((parts[..., 0] + 1j * parts[..., 1])
-                 + sgn * (parts[..., 2] + 1j * parts[..., 3])) * norm[m0:][None, :]
-        cols.append(jnp.zeros((L, mb), dtype=block.dtype).at[m0:, :].set(block.T))
+        for k in range(len(positives)):
+            c = 4 * k
+            p = jnp.where(keep, parts[..., c:c + NC], 0.0)
+            # The scalar route's rows are `sqrt((2l+1)/4pi) * d^l_{m0}`, not the bare Wigner row:
+            # the band's `_diagonal_normalization` seed carries the degree factor (measured as a
+            # constant ratio of exactly that over every row and lane, 5.2e-08 at Nside 32), and so
+            # does the fused kernel that shares the seed.  The march closes the form on the bare
+            # row, so the degree factor is applied here rather than inside the kernel, where it
+            # would also land on the spin-2 route -- whose contract deliberately leaves it to
+            # `_finish_forward_s2fft`.
+            block = ((p[..., 0] + 1j * p[..., 1])
+                     + sgn * (p[..., 2] + 1j * p[..., 3])) * norm[m0:][None, :]
+            cols[k].append(jnp.zeros((L, mb), dtype=block.dtype).at[m0:, :].set(block.T))
     # Window column ranges are disjoint and tile the positive-m block, so one concatenation assembles
     # it; `out.at[...].set` per window would copy the whole buffer once per window (see
     # `_inverse_impl`).
-    return jnp.concatenate(cols, axis=1)
+    return [jnp.concatenate(c, axis=1) for c in cols]
+
+
+@partial(jax.jit, static_argnames=("L", "nside"))
+def _forward_fold_impl(positive, weights, phase, *, L, nside):
+    return _fold_analyze([positive], weights, phase, L=L, nside=nside)[0]
 
 
 def forward_latitudinal_positive(positive, weights, phase, *, L, nside):
@@ -657,6 +680,20 @@ def forward_latitudinal_positive(positive, weights, phase, *, L, nside):
     symmetry in ``_finish_forward_s2fft``, which is why this route needs no mirror channel.
     """
     return _forward_fold_impl(positive, weights, phase, L=L, nside=nside)
+
+
+@partial(jax.jit, static_argnames=("L", "nside"))
+def _forward_fold_pair_impl(positive_a, positive_b, weights, phase, *, L, nside):
+    return _fold_analyze([positive_a, positive_b], weights, phase, L=L, nside=nside)
+
+
+def forward_latitudinal_positive_pair(positive_a, positive_b, weights, phase, *, L, nside):
+    """Two folded scalar analyses, one march.
+
+    Same contract as `forward_latitudinal_positive` applied to each map; the two rows are the same
+    rows, so the second map costs its emit contraction and its fp64 partials and not its recurrence.
+    """
+    return _forward_fold_pair_impl(positive_a, positive_b, weights, phase, L=L, nside=nside)
 
 
 # ------------------------------------------------------------------- synthesis: the same row, summed

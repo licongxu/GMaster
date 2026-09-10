@@ -1853,11 +1853,35 @@ def _shared_band_route(nside, L_work):
     return (True, _theta_matrix_synth_pair_ready(nside, L_work))
 
 
-def _map2alm_pair_once_pallas(maps_a, maps_b, ell, order, *, nside, L_work):
-    """Two scalar analyses, one ring FFT per map and one sweep of the band.
+def _march_pair_route(nside, L_work):
+    """True when the folded spin-0 march can serve a pair of same-geometry analyses.
 
-    The azimuthal stage is per-map work and is done twice; only the latitudinal
-    contraction is shared, which is where the bytes are.
+    This is the pair route for the sizes where no band exists -- Nside 2048 and above.  A marched
+    row's cost is the Legendre recurrence, which depends on the `(m, theta)` triple alone; the map
+    enters only in the emit, where four channels already fold through one Triton reduction tree.
+    Two maps therefore share the recurrence, though less completely than the band pairing does,
+    because the emit's fp64 partials and rhs also double: measured against two separate calls,
+    one paired latitudinal step costs **0.489** at Nside 512 (13.10 ms against 26.81 ms, where a
+    single march is 13.90 ms), 0.504 at 1024 (55.0 against 109.2 ms) and **0.752** at 2048 (435.0
+    against 578.4 ms), the trend being the store and rhs volume growing into the recurrence
+    (`.qwen/tmp/marchpair_512.log`, `.qwen/tmp/marchpair_1024.log`, `.qwen/tmp/marchpair_2048.log`).
+    The pairing cannot be bit-identical -- widening the emit block from 4 to 8 channels changes the
+    reduction tree, which shows up as 1.2-1.3e-07 relative against the single march -- so it is
+    checked against the fp64 band instead: at Nside 512 `|paired - band| = 2.03e-04` against
+    `|single - band| = 2.03e-04`, max abs 8.406e-08 against 8.405e-08, i.e. the paired route is
+    exactly as close to the accurate contraction as the march it replaces.  The synthesis half is
+    not paired here: the marched synthesis kernel keeps per-lane accumulators and per-degree
+    coefficient loads, both of which scale with the number of maps, so it has no shared reduction
+    tree to widen and a second map would double the part that costs.
+    """
+    return _spin_march.fold_requested(nside, L_work)
+
+
+def _map2alm_pair_once_pallas(maps_a, maps_b, ell, order, *, nside, L_work, march_pair):
+    """Two scalar analyses, one ring FFT per map and one sweep of the row source.
+
+    The azimuthal stage is per-map work and is done twice; only the latitudinal contraction is
+    shared, which is where the bytes (band) or the recurrence (march) are.
     """
     ftm_a = _forward_ring_fft_positive(
         maps_a[0],
@@ -1876,8 +1900,12 @@ def _map2alm_pair_once_pallas(maps_a, maps_b, ell, order, *, nside, L_work):
     theta = _stable_thetas(L_work, nside)
     weights = quadrature_jax.quad_weights_transform(L_work, "healpix", nside)
     phase = -healpix_ffts.p2phi_rings_jax(jnp.arange(len(theta)), nside)
-    positive_a, positive_b = _theta_matrix_latitudinal_pair(
-        ftm_a, ftm_b, L=L_work, nside=nside, weights=weights, phase=phase)
+    if march_pair:
+        positive_a, positive_b = _spin_march.forward_latitudinal_positive_pair(
+            ftm_a, ftm_b, weights, phase, L=L_work, nside=nside)
+    else:
+        positive_a, positive_b = _theta_matrix_latitudinal_pair(
+            ftm_a, ftm_b, L=L_work, nside=nside, weights=weights, phase=phase)
     return positive_a[ell, order][None, :], positive_b[ell, order][None, :]
 
 
@@ -1896,18 +1924,19 @@ def _alm2map_core_pallas_pair_eager(alm_a, alm_b, *, nside, L, L_work):
 
 
 def _map2alm_core_pallas_pair_eager(
-    maps_a, maps_b, ell, order, *, nside, L, L_work, n_iter, pair_synth
+    maps_a, maps_b, ell, order, *, nside, L, L_work, n_iter, pair_synth, march_pair
 ):
-    """Two Richardson recursions stepping in lockstep over one band.
+    """Two Richardson recursions stepping in lockstep over one row source.
 
     The recursions are independent -- each refines its own alms against its own
     map -- so they can share a pass even though neither can be batched internally.
-    `pair_synth` is static because whether this geometry's synthesis band may be
-    shared is decided before any trace, and a traced program must not branch on a
-    table cache.
+    `pair_synth` and `march_pair` are static because which source serves this
+    geometry is decided before any trace, and a traced program must not branch on
+    a table cache; the two also select different kernels, so neither can become a
+    runtime value.
     """
     alm_a, alm_b = _map2alm_pair_once_pallas(
-        maps_a, maps_b, ell, order, nside=nside, L_work=L_work
+        maps_a, maps_b, ell, order, nside=nside, L_work=L_work, march_pair=march_pair
     )
     for _ in range(n_iter):
         if pair_synth:
@@ -1923,7 +1952,7 @@ def _map2alm_core_pallas_pair_eager(
             )
         delta_a, delta_b = _map2alm_pair_once_pallas(
             synth_a - maps_a, synth_b - maps_b, ell, order,
-            nside=nside, L_work=L_work,
+            nside=nside, L_work=L_work, march_pair=march_pair,
         )
         alm_a -= delta_a
         alm_b -= delta_b
@@ -1936,7 +1965,7 @@ _alm2map_core_pallas_pair_traced = jax.jit(
 
 _map2alm_core_pallas_pair_traced = jax.jit(
     _map2alm_core_pallas_pair_eager,
-    static_argnames=("nside", "L", "L_work", "n_iter", "pair_synth"),
+    static_argnames=("nside", "L", "L_work", "n_iter", "pair_synth", "march_pair"),
 )
 
 
@@ -1948,17 +1977,19 @@ def _alm2map_core_pallas_pair(alm_a, alm_b, *, nside, L, L_work):
 
 
 def _map2alm_core_pallas_pair(
-    maps_a, maps_b, ell, order, *, nside, L, L_work, n_iter, pair_synth
+    maps_a, maps_b, ell, order, *, nside, L, L_work, n_iter, pair_synth, march_pair
 ):
     """Paired analysis, traced whole below `_PALLAS_TRACED_MAX_L`.
 
     Same condition as the single route, for the same reason: tracing removes host
     dispatch, which pays up to `_PALLAS_TRACED_MAX_L` and costs 17 % above it.
+    The march pairing only ever serves sizes far above that gate, so in practice it
+    runs op-by-op and the flag is there to keep one code path.
     """
     core = (_map2alm_core_pallas_pair_traced if _trace_route_ready(nside, L_work)
             else _map2alm_core_pallas_pair_eager)
     return core(maps_a, maps_b, ell, order, nside=nside, L=L, L_work=L_work,
-                n_iter=n_iter, pair_synth=pair_synth)
+                n_iter=n_iter, pair_synth=pair_synth, march_pair=march_pair)
 
 
 @lru_cache(maxsize=32)
@@ -2389,20 +2420,27 @@ def map2alm(map, spin, map_info, alm_info, *, n_iter):
 
 
 def map2alm_pair(map_a, map_b, map_info, alm_info, *, n_iter):
-    """Two spin-0 analyses that share one pass over the Legendre band, or None.
+    """Two spin-0 analyses that share one latitudinal pass, or None.
 
     `map_a` and `map_b` are both ``(1, npix)`` and are analysed against the same
     `alm_info` with the same `n_iter`.  The two transforms are independent; the
-    only reason to run them together is that the band they stream is the largest
-    thing either one touches, so one program can serve both for 0.53-0.68x of the
-    price of two (`_shared_band_route`).  Returns `(alm_a, alm_b)`, or None when
-    this geometry cannot share -- the caller then makes two ordinary `map2alm`
-    calls, which is exactly what a None here preserves.
+    only reason to run them together is that the latitudinal step dominates either
+    one, so one pass can serve both.  Where a Legendre band exists it is the largest
+    thing either transform touches and pairing it reads it once (0.53-0.68x of two
+    calls, outputs bit-identical, `_shared_band_route`).  Where none exists -- Nside
+    2048 and above -- the folded march generates its row inside the kernel, so the
+    two maps share the recurrence itself: 0.752 of two calls there, 0.489 at
+    Nside 512 (`_march_pair_route`).  Returns `(alm_a, alm_b)`, or None when this
+    geometry cannot share -- the caller then makes two ordinary `map2alm` calls,
+    which is exactly what a None here preserves.
 
     Both halves come out eagerly, so a caller that needs only one of them pays for
     both; that second transform costs about a tenth of the first here against the
     full price of a separate call, and it is the trade `NmtField` makes on behalf
-    of the pipeline that always needs both.
+    of the pipeline that always needs both.  The band route is bit-identical to two
+    separate transforms; the march route is not, because widening the emit block
+    reassociates the theta sum, and its error against the fp64 band is measured
+    unchanged from the shipped march's.
     """
     maps_a = jnp.asarray(map_a)
     maps_b = jnp.asarray(map_b)
@@ -2416,12 +2454,16 @@ def map2alm_pair(map_a, map_b, map_info, alm_info, *, n_iter):
     if not _use_pallas_sht(L_work, 0) or _use_multi_gpu_pallas(L_work, maps_a):
         return None
     analysis, pair_synth = _shared_band_route(map_info.nside, L_work)
+    march_pair = False
+    if not analysis:
+        march_pair = _march_pair_route(map_info.nside, L_work)
+        analysis = march_pair
     if not analysis:
         return None
     return _map2alm_core_pallas_pair(
         maps_a, maps_b, alm_info._ell, alm_info._m,
         nside=map_info.nside, L=L, L_work=L_work, n_iter=int(n_iter),
-        pair_synth=pair_synth,
+        pair_synth=pair_synth, march_pair=march_pair,
     )
 
 

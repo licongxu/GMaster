@@ -790,13 +790,15 @@ def test_shared_band_pair_is_bit_identical_to_two_transforms(nside):
 
 
 @pytest.mark.skipif(not _HAS_NVIDIA_GPU, reason="requires an NVIDIA GPU")
-def test_shared_band_pair_declines_with_the_band(monkeypatch):
-    """No band, no pair: the caller must be able to fall back to two `map2alm` calls.
+def test_shared_band_pair_declines_when_no_route_serves(monkeypatch):
+    """The pair follows the route that serves a single transform, and declines with it.
 
-    `map2alm_pair` returning None is the whole fallback contract -- the field
-    constructor treats it as "do what you did before" -- so it has to refuse for
-    every reason the band route refuses, including the budget.  A pair that pressed
-    on here would be asking for the fused fp64 kernel twice.
+    With no band the pair rides the marched row (`_march_pair_route`) rather than
+    giving up -- that is the whole point of pairing on the band-refused sizes -- so
+    refusing the budget alone no longer refuses the pair.  Both routes have to be
+    shut off for `map2alm_pair` to return None, which is the fallback contract: the
+    field constructor treats None as "do what you did before" and makes two
+    `map2alm` calls.
     """
     nside = 64
     L = 3 * nside
@@ -806,8 +808,45 @@ def test_shared_band_pair_declines_with_the_band(monkeypatch):
     maps = jnp.asarray(np.zeros((1, npix)))
     assert utils.map2alm_pair(maps, maps, minfo, ainfo, n_iter=1) is not None
     monkeypatch.setattr(utils, "_MATRIX_BAND_BUDGET", 0)
+    monkeypatch.setenv("GMASTER_SPIN0_MARCH", "0")
     assert utils._shared_band_route(nside, L) == (False, False)
+    assert utils._march_pair_route(nside, L) is False
     assert utils.map2alm_pair(maps, maps, minfo, ainfo, n_iter=1) is None
+
+
+@pytest.mark.skipif(not _HAS_NVIDIA_GPU, reason="requires an NVIDIA GPU")
+@pytest.mark.parametrize("nside", [64, 128])
+def test_marched_pair_shares_one_recurrence(monkeypatch, nside):
+    """Where there is no band, two maps share the marched Legendre row.
+
+    The march generates its row inside the kernel, so a second right-hand side adds
+    an emit contraction to a row that is being computed anyway -- measured 0.752 of
+    two calls at Nside 2048, where this is the live route, and 0.489 at Nside 512
+    with the march forced (`.qwen/tmp/marchpair_2048.log`, `.qwen/tmp/marchpair_512.log`).
+    Unlike the band pairing this cannot be bit-identical: widening the emit block from
+    4 to 8 channels reassociates the theta reduction.  The bar below is that
+    reassociation, measured at 3.9e-07 on this geometry at Nside 64 and 4.4e-06 at 256
+    (`.qwen/tmp/marchpairwire_s34.log`), and the paired route's error against the fp64
+    band is the shipped march's own error to the fifth digit.
+    """
+    monkeypatch.setenv("GMASTER_SPIN0_MARCH", "1")
+    lmax = 3 * nside - 1
+    L = lmax + 1
+    npix = 12 * nside ** 2
+    assert utils._shared_band_route(nside, L) == (False, False)
+    assert utils._march_pair_route(nside, L) is True
+    minfo = nmt.NmtMapInfo(None, (npix,))
+    ainfo = nmt.NmtAlmInfo(lmax)
+    rng = np.random.default_rng(29)
+    maps_a = jnp.asarray(rng.normal(size=(1, npix)))
+    maps_b = jnp.asarray(rng.normal(size=(1, npix)))
+
+    pair = utils.map2alm_pair(maps_a, maps_b, minfo, ainfo, n_iter=3)
+    assert pair is not None
+    for maps, got in ((maps_a, pair[0]), (maps_b, pair[1])):
+        ref = np.asarray(nmt.map2alm(maps, 0, minfo, ainfo, n_iter=3))
+        np.testing.assert_allclose(
+            np.asarray(got), ref, rtol=0.0, atol=1e-4 * float(np.max(np.abs(ref))))
 
 
 @pytest.mark.parametrize("nside", [512, 1024, 2048, 4096, 8192])
