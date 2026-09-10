@@ -6808,6 +6808,11 @@ zero forward cost, and the suite passes with `complex64` rings.)
 host staging of the polarised map becomes float32. Nside 4096 spin 2 is blocked on capacity, not on
 arithmetic, so if that cell is ever attempted this is the first 35 % of the RSS to spend.
 
+(*Superseded by addenda 25 §2 and 29 §4b.* The cell never reaches our allocator on the way to a
+score: `pymaster`'s own `compute_coupling_matrix` segfaults at `lmax=12287` spin 2 with 300 GB of
+host RAM free, because of the spin-2 operator's element count rather than any memory limit, so the
+float32-ring saving recommended here cannot be spent on this cell.)
+
 **Measurement hygiene note.** The first small-`Nside` fp32-ring pass
 (`.qwen/tmp/board_small_rings_fp32_s29.log`) ran while an unrelated `pytest` held 73.6 GiB of GPU1
 (pid 1724605) and printed a 12-deep XLA allocation-retry cascade (`Failed to allocate 71.21GiB …
@@ -8003,6 +8008,23 @@ crash, so an fp32-ring session declines one size earlier than it strictly needs 
 conservatism is a recorded choice, not an oversight, and `test_paired_fold_gate_sides_at_the_measured_sizes`
 pins the five verdicts so a future ring-aware estimate has to be justified against the test
 rather than silently widening the route.
+
+**4b. The `Nside=4096` spin-2 board cell cannot be produced, and this session's new knob does
+not change that.** The spin-2 arm at that geometry prints its geometry header and exits —
+**exit 139, core dumped**, log otherwise empty — identically with `complex64` and
+`complex128` rings (`.qwen/tmp/n4096_spin2_s35.log`,
+`.qwen/tmp/n4096_spin2_fp64ring_s35.log`).  That is addendum 25 §2's finding reproduced on the
+harness, not a new one: `pymaster` builds the field and then segfaults inside
+`compute_coupling_matrix` because the spin-2 operator holds `ncls**2 * (lmax+1)**2` = 5.43e9
+elements, past 2**31, with the threshold bracketing that count rather than any memory limit.
+Re-run stage by stage here for the record (`.qwen/tmp/n4096_spin2_who_s35.py`: reference
+`NmtField` at 4096 spin 2 **completes**, 27.5 GB peak RSS, exit 0;
+`.qwen/tmp/n4096_ref_coupling_s35.log`: its coupling **SIGSEGV**s with 300 GB of host RAM
+free).  What the reproduction adds is only the consequence for the ring lever: addendum 26's
+"first 35 % of the RSS to spend" advice points at a cell whose reference dies *before our code
+is ever timed*, so float32 rings cannot unlock it.  Scoring that geometry needs the reference
+replaced (the per-pass `ducc0` ladder of addendum 25 §3, where 4096 spin 2 accuracy is already
+measured at `rel alm` 1.73e-04) or its element count reduced — not a precision switch.
 
 **5. Verification.** Default suite **193 passed, 3 skipped** in 460 s
 (`.qwen/tmp/s35_verify.log` §4), up from 185 by the five gate tests and the two AD tests.
