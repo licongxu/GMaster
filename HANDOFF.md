@@ -8218,3 +8218,29 @@ optimisation is explained by a gate, go read which function that gate actually g
 (c) Bit identity is the cheap half of the proof and it should always be taken: it converted this
 from "a 6 % speed change with a tolerance question" into "a dispatch change", and it is what
 made the §5b reconciliation possible at all.
+
+### 10. B3-bis, the same trace on the route that serves `Nside>=1024`: measured 1.13x *worse*, refused
+
+The spin-2 win above is invisible above `Nside=512`, so the obvious follow-up is to trace the loop
+that *does* run there — `_map2alm_core`, whose refinement is also Python-side.
+`.qwen/tmp/trace3_s35.py` does exactly that at `Nside=1024`, `L_work=3072`, float64 tables, seven
+passes, with no slab and no table argument at all (the route owns neither), so the byte problem
+that ends the slab route cannot be the reason here:
+
+```
+nside=1024 slab=no
+nside=1024 shipped (eager loop): cold=57777.5 ms warm=536.305 ms
+nside=1024 traced  (one program): cold=47093.4 ms warm=605.792 ms
+nside=1024 tables=fp64 max|d|=0.000e+00 bit_identical=True ratio=1.130
+```
+
+(`.qwen/tmp/s35_b3bis.log`.)  Bit-identical and 13 % slower.  Removing the same six boundaries
+that paid on the slab route costs here, which is the honest boundary of §9(a): the trace is not a
+universal good, it is a trade of boundary cost against scheduling quality, and on the generic
+s2fft route the scheduler was already doing better with the boundaries in place.  This route is
+*not* traced; nothing in `gmaster/` changed for `Nside>=1024` in this addendum.
+
+For scale, the same probe's eager arm (536.305 ms for the seven-pass analysis) is 61 % of the
+`Nside=1024` spin-2 `TOTAL` of 1231 ms, and the stage split there is field 539 ms / mask 357 ms /
+coupling 334 ms — field+mask 73 % of the wall, still the mass to attack, and still at CPU parity
+per pass (`.qwen/tmp/s35_n1024s2_stages.log`).
