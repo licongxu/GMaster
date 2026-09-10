@@ -8249,3 +8249,53 @@ For scale, the same probe's eager arm (536.305 ms for the seven-pass analysis) i
 `Nside=1024` spin-2 `TOTAL` of 1231 ms, and the stage split there is field 539 ms / mask 357 ms /
 coupling 334 ms — field+mask 73 % of the wall, still the mass to attack, and still at CPU parity
 per pass (`.qwen/tmp/s35_n1024s2_stages.log`).
+
+---
+
+## Addendum 31 (session 35): the table-free spin-2 march was scoped against a route that no longer ships, and the board's own 2048 spread is 8 %
+
+### 1. A live baseline check on the anchored-Jacobi spin-2 march
+
+The standing plan for the largest spin-2 cells (session 20's note, `spin2-anchored-jacobi-march`) is
+a Pallas kernel around the anchored Jacobi march of `d^l_{m,-2}`, scoped against a recorded
+**13.27 s/pass** for "the generic per-window loop that ships at `Nside=1024`", with a plain-XLA
+projection of `48 x 5.65 ms = 271 ms/pass`.  That scoping baseline is no longer what runs.
+
+Measured this session, clean and single-tenant, `Nside=1024`, `L_work=3072`, float64 tables, the
+whole seven-pass polarised analysis (`_map2alm_core`, `n_iter=3`, i.e. `1+2*n_iter` latitudinal
+passes) is **533.623 ms** — **76.2 ms per pass including the ring-FFT stages around it**, so the
+latitudinal work alone is cheaper still (`.qwen/tmp/s35_b3bis_clean.log`).  Nothing in that route
+is 13.27 s, and nothing in it is 175x off ducc0.
+
+Consequence: the projected 271 ms/pass generator is **~3.6x slower than the route it would
+replace**.  The lever is closed at `Nside=1024` unless the value-producing rate rises by about
+4x from the 142.5 G values/s recorded for the segment-map arm; the accuracy gate (5e-07 at K=8)
+was never the binding constraint, the rate is, and the rate has to beat a baseline that moved
+under it.
+
+**The general point:** a big rock scoped against a remembered baseline must be re-timed against
+the current route before a single kernel is written.  Three sessions of unrelated work (the slab
+contraction, the folded march, the traced loop) moved that baseline by more than an order of
+magnitude, and the plan survived in the notes as if it had not.
+
+### 2. Post-trace board, clean, single tenant, defaults (float64 tables, `follow` rings)
+
+`.qwen/tmp/s35_board_clean.log`, `benchmarks/benchmark_pipeline.py --nside N --spins 0,2`:
+
+| Nside | spin 0 TOTAL | ratio | spin 2 TOTAL | ratio | spin 2 rel |
+|---|---|---|---|---|---|
+| 64 | 7→2 ms | 3.1x | 15→3 ms | 4.5x | 1.07e-10 |
+| 128 | 21→6 ms | 3.6x | 46→11 ms | 4.2x | 4.90e-09 |
+| 256 | 62→25 ms | 2.4x | 151→54 ms | 2.8x | 2.74e-08 |
+| 512 | 342→165 ms | 2.1x | 714→335 ms | 2.1x | 3.56e-07 |
+| 1024 | 1767→699 ms | 2.5x | 3338→1233 ms | 2.7x | 3.69e-06 |
+| 2048 | 10629→5185 ms | 2.0x | 18503→8703 ms | 2.1x | 1.09e-05 |
+
+`Nside>=1024` is where the traced route cannot reach, and the rows show it: spin 2 at 1024 is
+1233 ms here against 1231/1224 ms from the two runs before it in this session, and at 2048 8703
+against 8725/8694.  Those are the same build's noise band, not a change.
+
+**Read the 2048 spread before quoting anything at 2048.** The same build gave spin-0 `TOTAL`
+4803 ms and 5185 ms in two runs of this session (7.9 %), and the reference moved the same way
+(10553 → 10629 ms), so the ratio printed 2.2x and 2.0x.  Any claim smaller than ~10 % at
+`Nside=2048` is inside this box's own run-to-run band and should be quoted as such.
