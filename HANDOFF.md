@@ -8088,3 +8088,133 @@ bisect to discover a segfault that addendum 25 §2 had characterised three sessi
 (element count past 2**31, not memory).  The distinguishing signature — no traceback, exit
 139, identical under every one of our precision switches because the reference reads none —
 should have pointed at "grep HANDOFF for this geometry" before any probing.
+
+---
+
+## Addendum 30 (session 35): the polarised refinement loop was never traced — one program over its seven passes is bit-identical and worth 6 % at `Nside=512`, and the single-pass fusion price in addendum 29 §5b is not an argument against it
+
+### 1. What was missing, and why the quoted reason belonged to a different kernel
+
+`_map2alm_core_slab` kept its `n_iter` refinement loop in Python, so a polarised `map2alm`
+dispatched `1+2*n_iter` programs — seven at the pipeline's `n_iter=3`.  Spin 0 has had a
+single-program route since session 32 (`_PALLAS_TRACED_MAX_L`, addendum 26); spin 2 never got
+one, and the sentence usually quoted for that absence is `_use_pallas_sht` refusing
+`spin != 0`.  That gate belongs to the fused spin-weighted *kernel*, which the slab route never
+calls: `_map2alm_once_slab_body` and `_alm2map_core_slab_body` are plain JAX bodies over a
+precomputed Wigner-d slab.  Nothing in the polarised path was ever incompatible with tracing the
+loop; nobody had written the trace.
+
+### 2. The core measurement
+
+`.qwen/tmp/trace2_s35.py` — same slab route, same tables, arms = shipped eager loop (run first,
+so the traced arm is not compared against a cold cache) then one `jax.jit` over the whole
+`1 + 2*n_iter` sequence with both table sets and both slabs passed as explicit arguments.
+Warm median of 5, `n_iter=3`, `L_work = 3*nside`.
+
+| Nside | tables | eager ms | traced ms | ratio | max\|d\| |
+|---|---|---|---|---|---|
+| 64 | fp64 | 1.482 / 1.481 | 1.355 / 1.358 | 0.914 | 0.000e+00 |
+| 128 | fp64 | 5.829 / 5.830 / 5.835 | 5.999 / 5.996 / 5.974 | **1.029** | 0.000e+00 |
+| 256 | fp64 | 36.949 | 34.479 | 0.933 | 0.000e+00 |
+| 512 | fp64 | 239.320 | 225.025 | 0.940 | 0.000e+00 |
+| 128 | fp32 | 2.087 | 1.583 | 0.759 | 0.000e+00 |
+| 256 | fp32 | 8.966 | 7.900 | 0.881 | 0.000e+00 |
+| 512 | fp32 | 60.955 | 52.372 | 0.859 | 0.000e+00 |
+
+(`.qwen/tmp/s35_b3_fp64.log`, `.qwen/tmp/s35_b3_repeat.log`, `.qwen/tmp/s35_b3_256.log`,
+`.qwen/tmp/s35_b3_512.log`.)  Every cell is bit-identical, which is the expected result: the
+traced program contains exactly the ops the eager loop was already emitting, with the
+boundaries removed.
+
+### 3. End to end — both arms in this session, same box, GPU1, defaults (float64 tables, `follow` rings)
+
+| Nside | arm | TOTAL (pymaster→GMaster) | field | mask | coupling | GPU `bytes_in_use` |
+|---|---|---|---|---|---|---|
+| 128 | eager | 40→10 ms (4.0x) | 6 | 2 | 2 | 1.1 GiB |
+| 128 | traced | 44→11 ms (4.1x) | 7 | 2 | 2 | 1.1 GiB |
+| 256 | eager | 165→56 ms (3.0x) | 39 | 10 | 8 | 7.8 GiB |
+| 256 | traced | 166→**52** ms (**3.2x**) | 37 | 10 | 8 | 7.9 GiB |
+| 512 | eager | 703→340 ms (2.1x) | 240 | 71 | 45 | 57.5 GiB |
+| 512 | traced | 709→**333** ms (2.1x) | **231** | **63** | 45 | 57.6 GiB |
+
+(`.qwen/tmp/s35_b3_pipe_before.log` is the stashed-code arm, `.qwen/tmp/s35_b3_pipe_after.log`
+the traced one.)  `rel` is identical in the two arms at all three sizes — 4.90e-09 / 2.74e-08 /
+3.56e-07 — which is the pipeline-level confirmation of the bit identity in §2.
+
+The 57.5 → 57.6 GiB column deserves a note because it looks alarming and is not: that field is
+`memory_stats()["bytes_in_use"]` at the end of the run, it is dominated by the cached Wigner-d
+slabs (18.74 GiB each at `Nside=512` in float64), and the traced route adds 0.1 GiB to it.
+
+### 4. The range this lever can reach, and the range it cannot
+
+`_spin_slabs` returns `(None, None)` at `L_work = 3072`, so there is no slab route above
+`Nside=512` for the polarised transform at all: at 1024/2048/4096 the analysis takes the generic
+s2fft scatter loop and this change is invisible there.  Measured float64 analysis-slab sizes:
+47.8 MiB / 335 MiB / 2.44 GiB / 18.74 GiB at 64/128/256/512.
+
+That matters for how much this is worth.  The cells where GMaster is weakest (2.2x at 2048,
+1.7x at 4096 spin 0) are exactly the cells this cannot touch.  `_SPIN_SLAB_TRACED_MAX_L = 1536`
+records the measured range, not a limit the trace would refuse.
+
+### 5. Reconciling with addendum 29 §5b, which priced the *opposite* decision at the same size
+
+Addendum 29 §5b says forcing fusion at `Nside=512` costs 34.414 → 38.175 ms per analysis call
+(+11 %) and keeps `_SLAB_FUSE_MAX_BYTES = 4 GiB`.  This addendum traces the *same geometry and
+precision* into one program and gets 239.320 → 225.025 ms (−6 %).  Both are correct, and the
+arithmetic lines up exactly: 239.320/7 = 34.19 ms, i.e. §5b's 34.414 ms is one *pass* of the
+loop this addendum bundles.
+
+- §5b prices putting one slab and one map through one extra boundary: a loss, correctly refused.
+- This prices removing the six boundaries *between* seven passes: a win, even though each pass
+  inside the program is fused in exactly the way §5b refused.
+- Per pass: eager 34.19 ms, traced 32.15 ms (−6.7 %).
+
+A future session reading §5b as "do not put the slab inside a jit at 512" and stopping there
+would be wrong about this route, and a future session reading *this* addendum as "fusion at 512
+is good" would be wrong about §5b.  The quantity that matters is the number of boundaries
+removed, not whether one slab rides one boundary.
+
+### 6. Cold compile
+
+One big program costs more compile than seven small ones. Per-process cold arm (first call):
+`Nside=512` fp64 8.98 → 12.59 s, `Nside=512` fp32 21.57 → 22.60 s, `Nside=256` fp64 7.04 →
+6.97 s (`.qwen/tmp/s35_b3_fp64.log`, `.qwen/tmp/s35_b3_512.log`).  It is paid once per shape and
+does not appear in the warmed harness numbers above.
+
+### 7. The one reversal, and why it was not carved out of the gate
+
+`Nside=128` with float64 tables is 1.029/1.028/1.024 in three separate processes — real, not
+noise.  It is also not separable by any monotone rule: 64 wins (0.914), 128 loses, 256 and 512
+win, so a size- or byte-monotone gate that drops 128 also drops 64.  With float32 tables the
+same geometry is the largest win on the board (1.32x).  End to end it does not show: nine-repeat
+harness runs give traced 10 ms and 11 ms against eager 10 ms and 11 ms
+(`.qwen/tmp/s35_b3_n128ab.log`), while the reference arm moves 38→40 ms between the same runs.
+It is therefore left inside a single upper gate instead of a one-cell exception, and priced at
+2.9 % of one sub-stage.
+
+### 8. Verification
+
+- Full suite on GPU1 with the route enabled: **193 passed, 3 skipped in 461.94 s**
+  (`.qwen/tmp/s35_b3_suite.log`) — the same counts as the pre-change bar.
+- `tests/test_sht.py -k "spin2 or spin_2 or polar or grad or adjoint"`: 11 passed.
+- Three new tests: the gate table at 64/128/256/512/1024/2048, an `eval_shape` probe pinning
+  that a traced input takes the eager loop, and a bit-identity check of the traced loop against
+  the eager loop at `Nside=32/48` (11 passed with the existing selection, 55.07 s).
+- Reverse mode is untouched by construction: `_spin_slab_trace_ready` returns False for a
+  `jax.core.Tracer`, and `map2alm` always passes `jnp.asarray(map)`, so the guard sees the array.
+- Spin 0 cannot reach this code (the slab route is entered only under `if spin != 0`), and
+  `map2alm_pair` requires two `(1, npix)` maps.
+- Committed as `perf(sht): trace the polarised refinement loop into one program`.
+
+### 9. Lessons
+
+(a) A gate that prices **one** boundary is not evidence about a program that removes **N** of
+them.  Addendum 29 §5b wrote down a real +11 % for fusing a single pass at `Nside=512`; that
+number was then (implicitly) used as the reason the loop stayed in Python for seven passes.  The
+sign flips with the count, and only the count.
+(b) "Route X has no traced form" is a statement about code, not physics.  The excuse on file for
+the missing spin-2 trace described a kernel that this route does not call.  When a missing
+optimisation is explained by a gate, go read which function that gate actually guards.
+(c) Bit identity is the cheap half of the proof and it should always be taken: it converted this
+from "a 6 % speed change with a tolerance question" into "a dispatch change", and it is what
+made the §5b reconciliation possible at all.
