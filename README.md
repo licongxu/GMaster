@@ -281,6 +281,20 @@ program may read the band but must never build it. That is worth 13.74 → 12.44
 `Nside=256` spin 0 with bit-identical alms and costs ~10 GB of peak host RSS during the compile;
 `Nside=512` is 17 % *slower* as one program and is left op-by-op (HANDOFF addendum 26).
 
+The **polarised** refinement loop now has the same treatment, up to `L_work = 1536`
+(`_SPIN_SLAB_TRACED_MAX_L`, `Nside=512`). `map2alm` at spin 2 ran its `1+2*n_iter` Jacobi passes as
+separate XLA programs — seven at `n_iter=3` — and one program over the whole sequence is
+bit-identical (`max|d| = 0.000e+00` at every size tried) while removing the six boundaries between
+them: 36.949 → 34.479 ms at `Nside=256` and 239.320 → 225.025 ms at 512 with the default float64
+tables, 8.966 → 7.900 and 60.955 → 52.372 ms with `set_table_precision("fp32")`. On the harness the
+spin-2 cell goes 56 → 52 ms at 256 (3.0x → **3.2x**) and 340 → 333 ms at 512, `dCl` and device
+`bytes_in_use` unchanged (HANDOFF addendum 30). Note this is *not* contradicted by the analysis
+fusion gate above: that gate prices one slab riding one boundary (+11 % at 512), this prices six
+boundaries disappearing (−6 % at the same size and precision). The route is declined under an outer
+trace, so a gradient still sees the per-pass boundaries, and above `Nside=512` it does not exist —
+`_spin_slabs` returns no slab pair at `L_work=3072`, which is why the sizes where GMaster is
+weakest are the ones this lever cannot reach.
+
 A scalar field and its mask are now analysed by *one* program. `lmax_mask` defaults to `lmax` and
 `n_iter_mask` to `n_iter` in both codes, so a field built the way a pipeline builds one carries two
 independent spin-0 transforms of identical geometry over the same resident Legendre band. One
