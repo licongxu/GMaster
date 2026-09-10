@@ -1039,3 +1039,72 @@ def test_pool_headroom_survives_a_backend_without_allocator_stats(monkeypatch):
         monkeypatch.setattr(jax, "local_devices", lambda: [device])
         assert ss._pool_headroom() == float("inf")
 
+
+@pytest.mark.skipif(not _HAS_NVIDIA_GPU, reason="requires an NVIDIA GPU")
+@pytest.mark.parametrize("nside, traced", [(64, True), (128, True), (256, True),
+                                           (512, True), (1024, False), (2048, False)])
+def test_polar_refinement_trace_gate_sides_at_the_measured_sizes(nside, traced):
+    """One program over the refinement loop is offered only inside the measured range.
+
+    The cap is Nside 512 (`L_work = 3*nside = 1536`), where the polarised analysis is
+    36.949 -> 34.479 ms at 256 and 239.320 -> 225.025 ms at 512 with float64 tables and
+    8.966 -> 7.900 / 60.955 -> 52.372 ms with float32 ones, end to end 56 -> 52 and
+    340 -> 333 ms at spin 2 (`.qwen/tmp/s35_b3_fp64.log`, `.qwen/tmp/s35_b3_pipe_after.log`).
+    Above it `_spin_slabs` hands back no slab pair at all, so the traced route would be
+    measuring a geometry that does not exist; the cap records the range rather than a limit
+    the trace would refuse.
+    """
+    L_work = 3 * nside
+    maps = jnp.zeros((2, 12 * nside ** 2), dtype=jnp.float64)
+    assert utils._spin_slab_trace_ready(maps, L_work) is traced
+
+
+@pytest.mark.skipif(not _HAS_NVIDIA_GPU, reason="requires an NVIDIA GPU")
+def test_polar_refinement_stays_eager_under_a_trace():
+    """Reverse mode keeps the per-pass boundaries it was measured with.
+
+    `map2alm` converts its input with `jnp.asarray`, so the guard sees the array itself and a
+    traced input means the caller is inside `grad`/`jit`.  One graph over `n_iter` refinement
+    passes would keep every iteration's residual alive for the transpose, which has never been
+    measured here, so a traced input must fall back to the eager loop rather than pick a route
+    chosen for forward-only timings.
+    """
+    seen = []
+
+    def probe(maps_in):
+        seen.append(utils._spin_slab_trace_ready(maps_in, 192))
+        return 0.0
+
+    jax.eval_shape(probe, jnp.zeros((2, 12 * 64 ** 2), dtype=jnp.float64))
+    assert seen == [False]
+
+
+@pytest.mark.skipif(not _HAS_NVIDIA_GPU, reason="requires an NVIDIA GPU")
+@pytest.mark.parametrize("nside", [32, 48])
+def test_traced_refinement_loop_matches_the_eager_loop(nside):
+    """Tracing `1+2*n_iter` polarised passes into one program changes the dispatch, not the answer.
+
+    Both arms call the same `_map2alm_once_slab_body`/`_alm2map_core_slab_body` bodies, so the
+    comparison is exact.  This is the correctness half of the 1.07-1.32x measured at Nside
+    64-512; the shipped gate is what keeps it inside that range.
+    """
+    lmax = 3 * nside - 1
+    L = lmax + 1
+    npix = 12 * nside ** 2
+    rng = np.random.default_rng(11)
+    maps = jnp.asarray(rng.normal(size=(2, npix)) * 1e-3)
+    ell, order = utils._ell_order_arrays(lmax)
+    a_slab, s_slab = utils._spin_slabs(L, 2, nside=nside)
+    assert a_slab is not None and s_slab is not None
+
+    traced = utils._map2alm_core_slab(maps, ell, order, spin=2, nside=nside, L=L,
+                                      L_work=L, n_iter=2, analysis_slab=a_slab,
+                                      synthesis_slab=s_slab)
+    eager = utils._map2alm_once_slab(maps, ell, order, spin=2, nside=nside, L=L,
+                                     L_work=L, slab=a_slab)
+    for _ in range(2):
+        eager = utils._map2alm_iteration_slab(
+            eager, maps, ell, order, spin=2, nside=nside, L=L, L_work=L,
+            analysis_slab=a_slab, synthesis_slab=s_slab)
+    np.testing.assert_array_equal(np.asarray(traced), np.asarray(eager))
+

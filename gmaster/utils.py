@@ -1705,6 +1705,59 @@ def _alm2map_core_slab(alm, *, spin, nside, L, L_work, slab):
         spin=spin, nside=nside, L=L, L_work=L_work)
 
 
+# Largest working bandlimit whose whole polarised refinement loop is traced into one program.
+# 1536 is Nside 512, and the slab route does not reach past it anyway (`_spin_slabs` returns no
+# pair at 1024), so the cap is the measured range rather than a boundary the trace would refuse.
+# With the default float64 tables map2alm goes 36.949 -> 34.479 ms at Nside 256 and 239.320 ->
+# 225.025 ms at 512; with `set_table_precision("fp32")` 8.966 -> 7.900 ms at 256 and 60.955 ->
+# 52.372 ms at 512, every arm bit-identical to the eager loop (`max|d|=0.000e+00`).  End to end
+# that is 56 -> 52 ms at Nside 256 and 340 -> 333 ms at 512 spin 2, with `dCl` unchanged to every
+# printed digit and `bytes_in_use` unchanged too (57.5 -> 57.6 GiB, the slabs, not this program).
+# Nside 128 with float64 tables is the one core-call reversal, 5.829/5.830/5.835 ->
+# 5.999/5.996/5.974 ms (1.03x, three repeats), and nine-repeat harness runs put both arms at
+# 10-11 ms, so it is left inside a single upper gate rather than carved out (`.qwen/tmp/
+# s35_b3_fp64.log`, `.qwen/tmp/s35_b3_repeat.log`, `.qwen/tmp/s35_b3_256.log`,
+# `.qwen/tmp/s35_b3_512.log`, `.qwen/tmp/s35_b3_pipe_before.log`, `.qwen/tmp/s35_b3_pipe_after.log`,
+# `.qwen/tmp/s35_b3_n128ab.log`).
+_SPIN_SLAB_TRACED_MAX_L = 1536
+
+
+def _spin_slab_trace_ready(maps, L_work):
+    """Whether the refinement loop may become one program at this size.
+
+    The loop keeps its eager form under an outer trace: one graph over `n_iter` refinement passes
+    keeps every iteration's residual alive for the transpose, which is a memory cost this route has
+    never been measured against, and the repository's AD tests reach only the scalar route.  A
+    gradient of a polarised analysis therefore continues to see the boundaries it had before.
+    """
+    if isinstance(maps, jax.core.Tracer):
+        return False
+    return L_work <= _SPIN_SLAB_TRACED_MAX_L
+
+
+@partial(jax.jit, static_argnames=("spin", "nside", "L", "L_work", "n_iter"))
+def _map2alm_core_slab_traced(maps, ell, order, analysis_tables, synthesis_tables,
+                              analysis_slab, synthesis_slab, *, spin, nside, L,
+                              L_work, n_iter):
+    """Polarised analysis with the refinement loop inside one XLA program.
+
+    The tables ride in as arguments because a traced program may read them but must never build
+    them (`_theta_matrix`'s rule, and the reason `_trace_route_ready` warms the scalar band
+    first): a build inside this program would be re-run by XLA on every call.
+    """
+    alm = _map2alm_once_slab_body(
+        maps, analysis_tables, ell, order, spin=spin, nside=nside, L=L,
+        L_work=L_work, slab=analysis_slab)
+    for _ in range(n_iter):
+        residual = _alm2map_core_slab_body(
+            alm, synthesis_slab, synthesis_tables, spin=spin, nside=nside, L=L,
+            L_work=L_work) - maps
+        alm = alm - _map2alm_once_slab_body(
+            residual, analysis_tables, ell, order, spin=spin, nside=nside, L=L,
+            L_work=L_work, slab=analysis_slab)
+    return alm
+
+
 def _map2alm_iteration_slab(alm, maps, ell, order, *, spin, nside, L, L_work,
                             analysis_slab, synthesis_slab):
     residual = (
@@ -1720,6 +1773,14 @@ def _map2alm_iteration_slab(alm, maps, ell, order, *, spin, nside, L, L_work,
 
 def _map2alm_core_slab(maps, ell, order, *, spin, nside, L, L_work, n_iter,
                        analysis_slab, synthesis_slab):
+    if _spin_slab_trace_ready(maps, L_work):
+        device = getattr(maps, "device", None) or getattr(maps[0], "device", None)
+        return _map2alm_core_slab_traced(
+            maps, ell, order,
+            _spin_ring_analysis_tables(L_work, nside, device),
+            _spin_ring_synthesis_tables(L_work, nside, device),
+            analysis_slab, synthesis_slab,
+            spin=spin, nside=nside, L=L, L_work=L_work, n_iter=n_iter)
     alm = _map2alm_once_slab(maps, ell, order, spin=spin, nside=nside, L=L,
                              L_work=L_work, slab=analysis_slab)
     for _ in range(n_iter):
