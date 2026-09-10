@@ -8302,3 +8302,37 @@ against 8725/8694.  Those are the same build's noise band, not a change.
 4803 ms and 5185 ms in two runs of this session (7.9 %), and the reference moved the same way
 (10553 → 10629 ms), so the ratio printed 2.2x and 2.0x.  Any claim smaller than ~10 % at
 `Nside=2048` is inside this box's own run-to-run band and should be quoted as such.
+
+### 11. What the large-`Nside` ratios are actually made of: warmed transforms against ducc0, in one table
+
+`benchmarks/benchmark_sht.py` warms a single `map2alm`/`alm2map` pair and compares it with the
+installed NaMaster (i.e. ducc0) at the pipeline's own geometries.  On GPU1, defaults,
+`.qwen/tmp/s35_sht_large.log`:
+
+| Nside | spin | ours analysis | ducc0 | ratio | ours synthesis | ducc0 | ratio |
+|---|---|---|---|---|---|---|---|
+| 1024 | 0 | 0.0597 s | 0.0631 s | **1.056x** | 0.0398 s | 0.0571 s | 1.435x |
+| 1024 | 2 | 0.0880 s | 0.1193 s | **1.356x** | 0.0789 s | 0.1094 s | 1.387x |
+| 2048 | 2 | 0.6174 s | 0.6342 s | **1.027x** | 0.4962 s | 0.6165 s | 1.242x |
+
+(The `Nside=2048` spin-0 arm did not fit its 600 s slice — the script benchmarks four backends in
+one process, and `jax-generic` at that size is minutes of compile; it is re-running with a 1400 s
+budget into `.qwen/tmp/s35_sht_2048s0.log`.  The same log shows `jax-single` at 0.50x/0.35x of
+ducc0 at `Nside=1024` spin 0 and `jax-generic` at 0.008x, which is what the fallbacks cost if a
+gate ever sends a geometry to them.)
+
+**The pipeline ratios at large `Nside` are not transform ratios.**  At `Nside=2048` spin 2 the
+transform is at CPU parity (1.027x analysis, 1.242x synthesis) and the cell still scores 2.1x,
+because coupling runs 10802 → 2593 ms (4.2x) and `coupled_cell` 617 → 3 ms.  Splitting the same
+cell (8703 ms total = field 3998 + mask 2092 + coupling 2593 + cell 3 + decouple 4):
+
+- making both polar transforms **2x faster** (i.e. 2x faster than ducc0, the actual open problem)
+  would give 3489 + 2593 + 7 ≈ **6.1 s → 3.0x**;
+- making coupling 2x faster would give 6090 + 1297 + 7 ≈ 7.4 s → 2.5x.
+
+So the transforms are the bigger lever at the top of the board even though coupling carries the
+bigger ratio, and the thing standing in front of them is per-pass throughput against ducc0, not
+dispatch, not memory, and not the precision switches.  That is the same wall addendum 25's
+per-pass ladder and the march's issue-bound attribution describe; §10 above says the trace route
+around it is closed, and addendum 31 §1 says the table-free generator idea was priced against a
+baseline that no longer exists.
