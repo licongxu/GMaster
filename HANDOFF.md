@@ -8245,10 +8245,13 @@ scheduling quality, and on the generic s2fft route the scheduler was already doi
 the boundaries in place.  This route is *not* traced; nothing in `gmaster/` changed for
 `Nside>=1024` in this addendum.
 
-For scale, the same probe's eager arm (536.305 ms for the seven-pass analysis) is 61 % of the
-`Nside=1024` spin-2 `TOTAL` of 1231 ms, and the stage split there is field 539 ms / mask 357 ms /
-coupling 334 ms — field+mask 73 % of the wall, still the mass to attack, and still at CPU parity
-per pass (`.qwen/tmp/s35_n1024s2_stages.log`).
+For scale, the probe's eager arm (533.623 ms for the seven-pass analysis) is **43 % of the
+`Nside=1024` spin-2 `TOTAL` of 1233 ms and 60 % of its field+mask mass (540 + 358 ms)** — and it
+sits almost exactly on the harness's own `field` stage (539 ms and 540 ms in the two runs of it),
+which is the cross-check that the field stage of a spin-2 field *is* one seven-pass polarised
+analysis.  The rest of that stage split is mask 358 ms (a spin-0 transform, unpairable against a
+spin-2 field) and coupling 335 ms (`.qwen/tmp/s35_n1024s2_stages.log`,
+`.qwen/tmp/s35_board_clean.log`).
 
 ---
 
