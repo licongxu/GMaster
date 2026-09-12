@@ -8416,3 +8416,179 @@ below `L_work 1536` (addendum 30 §2–§7), the generic-route version of the sa
 refused (§10), the anchored-Jacobi march is shown to be scoped against a route that no longer ships
 (addendum 31 §1), and this §11–§13 is the transform-vs-pipeline accounting that was missing from
 every earlier scoreboard.
+
+---
+
+## Addendum 32 (session 36, 2026-09-12): the analysis emit was 40 % fp64 on a 1/64-rate card, the reference's polar skip was never taken, and the synthesis accumulator carried a block exponent it never needed
+
+Session 35 §13 closed with "the transform is at CPU parity per pass, the march is issue-bound, and the
+single open problem is fp32-class arithmetic with fp64 accuracy".  This session did not find that
+arithmetic.  It found that the kernels around the recurrence were paying for things the recurrence does
+not need, and that the reference skips work the march was doing.  Four shipped changes, each bit-level
+or digit-level checked, and a maths note (`docs/latitudinal_march_maths.md`) that writes down the
+closed form, the recurrence, the exponent carry, the emit, the fold, the polar skip and the hardware
+bound with proofs.  Every number below is from a single-tenant run on GPU1 (see §9 for why that has
+to be said).
+
+### 1. The emit's fp64 tail
+
+`_kern`'s per-degree emit did, in a one-warp program: `exp2(emax + log2 N(ell, m))` in **float64**, four
+`float32 -> float64` converts, four float64 multiplies and a float64 store.  Session 21's ablation table
+(`marchonly 0.43 / chan1 18.29 / nomax 25.98 / norenorm 26.87 / full 27.13`) attributed the emit to its
+reduction trees and never split out that tail, and every later "the emit is the cost" sentence inherited
+the attribution.  On this card float64 issues at 1/64 of float32 (measured this session: 0.45 vs 30.5
+TFMA/s in one kernel, `.qwen/tmp/fp64_peak_s36.py`), so a handful of fp64 ops per degree costs as much
+as the ~30 compensated fp32 ops of the recurrence.
+
+The fix (§5 of the maths note): split `log2 N = lex + frac`, precompute `2^frac` as a float32 table per
+`(m, ell)`, store float32 partials `p = sum * 2^frac * (-1)^m` and an int32 binade `e = emax + lex`
+per degree, and let the driver form `p * 2^e` in float64 with an exact bit-assembled power
+(`_pow2_f64_xla`) before the tile sum.  The kernel loop was also unrolled 8 degrees per iteration
+(`_UNROLL`, env `GMASTER_MARCH_UNROLL`): the emits of consecutive degrees are independent of the
+recurrence and of each other, so the scheduler overlaps their trees with the next degrees' arithmetic.
+
+`.qwen/tmp/emit_ablate_s36.py`, first 128-order window, medians (ms/window):
+
+| Nside | ship (fp64 emit) | fp32 emit | + unroll 8 | recurrence only | rel vs ship |
+|---|---|---|---|---|---|
+| 1024 (m0 = 0) | 3.74 | 2.26 | **1.92** | 1.23 | 7.5e-08 |
+| 1024 (m0 = 1024) | 2.51 | — | **1.30** | — | 9.0e-08 |
+| 1024 (m0 = 2560) | 0.65 | — | **0.37** | — | 8.8e-08 |
+| 2048 | 10.15 | — | **7.36** | 3.56 | 7.3e-08 |
+| 4096 | 43.23 | — | **22.51** | 13.68 | 6.6e-08 |
+
+Unroll 4 gives 2.18 ms and 16 spills (3.22 ms); a block-wide max once per 8 degrees (`blkmaxK`) was
+2.05 vs 1.92 and is not shipped.  The relative change is `~2u` of float32, which is the one extra
+rounding the proposition in the note predicts.  Accuracy against ducc0 after the change is unchanged to
+the printed digit (§5).
+
+### 2. The reference's polar skip
+
+ducc0/libsharp skip, for each order `m`, every ring whose `mlim(theta) = s|cos theta| +
+sqrt((lmax sin theta + ofs)^2 - s^2 sin^2 theta)`, `ofs = max(100, 0.01 lmax)`, is below `m`
+(`sharp_get_mlim`).  The march computed every `(m, theta)` lane of the triangle.  `_polar_skip` now
+applies the same rule per `(m, theta-tile)` program: the analysis program zeroes its row and marches
+no degree, the synthesis program stores its zero accumulators.  The maths note §8 gives the WKB bound
+(`S ~ 0.94 delta^1.5 / (sqrt(l' sin theta) cos theta) >~ 19` at the margin, i.e. below 1e-8 of the
+oscillatory amplitude) and the point that matters more: the neglected set is exactly the reference's,
+so the alm agreement with ducc0 does not move.  Work removed (`.qwen/tmp/mlim_count_s36.py`):
+analysis 13.9 / 17.5 / 19.3 % at Nside 1024 / 2048 / 4096; synthesis spin 0 (tile 1024) 2.5 / 10.0 /
+15.1 %, spin 2 (tile 512) 9.3 / 14.8 / 17.9 %.  `GMASTER_MARCH_POLAR_SKIP=0` restores the full march.
+
+### 3. Synthesis: a fixed accumulator binade
+
+`_accumulate_fast` re-derived, per lane and per degree, for *each* of the two order signs: the block
+exponent's `lift`, a residue rescale of both accumulators, the term alignment, and a `2^+-24` guard --
+about 25 vector ops per accumulator against 4 FMAs of arithmetic.  None of it is needed once the
+coefficients are prescaled: `_window_prescale` divides a window's coefficients by the power of two at
+their maximum, so `|coef| < 4`, `|d| <= 1` and the accumulator is below `2^(2 + log2 L)` in float32
+with no block exponent at all; the alignment `nd * 2^tex` is one exact power shared by both order
+signs (`lexm` was the same array as `lexd` -- the mirror sign is `+-1`).  `_accumulate_fixed` is that:
+one `_pow2`, one multiply, four FMAs.  The driver multiplies the result back by the window scale.
+Powers of two commute with rounding, so this is bit-identical to the old path except for terms below
+`2^-126` of the window scale, which are flushed; the map error against ducc0 is unchanged to the digit
+(2.32e-04 at 1024 spin 2, 8.19e-04 at 2048 spin 0, max relative to the map maximum, `.qwen/tmp/acc_s36.py`).
+
+### 4. Spin-2 analysis assembly by concatenation, and the Nside 4096 spin-2 pass
+
+`_forward_impl` wrote each window into a `(L, 2L-1)` complex128 buffer with `out.at[...].set` inside a
+loop unrolled over up to 192 windows; it now collects per-window column blocks and concatenates once,
+like `_inverse_impl` (session 27 priced this at 0.98-0.99x for *time* at 1024/2048; the reason to do it
+is the 4.8 GiB buffer XLA has to keep live across the unrolled program at 4096).  §5 has the result.
+
+### 5. Per-pass ladder against ducc0 (`.qwen/tmp/parity_s0_s35.py`, GPU1, warm medians)
+
+| Nside | spin | analysis before → after | vs ducc0 | synthesis before → after | vs ducc0 |
+|---|---|---|---|---|---|
+| 1024 | 2 | 0.0880 → **0.0669** s | 1.36x → **1.44x** | 0.0789 → **0.0555** | 1.39x → **1.65x** |
+| 2048 | 0 | 0.3073 → **0.2275** | 0.97x → **1.22x** | 0.2311 → **0.1524** | 1.27x → **1.78x** |
+| 2048 | 2 | 0.6174 → **0.4867** | 1.03x → **1.15x** | 0.4962 → **0.3431** | 1.24x → **1.61x** |
+| 4096 | 0 | 2.285 → **1.7212** | 0.88x → **1.05x** | 1.747 → **1.0854** | 1.16x → **1.70x** |
+
+(`.qwen/tmp/ladder_s36b.log`, `ladder_s36d.log`, `chain_s36f.log`; the 4096 row is gmaster-78's
+single-tenant `ladder_s36c.log`, the 2048 spin-2 row gmaster-fd's `chain_s36f.log`; the two forks'
+rows agree to 1–2 % where both exist.  "Before" is addendum 25/31.  Every JAX process preallocates
+75 % of the card, so no two JAX processes can share GPU1: every ratio taken while the other fork
+had a process alive is discarded.)
+The intermediate arms are on record too: fp32 emit alone took 1024 spin 2 analysis to 0.0727 and
+2048 spin 0 to 0.2733; adding the skip 0.0676 / 0.2474; the skip is worth 2–8 % of a pass (less
+than its share of the kernel because the ring stage and assembly do not shrink).
+
+### 6. The probe's accuracy columns were comparing a float against an array
+
+`parity_s0_s35.py` unpacked `_timed` as `_, cold, ours = ...` and then took `np.abs(ours - ref)`
+with `ours` the median *time*.  Every `max|dalm|` it ever printed was `|t - alm|`.  Fixed in place;
+`.qwen/tmp/acc_s36.py` is the direct check (max and rms relative, by `ell` band).
+
+### 7. Nside 4096 spin 2 never ran out of memory — it baked a 4 GiB table into a program
+
+`_map2alm_once`, `_alm2map_core` and `_map2alm_iteration` were jit boundaries that called the
+*non*-boundary `_forward_s2fft`/`_inverse_s2fft` inside their trace; those build the polarised ring
+chirp-Z tables under `ensure_compile_time_eval`, so the concrete arrays became HLO constants of the
+outer program, copied to the host at lowering (`_array_mlir_constant_handler`).  At Nside 4096 the
+analysis kernel table is `(8190, 65536)` complex64 = **4.00 GiB**, and the pass died with
+`RESOURCE_EXHAUSTED: Out of memory while trying to allocate 4.00GiB` before any transform ran
+(`.qwen/tmp/validate_s36c.log`).  Addendum 25 recorded this cell as "the 96 GiB device pool"; it was
+a constant.  The tables now cross as arguments (`_polarised_ring_tables`, `*_impl` boundaries).
+Result at 4096 spin 2: see `chain_s36e.log` / `gm_only_pipeline_s36.py` below.
+
+### 8. The fp64 rate, measured with independent accumulators
+
+`.qwen/tmp/fp64_peak_s36.py` (8 independent FMA chains per lane, 4 warps): **float64 0.45 TFMA/s
+(0.90 TFLOP/s), float32 30.5 TFMA/s** — 68:1.  Against ducc0's 1.72–2.0 s per Nside-4096 pass
+on the 96-core host, `docs/latitudinal_march_maths.md` §7 gives the lower bound for *any* float64
+kernel on this card: 4.0 s (datasheet rate) / 8.3 s (measured) for six FMAs per triple.  The
+reference cannot be beaten in float64 on this GPU; the march is compensated float32 for that reason.
+
+### 9. Proofs of record are Lean 4 now — and the project is sorry-free
+
+`formal/lean/` is a Lake project on Mathlib (`~/.elan/bin/lake build` passes).  The files mirror
+the sections of `docs/latitudinal_march_maths.md`, and the note names the theorem for every
+statement.  This session's two forks split the work: gmaster-fd wrote the project (Indices,
+Recurrence, ExponentCarry, Emit, Fold, Wall, PolarSkip — index combinatorics and the `ε_m` flip,
+the seeds and the exact rearrangement into the kernel's `(c1 x + c0) v - cb v'`, exact exponent
+carry, the `2^-71` flush bound, the binade split and two-rounding bound, symmetric-Jacobi parity and
+the hemisphere fold, `Σ_{m<L}(L-m) = L(L+1)/2` and the time bound, ducc0's `mlim` as the root of its
+quadratic); gmaster-78 then removed the last `sorry` and formalised what had been numerical:
+`JacobiSum.lean` proves DLMF 18.9.2 for the explicit 18.5.7 sum (`jacobi_three_term`, via three
+binomial ratio identities and a telescoping certificate), so `march_eq_jacobi` is sorry-free;
+`Mirror.lean` proves the spin-2 mirror identity the kernel uses (`rowNeg_reflect`,
+`mirror_identity`); `WignerJacobi.lean` proves `wignerD_eq_jacobiForm`, the §1 identification of
+Wigner's explicit sum with the Jacobi closed form in both `ε` branches.  The only statement with no
+Lean counterpart is the §8 WKB decay estimate behind the polar-skip margin (the rule itself is the
+reference's, and the ducc0 agreement is unchanged with the skip on and off).
+`.qwen/tmp/closed_form_check_s36.py` remains as the numerical cross-check (6e-13 / 4e-12).  The
+kernel writes `(-1)^m` for the closed form's `(-1)^(m+s)`, correct for even spin only
+(`Indices.sign_of_odd_spin`).
+
+### 10. After the constant: the polarised ring stage at Nside 4096 needs ~50 GiB on its own
+
+With the tables passing as arguments the 4096 spin-2 pass got past lowering and died inside the
+transform (`Failed to load in-memory CUBIN ... CUDA_ERROR_OUT_OF_MEMORY`, `chain_s36e.log`).  The
+polar chirp-Z ran all `2(nside-1) = 8190` cap rows in one batch: each intermediate (padded signal,
+its FFT, the product with the kernel spectrum, the inverse FFT) is `(8190, 65536)` complex128 =
+8.6 GiB, on top of 14 GiB of resident tables, before the `(16383, 24575)` ftm, the march's own
+buffers and the `(12288, 24575)` output exist.  `_forward_ring_fft_full` and
+`_inverse_ring_fft_complex` now process cap rows in `fori_loop` chunks of `_CAP_CHUNK_ROWS = 1024`
+(`GMASTER_CAP_CHUNK_ROWS`), so the peak of the stage is one chunk's intermediates; the last window
+is clamped and rewrites identical rows.  Bit-identical to the unchunked stage (CPU backend,
+`.qwen/tmp/czt_chunk_check_s36.py`: forward and inverse `max|d| = 0`), geometries with fewer cap
+rows than a chunk (Nside <= 512) take the unchanged single-batch path.  Measured effect at 4096:
+`.qwen/tmp/chain_s36f.log` (`mem_stages_s36.py` and the parity pass).
+
+### 11. The board after this session (single tenant, defaults: float64 tables, `follow` rings, fp64 coupling)
+
+`benchmarks/benchmark_pipeline.py`, `.qwen/tmp/chain_s36g.log`, pymaster → GMaster `TOTAL`:
+
+| Nside | spin 0 | ratio (addendum 31 → now) | spin 2 | ratio (addendum 31 → now) |
+|---|---|---|---|---|
+| 1024 | 1666 → 584 ms | 2.5x → **2.9x** | 3005 → 1065 ms | 2.7x → **2.8x** |
+| 2048 | 10172 → 4144 ms | 2.0x → **2.5x** | 17143 → 7123 ms | 2.1x → **2.4x** |
+| 4096 | 70873 → 33476 ms | 1.7x → **2.1x** | reference segfaults (addendum 25) | GMaster-only run: §12 |
+
+`rel` against pymaster: 7.70e-07 / 3.57e-06 (1024), 1.27e-06 / 1.09e-05 (2048), 1.45e-06 (4096
+spin 0) — the same digits as before the session, which is the pipeline-level statement of the
+bit-for-bit accuracy checks in §2–§3.  The 4096 spin-0 stage split is `field 10311 + mask 10403 +
+coupling 12651 ms`: the two transform stages fell from 14749 + 14781 (addendum 24) to 20714 ms
+together (1.43x), and with `GMASTER_COUPLING_PRECISION=fp32` (addendum 24: coupling 3189 ms) the
+cell would sit at ~24 s, i.e. ~3.0x.

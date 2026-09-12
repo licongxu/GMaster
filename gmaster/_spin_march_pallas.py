@@ -57,6 +57,13 @@ _TILE = int(os.environ.get("GMASTER_SPIN2_MARCH_TILE", "256"))
 _WARPS = int(os.environ.get("GMASTER_SPIN2_MARCH_WARPS", "1"))
 # Ceiling on programs per march launch for the wide m-window (see :func:`_march_windows`).
 _MARCH_GRID_CAP = int(os.environ.get("GMASTER_MARCH_GRID_CAP", "2048"))
+# Degrees per loop iteration of the analysis march (see `_kern`): 8 measured best at Nside 1024
+# (K=4 2.18 ms, K=8 1.92, K=16 3.22 -- spills -- against 3.82 for the per-degree loop,
+# `.qwen/tmp/emit_ablate_s36.py`).
+_UNROLL = int(os.environ.get("GMASTER_MARCH_UNROLL", "8"))
+# `GMASTER_MARCH_POLAR_SKIP=0` marches every (m, theta tile) program, including the ones above the
+# ring's `mlim` (see `_polar_skip`); on by default.
+_POLAR_SKIP = os.environ.get("GMASTER_MARCH_POLAR_SKIP", "1") == "1"
 
 _CALLS: dict = {}
 
@@ -200,8 +207,47 @@ def _pow2_f64(d):
     return jax.lax.bitcast_convert_type(biased << 52, jnp.float64)
 
 
-def _kern(manr, ex0r, xr, xlr, c1r, c0r, cbr, c1lr, c0lr, cblr, lgnr, sgnr, rr, m0_ref, out_ref,
-          *, L, ntheta, chunk, spin=SPIN, nc=NC):
+def _polar_skip(m, xv, valid, *, L, spin):
+    """True when no harmonic of order `m` is non-negligible on any ring of this tile.
+
+    ducc0's `sharp_get_mlim` (libsharp2 `sharp_ylmgen_c`): a ring at colatitude theta carries no
+    order above `mlim(theta) = s|cos theta| + sqrt((lmax sin theta + ofs)^2 - s^2 sin^2 theta)`,
+    `ofs = max(100, 0.01 lmax)`, and the reference skips the ring for every higher order.  Beyond
+    that order every `d^ell_{m,-s}(theta)` with `ell <= lmax` sits in its forbidden region by at
+    least `ofs` in `m`, where the WKB action `(2 sqrt 2 / 3) ofs^1.5 / sqrt(lmax sin theta) / cos theta`
+    puts it below ~1e-8 (docs/latitudinal_march_maths.md §8).  The tile is skipped when its
+    largest `mlim` is below `m`; the work that removes is 14 / 17 / 19 % of the analysis march at
+    Nside 1024 / 2048 / 4096 (`.qwen/tmp/mlim_count_s36.py`).  `xv` is the float32 cosine; the
+    half-precision of `1 - x^2` at the pole moves `mlim` by ~1 order against a margin of 100.
+    """
+    if not _POLAR_SKIP:
+        return jnp.zeros((), jnp.bool_)
+    sth = jnp.sqrt(jnp.maximum(1.0 - xv * xv, 0.0))
+    lmax = float(L - 1)
+    t1 = lmax * sth + max(100.0, 0.01 * lmax)
+    ml = spin * jnp.abs(xv) + jnp.sqrt(jnp.maximum(t1 * t1 - (spin * sth) ** 2, 0.0))
+    return m.astype(jnp.float32) > jnp.max(jnp.where(valid, ml, 0.0))
+
+
+def _kern(manr, ex0r, xr, xlr, c1r, c0r, cbr, c1lr, c0lr, cblr, mantr, lexr, sgnr, rr, m0_ref,
+          out_ref, oex_ref, *, L, ntheta, chunk, unroll, spin=SPIN, nc=NC):
+    """One (m-window row, theta tile) of the analysis march; see the module docstring.
+
+    The emit is float32 end to end and the fp64 lives outside the kernel.  Each degree stores its
+    four channel partials as float32 scaled by the normalisation's *fractional* binade
+    (`mantr`, in [1, 2)) and, in `oex_ref`, the integer binade the partial is missing: the tile's
+    exponent `emax` plus `lexr = floor(log2 N(ell, m))`.  The driver applies `2**oex` in float64
+    and sums the tiles.  The shipped form computed `exp2(emax + log2 N)` in float64 in the kernel
+    and stored `float64` partials -- a warp-wide fp64 exp2, four fp64 converts and four fp64
+    multiplies per degree on a card that issues fp64 at 1/64 rate, which session 21's ablations
+    booked under "the emit" without splitting it out.  Measured on the first 128-order window,
+    `.qwen/tmp/emit_ablate_s36.py` (medians, GPU1): Nside 1024 3.74 -> 2.26 ms from the fp32 emit
+    alone, and 1.92 ms with `unroll` degrees per loop iteration (the independent per-degree
+    reduction trees then overlap the next degrees' recurrence); Nside 4096 43.2 -> 22.5 ms.  The
+    recurrence-only floor is 1.23 / 13.7 ms at those sizes.  The change is a rounding-order change
+    (one float32 multiply by the fractional binade per partial): 7.5e-08 relative to the fp64-emit
+    kernel over every lane at Nside 1024, windows m0 = 0 / 1024 / 2560.
+    """
     row = pl.program_id(0)
     tile = pl.program_id(1)
     m0 = plt.load(m0_ref.at[0])
@@ -216,17 +262,22 @@ def _kern(manr, ex0r, xr, xlr, c1r, c0r, cbr, c1lr, c0lr, cblr, lgnr, sgnr, rr, 
     # One lane per iteration, matching `emit`'s store width: the Triton lowering requires every
     # operation's array to be a power of two in size, and a ragged last window makes `mb` something
     # like 96 (nside 32, L = 96), so a `(mb, NC)` head block fails to compile on those geometries.
+    xv = plt.load(xr.at[t], mask=valid, other=0.0)
+    skip = _polar_skip(m, xv, valid, L=L, spin=spin)
+
     def zero_head(i, carry):
         plt.store(out_ref.at[row, tile, i, slice(0, nc)],
-                  jnp.zeros((nc,), dtype=jnp.float64))
+                  jnp.zeros((nc,), dtype=jnp.float32))
+        plt.store(oex_ref.at[row, tile, i], jnp.int32(0))
         return carry
 
-    lax.fori_loop(0, jnp.maximum(nstart - m0, 0), zero_head, ())
+    # A skipped tile zeroes its whole row (`out_ref.shape[2]` lanes) instead of marching it.
+    lax.fori_loop(0, jnp.where(skip, out_ref.shape[2], jnp.maximum(nstart - m0, 0)),
+                  zero_head, ())
 
     man = plt.load(manr.at[row, t], mask=valid, other=0.0)
     ex0 = plt.load(ex0r.at[row, t])
     ex = ex0
-    xv = plt.load(xr.at[t], mask=valid, other=0.0)
     xl = plt.load(xlr.at[t], mask=valid, other=0.0)
     r = plt.load(rr.at[row, t, slice(0, nc)])
     mf = m.astype(jnp.float32)
@@ -235,20 +286,24 @@ def _kern(manr, ex0r, xr, xlr, c1r, c0r, cbr, c1lr, c0lr, cblr, lgnr, sgnr, rr, 
     alpha = mf + jnp.float32(spin)
     beta = jnp.abs(mf - jnp.float32(spin))
     p1f = ((alpha + beta + 2.0) / 2.0) * xv + ((alpha - beta) / 2.0)
-    sgn = plt.load(sgnr.at[row]).astype(jnp.float64)
+    sgn = plt.load(sgnr.at[row]).astype(jnp.float32)
 
-    def emit(cur, ex, ell):
+    def emit(cur, ex, ell, ok):
         # One reduction for all four channels: `cur[:, None] * r` is a (chunk, NC) block, so theta
         # folds through a single Triton tree and the channels share its latency instead of running
-        # four dependent ones; the partial leaves as one (NC,) float64 store.
+        # four dependent ones; the partial leaves as one (NC,) float32 store plus its binade.
         emax = jnp.max(ex)
         val = cur * _pow2((ex - emax).astype(jnp.int32))
-        sc = jnp.exp2(emax.astype(jnp.float64) + plt.load(lgnr.at[row, ell]).astype(jnp.float64))
-        parts = jnp.sum(val[:, None] * r, axis=0) * (sc * sgn)
-        plt.store(out_ref.at[row, tile, ell - m0, slice(0, nc)], parts.astype(jnp.float64))
+        parts = jnp.sum(val[:, None] * r, axis=0) * (plt.load(mantr.at[row, ell]) * sgn)
+        plt.store(out_ref.at[row, tile, ell - m0, slice(0, nc)], parts,
+                  mask=jnp.broadcast_to(ok, (nc,)))
+        plt.store(oex_ref.at[row, tile, ell - m0], emax + plt.load(lexr.at[row, ell]), mask=ok)
 
     def degree(ell, st):
         ph, pl_, ch, cl, ex = st
+        # Degrees past `L` only occur in the tail of an unrolled block; they are marched on the
+        # last coefficient and their emit is masked off.
+        ell = jnp.minimum(ell, L - 1)
         c1 = jnp.broadcast_to(plt.load(c1r.at[row, ell]).astype(jnp.float32), xv.shape)
         c0 = jnp.broadcast_to(plt.load(c0r.at[row, ell]).astype(jnp.float32), xv.shape)
         cb = jnp.broadcast_to(plt.load(cbr.at[row, ell]).astype(jnp.float32), xv.shape)
@@ -289,29 +344,64 @@ def _kern(manr, ex0r, xr, xlr, c1r, c0r, cbr, c1lr, c0lr, cblr, lgnr, sgnr, rr, 
         ex = ex + jnp.where(large, JUMP, jnp.where(small, -JUMP, 0)).astype(jnp.int32)
         nxt = nxt * mult
         nxtl = nxtl * mult
-        emit(nxt, ex, ell)
         return (jnp.where(valid, ch * mult, jnp.float32(0.0)),
                 jnp.where(valid, cl * mult, jnp.float32(0.0)), nxt, nxtl, ex)
 
+    def block(it, st):
+        # `unroll` degrees per iteration: the recurrence is one serial chain, but the emits of
+        # consecutive degrees are independent of it and of each other, so the scheduler can overlap
+        # their reduction trees with the following degrees' arithmetic.
+        base = nstart + it * unroll
+        stage = []
+        for k in range(unroll):
+            st = degree(base + k, st)
+            stage.append((st[2], st[4]))
+        for k, (cur, exk) in enumerate(stage):
+            emit(cur, exk, base + k, base + k < L)
+        return st
+
     zb = jnp.zeros_like(man)
-    lax.fori_loop(nstart, L, degree, (zb, zb, man, zb, ex))
+    lax.fori_loop(0, jnp.where(skip, 0, (L - nstart + unroll - 1) // unroll), block,
+                  (zb, zb, man, zb, ex))
 
 
 def _call(L, ntheta, ntile, mb, spin=SPIN, Lm=None, nc=NC):
     # `Lm` is the slab's ell extent: the window's own range `L - m0`, which is what the row writes
     # (`L - nstart` lanes at index `ell - m0`) plus the head it zeroes.
     Lm = L if Lm is None else Lm
-    key = (int(L), int(ntheta), int(ntile), int(mb), int(Lm), _TILE, _WARPS, int(spin), int(nc))
+    key = (int(L), int(ntheta), int(ntile), int(mb), int(Lm), _TILE, _WARPS, _UNROLL, int(spin),
+           int(nc))
     call = _CALLS.get(key)
     if call is None:
         call = jax.jit(pl.pallas_call(
-            partial(_kern, L=L, ntheta=ntheta, chunk=_TILE, spin=spin, nc=nc),
-            out_shape=jax.ShapeDtypeStruct((mb, ntile, Lm, nc), jnp.float64),
+            partial(_kern, L=L, ntheta=ntheta, chunk=_TILE, unroll=_UNROLL, spin=spin, nc=nc),
+            out_shape=(jax.ShapeDtypeStruct((mb, ntile, Lm, nc), jnp.float32),
+                       jax.ShapeDtypeStruct((mb, ntile, Lm), jnp.int32)),
             grid=(mb, ntile),
             compiler_params=plt.CompilerParams(num_warps=_WARPS),
             name=f"gmaster_spin{int(spin)}_march"))
         _CALLS[key] = call
     return call
+
+
+def _analysis_inputs(g):
+    """Kernel operands from a `_window_geometry` tuple: the normalisation split into its
+    fractional binade (float32, in [1, 2)) and its integer binade (int32)."""
+    lgs = g[10]
+    lex = jnp.floor(lgs)
+    return (*g[:10], jnp.exp2(lgs - lex).astype(jnp.float32), lex.astype(jnp.int32), g[11])
+
+
+def _pow2_f64_xla(e):
+    """Exact `2.0**e` for an integer array, assembled from the exponent field; binades the
+    partial cannot represent in float64 (below 2**-1022) are the contributions that vanish."""
+    biased = (jnp.clip(e, -1022, 1023) + 1023).astype(jnp.int64)
+    return jnp.where(e < -1022, 0.0, lax.bitcast_convert_type(biased << 52, jnp.float64))
+
+
+def _sum_tiles(parts, oex):
+    """`(mb, ntile, Lm, nc)` float32 partials and their binades to `(mb, Lm, nc)` float64."""
+    return jnp.sum(parts.astype(jnp.float64) * _pow2_f64_xla(oex)[..., None], axis=1)
 
 
 # --------------------------------------------------------------------------------- geometry, in
@@ -480,10 +570,13 @@ def _forward_impl(ftm, *, L, spin, nside):
     npad = ntile * _TILE
     x = jnp.cos(theta)
     sh, ch = jnp.sin(theta / 2.0), jnp.cos(theta / 2.0)
-    off = L - 1
     rev = ftm[::-1]                                  # ring i of rev is the ring at pi - theta_i
     sign = ss._sign(L, SPIN)
-    out = jnp.zeros((L, 2 * L - 1), dtype=jnp.complex128)
+    # Assembled by one concatenation of per-window column blocks, like `_inverse_impl`: the
+    # per-window `out.at[...].set` form holds a full (L, 2L-1) complex128 buffer -- 4.8 GiB at
+    # Nside 4096 -- across an unrolled loop of up to 192 windows, and XLA's buffer assignment for
+    # that program is what pushed the spin-2 pass past the pool there (session 36).
+    dirs, mirs = [], []
     for (m0, m1, lo) in _march_windows(L, ntile, SPIN):
         mb = m1 - m0
         g = _window_geometry(m0, mb, x, sh, ch, L, npad)
@@ -492,24 +585,25 @@ def _forward_impl(ftm, *, L, spin, nside):
         chan = jnp.stack([direct.real.T, direct.imag.T, mirror.real.T, mirror.imag.T], axis=-1)
         rhs = jnp.zeros((mb, npad, NC), dtype=jnp.float32).at[:, :ntheta].set(
             lax.convert_element_type(chan, jnp.float32))
-        parts = _call(L, ntheta, ntile, mb, Lm=L - m0)(*g, rhs, jnp.asarray([m0], jnp.int32)).sum(1)
+        parts = _sum_tiles(*_call(L, ntheta, ntile, mb, Lm=L - m0)(
+            *_analysis_inputs(g), rhs, jnp.asarray([m0], jnp.int32)))
         parts = parts.transpose(1, 0, 2)             # (m, ell, channel) -> (ell, m, channel)
         # Slab index `i` is ell = m0 + i, and row `i_m` emits from max(m0 + i_m, spin); the kernel
         # zeroed the head, so this mask only pins the contract down outside the kernel.
         acc = jnp.where(
             (jnp.arange(L - m0)[:, None]
              >= jnp.maximum(jnp.arange(mb)[None, :], SPIN - m0))[..., None], parts, 0.0)
-        # `acc` is already (ell, m, channel); the shipped kernel returns (m, ell, channel) and
-        # transposes here, which is the only difference in this assembly.
-        out = out.at[lo:, off + m0:off + m1].set(acc[:, :, 0] + 1j * acc[:, :, 1])
+        head = jnp.zeros((lo, mb), dtype=jnp.complex128)
+        dirs.append(jnp.concatenate([head, acc[:, :, 0] + 1j * acc[:, :, 1]], axis=0))
         mir = sign[lo:, None] * (acc[:, :, 2] + 1j * acc[:, :, 3])
         if m0:
-            out = out.at[lo:, off - m1 + 1:off - m0 + 1].set(mir[:, ::-1])
+            mirs.append(jnp.concatenate([head, mir[:, ::-1]], axis=0))     # columns off-m1+1 .. off-m0
         else:
             # Column off is the direct channel alone: m = 0 is its own mirror and does not
             # satisfy the theta -> pi-theta relation.
-            out = out.at[lo:, off - m1 + 1:off].set(mir[:, 1:][:, ::-1])
-    return out
+            mirs.append(jnp.concatenate([head[:, 1:], mir[:, 1:][:, ::-1]], axis=0))
+    # Ascending windows cover descending mirror columns: highest window first, window 0 last.
+    return jnp.concatenate(mirs[::-1] + dirs, axis=1)
 
 
 def forward_latitudinal(ftm, *, L, spin, nside):
@@ -690,8 +784,8 @@ def _fold_analyze(positives, weights, phase, *, L, nside):
         mb = m1 - m0
         g = _window_geometry(m0, mb, x, sh, ch, L, npad, spin=0)
         rhs = rhs_all[m0:m1]
-        parts = _call(L, north, ntile, mb, spin=0, Lm=L - m0, nc=nc)(
-            *g, rhs, jnp.asarray([m0], jnp.int32)).sum(1)      # (mb, L - m0, nc)
+        parts = _sum_tiles(*_call(L, north, ntile, mb, spin=0, Lm=L - m0, nc=nc)(
+            *_analysis_inputs(g), rhs, jnp.asarray([m0], jnp.int32)))   # (mb, L - m0, nc)
         ms = m0 + jnp.arange(mb)
         el = m0 + jnp.arange(L - m0)
         # Rows emit from `ell = m` and never below it; the kernel zeroed that head and the mask keeps
@@ -831,6 +925,22 @@ def _accumulate(nd, ndl, tex, aex, at0, rh, rl, ih, il, a_r, a_l, b_r, b_l):
     return a_r * amult, a_l * amult, b_r * amult, b_l * amult, aex
 
 
+def _accumulate_fixed(nd, tex, rh, ih, mrh, mih, a_r, b_r, c_r, d_r):
+    """Plain-float32 accumulation of one degree's term into both order signs at a fixed binade.
+
+    The coefficients arrive prescaled to `[1, 2)` at their maximum (`_window_prescale`) and the
+    term `nd * 2**tex` is the bare `|d| / 2**frac <= 1`, so the accumulators stay below
+    `2**(2 + log2 L)` and need no block exponent: the alignment is one exact power of two shared by
+    the direct and mirror sums (their `lex` are the same array), then four FMAs.  Against
+    `_accumulate_fast`, which re-derived a per-lane block exponent, a lift, a residue rescale and
+    a 2^+-24 guard for each of the two sums every degree, this is the same arithmetic with the
+    range bookkeeping removed: bit-identical except for terms below `2**-126` of the window's
+    scale, which are flushed.
+    """
+    nd = nd * _pow2(tex)
+    return a_r + nd * rh, b_r + nd * ih, c_r + nd * mrh, d_r + nd * mih
+
+
 def _accumulate_fast(nd, tex, aex, at0, rh, ih, a_r, b_r):
     """Plain-float32 accumulation of one degree's term: same range guards, no limbs.
 
@@ -898,6 +1008,8 @@ def _kern_synth(manr, ex0r, xr, xlr, c1r, c0r, cbr, c1lr, c0lr, cblr,
     alpha = mf + jnp.float32(spin)
     beta = jnp.abs(mf - jnp.float32(spin))
     p1f = ((alpha + beta + 2.0) / 2.0) * xv + ((alpha - beta) / 2.0)
+    # A tile above its `mlim` marches no degree and stores its zero accumulators.
+    stop = jnp.where(_polar_skip(m, xv, valid, L=L, spin=spin), nstart, L)
 
     def degree(ell, st):
         if _ACC_FAST:
@@ -951,19 +1063,15 @@ def _kern_synth(manr, ex0r, xr, xlr, c1r, c0r, cbr, c1lr, c0lr, cblr,
         chs = jnp.where(valid, ch * dmult, jnp.float32(0.0))
         cls = jnp.where(valid, cl * dmult, jnp.float32(0.0))
         if _ACC_FAST:
-            tex = jnp.where(valid, ex + lex, aexd)
-            adr, adi, aexd = _accumulate_fast(
-                nxt, tex, aexd, at0,
+            # Pad lanes carry `EX_PAD` and flush to zero through `_pow2`; `lexmr` is the same
+            # array as `lexdr` (the mirror sign is +-1), so one alignment serves both sums.
+            adr, adi, amr, ami = _accumulate_fixed(
+                nxt, ex + lex,
                 jnp.broadcast_to(plt.load(drh.at[row, ell]), xv.shape),
                 jnp.broadcast_to(plt.load(dih.at[row, ell]), xv.shape),
-                adr, adi)
-            lexm = jnp.broadcast_to(plt.load(lexmr.at[row, ell]), xv.shape)
-            texm = jnp.where(valid, ex + lexm, aexm)
-            amr, ami, aexm = _accumulate_fast(
-                nxt, texm, aexm, at0,
                 jnp.broadcast_to(plt.load(mrh.at[row, ell]), xv.shape),
                 jnp.broadcast_to(plt.load(mih.at[row, ell]), xv.shape),
-                amr, ami)
+                adr, adi, amr, ami)
             return chs, cls, nxt, nxtl, ex, adr, adi, aexd, amr, ami, aexm
         tex = jnp.where(valid, ex + lex, aexd)
         adr, adl, adi, adli, aexd = _accumulate(
@@ -990,7 +1098,7 @@ def _kern_synth(manr, ex0r, xr, xlr, c1r, c0r, cbr, c1lr, c0lr, cblr,
     if _ACC_FAST:
         (_, _, _, _, _, adr, adi, aexd,
          amr, ami, aexm) = lax.fori_loop(
-            nstart, L, degree, (zb, zb, man, zb, ex, zb, zb, zi, zb, zb, zi))
+            nstart, stop, degree, (zb, zb, man, zb, ex, zb, zb, zi, zb, zb, zi))
         sd = _pow2_f64(aexd)
         sm_ = _pow2_f64(aexm)
         plt.store(out_ref.at[row, tile, slice(0, chunk), slice(0, 2)],
@@ -1002,8 +1110,8 @@ def _kern_synth(manr, ex0r, xr, xlr, c1r, c0r, cbr, c1lr, c0lr, cblr,
         return
     (_, _, _, _, _, adr, adl, adi, adli, aexd,
      amr, aml, ami, amli, aexm) = lax.fori_loop(
-        nstart, L, degree, (zb, zb, man, zb, ex, zb, zb, zb, zb, zi,
-                            zb, zb, zb, zb, zi))
+        nstart, stop, degree, (zb, zb, man, zb, ex, zb, zb, zb, zb, zi,
+                               zb, zb, zb, zb, zi))
     sd = _pow2_f64(aexd)
     sm_ = _pow2_f64(aexm)
     # Two stores, not one 4-channel `stack`: Pallas lowers concatenate only in arity 2.
@@ -1030,6 +1138,21 @@ def _call_synth(L, ntheta, ntile, mb, spin=SPIN):
     return call
 
 
+def _window_prescale(c):
+    """Divide a window's coefficients by the power of two at their maximum, returning the scale.
+
+    With `max(|Re c|, |Im c|) < 2` inside the kernel, `|d^ell_{m,-s}| <= 1` and at most `L` terms,
+    every synthesis accumulator is below `2^(2 + log2 L)` and no per-lane block exponent is needed
+    (`_kern_synth`): the accumulated value is the true one, and the caller multiplies the result by
+    `scale`.  Powers of two are exact, so this is bit-identical to accumulating at the caller's
+    scale except for terms below `2^-126` of it, which the fixed binade flushes.
+    """
+    amax = jnp.max(jnp.maximum(jnp.abs(c.real), jnp.abs(c.imag)))
+    e = jnp.where(amax > 0, jnp.floor(jnp.log2(jnp.where(amax > 0, amax, 1.0))), 0.0)
+    scale = jnp.exp2(e)
+    return c / scale, scale
+
+
 def _synth_coeff(flm, m0, mb, L, *, mirror):
     """Coefficient sequence and exponent split for one window of orders.
 
@@ -1054,13 +1177,14 @@ def _synth_coeff(flm, m0, mb, L, *, mirror):
     lgs = _log2_norm(m0, mb, L)                        # (mb, L) float64
     lex = jnp.floor(lgs)
     sc = jnp.exp2(lgs - lex) * ((-1.0) ** ms)[:, None]
+    c, scale = _window_prescale(c)
     out = []
     for part in (c.real.T * sc, c.imag.T * sc):
         hi = part.astype(jnp.float32)
         out.append(hi)
         out.append((part - hi.astype(jnp.float64)).astype(jnp.float32))
     drh, drl, dih, dil = out
-    return lex.astype(jnp.int32), drh, drl, dih, dil
+    return lex.astype(jnp.int32), drh, drl, dih, dil, scale
 
 
 def _synth_coeff0(alm, m0, mb, L, *, mirror):
@@ -1086,13 +1210,14 @@ def _synth_coeff0(alm, m0, mb, L, *, mirror):
         parity = 1.0 - 2.0 * ((ms[:, None] + jnp.arange(L)[None, :]) % 2)
     else:
         parity = 1.0
+    c, scale = _window_prescale(c)
     out = []
     for part in (c.real.T * sc * parity, c.imag.T * sc * parity):
         hi = part.astype(jnp.float32)
         out.append(hi)
         out.append((part - hi.astype(jnp.float64)).astype(jnp.float32))
     drh, drl, dih, dil = out
-    return lex.astype(jnp.int32), drh, drl, dih, dil
+    return lex.astype(jnp.int32), drh, drl, dih, dil, scale
 
 
 @partial(jax.jit, static_argnames=("L", "spin", "nside"))
@@ -1127,10 +1252,11 @@ def _inverse_impl(flm, *, L, spin, nside):
             # m = 0 is its own mirror and has no negative column, so its mirror accumulator is
             # simply never fed; every other row of this window is a genuine negative order.
             keep = (jnp.arange(mb) != 0)[:, None]
-            mc = tuple(jnp.where(keep, a, jnp.zeros_like(a)) for a in mc)
-        v = _call_synth(L, ntheta, ntile, mb)(*g[:10], *dc, *mc,
+            mc = tuple(jnp.where(keep, a, jnp.zeros_like(a)) for a in mc[:5]) + mc[5:]
+        v = _call_synth(L, ntheta, ntile, mb)(*g[:10], *dc[:5], *mc[:5],
                                               jnp.asarray([m0], jnp.int32))
         v = v.reshape(mb, npad, 4)[:, :ntheta]
+        v = v * jnp.stack([dc[5], dc[5], mc[5], mc[5]])
         dirs.append(v[:, :, 0].T + 1j * v[:, :, 1].T)             # columns L+m0 .. L+m1-1
         # `R_m(pi - theta_i)` is the marched lane at the mirrored ring, so the mirror accumulator
         # lands at the reversed theta axis; its rows are descending orders by the column layout.
@@ -1181,9 +1307,10 @@ def _inverse_fold_impl(positive, phase, *, L, nside):
         g = _window_geometry(m0, mb, x, sh, ch, L, npad, spin=0)
         dc = _synth_coeff0(alm, m0, mb, L, mirror=False)
         mc = _synth_coeff0(alm, m0, mb, L, mirror=True)
-        v = _call_synth(L, north, ntile, mb, spin=0)(*g[:10], *dc, *mc,
+        v = _call_synth(L, north, ntile, mb, spin=0)(*g[:10], *dc[:5], *mc[:5],
                                                      jnp.asarray([m0], jnp.int32))
         v = v.reshape(mb, npad, 4)[:, :north]
+        v = v * jnp.stack([dc[5], dc[5], mc[5], mc[5]])
         nf = jnp.exp(1j * (ms[:, None] * phase[:north][None, :]))
         sf = jnp.exp(1j * (ms[:, None] * jnp.flip(phase)[: north - 1][None, :]))
         dirs.append((v[:, :, 0] + 1j * v[:, :, 1]) * nf)              # (mb, north)

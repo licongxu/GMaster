@@ -3,6 +3,8 @@
 from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache, partial
 
+import os
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -1287,6 +1289,27 @@ def _spin_ring_analysis_tables(L, nside, device=None):
     )
 
 
+# Polar-cap rows per chirp-Z batch in the polarised ring stages.  All cap rows at once is
+# `2*(nside-1)` rows of a `next_pow2(width + 2L)`-point transform: at Nside 4096 that is
+# `(8190, 65536)` complex128 = 8.6 GiB *per intermediate* (pad, FFT, product, inverse FFT), which
+# with the 14 GiB of resident tables is what exhausted the 71 GiB pool for a single spin-2 pass
+# (`.qwen/tmp/chain_s36e.log`, session 36).  Rows are independent, so the stage runs in
+# `fori_loop` chunks and the peak is one chunk's intermediates.  Chunks past the end are clamped
+# to the last full window and rewrite identical rows.
+_CAP_CHUNK_ROWS = int(os.environ.get("GMASTER_CAP_CHUNK_ROWS", "1024"))
+
+
+def _chunked_rows(nrows, chunk, body, init):
+    """`init` overwritten chunk by chunk with `body(row_block_start)`; clamped last window."""
+    nchunk = -(-nrows // chunk)
+
+    def step(i, acc):
+        start = jnp.minimum(i * chunk, nrows - chunk)
+        return jax.lax.dynamic_update_slice_in_dim(acc, body(start), start, axis=0)
+
+    return jax.lax.fori_loop(0, nchunk, step, init)
+
+
 @partial(jax.jit, static_argnames=("L", "nside"))
 def _forward_ring_fft_full(signal, tables, *, L, nside):
     """Complex ring FFT returning the full centered window m in [-(L-1), L).
@@ -1317,11 +1340,22 @@ def _forward_ring_fft_full(signal, tables, *, L, nside):
         cap_pixels = jnp.where(jnp.asarray(valid)[rows],
                                pixels[jnp.asarray(gather)[rows]], 0.0)
         transform_size = _next_fast_len_pow2(width + 2 * L)
-        embedded = jnp.pad(cap_pixels * chirp_in, ((0, 0), (0, transform_size - width)))
-        convolution = jnp.fft.ifft(
-            jnp.fft.fft(embedded, axis=-1) * kernel_spec, axis=-1
-        )
-        cap_out = chirp_out * convolution[:, width - 1 : width - 1 + 2 * L - 1]
+
+        def czt(px, c_in, k_spec, c_out):
+            embedded = jnp.pad(px * c_in, ((0, 0), (0, transform_size - width)))
+            convolution = jnp.fft.ifft(jnp.fft.fft(embedded, axis=-1) * k_spec, axis=-1)
+            return c_out * convolution[:, width - 1 : width - 1 + 2 * L - 1]
+
+        nrows = int(caps.size)
+        if nrows <= _CAP_CHUNK_ROWS:
+            cap_out = czt(cap_pixels, chirp_in, kernel_spec, chirp_out)
+        else:
+            chunk = _CAP_CHUNK_ROWS
+            cap_out = _chunked_rows(
+                nrows, chunk,
+                lambda start: czt(*(jax.lax.dynamic_slice_in_dim(a, start, chunk, axis=0)
+                                    for a in (cap_pixels, chirp_in, kernel_spec, chirp_out))),
+                jnp.zeros((nrows, 2 * L - 1), dtype=chirp_out.dtype))
 
     belt_rows = belt_hi - belt_lo
     if belt_rows == 0:
@@ -1384,16 +1418,28 @@ def _inverse_ring_fft_complex(centered, tables, *, L, nside):
     if caps.size:
         cap_grid = grid[jnp.asarray(caps)]
         transform_size = _next_fast_len_pow2(2 * L - 1 + width)
-        embedded = jnp.pad(cap_grid * chirp_c,
-                           ((0, 0), (0, transform_size - (2 * L - 1))))
-        convolution = jnp.fft.ifft(
-            jnp.fft.fft(embedded, axis=-1) * kernel_spec, axis=-1
-        )
         p_index = jnp.arange(width, dtype=jnp.int64)
-        cap_res = chirp_p * convolution[:, 2 * L - 2 : 2 * L - 2 + width]
-        rows_nphi = nphi[jnp.asarray(caps)][:, None]
-        wrap_phase = ((L - 1) % rows_nphi) * p_index[None, :] % rows_nphi
-        cap_res *= jnp.exp(-1j * wrap_phase * (2 * jnp.pi / rows_nphi))
+        caps_nphi = nphi[jnp.asarray(caps)]
+
+        def czt(g, c_c, k_spec, c_p, rows_nphi):
+            embedded = jnp.pad(g * c_c, ((0, 0), (0, transform_size - (2 * L - 1))))
+            convolution = jnp.fft.ifft(jnp.fft.fft(embedded, axis=-1) * k_spec, axis=-1)
+            res = c_p * convolution[:, 2 * L - 2 : 2 * L - 2 + width]
+            rows_nphi = rows_nphi[:, None]
+            wrap_phase = ((L - 1) % rows_nphi) * p_index[None, :] % rows_nphi
+            return res * jnp.exp(-1j * wrap_phase * (2 * jnp.pi / rows_nphi))
+
+        nrows = int(caps.size)
+        if nrows <= _CAP_CHUNK_ROWS:
+            cap_res = czt(cap_grid, chirp_c, kernel_spec, chirp_p, caps_nphi)
+        else:
+            chunk = _CAP_CHUNK_ROWS
+            cap_res = _chunked_rows(
+                nrows, chunk,
+                lambda start: czt(*(jax.lax.dynamic_slice_in_dim(a, start, chunk, axis=0)
+                                    for a in (cap_grid, chirp_c, kernel_spec, chirp_p,
+                                              caps_nphi))),
+                jnp.zeros((nrows, width), dtype=chirp_p.dtype))
 
     belt_rows = belt_hi - belt_lo
     if belt_rows == 0:
@@ -1566,17 +1612,44 @@ def _unpack_spin(alm, L, L_work):
     return jnp.concatenate((negative, positive), axis=1)
 
 
+def _polarised_ring_tables(spin, L_work, nside, like, *, synthesis):
+    """The ring chirp-Z constants a polarised core needs, fetched *outside* its trace.
+
+    `_map2alm_once`, `_alm2map_core` and `_map2alm_iteration` used to be the jit boundaries
+    themselves and called the non-boundary `_forward_s2fft`/`_inverse_s2fft` inside their trace;
+    those build the tables under `ensure_compile_time_eval`, so the concrete arrays were baked
+    into the outer program as HLO constants -- copied to the host at lowering
+    (`_array_mlir_constant_handler`) and re-embedded per executable.  At Nside 4096 the analysis
+    kernel table alone is `(8190, 65536)` complex64 = 4.00 GiB and the polarised `map2alm` died
+    with `RESOURCE_EXHAUSTED ... 4.00GiB` before any transform ran
+    (`.qwen/tmp/validate_s36c.log`, session 36).  Spin 0 passes `()` and never saw it.
+    """
+    if spin == 0:
+        return ()
+    device = getattr(like, "device", None)
+    if synthesis:
+        return _spin_ring_synthesis_tables(L_work, nside, device)
+    return _spin_ring_analysis_tables(L_work, nside, device)
+
+
+def _alm2map_core(alm, ell, order, *, spin, nside, L, L_work):
+    tables = _polarised_ring_tables(spin, L_work, nside, alm, synthesis=True)
+    return _alm2map_core_impl(alm, tables, ell, order, spin=spin, nside=nside, L=L,
+                              L_work=L_work)
+
+
 @partial(
     jax.jit,
     static_argnames=("spin", "nside", "L", "L_work"),
 )
-def _alm2map_core(alm, ell, order, *, spin, nside, L, L_work):
+def _alm2map_core_impl(alm, tables, ell, order, *, spin, nside, L, L_work):
     if spin == 0:
         elm = _unpack_real(alm[0], L, L_work)
-        maps = _inverse_s2fft(elm, L=L_work, spin=0, nside=nside, reality=True)
+        maps = _inverse_s2fft_impl(elm, (), L=L_work, spin=0, nside=nside, reality=True)
         return jnp.real(maps)[None, :]
-    maps = _inverse_s2fft(
+    maps = _inverse_s2fft_impl(
         _unpack_spin(alm, L, L_work),
+        tables,
         L=L_work,
         spin=spin,
         nside=nside,
@@ -1585,17 +1658,24 @@ def _alm2map_core(alm, ell, order, *, spin, nside, L, L_work):
     return jnp.stack([jnp.real(maps), jnp.imag(maps)])
 
 
+def _map2alm_once(maps, ell, order, *, spin, nside, L, L_work):
+    tables = _polarised_ring_tables(spin, L_work, nside, maps, synthesis=False)
+    return _map2alm_once_impl(maps, tables, ell, order, spin=spin, nside=nside, L=L,
+                              L_work=L_work)
+
+
 @partial(
     jax.jit,
     static_argnames=("spin", "nside", "L", "L_work"),
 )
-def _map2alm_once(maps, ell, order, *, spin, nside, L, L_work):
+def _map2alm_once_impl(maps, tables, ell, order, *, spin, nside, L, L_work):
     if spin == 0:
-        flm = _forward_s2fft(maps[0], L=L_work, spin=0, nside=nside, reality=True)
+        flm = _forward_s2fft_impl(maps[0], (), L=L_work, spin=0, nside=nside, reality=True)
         return flm[ell, L_work - 1 + order][None, :]
 
-    plus = _forward_s2fft(
+    plus = _forward_s2fft_impl(
         maps[0] + 1j * maps[1],
+        tables,
         L=L_work,
         spin=spin,
         nside=nside,
@@ -1606,16 +1686,24 @@ def _map2alm_once(maps, ell, order, *, spin, nside, L, L_work):
     return jnp.stack([-(plus_m + minus_m) / 2, 0.5j * (plus_m - minus_m)])
 
 
-@partial(jax.jit, static_argnames=("spin", "nside", "L", "L_work"))
 def _map2alm_iteration(alm, maps, ell, order, *, spin, nside, L, L_work):
+    a_tables = _polarised_ring_tables(spin, L_work, nside, maps, synthesis=False)
+    s_tables = _polarised_ring_tables(spin, L_work, nside, alm, synthesis=True)
+    return _map2alm_iteration_impl(alm, maps, a_tables, s_tables, ell, order, spin=spin,
+                                   nside=nside, L=L, L_work=L_work)
+
+
+@partial(jax.jit, static_argnames=("spin", "nside", "L", "L_work"))
+def _map2alm_iteration_impl(alm, maps, a_tables, s_tables, ell, order, *, spin, nside, L,
+                            L_work):
     residual = (
-        _alm2map_core(
-            alm, ell, order, spin=spin, nside=nside, L=L, L_work=L_work
+        _alm2map_core_impl(
+            alm, s_tables, ell, order, spin=spin, nside=nside, L=L, L_work=L_work
         )
         - maps
     )
-    return alm - _map2alm_once(
-        residual, ell, order, spin=spin, nside=nside, L=L, L_work=L_work
+    return alm - _map2alm_once_impl(
+        residual, a_tables, ell, order, spin=spin, nside=nside, L=L, L_work=L_work
     )
 
 
