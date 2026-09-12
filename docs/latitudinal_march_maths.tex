@@ -21,10 +21,11 @@
 \newcommand{\ofs}{\mathrm{ofs}}
 
 \numberwithin{equation}{section}
+\emergencystretch=2.5em
 
 \title{\textbf{The table-free latitudinal march}}
 \author{}
-\date{}
+\date{GMaster, session 36 -- 12 September 2026}
 
 \begin{document}
 \maketitle
@@ -51,7 +52,8 @@ with $M=\max(m,s)$ and $\varepsilon_m=\mathrm{sign}(m-s)$ (equal to $+1$ at
 $m=s$).  The kernel marches this polynomial by the three-term recurrence,
 carries an exact binary exponent, emits a binade-split partial, and may skip
 polar tiles by ducc0's $\mlim$ cutoff.  Every identity below is proved in
-Lean; only the WKB estimate of \S\ref{sec:polar} is not.
+Lean; only the WKB estimate of \S\ref{sec:polar} and the IEEE scaling remark
+on the synthesis accumulator at the end of \S\ref{sec:emit} are not.
 
 \tableofcontents
 
@@ -343,6 +345,25 @@ Lean: \texttt{Emit.flushed\_lane\_small}, \texttt{flush\_bound},
 \texttt{int\_binade\_is\_zpow}, \texttt{two\_roundings},
 \texttt{dropped\_partial\_small}.
 
+\paragraph{Synthesis accumulator (remark, not formalised).}
+The synthesis kernel contracts the same marched row against harmonic
+coefficients and accumulates per lane.  It used to carry a block exponent
+per accumulator, re-derived at every degree for each order sign.  The
+coefficients of a window are now divided by the power of two at their
+maximum, so $\lvert c\rvert<4$; with $\lvert d^\ell_{m,-s}\rvert\le 1$ the
+accumulator over at most $L$ degrees is below $2^{2+\log_2 L}$ in magnitude,
+inside float32 range with no exponent lane, and the alignment
+$n_d\,2^{t}$ of the marched row is one exact power of two shared by both
+order signs (the mirror sign is $\pm 1$).  Multiplication by a power of two
+commutes with rounding, so the result is bit-identical to the
+block-exponent form except for terms below $2^{-126}$ of the window scale,
+which are flushed.  The driver multiplies the result back by the window
+scale.  Measured map error against ducc0 is unchanged to the printed digit
+($2.32\times 10^{-4}$ at $N_{\mathrm{side}}=1024$ spin~$2$,
+$8.19\times 10^{-4}$ at $2048$ spin~$0$, maximum relative to the map
+maximum).  This is a statement about IEEE scaling rather than an identity,
+and has no Lean counterpart.
+
 \section{Hemisphere fold}
 \label{sec:fold}
 
@@ -367,18 +388,42 @@ $\phi_0$.  The sum~\eqref{eq:A} therefore collapses, per northern lane, to
 One recurrence, two right-hand sides; the parity sign is applied outside
 the kernel.  This halves the lane count for spin~$0$.
 
-For spin~$2$ the code uses
-$T[m,\pi-\theta,\ell]=(-1)^{\ell-m'}T[-m,\theta,\ell]$ with $m'=-s$
-(measured residual $2.3\times 10^{-12}$).  It is a consequence of the general
-reflection $P_n^{(\alpha,\beta)}(-x)=(-1)^nP_n^{(\beta,\alpha)}(x)$, which swaps
-the two half-angle powers in~\eqref{eq:d}: for $s\le m\le\ell$,
-$d^\ell_{m,-s}(\pi-\theta)=(-1)^{\ell+m}\,d^\ell_{m,s}(\theta)$, and
-$d^\ell_{-m,-s}=(-1)^{m+s}d^\ell_{m,s}$ is read off the same Jacobi form.
-Lean: \texttt{Mirror.jacobi\_reflect}, \texttt{rowNeg\_reflect},
-\texttt{mirror\_identity}.
-
 Lean: \texttt{Fold.jacobi\_symmetric\_parity}, \texttt{row0\_reflect},
 \texttt{sum\_pairs\_even}, \texttt{sum\_pairs\_odd}, \texttt{fold\_even}.
+
+For spin~$2$ the kernel uses the mirror channel
+$T[m,\pi-\theta,\ell]=(-1)^{\ell+s}\,T[-m,\theta,\ell]$ (measured residual
+$2.3\times 10^{-12}$ over every row).  It is the following identity.
+
+\begin{lemma}[mirror]
+\label{lem:mirror}
+For $s\le m\le\ell$,
+\begin{equation}
+\label{eq:mirror}
+d^\ell_{m,-s}(\pi-\theta)=(-1)^{\ell+m}\,d^\ell_{m,s}(\theta),
+\qquad
+d^\ell_{-m,-s}(\theta)=(-1)^{m+s}\,d^\ell_{m,s}(\theta),
+\end{equation}
+hence $d^\ell_{m,-s}(\pi-\theta)=(-1)^{\ell+s}\,d^\ell_{-m,-s}(\theta)$.
+\end{lemma}
+
+\begin{proof}
+From the explicit sum, $P_n^{(\alpha,\beta)}(-x)=(-1)^nP_n^{(\beta,\alpha)}(x)$.
+Under $\theta\mapsto\pi-\theta$ one has $\sin\frac{\theta}{2}\leftrightarrow
+\cos\frac{\theta}{2}$ and $x\mapsto -x$, so the Jacobi form~\eqref{eq:d} of
+$d^\ell_{m,-s}$, with $(\alpha,\beta)=(m+s,\,m-s)$ and $n=\ell-m$, becomes
+$(-1)^{\ell-m}$ times the Jacobi form with $(\alpha,\beta)=(m-s,\,m+s)$.
+That is Edmonds's form~\eqref{eq:edmonds} of $d^\ell_{m,s}$ (there
+$a=m-s$, $b=m+s$, the same $n$): the factorial ratio is symmetric in
+$(a,b)$ and the sign $\xi$ is $(-1)^{m+s}$ in both, so the first identity
+holds with $(-1)^{\ell-m}=(-1)^{\ell+m}$.  The same form with
+$(m',m)=(-m,-s)$ has $a=m-s$, $b=m+s$ and $\xi=1$, which is the second
+identity.  Multiplying the two signs gives $(-1)^{\ell+m}(-1)^{m+s}=(-1)^{\ell+s}$.
+\end{proof}
+
+Lean: \texttt{Mirror.jacobi\_reflect}, \texttt{rowNeg\_reflect} (the first
+identity on the Jacobi closed forms \texttt{rowNeg}, \texttt{rowPos}),
+\texttt{mirror\_identity} (the kernel's form).
 
 \section{The arithmetic wall}
 \label{sec:wall}
@@ -387,6 +432,10 @@ Lean: \texttt{Fold.jacobi\_symmetric\_parity}, \texttt{row0\_reflect},
 \label{lem:live}
 $\sum_{m<L}(L-m)=L(L+1)/2$.
 \end{lemma}
+
+\begin{proof}
+Substitute $k=L-m$; the sum is $\sum_{k=1}^{L}k$.
+\end{proof}
 
 Let $N$ be the number of $(m,\ell,\theta)$ triples visited.  Before polar
 skip, $N=\tfrac12 L(L+1)\lceil n_\theta/2\rceil$ on the folded spin-$0$
@@ -417,9 +466,18 @@ T\ge\frac{6\cdot 6.2\times 10^{11}}{0.94\times 10^{12}}\,\mathrm{s}
 \end{equation}
 at the datasheet rate ($8.3\,\mathrm{s}$ measured), against ducc0's
 $2.02\,\mathrm{s}$ on the host.  No float64 kernel on this card can beat
-the CPU reference at the top of the board.
+the CPU reference at the top of the board.  This is why the march is a
+compensated float32 recurrence: its per-triple cost is about $30$ float32
+instructions against an issue rate of $\sim 6\times 10^{13}$
+lane-instructions per second, a floor of $\sim 0.3\,\mathrm{s}$ per pass at
+$N_{\mathrm{side}}=4096$.  After the binade-split emit of \S\ref{sec:emit}
+the analysis kernel measures $22.5\,\mathrm{ms}$ per $128$-order window at
+$N_{\mathrm{side}}=4096$ against a recurrence-only floor of $13.7\,\mathrm{ms}$,
+so the emit is $39$~per cent of the kernel and the compensated recurrence
+$61$~per cent.
 
-Lean: \texttt{Wall.live\_degrees}, \texttt{time\_lower\_bound}.
+Lean: \texttt{Wall.live\_degrees}, \texttt{time\_lower\_bound}
+($c\,N\le\mathrm{fmas}\le R\,T$ gives $T\ge cN/R$).
 
 \section{Polar skip}
 \label{sec:polar}
@@ -459,6 +517,15 @@ $m^2-2s\lvert\cos\theta\rvert\, m+s^2-t_1^2=0$ on a ring with
 $\cos^2\theta+\sin^2\theta=1$ and $t_1=\ell_{\max}\sin\theta+\ofs$.
 For $s=0$ one has $\mlim=\ell_{\max}\sin\theta+\ofs$.
 \end{lemma}
+
+\begin{proof}
+The roots are $s\lvert\cos\theta\rvert\pm\sqrt{s^2\cos^2\theta-s^2+t_1^2}
+=s\lvert\cos\theta\rvert\pm\sqrt{t_1^2-s^2\sin^2\theta}$; the larger
+is~\eqref{eq:mlim}.  At $s=0$ the square root is $t_1$.
+\end{proof}
+
+Skipping every order $m\ge M$ on one ring removes $(L-M)(L-M+1)/2$
+degrees (Lemma~\ref{lem:live} applied to $L-M$).
 
 Every $\ell\le\ell_{\max}$ then has $\delta\ge\ofs$.  At
 $\ell_{\max}=12287$, $\sin\theta=\tfrac12$, one finds $S\sim 19$, so
@@ -532,7 +599,8 @@ Section & File & Content \\
 \end{tabular}
 \end{center}
 
-Not formalised: the WKB action \eqref{eq:S}.
+Not formalised: the WKB action \eqref{eq:S}, and the IEEE scaling remark on
+the synthesis accumulator (\S\ref{sec:emit}).
 
 \begin{thebibliography}{9}
 \bibitem{Edm57}

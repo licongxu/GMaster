@@ -9,8 +9,9 @@ recurrence of the explicit Jacobi sum, is proved in `GMasterMarch.JacobiSum.jaco
 (a telescoping certificate over the summands, see §2), and the spin-2 mirror identity in
 `GMasterMarch.Mirror.mirror_identity`; the identification of the Jacobi closed form with Wigner's
 function is `GMasterMarch.WignerJacobi.wignerD_eq_jacobiForm`, proved from Wigner's explicit sum
-formula.  The one thing outside Lean is the WKB decay estimate of §8, which is asymptotic analysis
-justifying a rule that is the reference's own and is checked against ducc0.  Notation: `L = lmax + 1`, spin `s >= 0`,
+formula.  Outside Lean are the WKB decay estimate of §8, which is asymptotic analysis
+justifying a rule that is the reference's own and is checked against ducc0, and the IEEE scaling
+remark on the synthesis accumulator at the end of §5.  Notation: `L = lmax + 1`, spin `s >= 0`,
 order `m >= 0`, colatitude `theta`, `x = cos theta`.  The transform the kernel implements is,
 for each order `m` and one of four real channels `r_c(theta)` (real/imaginary x direct/mirror),
 
@@ -164,6 +165,18 @@ per 128-order window at Nside 1024 (`.qwen/tmp/emit_ablate_s36.py`), and with ei
 loop iteration 1.92 ms.  Measured relative change against the float64-emit kernel over every lane:
 7.5e-08 at Nside 1024 (windows m0 = 0 / 1024 / 2560), 7.3e-08 at 2048, 6.6e-08 at 4096 --
 i.e. `~ 2u` as the proposition predicts.
+
+*Synthesis accumulator (remark, not formalised).* The synthesis kernel contracts the same marched
+row against harmonic coefficients and accumulates per lane.  It used to carry a block exponent per
+accumulator, re-derived at every degree for each order sign.  The window's coefficients are now
+divided by the power of two at their maximum, so `|c| < 4`; with `|d| <= 1` the accumulator over at
+most `L` degrees is below `2^(2 + log2 L)`, inside float32 range with no exponent lane, and the
+alignment `nd * 2^tex` of the marched row is one exact power shared by both order signs.  Powers of
+two commute with rounding, so the result is bit-identical to the block-exponent form except for
+terms below `2^-126` of the window scale, which are flushed; the driver multiplies back by the
+window scale.  Map error against ducc0 is unchanged to the printed digit (2.32e-04 at 1024 spin 2,
+8.19e-04 at 2048 spin 0, max relative to the map maximum, `.qwen/tmp/acc_s36.py`).  This is an
+IEEE scaling statement rather than an identity and has no Lean counterpart.
 
 ## 6. Hemisphere fold (spin 0) and mirror channel (spin 2)
 
