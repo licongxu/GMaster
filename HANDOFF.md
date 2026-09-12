@@ -8648,3 +8648,32 @@ the reference cannot do at all (its coupling matrix segfaults, addendum 25 §2).
 numbers above are dominated by XLA compilation (the `field` at `n_iter=0` is one pass; the
 `mask_alms` stage compiles the spin-0 fold at this size); the warm `n_iter=3` pipeline is the
 `gm_only_pipeline_s36.py` run below.
+
+**5. The allocator.**  With the four fixes the `n_iter = 3` pipeline still lost one 26 GiB request
+at the coupled cell with 52 GiB free — none of the coupling programs needs it (compile-time
+`memory_analysis` at these shapes: quadrature 4.5 GiB of temporaries, Wigner-d table 4.5,
+binning contraction on the pieces 0.78, coupled cell 2.3; `.qwen/tmp/*memanalysis_s36.py`), so
+it is the BFC pool's fragmentation after a long polarised field build, which the `n_iter = 0`
+probe happened not to trigger.  JAX's `cuda_async` allocator (CUDA memory pools, virtual-address
+backed) has no contiguity requirement; under it the full pipeline runs, and `memory_stats` still
+reports `bytes_in_use`/`bytes_limit`, so `make_room` keeps working.  `gmaster/__init__.py` now
+sets `XLA_PYTHON_CLIENT_ALLOCATOR=cuda_async` when the user has not chosen an allocator (JAX reads
+it at backend initialisation).  The 9 GiB device cache of Wigner-d quadrature tables
+(`_WD_TRIPLE_CACHE`) joins the eviction through `utils._ROOM_HOOKS`.
+
+**Full pipeline, `n_iter = 3`, defaults, one cold process** (`.qwen/tmp/gm_only_pipeline_s36.py
+4096 2`, `chain_s36s.log`):
+
+```text
+MARK field            762931 ms   GPU in use 33.9 GiB peak 64.1 GiB
+MARK mask_alms        413849 ms   GPU in use 50.0 GiB peak 71.7 GiB
+MARK coupling         126010 ms   GPU in use 37.9 GiB peak 71.7 GiB
+MARK coupled_cell        212 ms
+MARK decouple            295 ms
+REP 0 TOTAL 1303296 ms  decoupled (4, 409) finite True
+```
+
+The cold column is compilation-dominated (the same stages warm are seconds: the warm
+repetition's `field` was 4.1 s before a second process was let onto the card by a bad guard and
+killed it; the warm repetition is re-run below).  Peak 71.7 GiB on the device for a pipeline
+whose reference cannot allocate its coupling matrix at all.

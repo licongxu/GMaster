@@ -1,6 +1,14 @@
 """GPU-accelerated pseudo-C_ell estimation with a NaMaster-compatible API."""
 
 import logging
+import os
+
+# JAX's default BFC pool fragments over a long pipeline: at Nside 4096 spin 2 the coupling
+# matrix (18 GiB in row pieces) and a 26 GiB temporary were refused with 52 GiB free, while the
+# same pipeline completes under CUDA's virtual-address-backed async allocator (session 36,
+# `.qwen/tmp/chain_s36s.log`).  Set only when the user has not chosen an allocator; JAX reads
+# it when the backend initialises, so importing gmaster before first device use suffices.
+os.environ.setdefault("XLA_PYTHON_CLIENT_ALLOCATOR", "cuda_async")
 
 import jax
 

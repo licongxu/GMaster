@@ -437,6 +437,7 @@ def _general_coupling_matrix_quadrature(
 
 
 _WD_TRIPLE_CACHE = {}
+utils._ROOM_HOOKS.append(_WD_TRIPLE_CACHE.clear)   # 9 GiB of device tables at Nside 4096
 
 
 def _wigner_d_shared(beta, m, n, order):
@@ -1181,6 +1182,11 @@ class NmtWorkspace:
 
         alm1 = fl1.get_mask_alms()[None, :]
         alm2 = alm1 if fl2 is fl1 else fl2.get_mask_alms()[None, :]
+        # The stage needs room for the matrix twice over (its blocks and the assembled form) plus
+        # the quadrature's own temporaries; with a polarised field at Nside 4096 both ring-table
+        # sets (30 GiB) are still cached and the quadrature's Wigner-d transpose could not even be
+        # autotuned (`.qwen/tmp/chain_s36q.log`).  Evict them up front if the pool is short.
+        utils.make_room(2 * (self.ncls * (self.lmax + 1)) ** 2 * 8)
         self.pcl_mask = _compute_coupled_cell(
             alm1,
             alm2,
@@ -1309,9 +1315,6 @@ class NmtWorkspace:
                 blocks.append(odd_levels[level] if pure_any else odd)
                 slots.append((offset + index, offset + 3 - index))
                 signs.append(-spin_sign if index in (1, 2) else spin_sign)
-        # The assembly holds two copies of the dense matrix; give it the room the cached ring
-        # tables occupy if the pool is short (Nside 4096 spin 2, `utils.make_room`).
-        utils.make_room(2 * (self.ncls * (self.lmax + 1)) ** 2 * jnp.dtype(window_cls.dtype).itemsize)
         self.mcm = _assemble_mcm(
             window_cls.dtype,
             tuple(blocks),

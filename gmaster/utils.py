@@ -105,6 +105,9 @@ def drop_ring_tables():
     _spin_ring_synthesis_tables.cache_clear()
 
 
+_ROOM_HOOKS = []       # extra callables that free device caches (registered by workspaces)
+
+
 def make_room(nbytes):
     """Drop the ring-table caches when the device pool cannot hold `nbytes` more.
 
@@ -118,6 +121,8 @@ def make_room(nbytes):
     limit, in_use = stats.get("bytes_limit"), stats.get("bytes_in_use")
     if limit and in_use is not None and limit - in_use < nbytes:
         drop_ring_tables()
+        for hook in _ROOM_HOOKS:
+            hook()
 
 
 def set_table_precision(name):
