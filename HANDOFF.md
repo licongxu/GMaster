@@ -8586,6 +8586,12 @@ rows than a chunk (Nside <= 512) take the unchanged single-batch path.  Measured
 | 2048 | 10172 → 4144 ms | 2.0x → **2.5x** | 17143 → 7123 ms | 2.1x → **2.4x** |
 | 4096 | 70873 → 33476 ms | 1.7x → **2.1x** | reference segfaults (addendum 25) | GMaster-only run: §12 |
 
+Re-measured under the `cuda_async` allocator that §12 makes the default (`chain_s36t.log`, same
+harness): 1024 spin 0 1650 → 639 ms (2.6x), spin 2 3104 → 1055 ms (2.9x); 2048 spin 0
+10236 → 3783 ms (**2.7x**), spin 2 17071 → 7120 ms (2.4x).  The 1024 spin-0 cell moved 584 → 639 ms
+and the 2048 spin-0 cell 4144 → 3783 ms between the two allocators, i.e. inside this box's own
+run-to-run band (addendum 31 §2 quotes 8 % at 2048); the `rel` columns are identical.
+
 `rel` against pymaster: 7.70e-07 / 3.57e-06 (1024), 1.27e-06 / 1.09e-05 (2048), 1.45e-06 (4096
 spin 0) — the same digits as before the session, which is the pipeline-level statement of the
 bit-for-bit accuracy checks in §2–§3.  The 4096 spin-0 stage split is `field 10311 + mask 10403 +
@@ -8677,3 +8683,47 @@ The cold column is compilation-dominated (the same stages warm are seconds: the 
 repetition's `field` was 4.1 s before a second process was let onto the card by a bad guard and
 killed it; the warm repetition is re-run below).  Peak 71.7 GiB on the device for a pipeline
 whose reference cannot allocate its coupling matrix at all.
+
+**6. Two more residents, and the warm number.**  The warm repetition of that run died in a cuFFT
+work-area allocation at 76.5 GiB in the pool (`chain_s36s2.log`, `chain_s36u.log`): the async
+pool is not capped at the nominal 71 GiB, and two things had survived from the first repetition —
+the 9 GiB Wigner-d quadrature cache and, during the mask transform, the 30 GiB of polarised ring
+tables that the spin-0 mask stage never uses.  Three changes: `NmtField` calls `utils.make_room`
+before its transforms; `compute_coupling_matrix` asks for the mask transform's temporaries as well
+as the matrix's; a quadrature cache above `_WD_CACHE_KEEP_BYTES` (2 GiB) is dropped once its
+workspace is built.  And the fused refinement iteration (`_map2alm_iteration_impl`) was the
+pipeline's single largest allocation — XLA gives a program one temporary buffer, 26 GiB here —
+so above `_ITERATION_SPLIT_BYTES` the iteration runs as its two programs (field-stage peak
+64.1 → 58.9 GiB, `MaxAllocSize` 26 → 20 GiB).
+
+`.qwen/tmp/chain_s36v.log`, `gm_only_pipeline_s36.py 4096 2 1`, defaults, one process:
+
+```text
+cold: field 790513  mask_alms 404227  coupling 126874  coupled_cell 212  decouple 263   TOTAL 1322089 ms
+warm: field   4030  mask_alms  23205  coupling  10921  coupled_cell 12582 decouple 10   TOTAL   50748 ms
+      decoupled (4, 409) finite, GPU peak 73.0 GiB, host RSS 69.7 GB
+```
+
+The cold column is compilation; the warm stage stamps are enqueue times (the coupled cell
+absorbs the transforms' completion), so the quotable figure is the warm **TOTAL: the full
+Nside 4096 spin-2 MASTER pipeline in 50.7 s on one card**, against a reference that segfaults
+before its coupling matrix exists.  Tests: full suite 202 passed, 3 skipped (`chain_s36u.log`),
+workspace/field/covariance 60 passed after the last two edits (`chain_s36v.log`).
+
+### 13. Where this leaves the standing bar
+
+| Nside | spin 0 | spin 2 |
+|---|---|---|
+| 1024 | 2.6–2.9x | 2.8–2.9x |
+| 2048 | 2.5–2.7x | 2.4x |
+| 4096 | 2.1x (fp64 coupling; ~3.0x with `GMASTER_COUPLING_PRECISION=fp32`) | runs (50.7 s warm); reference cannot |
+
+Per pass the transforms are now 1.05–1.78x ducc0 at Nside ≥ 2048 in both directions (§5), up
+from 0.86–1.28x, and the accuracy against the reference is unchanged to the printed digit at
+every geometry.  What remains is the wall §8 and `docs/latitudinal_march_maths.md` §7 state and
+`formal/lean/GMasterMarch/Wall.lean` proves: on a card whose float64 rate is 1/64 of float32,
+no float64 kernel can beat the 96-core reference at Nside 4096, and the compensated-float32
+march that beats it is at ~60 % recurrence / 40 % emit after this session.  The next lever there
+is arithmetic, not memory or dispatch: fewer instructions per marched degree (seed peel,
+block-granularity range guard, a transpose-reduce for the emit's shuffle trees), each worth
+5–15 % of the kernel by the ablations on file.

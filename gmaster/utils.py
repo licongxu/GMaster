@@ -117,12 +117,19 @@ def make_room(nbytes):
     in use (`.qwen/tmp/chain_s36j.log`, session 36).  A device without allocator statistics
     reports nothing and nothing is dropped.
     """
-    stats = jax.devices()[0].memory_stats() or {}
-    limit, in_use = stats.get("bytes_limit"), stats.get("bytes_in_use")
-    if limit and in_use is not None and limit - in_use < nbytes:
+    def short():
+        stats = jax.devices()[0].memory_stats() or {}
+        limit, in_use = stats.get("bytes_limit"), stats.get("bytes_in_use")
+        return bool(limit) and in_use is not None and limit - in_use < nbytes
+
+    if not short():
+        return
+    # Cheapest first: the Wigner-d quadrature cache (9 GiB at Nside 4096, seconds to rebuild),
+    # then the ring tables (30 GiB, which the next transform rebuilds).
+    for hook in _ROOM_HOOKS:
+        hook()
+    if short():
         drop_ring_tables()
-        for hook in _ROOM_HOOKS:
-            hook()
 
 
 def set_table_precision(name):
@@ -1707,9 +1714,21 @@ def _map2alm_once_impl(maps, tables, ell, order, *, spin, nside, L, L_work):
     return jnp.stack([-(plus_m + minus_m) / 2, 0.5j * (plus_m - minus_m)])
 
 
+# Above this ring-spectrum size one refinement iteration runs as its two programs (synthesis,
+# then analysis of the residual) instead of one: XLA hands a program a single temporary buffer,
+# and the fused iteration's was 26 GiB at Nside 4096 spin 2 (`MaxAllocSize` in
+# `.qwen/tmp/chain_s36s2.log`), the largest allocation of the whole pipeline.
+_ITERATION_SPLIT_BYTES = 4 * 1024 ** 3
+
+
 def _map2alm_iteration(alm, maps, ell, order, *, spin, nside, L, L_work):
     a_tables = _polarised_ring_tables(spin, L_work, nside, maps, synthesis=False)
     s_tables = _polarised_ring_tables(spin, L_work, nside, alm, synthesis=True)
+    if (4 * nside - 1) * 2 * L_work * 16 > _ITERATION_SPLIT_BYTES:
+        residual = _alm2map_core_impl(alm, s_tables, ell, order, spin=spin, nside=nside, L=L,
+                                      L_work=L_work) - maps
+        return alm - _map2alm_once_impl(residual, a_tables, ell, order, spin=spin, nside=nside,
+                                        L=L, L_work=L_work)
     return _map2alm_iteration_impl(alm, maps, a_tables, s_tables, ell, order, spin=spin,
                                    nside=nside, L=L, L_work=L_work)
 

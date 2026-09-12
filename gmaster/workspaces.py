@@ -438,6 +438,19 @@ def _general_coupling_matrix_quadrature(
 
 _WD_TRIPLE_CACHE = {}
 utils._ROOM_HOOKS.append(_WD_TRIPLE_CACHE.clear)   # 9 GiB of device tables at Nside 4096
+_WD_CACHE_KEEP_BYTES = 2 * 1024 ** 3
+
+
+def _drop_large_wigner_cache():
+    """Forget quadrature tables too large to keep between workspaces.
+
+    The cache pays off for repeated small workspaces; at Nside 4096 spin 2 it is 9 GiB of device
+    memory that outlived its workspace and pushed the next field's mask transform over the pool
+    (`.qwen/tmp/chain_s36u.log`, cuFFT plan allocation aborting the process).
+    """
+    total = sum(int(t.size) * int(t.dtype.itemsize) for t in _WD_TRIPLE_CACHE.values())
+    if total > _WD_CACHE_KEEP_BYTES:
+        _WD_TRIPLE_CACHE.clear()
 
 
 def _wigner_d_shared(beta, m, n, order):
@@ -1186,7 +1199,9 @@ class NmtWorkspace:
         # the quadrature's own temporaries; with a polarised field at Nside 4096 both ring-table
         # sets (30 GiB) are still cached and the quadrature's Wigner-d transpose could not even be
         # autotuned (`.qwen/tmp/chain_s36q.log`).  Evict them up front if the pool is short.
-        utils.make_room(2 * (self.ncls * (self.lmax + 1)) ** 2 * 8)
+        nside = getattr(fl1.minfo, "nside", None) or 0
+        utils.make_room(2 * (self.ncls * (self.lmax + 1)) ** 2 * 8
+                        + 6 * (4 * nside - 1) * 2 * (self.lmax_mask + 1) * 16)
         self.pcl_mask = _compute_coupled_cell(
             alm1,
             alm2,
@@ -1315,6 +1330,7 @@ class NmtWorkspace:
                 blocks.append(odd_levels[level] if pure_any else odd)
                 slots.append((offset + index, offset + 3 - index))
                 signs.append(-spin_sign if index in (1, 2) else spin_sign)
+        _drop_large_wigner_cache()
         self.mcm = _assemble_mcm(
             window_cls.dtype,
             tuple(blocks),

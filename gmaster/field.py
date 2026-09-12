@@ -4,6 +4,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from . import utils
 from .utils import (
     NmtAlmInfo,
     NmtMapInfo,
@@ -189,6 +190,12 @@ class NmtField:
                     "i,iap->ap", self.alphas, templates_unmasked
                 )
 
+        # A large field's transforms need tens of GiB of temporaries (a polarised Nside 4096
+        # pass peaks at 40 GiB); evict the stale caches a previous workspace left on the
+        # device before starting (`utils.make_room`, session 36).
+        nside = getattr(self.minfo, "nside", None)
+        if nside:
+            utils.make_room(6 * (4 * nside - 1) * 2 * (self.ainfo.lmax + 1) * 16)
         if pure_any:
             task = (self.pure_e, self.pure_b)
             self.alm, maps = self._purify(
