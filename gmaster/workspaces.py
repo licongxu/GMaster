@@ -10,6 +10,7 @@ from jax.scipy.special import gammaln
 from scipy.special import roots_legendre
 
 from .bins import NmtBin, NmtBinFlat
+from . import utils
 from .utils import alm2map, map2alm
 
 # Operand precision of the coupling-matrix builders.  The polarised quadrature is two
@@ -127,8 +128,12 @@ def compute_coupled_cell_flat(
 _OFFSET_CHUNK = 16
 
 
+# Dense coupling matrices above this size are assembled in pieces (`_assemble_mcm`).
+_MCM_PIECED_BYTES = 4 * 1024 ** 3
+
+
 @partial(jax.jit, static_argnames=("dtype", "lmax", "ncls", "slots", "signs"))
-def _assemble_mcm(dtype, blocks, *, lmax, ncls, slots, signs):
+def _assemble_mcm_program(dtype, blocks, *, lmax, ncls, slots, signs):
     """Place the coupling blocks into the mode-coupling matrix in one program.
 
     The chain of ``matrix.at[:, i, :, j].set(...)`` this replaces was up to eight host
@@ -141,12 +146,44 @@ def _assemble_mcm(dtype, blocks, *, lmax, ncls, slots, signs):
     Values are bit-identical because every sign here is exactly ``+-1``: the agreement with
     the reference is unchanged (rel ``dCl`` 1.09e-05 at 2048 spin 2 in both logs).
     """
-    matrix = jnp.zeros((ncls, ncls, lmax + 1, lmax + 1), dtype=dtype)
+    matrix = jnp.zeros((lmax + 1, ncls, lmax + 1, ncls), dtype=dtype)
     for block, (row, column), sign in zip(blocks, slots, signs):
-        matrix = matrix.at[row, column].set(block * sign)
-    return matrix.transpose(2, 0, 3, 1).reshape(
-        (ncls * (lmax + 1), ncls * (lmax + 1))
-    )
+        matrix = matrix.at[:, row, :, column].set(block * sign)
+    return matrix.reshape((ncls * (lmax + 1), ncls * (lmax + 1)))
+
+
+@partial(jax.jit, static_argnames=("signs",))
+def _mcm_row(pieces, *, signs):
+    """One row channel of the matrix: `(l1, l2, c2)` with the channel axis innermost."""
+    return jnp.stack([p * s for p, s in zip(pieces, signs)], axis=-1)
+
+
+def _assemble_mcm(dtype, blocks, *, lmax, ncls, slots, signs):
+    """The dense mode-coupling matrix from its `(lmax+1, lmax+1)` blocks.
+
+    Below `_MCM_PIECED_BYTES` this is the single program above.  Above it the one-program
+    form is a single XLA transpose fusion the size of the matrix, and at Nside 4096 spin 2
+    (`ncls = 4`, 18 GiB) that fusion could not be autotuned inside the pool even with the
+    ring tables evicted and 22.6 GiB in use (`.qwen/tmp/chain_s36l.log`: the autotuner
+    wants the output plus reference copies).  So the matrix is built one row channel at a
+    time -- each `(l1, l2, ncls)` piece is a transpose of `ncls` blocks, a quarter of the
+    matrix -- and the pieces are joined along the row-channel axis, whose innermost axis
+    already matches the output: a plain concatenate, not a transpose.  Values are unchanged.
+    """
+    n = ncls * (lmax + 1)
+    if n * n * jnp.dtype(dtype).itemsize <= _MCM_PIECED_BYTES:
+        return _assemble_mcm_program(dtype, blocks, lmax=lmax, ncls=ncls, slots=slots,
+                                     signs=signs)
+    placed = {slot: (block, sign) for block, slot, sign in zip(blocks, slots, signs)}
+    rows = []
+    for c1 in range(ncls):
+        pieces, sg = [], []
+        for c2 in range(ncls):
+            block, sign = placed.get((c1, c2), (blocks[0], 0.0))
+            pieces.append(block)
+            sg.append(float(sign))
+        rows.append(_mcm_row(tuple(pieces), signs=tuple(sg)))             # (l1, l2, ncls)
+    return _RowPieces(rows)
 
 
 @partial(jax.jit, static_argnames="lmax")
@@ -961,6 +998,77 @@ def _expanded_binning_operators(bins, ncls):
     return cached
 
 
+class _RowPieces(tuple):
+    """The mode-coupling matrix held as `ncls` row-channel pieces, never assembled on device.
+
+    Piece `c1` is `(lmax + 1, lmax + 1, ncls)` with `piece[l1, l2, c2] = M[(l1, c1), (l2, c2)]`,
+    i.e. the rows of channel `c1` in the `l * ncls + c` ordering.  Above `_MCM_PIECED_BYTES` the
+    dense matrix is a single contiguous buffer the size of the whole set (18 GiB at Nside 4096
+    spin 2) that the allocator could not place next to the pieces themselves
+    (`.qwen/tmp/chain_s36p.log`: 19.3 GiB in use, a further 18 GiB refused with 52 GiB free), so
+    the consumers contract from the pieces and the dense form exists only on the host.
+    """
+
+    @property
+    def n(self):
+        return self[0].shape[0] * len(self)
+
+    def dense_host(self):
+        """The `(n, n)` float64 matrix as a numpy array (host memory)."""
+        n = self.n
+        return np.concatenate([np.asarray(p)[:, None] for p in self], axis=1).reshape((n, n))
+
+    def matvec(self, v):
+        """`M @ v` for a flat `(n,)` vector, returned flat in the same ordering."""
+        lmax1 = self[0].shape[0]
+        cols = [p.reshape((lmax1, self.n)) @ v for p in self]          # each (lmax + 1,)
+        return jnp.stack(cols, axis=1).reshape(-1)
+
+
+def _mcm_dense(mcm):
+    """Host numpy copy of the matrix whichever form it is held in."""
+    return mcm.dense_host() if isinstance(mcm, _RowPieces) else np.asarray(mcm)
+
+
+# Contract `output @ mcm` in row chunks of the matrix above this size (`_left_contract`).
+_LEFT_CONTRACT_CHUNK_BYTES = 4 * 1024 ** 3
+
+
+def _left_contract(output, mcm):
+    """`output @ mcm`, in row chunks of `mcm` when the matrix is large.
+
+    XLA autotunes the GEMM with duplicate operand buffers; at Nside 4096 spin 2 the 18 GiB
+    matrix could not be duplicated inside the pool after the field, so the contraction ran out
+    of memory at the first sync after `compute_coupling_matrix` (`.qwen/tmp/chain_s36m2.log`).
+    `sum_k output[:, rows_k] @ mcm[rows_k, :]` over contiguous row blocks has the same value up
+    to summation order; below `_LEFT_CONTRACT_CHUNK_BYTES` the single GEMM is kept.
+    """
+    if isinstance(mcm, tuple):
+        # Row-channel pieces (`_RowPieces`): rows `(l1, c1)` of the matrix are piece `c1`,
+        # and the matching columns of `output` are `c1::ncls`.
+        ncls = len(mcm)
+        lmax1 = mcm[0].shape[0]
+        acc = output[:, 0::ncls] @ mcm[0].reshape((lmax1, lmax1 * ncls))
+        for c1 in range(1, ncls):
+            acc = acc + output[:, c1::ncls] @ mcm[c1].reshape((lmax1, lmax1 * ncls))
+        return acc
+    n = mcm.shape[0]
+    if mcm.size * jnp.dtype(mcm.dtype).itemsize <= _LEFT_CONTRACT_CHUNK_BYTES:
+        return output @ mcm
+    # The chunk count is the smallest divisor of `n` at or above the byte target, so no row is
+    # padded: padding would copy the whole matrix, which is the allocation this avoids.
+    target = -(-(mcm.size * jnp.dtype(mcm.dtype).itemsize) // _LEFT_CONTRACT_CHUNK_BYTES)
+    nchunk = next(k for k in range(target, n + 1) if n % k == 0)
+    chunk = n // nchunk
+    # Static slices, not a `fori_loop`: XLA's copy insertion duplicates a jit parameter that
+    # enters a while loop, and for this operand that duplicate is the matrix itself
+    # (`.qwen/tmp/chain_s36n2.log`: a second 18 GiB request with the matrix already resident).
+    acc = output[:, 0:chunk] @ mcm[0:chunk, :]
+    for k in range(1, nchunk):
+        acc = acc + output[:, k * chunk:(k + 1) * chunk] @ mcm[k * chunk:(k + 1) * chunk, :]
+    return acc
+
+
 @partial(jax.jit, static_argnames=("ncls", "norm_type"))
 def _banded_operators(mcm, beam1, beam2, output, theory, wawb, *, ncls, norm_type):
     beam = jnp.repeat(beam1 * beam2, ncls)
@@ -969,7 +1077,7 @@ def _banded_operators(mcm, beam1, beam2, output, theory, wawb, *, ncls, norm_typ
     # way XLA has to materialise `mcm * beam` before the dot: a second full copy of the largest
     # tensor in the stage (18.0 GiB for the polarised matrix at Nside 4096, where the very next
     # allocation is what fails -- `.qwen/tmp/s2_4096_s31.log`).
-    one_sided = (output @ mcm) * beam[None, :]
+    one_sided = _left_contract(output, mcm) * beam[None, :]
     if norm_type:
         mcm_binned = wawb * jnp.eye(output.shape[0])
     else:
@@ -1201,6 +1309,9 @@ class NmtWorkspace:
                 blocks.append(odd_levels[level] if pure_any else odd)
                 slots.append((offset + index, offset + 3 - index))
                 signs.append(-spin_sign if index in (1, 2) else spin_sign)
+        # The assembly holds two copies of the dense matrix; give it the room the cached ring
+        # tables occupy if the pool is short (Nside 4096 spin 2, `utils.make_room`).
+        utils.make_room(2 * (self.ncls * (self.lmax + 1)) ** 2 * jnp.dtype(window_cls.dtype).itemsize)
         self.mcm = _assemble_mcm(
             window_cls.dtype,
             tuple(blocks),
@@ -1277,7 +1388,7 @@ class NmtWorkspace:
     def _postprocess(self):
         output, theory = _expanded_binning_operators(self.bins, self.ncls)
         self.mcm_binned, one_sided = _banded_operators(
-            self.mcm,
+            tuple(self.mcm) if isinstance(self.mcm, _RowPieces) else self.mcm,
             self.beam1,
             self.beam2,
             output,
@@ -1289,6 +1400,13 @@ class NmtWorkspace:
         self.bpws = jnp.linalg.solve(self.mcm_binned, one_sided)
 
     def get_coupling_matrix(self):
+        """The dense `(ncls (lmax+1), ncls (lmax+1))` matrix.
+
+        Above `_MCM_PIECED_BYTES` the matrix is held as row-channel pieces on the device and
+        the dense form is returned as a host numpy array (18 GiB at Nside 4096 spin 2).
+        """
+        if isinstance(self.mcm, _RowPieces):
+            return self.mcm.dense_host()
         return self.mcm
 
     def update_coupling_matrix(self, new_matrix):
@@ -1334,7 +1452,9 @@ class NmtWorkspace:
         theory = cl_in[:, : self.lmax + 1] * (
             self.beam1 * self.beam2
         )[None, :]
-        coupled = self.mcm @ theory.T.reshape(-1)
+        flat = theory.T.reshape(-1)
+        coupled = (self.mcm.matvec(flat) if isinstance(self.mcm, _RowPieces)
+                   else self.mcm @ flat)
         return coupled.reshape((self.lmax + 1, self.ncls)).T
 
     def decouple_cell(self, cl_in, cl_bias=None, cl_noise=None):
@@ -1436,7 +1556,7 @@ class NmtWorkspace:
         multipoles = np.arange(self.lmax + 1, dtype=np.int32)
         with fitsio.FITS(fname, "rw", clobber=True) as fits:
             fits.write(
-                np.asarray(self.mcm), header=header, extname="WSP_PRIMARY"
+                _mcm_dense(self.mcm), header=header, extname="WSP_PRIMARY"
             )
             fits.write(
                 [multipoles, np.asarray(self.beam1), np.asarray(self.beam2)],

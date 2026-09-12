@@ -8592,3 +8592,59 @@ bit-for-bit accuracy checks in §2–§3.  The 4096 spin-0 stage split is `field
 coupling 12651 ms`: the two transform stages fell from 14749 + 14781 (addendum 24) to 20714 ms
 together (1.43x), and with `GMASTER_COUPLING_PRECISION=fp32` (addendum 24: coupling 3189 ms) the
 cell would sit at ~24 s, i.e. ~3.0x.
+
+### 12. Nside 4096 spin 2: the pipeline the reference cannot run
+
+With §7 and §10 in place the polarised `NmtField` builds at Nside 4096 (GPU peak 56 GiB; one
+analysis pass peaks 37 GiB, one synthesis pass 40 GiB — `.qwen/tmp/chain_s36g.log`,
+`chain_s36h.log`).  The pipeline then reached the mode-coupling matrix, which is where the
+reference segfaults (addendum 25 §2), and three further allocations had to go
+(`.qwen/tmp/coupling4096s2_s36.py`, probe with the field at `n_iter=0`):
+
+1. **The cached ring tables.**  30 GiB of complex128 chirp-Z tables sat in `lru_cache`s while the
+   `(ncls (lmax+1))^2` matrix (`ncls = 4`, 18 GiB per copy) was assembled: 50.6 GiB in use at the
+   failure.  `utils.make_room(nbytes)` drops the caches when the pool cannot hold the assembly
+   (`compute_coupling_matrix` calls it before `_assemble_mcm`); they are rebuilt on the next
+   transform.  In use at the assembly: 50.6 → 22.6 GiB (`chain_s36k.log`).
+2. **The transpose fusion.**  The one-program assembly is a single XLA transpose fusion the size
+   of the matrix, and its autotuner wants the output plus reference copies: it failed at 22.6 GiB
+   in use.  Above `_MCM_PIECED_BYTES` (4 GiB) `_assemble_mcm` now builds one row channel at a time
+   (`(l1, l2, ncls)` pieces, a quarter of the matrix each) and joins them along the row-channel
+   axis, a plain concatenate (`chain_s36l.log` → assembly completes; values identical, checked on
+   CPU against the single-program form).
+3. **The binning GEMM.**  `output @ mcm` is autotuned with duplicate operands too; above
+   `_LEFT_CONTRACT_CHUNK_BYTES` (4 GiB) `_left_contract` sums `output[:, rows_k] @ mcm[rows_k, :]`
+   over a divisor-based row split (no padding: padding the matrix is another 18 GiB copy, which is
+   exactly what the first version of this did — `chain_s36n.log`).  8e-16 against the single GEMM.
+
+Small geometries take none of these paths (all three are size-gated), and the workspace,
+covariance and field tests pass (60 passed).  Result of the probe with all three: below.
+
+**4. The matrix itself.**  With 1–3 in place the 18 GiB request still failed with 52 GiB free:
+`.qwen/tmp/chain_s36p.log` has the allocator map (`****_*___****...`, free space in runs under
+~10 GiB) and 19.3 GiB in use — the four 4.5 GiB row-channel pieces plus the field's state — so
+the request was the concatenated matrix, which needs one contiguous 18 GiB region beside the
+pieces.  (`TF_GPU_ALLOCATOR=cuda_malloc_async` is not honoured by this JAX; the BFC allocator ran
+regardless.)  Above `_MCM_PIECED_BYTES` the matrix is therefore never assembled on device:
+`_assemble_mcm` returns `_RowPieces`, a tuple of the `(l1, l2, ncls)` pieces, `_left_contract`
+contracts `output @ M` from them (`output[:, c1::ncls] @ piece_c1`), `couple_cell` uses
+`_RowPieces.matvec`, and `get_coupling_matrix`/`write_to` produce the dense form on the host.
+Every small geometry keeps the dense device matrix (the tests compare `.mcm` directly and pass:
+`chain_s36q.log`).
+
+**Result** (`.qwen/tmp/chain_s36q.log`, field at `n_iter=0`, one cold process incl. compilation):
+
+```text
+MARK field n_iter=0       352428 ms  GPU in_use 20.9 GiB peak 39.9 GiB
+MARK mask_alms            394313 ms  GPU in_use 37.0 GiB peak 58.9 GiB
+MARK coupling             127119 ms  GPU in_use 38.0 GiB peak 58.9 GiB
+MARK coupled_cell            213 ms
+MARK decouple                246 ms
+RESULT decoupled (4, 409) finite True
+```
+
+The Nside 4096 spin-2 MASTER pipeline runs to decoupled bandpowers on one 96 GB card, which
+the reference cannot do at all (its coupling matrix segfaults, addendum 25 §2).  The cold
+numbers above are dominated by XLA compilation (the `field` at `n_iter=0` is one pass; the
+`mask_alms` stage compiles the spin-0 fold at this size); the warm `n_iter=3` pipeline is the
+`gm_only_pipeline_s36.py` run below.

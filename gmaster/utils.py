@@ -94,10 +94,30 @@ def set_ring_precision(name):
     if name == nmt_params.ring_precision:
         return
     nmt_params.ring_precision = name
+    drop_ring_tables()
+
+
+def drop_ring_tables():
+    """Evict the cached ring chirp-Z tables (they are rebuilt on the next transform)."""
     _ring_analysis_tables.cache_clear()
     _ring_synthesis_tables.cache_clear()
     _spin_ring_analysis_tables.cache_clear()
     _spin_ring_synthesis_tables.cache_clear()
+
+
+def make_room(nbytes):
+    """Drop the ring-table caches when the device pool cannot hold `nbytes` more.
+
+    The polarised ring tables are 30 GiB of complex128 at Nside 4096 and live in `lru_cache`s
+    for the process; the coupling matrix never uses them, and at Nside 4096 spin 2 its assembly
+    (two `(ncls (lmax+1))^2` float64 copies, 18 GiB each) failed with them resident at 50.6 GiB
+    in use (`.qwen/tmp/chain_s36j.log`, session 36).  A device without allocator statistics
+    reports nothing and nothing is dropped.
+    """
+    stats = jax.devices()[0].memory_stats() or {}
+    limit, in_use = stats.get("bytes_limit"), stats.get("bytes_in_use")
+    if limit and in_use is not None and limit - in_use < nbytes:
+        drop_ring_tables()
 
 
 def set_table_precision(name):
@@ -1299,15 +1319,16 @@ def _spin_ring_analysis_tables(L, nside, device=None):
 _CAP_CHUNK_ROWS = int(os.environ.get("GMASTER_CAP_CHUNK_ROWS", "1024"))
 
 
-def _chunked_rows(nrows, chunk, body, init):
-    """`init` overwritten chunk by chunk with `body(row_block_start)`; clamped last window."""
-    nchunk = -(-nrows // chunk)
+def _chunked_rows(nrows, chunk, body):
+    """`body(lo, hi)` over static row blocks `[lo, hi)`, concatenated.
 
-    def step(i, acc):
-        start = jnp.minimum(i * chunk, nrows - chunk)
-        return jax.lax.dynamic_update_slice_in_dim(acc, body(start), start, axis=0)
-
-    return jax.lax.fori_loop(0, nchunk, step, init)
+    Static slices rather than a `fori_loop`: XLA's copy insertion duplicates every jit
+    parameter that enters a while loop, and here those parameters are the chirp-Z tables
+    (8.6 GiB each at Nside 4096); a Python loop of static slices lets XLA fuse each slice into
+    its FFT chain instead.
+    """
+    return jnp.concatenate(
+        [body(lo, min(lo + chunk, nrows)) for lo in range(0, nrows, chunk)], axis=0)
 
 
 @partial(jax.jit, static_argnames=("L", "nside"))
@@ -1350,12 +1371,10 @@ def _forward_ring_fft_full(signal, tables, *, L, nside):
         if nrows <= _CAP_CHUNK_ROWS:
             cap_out = czt(cap_pixels, chirp_in, kernel_spec, chirp_out)
         else:
-            chunk = _CAP_CHUNK_ROWS
             cap_out = _chunked_rows(
-                nrows, chunk,
-                lambda start: czt(*(jax.lax.dynamic_slice_in_dim(a, start, chunk, axis=0)
-                                    for a in (cap_pixels, chirp_in, kernel_spec, chirp_out))),
-                jnp.zeros((nrows, 2 * L - 1), dtype=chirp_out.dtype))
+                nrows, _CAP_CHUNK_ROWS,
+                lambda lo, hi: czt(*(a[lo:hi] for a in (cap_pixels, chirp_in, kernel_spec,
+                                                         chirp_out))))
 
     belt_rows = belt_hi - belt_lo
     if belt_rows == 0:
@@ -1433,13 +1452,10 @@ def _inverse_ring_fft_complex(centered, tables, *, L, nside):
         if nrows <= _CAP_CHUNK_ROWS:
             cap_res = czt(cap_grid, chirp_c, kernel_spec, chirp_p, caps_nphi)
         else:
-            chunk = _CAP_CHUNK_ROWS
             cap_res = _chunked_rows(
-                nrows, chunk,
-                lambda start: czt(*(jax.lax.dynamic_slice_in_dim(a, start, chunk, axis=0)
-                                    for a in (cap_grid, chirp_c, kernel_spec, chirp_p,
-                                              caps_nphi))),
-                jnp.zeros((nrows, width), dtype=chirp_p.dtype))
+                nrows, _CAP_CHUNK_ROWS,
+                lambda lo, hi: czt(*(a[lo:hi] for a in (cap_grid, chirp_c, kernel_spec, chirp_p,
+                                                         caps_nphi))))
 
     belt_rows = belt_hi - belt_lo
     if belt_rows == 0:
