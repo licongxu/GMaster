@@ -1,0 +1,546 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[margin=2.5cm]{geometry}
+\usepackage{fontspec}
+\usepackage{amsmath,amssymb,amsthm,mathtools}
+\usepackage{booktabs}
+\usepackage{microtype}
+\usepackage[hidelinks]{hyperref}
+
+\setmainfont{Latin Modern Roman}
+\setmonofont{Latin Modern Mono}[Scale=MatchLowercase]
+
+\newtheorem{theorem}{Theorem}[section]
+\newtheorem{proposition}[theorem]{Proposition}
+\newtheorem{lemma}[theorem]{Lemma}
+
+\newcommand{\LG}{\mathrm{LG2N}}
+\newcommand{\fl}[1]{\mathrm{fl}_{#1}}
+\newcommand{\emax}{e_{\max}}
+\newcommand{\mlim}{m_{\mathrm{lim}}}
+\newcommand{\ofs}{\mathrm{ofs}}
+
+\numberwithin{equation}{section}
+
+\title{\textbf{The table-free latitudinal march}}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+\vspace{-2.2em}
+
+\begin{center}
+{\small Lean~4 / Mathlib proof of record: \texttt{formal/lean/} (v4.34.0-rc2).}
+\end{center}
+
+\medskip
+\noindent\textbf{Abstract.}
+We record the identities used by the table-free latitudinal march.  For spin
+$s\ge 0$, order $m\ge 0$ and $x=\cos\theta$, the Wigner function is the Jacobi
+polynomial
+\begin{equation*}
+d^\ell_{m,-s}(\theta)
+  =(-1)^{m+s}\,
+   2^{\varepsilon_m\,\LG(\ell,m)}\,
+   \bigl(\sin\tfrac{\theta}{2}\bigr)^{m+s}
+   \bigl(\cos\tfrac{\theta}{2}\bigr)^{\lvert m-s\rvert}
+   P_{\ell-M}^{(m+s,\lvert m-s\rvert)}(x),
+\end{equation*}
+with $M=\max(m,s)$ and $\varepsilon_m=\mathrm{sign}(m-s)$ (equal to $+1$ at
+$m=s$).  The kernel marches this polynomial by the three-term recurrence,
+carries an exact binary exponent, emits a binade-split partial, and may skip
+polar tiles by ducc0's $\mlim$ cutoff.  Every identity below is proved in
+Lean; only the WKB estimate of \S\ref{sec:polar} is not.
+
+\tableofcontents
+
+\section{Introduction}
+
+The transform implemented by \texttt{gmaster/\_spin\_march\_pallas.py} is, for
+each order $m$ and each of four real channels $r_c(\theta)$,
+\begin{equation}
+\label{eq:A}
+A_c(\ell,m)
+  =\sum_{\theta} d^\ell_{m,-s}(\theta)\, r_c(\theta),
+  \qquad
+  \ell=\max(m,s),\dots,L-1,
+\end{equation}
+where $L=\ell_{\max}+1$.  The kernel never stores associated Legendre tables.
+It evaluates $d^\ell_{m,-s}$ from a Jacobi recurrence in compensated float32,
+with an integer exponent lane, a float32 emit, and an optional polar skip.
+
+This note is the human-readable statement.  The proof of record is the Lean~4
+project \texttt{GMasterMarch}; Appendix~\ref{app:lean} names the theorems.
+The project has no \texttt{sorry}: DLMF~18.9.2 for the explicit Jacobi sum
+is proved in \texttt{JacobiSum.jacobi\_three\_term} (a telescoping certificate
+over the summands, \S\ref{sec:rec}), the identification of the Jacobi closed
+form with Wigner's explicit sum in \texttt{WignerJacobi.wignerD\_eq\_jacobiForm}
+(\S\ref{sec:closed}), and the spin-$2$ mirror identity in
+\texttt{Mirror.mirror\_identity} (\S\ref{sec:fold}).  The WKB estimate in
+\S\ref{sec:polar} is asymptotic and has no Lean counterpart.
+
+The argument is organised as follows.  \S\ref{sec:closed} substitutes
+$m'\mapsto m$, $m\mapsto -s$ into Edmonds's Jacobi form of the small-$d$
+matrix.  \S\ref{sec:rec} rearranges DLMF~18.9.2 into the marched coefficients
+and proves that $\alpha^2-\beta^2=4ms$.  \S\ref{sec:carry}--\S\ref{sec:emit}
+treat the exponent lane and the binade-split emit.  \S\ref{sec:fold} records
+the hemisphere fold.  \S\ref{sec:wall} converts the live-degree count into a
+hardware lower bound.  \S\ref{sec:polar} identifies ducc0's $\mlim$ with the
+larger root of its quadratic.
+
+\section{Closed form}
+\label{sec:closed}
+
+Write $\alpha=m+s$, $\beta=\lvert m-s\rvert$, $M=\max(m,s)$ and $n=\ell-M$.
+
+\begin{theorem}
+\label{thm:closed}
+\begin{align}
+d^\ell_{m,-s}(\theta)
+  &=(-1)^{m+s}\,
+    2^{\varepsilon_m\,\LG(\ell,m)}\,
+    \Bigl(\sin\tfrac{\theta}{2}\Bigr)^\alpha
+    \Bigl(\cos\tfrac{\theta}{2}\Bigr)^\beta
+    P_n^{(\alpha,\beta)}(x),
+\label{eq:d}
+\\
+\LG(\ell,m)
+  &=\log_2\sqrt{\frac{(\ell+m)!\,(\ell-m)!}{(\ell-s)!\,(\ell+s)!}},
+  \qquad
+  \varepsilon_m
+  =
+  \begin{cases}
+    +1,& m\ge s,\\
+    -1,& m<s.
+  \end{cases}
+\label{eq:LG}
+\end{align}
+\end{theorem}
+
+\begin{proof}
+Edmonds (1957, eq.~4.1.23) writes, for $d^j_{m'm}$ with
+$a=\lvert m-m'\rvert$, $b=\lvert m+m'\rvert$ and $n=j-(a+b)/2$,
+\begin{equation}
+\label{eq:edmonds}
+d^j_{m'm}(\beta)
+  =\xi\,
+   \sqrt{\frac{n!\,(n+a+b)!}{(n+a)!\,(n+b)!}}\,
+   \Bigl(\sin\tfrac{\beta}{2}\Bigr)^a
+   \Bigl(\cos\tfrac{\beta}{2}\Bigr)^b
+   P_n^{(a,b)}(\cos\beta),
+\end{equation}
+where $\xi=1$ if $m\ge m'$ and $\xi=(-1)^{m-m'}$ otherwise.
+
+Substitute $m'\mapsto m$ and $m\mapsto -s$.  Then $a=\alpha$, $b=\beta$,
+and $a+b=2M$, so $n=\ell-M$.  Unless $m=s=0$ one has $-s<m$, hence
+$\xi=(-1)^{-s-m}=(-1)^{m+s}$.  The factorial ratio splits on the two
+branches of $M$:
+\begin{itemize}
+\item if $m\ge s$, then $n=\ell-m$, $n+a+b=\ell+m$, $n+a=\ell+s$,
+$n+b=\ell-s$, so the ratio is $2^{+\LG}$;
+\item if $m<s$, then $n=\ell-s$, $n+a+b=\ell+s$, $n+a=\ell+m$,
+$n+b=\ell-m$, so the ratio is $2^{-\LG}$.
+\end{itemize}
+This is the $\varepsilon_m$ flip in~\eqref{eq:LG}.
+\end{proof}
+
+The kernel writes $(-1)^m$ for $(-1)^{m+s}$.  The two agree for even spin
+($0$ and $2$, the only spins the march serves).  A spin-$1$ or spin-$3$
+march must restore $(-1)^s$.  The closed form \emph{is} Wigner's function:
+with $d^j_{m,-s}$ written as Wigner's explicit sum (Wigner 1931; Sakurai
+3.8.33), both sides are sums over $0\le k\le j-M$, the powers of
+$\sin\frac{\theta}{2}$ and $\cos\frac{\theta}{2}$ match term by term
+($\tfrac{x-1}{2}=-\sin^2\frac{\theta}{2}$, $\tfrac{x+1}{2}=\cos^2\frac{\theta}{2}$),
+and the coefficients agree by
+$\binom{j+s}{j-m-k}\binom{j-s}{k}(j-s-k)!\,(j-m-k)!\,(k+m+s)!\,k!=(j+s)!\,(j-s)!$
+for $m\ge s$ (and $(j+m)!\,(j-m)!$ for $m<s$), which is where the
+$\varepsilon_m$ flip comes from.  Numerically, spins $0$--$3$, $\ell\le 12$,
+four colatitudes: worst relative difference $6\times 10^{-13}$.
+
+Lean: \texttt{Indices.alpha\_add\_beta}, \texttt{alpha\_sub\_beta},
+\texttt{alpha\_sq\_sub\_beta\_sq}, \texttt{jratio\_of\_ge},
+\texttt{jratio\_of\_lt}, \texttt{sign\_of\_even\_spin},
+\texttt{sign\_of\_odd\_spin}; \texttt{WignerJacobi.wignerD} (Wigner's sum),
+\texttt{jacobiForm}, \texttt{coeff\_ge}, \texttt{coeff\_lt},
+\texttt{wignerD\_eq\_jacobiForm}.
+
+\section{Recurrence}
+\label{sec:rec}
+
+DLMF~18.9.2 for $P_n^{(\alpha,\beta)}$, with $S=2n+\alpha+\beta$, is
+\begin{equation}
+\label{eq:dlmf}
+2n\,(n+\alpha+\beta)\,(S-2)\,P_n
+  =(S-1)\bigl[S(S-2)x+(\alpha^2-\beta^2)\bigr]P_{n-1}
+   -2(n+\alpha-1)(n+\beta-1)S\,P_{n-2}.
+\end{equation}
+Write $\mathrm{den}=2n(n+\alpha+\beta)(S-2)$.  Then
+$v_\ell=(c_1 x+c_0)v_{\ell-1}-c_b v_{\ell-2}$ with
+\begin{equation}
+\label{eq:c}
+c_1=\frac{(S-1)S(S-2)}{\mathrm{den}},
+\quad
+c_0=\frac{(S-1)(\alpha^2-\beta^2)}{\mathrm{den}},
+\quad
+c_b=\frac{2(n+\alpha-1)(n+\beta-1)S}{\mathrm{den}}.
+\end{equation}
+
+\begin{lemma}
+\label{lem:c0}
+$\alpha^2-\beta^2=4ms$ for every $m,s\ge 0$.
+\end{lemma}
+
+\begin{proof}
+$\alpha-\beta=2\min(m,s)$ and $\alpha+\beta=2\max(m,s)$.
+\end{proof}
+
+Thus no coefficient in~\eqref{eq:c} is a difference of large numbers.
+A float32 (high, low) split therefore carries them to $2^{-48}$.
+
+Seeds: $P_0=1$, and DLMF~18.5.7 at $n=1$ gives
+\begin{equation}
+\label{eq:P1}
+P_1^{(\alpha,\beta)}(x)
+  =\tfrac{\alpha+\beta+2}{2}\,x+\tfrac{\alpha-\beta}{2}.
+\end{equation}
+For $s=2$ and $m\ge 2$ this is $(m+1)x+2$.
+
+Lean: \texttt{JacobiSum.jacobi} (the DLMF~18.5.7 sum), \texttt{tj} (its
+$k$-th summand in $u=\tfrac{x-1}{2}$), the ratio identities
+\texttt{tj\_succ}, \texttt{tj\_pred\_v}, \texttt{tj\_pred\_u} and their
+combinations \texttt{tj\_pred}, \texttt{tj\_pred2}, the telescoping
+certificate \texttt{W} with \texttt{summand\_telescopes}, \texttt{W\_zero},
+\texttt{W\_top}, and DLMF~18.9.2 itself, \texttt{jacobi\_three\_term};
+\texttt{Recurrence.jacobi\_zero}, \texttt{jacobi\_one}, \texttt{c0\_eq},
+\texttt{den\_pos}, \texttt{recurrence\_form}, \texttt{march},
+\texttt{march\_eq\_jacobi}.  No \texttt{sorry} in the chain.
+
+\emph{Proof of DLMF~18.9.2 for the sum (as formalised).}  Let
+$t_k=\binom{n+\alpha}{n-k}\binom{n+\beta}{k}u^k(u+1)^{n-k}$ for $0\le k\le n$
+and $t_k=0$ otherwise.  From $\binom{N}{j+1}(j+1)=\binom{N}{j}(N-j)$ and
+$\binom{N}{j}(N+1)=\binom{N+1}{j}(N+1-j)$:
+\begin{align*}
+(\alpha+k+1)(k+1)(u+1)\,t_{k+1}&=(n-k)(n+\beta-k)\,u\,t_k,\\
+(n+1+\alpha)(n+1+\beta)(u+1)\,t^{n}_k&=(n+1-k)(n+1+\beta-k)\,t^{n+1}_k,\\
+(n+1+\alpha)(n+1+\beta)\,u\,t^{n}_k&=(\alpha+k+1)(k+1)\,t^{n+1}_{k+1},
+\end{align*}
+and the difference of the last two expresses $t^n_k$ through $t^{n+1}_k$,
+$t^{n+1}_{k+1}$ with no division.  Applying it twice writes the recurrence's
+summand at degree $N$, times $D'=(N+\alpha)(N+\beta)(N+\alpha-1)(N+\beta-1)$,
+through $t_k,t_{k+1},t_{k+2}$ alone, and it equals $W(k+1)-W(k)$ for
+$W(k)=-q_0(k)\,t_k+\bigl(q_2(k-1)-C(u+1)(k+1)(k+1+\alpha)\bigr)t_{k+1}$
+(explicit polynomials $q_0,q_2,C$, found with sympy and checked by
+\texttt{ring}); $W(0)=0$ by the first identity at $k=0$ and $W(N+1)=0$
+because $t$ vanishes past $N$, so the sum telescopes to zero.
+
+\section{Exponent carry}
+\label{sec:carry}
+
+Every lane stores $v\cdot 2^{ex}$ with $v$ float32 and $ex\in\mathbb{Z}$.
+Initially $v=2^{f-\lfloor f\rfloor}\in[1,2)$ and $ex=\lfloor f\rfloor$, where
+\begin{equation}
+\label{eq:f}
+f=\alpha\log_2\sin\tfrac{\theta}{2}+\beta\log_2\cos\tfrac{\theta}{2}.
+\end{equation}
+Whenever $\max(\lvert v_\ell\rvert,\lvert v_{\ell-1}\rvert)$ leaves
+$[2^{-24},2^{24}]$, both lanes are multiplied by $2^{\mp 24}$ and $ex$
+moves by $\pm 24$.
+
+\begin{lemma}
+\label{lem:rescale}
+The rescaling is exact and commutes with the recurrence.
+\end{lemma}
+
+\begin{proof}
+Multiplying a binary float by a power of two changes only the exponent
+field, hence is exact in the absence of overflow or underflow.  With
+$\lvert v\rvert\le 2^{24}$ times the growth of one step, and the float32
+range $2^{\pm 126}$, overflow before the guard would require growth
+$>2^{100}$.  From~\eqref{eq:c} one has
+$\lvert c_1\rvert,\lvert c_0\rvert,\lvert c_b\rvert=O(m)$, so growth per
+step is $\le 2^{15}$ at $m<2^{14}$.  The recurrence is linear and
+homogeneous in $(v_\ell,v_{\ell-1})$, so a common scale persists.
+\end{proof}
+
+The band $2^{-24}$ is chosen so that $v\cdot r$ with
+$\lvert r\rvert$ of class $2^{24}$ and a $256$-lane sum stays inside
+float32.
+
+Lean: \texttt{ExponentCarry.lane\_rescale}, \texttt{guard\_large},
+\texttt{guard\_small}, \texttt{step\_homogeneous}, \texttt{rec2\_scaled} /
+\texttt{march\_eq\_rec2} / \texttt{march\_scaled} (the march from seeds
+scaled by $\lambda$ is $\lambda$ times the march at every degree),
+\texttt{no\_overflow\_before\_guard}.
+
+\section{Emit}
+\label{sec:emit}
+
+At degree $\ell$ the program holds $(v_\theta,ex_\theta)$ on $256$ lanes and
+reduces $\sum_\theta v_\theta\,2^{ex_\theta-\emax}\,r_c(\theta)$ with
+$\emax=\max_\theta ex_\theta$.  Lanes with $ex_\theta-\emax<-126$ are flushed
+to zero.
+
+\begin{lemma}[flush bound]
+\label{lem:flush}
+Flushed lanes change the tile partial by less than $2^{-70}$ relative to
+the largest lane's term.
+\end{lemma}
+
+\begin{proof}
+Stored $\lvert v\rvert$ lie in $[2^{-24},2^{24}]$.  The largest term is at
+least $2^{-24}\cdot 2^{\emax}\cdot\lvert r\rvert$; a flushed term is at most
+$2^{24}\cdot 2^{\emax-127}\cdot\lvert r\rvert$.  The ratio is $2^{-79}$, and
+there are at most $2^8$ lanes.
+\end{proof}
+
+From~\eqref{eq:d} the tile partial of~\eqref{eq:A} is
+\begin{equation}
+\label{eq:tile}
+A_c^{\mathrm{tile}}(\ell,m)
+  =(-1)^{m+s}\,
+   2^{\varepsilon\,\LG+\emax}
+   \sum_\theta
+   \bigl[v_\theta\, 2^{ex_\theta-\emax}\bigr]\, r_c(\theta).
+\end{equation}
+Write $\varepsilon\,\LG=\mathrm{lex}+\mathrm{frac}$ with
+$\mathrm{lex}=\lfloor\varepsilon\,\LG\rfloor$ and
+$\mathrm{frac}\in[0,1)$.  The kernel stores
+\begin{equation}
+\label{eq:p}
+p=\fl{32}\Bigl(\fl{32}\bigl(\textstyle\sum_\theta\mathrm{val}_\theta\, r_c(\theta)\bigr)
+   \cdot\fl{32}\bigl((-1)^{m+s}\,2^{\mathrm{frac}}\bigr)\Bigr),
+\qquad
+e=\mathrm{lex}+\emax,
+\end{equation}
+and the driver returns $\fl{64}(p)\cdot 2^e$, summing tiles in float64.
+
+\begin{proposition}
+\label{prop:binade}
+$\fl{64}(p)\,2^e$ equals~\eqref{eq:tile} with relative error at most
+$(1+u)^2(1+\delta)-1$, where $u=2^{-24}$ and $\delta$ is the relative error
+of the float32 tree sum.  Multiplication by $2^e$ is exact for
+$-1022\le e\le 1023$.  A partial with $e<-1022$ is below $2^{-1022}$ in
+magnitude and is dropped.
+\end{proposition}
+
+\begin{proof}
+$2^e$ is exactly representable in float64 on that range, and multiplication
+by it only changes the exponent field.  The two float32 roundings are
+$\fl{32}(2^{\mathrm{frac}})$ and the product; each contributes a factor in
+$[1-u,1+u]$.  The tree error $\delta$ is the same term the previous
+float64-emit kernel carried.  Harmonic coefficients are $O(1)$ sums of
+these partials, so a contribution below $2^{-1022}$ is below float64
+resolution.
+\end{proof}
+
+Measured relative change against the float64-emit kernel, over every lane:
+$7.5\times 10^{-8}$, $7.3\times 10^{-8}$, $6.6\times 10^{-8}$ at
+$N_{\mathrm{side}}=1024$, $2048$, $4096$, i.e.\ $\sim 2u$ as predicted.
+
+Lean: \texttt{Emit.flushed\_lane\_small}, \texttt{flush\_bound},
+\texttt{binade\_split}, \texttt{frac\_factor\_bounds},
+\texttt{int\_binade\_is\_zpow}, \texttt{two\_roundings},
+\texttt{dropped\_partial\_small}.
+
+\section{Hemisphere fold}
+\label{sec:fold}
+
+\begin{lemma}
+\label{lem:fold}
+$d^\ell_{m,0}(\pi-\theta)=(-1)^{\ell+m}\, d^\ell_{m,0}(\theta)$.
+\end{lemma}
+
+\begin{proof}
+$d^\ell_{m,0}(\theta)=\sqrt{(\ell-m)!/(\ell+m)!}\,P_\ell^m(\cos\theta)$ and
+$P_\ell^m(-x)=(-1)^{\ell+m}P_\ell^m(x)$ (DLMF~14.7.17).  Equivalently,
+$P_n^{(\alpha,\alpha)}(-x)=(-1)^n P_n^{(\alpha,\alpha)}(x)$ from the
+explicit sum, and $\alpha=\beta=m$ at spin~$0$.
+\end{proof}
+
+HEALPix rings satisfy $\theta_{N-1-i}=\pi-\theta_i$ and share weight and
+$\phi_0$.  The sum~\eqref{eq:A} therefore collapses, per northern lane, to
+\begin{equation}
+\label{eq:fold}
+\sum_{\mathrm{north}} d_i\bigl[G_i+(-1)^{\ell+m}G_i'\bigr].
+\end{equation}
+One recurrence, two right-hand sides; the parity sign is applied outside
+the kernel.  This halves the lane count for spin~$0$.
+
+For spin~$2$ the code uses
+$T[m,\pi-\theta,\ell]=(-1)^{\ell-m'}T[-m,\theta,\ell]$ with $m'=-s$
+(measured residual $2.3\times 10^{-12}$).  It is a consequence of the general
+reflection $P_n^{(\alpha,\beta)}(-x)=(-1)^nP_n^{(\beta,\alpha)}(x)$, which swaps
+the two half-angle powers in~\eqref{eq:d}: for $s\le m\le\ell$,
+$d^\ell_{m,-s}(\pi-\theta)=(-1)^{\ell+m}\,d^\ell_{m,s}(\theta)$, and
+$d^\ell_{-m,-s}=(-1)^{m+s}d^\ell_{m,s}$ is read off the same Jacobi form.
+Lean: \texttt{Mirror.jacobi\_reflect}, \texttt{rowNeg\_reflect},
+\texttt{mirror\_identity}.
+
+Lean: \texttt{Fold.jacobi\_symmetric\_parity}, \texttt{row0\_reflect},
+\texttt{sum\_pairs\_even}, \texttt{sum\_pairs\_odd}, \texttt{fold\_even}.
+
+\section{The arithmetic wall}
+\label{sec:wall}
+
+\begin{lemma}
+\label{lem:live}
+$\sum_{m<L}(L-m)=L(L+1)/2$.
+\end{lemma}
+
+Let $N$ be the number of $(m,\ell,\theta)$ triples visited.  Before polar
+skip, $N=\tfrac12 L(L+1)\lceil n_\theta/2\rceil$ on the folded spin-$0$
+route and $N=\tfrac12 L(L+1)\,n_\theta$ at spin~$2$.
+
+\begin{center}
+\small
+\begin{tabular}{@{}rrrrr@{}}
+\toprule
+$N_{\mathrm{side}}$ & $L$ & rings (spin $0$ / $2$) & $N$ spin~$0$ & $N$ spin~$2$ \\
+\midrule
+$1024$ & $3072$  & $2048$ / $4095$  & $9.7\times 10^{9}$  & $1.9\times 10^{10}$ \\
+$2048$ & $6144$  & $4096$ / $8191$  & $7.7\times 10^{10}$ & $1.5\times 10^{11}$ \\
+$4096$ & $12288$ & $8192$ / $16383$ & $6.2\times 10^{11}$ & $1.2\times 10^{12}$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+An analysis pass with $n_c$ channels costs at least $(2+n_c)N$ fused
+multiply-adds.  On this card the measured float64 FMA rate is
+$R_{64}=0.45\times 10^{12}\,\mathrm{s}^{-1}$ (datasheet
+$0.94\times 10^{12}$).  Hence any float64 SIMT spin-$0$ analysis at
+$N_{\mathrm{side}}=4096$ needs
+\begin{equation}
+\label{eq:T}
+T\ge\frac{6\cdot 6.2\times 10^{11}}{0.94\times 10^{12}}\,\mathrm{s}
+   =4.0\,\mathrm{s}
+\end{equation}
+at the datasheet rate ($8.3\,\mathrm{s}$ measured), against ducc0's
+$2.02\,\mathrm{s}$ on the host.  No float64 kernel on this card can beat
+the CPU reference at the top of the board.
+
+Lean: \texttt{Wall.live\_degrees}, \texttt{time\_lower\_bound}.
+
+\section{Polar skip}
+\label{sec:polar}
+
+For $m>(\ell+\tfrac12)\sin\theta$ the function $d^\ell_{m,-s}(\theta)$ is
+in its forbidden region.  Writing $u=\sqrt{\sin\theta}\,d^\ell_{m,0}$,
+\begin{equation}
+\label{eq:legendre}
+u''+\Bigl[(\ell+\tfrac12)^2-\frac{m^2-\tfrac14}{\sin^2\theta}\Bigr]u=0.
+\end{equation}
+With $\ell'=\ell+\tfrac12$ the WKB action from the turning point
+$\theta_t$ ($\sin\theta_t=m/\ell'$) down to $\theta<\theta_t$ is
+\begin{equation}
+\label{eq:S}
+S=\int_\theta^{\theta_t}
+   \sqrt{\frac{m^2}{\sin^2 t}-{\ell'}^2}\,\mathrm{d}t
+  \;\sim\;
+  \frac{2\sqrt{2}}{3}\,
+  \frac{\delta^{3/2}}{\sqrt{\ell'\sin\theta}\,\cos\theta},
+\end{equation}
+where $\delta=m-\ell'\sin\theta$.  This estimate is not formalised.
+
+ducc0 neglects, on the ring at $\theta$, every order above
+\begin{equation}
+\label{eq:mlim}
+\mlim
+  =s\lvert\cos\theta\rvert
+   +\sqrt{(\ell_{\max}\sin\theta+\ofs)^2-s^2\sin^2\theta},
+\qquad
+\ofs=\max(100,\,0.01\,\ell_{\max}).
+\end{equation}
+
+\begin{lemma}
+\label{lem:mlim}
+\eqref{eq:mlim} is the larger root of
+$m^2-2s\lvert\cos\theta\rvert\, m+s^2-t_1^2=0$ on a ring with
+$\cos^2\theta+\sin^2\theta=1$ and $t_1=\ell_{\max}\sin\theta+\ofs$.
+For $s=0$ one has $\mlim=\ell_{\max}\sin\theta+\ofs$.
+\end{lemma}
+
+Every $\ell\le\ell_{\max}$ then has $\delta\ge\ofs$.  At
+$\ell_{\max}=12287$, $\sin\theta=\tfrac12$, one finds $S\sim 19$, so
+neglected values sit below $\sim 10^{-8}$ times the oscillatory amplitude.
+The march skips a tile when $m>\max_{\mathrm{tile}}\mlim(\theta)$.  Because
+the neglected set is the reference's own, agreement with ducc0 is unchanged
+to the printed digit.
+
+\begin{center}
+\small
+\begin{tabular}{@{}rrrr@{}}
+\toprule
+$N_{\mathrm{side}}$ & analysis (tile $256$) & synth.\ spin~$0$ ($1024$) & synth.\ spin~$2$ ($512$) \\
+\midrule
+$1024$ & $13.9\%$ & $2.5\%$  & $9.3\%$  \\
+$2048$ & $17.5\%$ & $10.0\%$ & $14.8\%$ \\
+$4096$ & $19.3\%$ & $15.1\%$ & $17.9\%$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Lean: \texttt{PolarSkip.mlim\_is\_root}, \texttt{mlim\_ge},
+\texttt{mlim\_spin\_zero}, \texttt{skipped\_degrees}.
+
+\appendix
+\section{Lean correspondence}
+\label{app:lean}
+
+Build: \texttt{cd formal/lean \&\& $\sim$/.elan/bin/lake build}.
+There is no \texttt{sorry}; \texttt{lake env lean CheckAxioms.lean} prints the
+axioms of every main theorem (\texttt{propext}, \texttt{Classical.choice},
+\texttt{Quot.sound}).
+
+\begin{center}
+\small
+\begin{tabular}{@{}llp{7.4cm}@{}}
+\toprule
+Section & File & Content \\
+\midrule
+\S\ref{sec:closed}
+  & \texttt{Indices.lean}
+  & $\alpha+\beta=2M$, $\alpha^2-\beta^2=4ms$, both factorial branches, sign \\
+\S\ref{sec:closed}
+  & \texttt{WignerJacobi.lean}
+  & Wigner's explicit sum equals the Jacobi closed form, both branches \\
+\S\ref{sec:rec}
+  & \texttt{JacobiSum.lean}
+  & Jacobi sum; DLMF~18.9.2 by summand ratios and a telescoping certificate \\
+\S\ref{sec:rec}
+  & \texttt{Recurrence.lean}
+  & seeds, rearrangement, $\mathrm{march}=\mathrm{jacobi}$ \\
+\S\ref{sec:carry}
+  & \texttt{ExponentCarry.lean}
+  & exact rescaling, homogeneous step, no overflow before the guard \\
+\S\ref{sec:emit}
+  & \texttt{Emit.lean}
+  & flush $2^{-71}$, binade split, $[1,2)$ mantissa, two roundings \\
+\S\ref{sec:fold}
+  & \texttt{Fold.lean}
+  & $P_n^{(\alpha,\alpha)}(-x)=(-1)^n P_n^{(\alpha,\alpha)}(x)$, paired rings \\
+\S\ref{sec:fold}
+  & \texttt{Mirror.lean}
+  & $P_n^{(\alpha,\beta)}(-x)=(-1)^nP_n^{(\beta,\alpha)}(x)$; the spin-$2$ mirror identity \\
+\S\ref{sec:wall}
+  & \texttt{Wall.lean}
+  & Lemma~\ref{lem:live}; time bound from an FMA count and a rate \\
+\S\ref{sec:polar}
+  & \texttt{PolarSkip.lean}
+  & Lemma~\ref{lem:mlim}; degrees removed by a cutoff \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Not formalised: the WKB action \eqref{eq:S}.
+
+\begin{thebibliography}{9}
+\bibitem{Edm57}
+A.~R. Edmonds, \emph{Angular Momentum in Quantum Mechanics},
+Princeton University Press, 1957.
+\bibitem{DLMF}
+NIST Digital Library of Mathematical Functions,
+\url{https://dlmf.nist.gov/}.
+\end{thebibliography}
+
+\end{document}
