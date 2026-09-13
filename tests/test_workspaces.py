@@ -5,12 +5,15 @@ import pytest
 jax.config.update("jax_enable_x64", True)
 
 import gmaster as nmt
+from gmaster import workspaces as ws
 from gmaster.workspaces import (
     _apply_toeplitz,
     _binning_operators,
     _coupling_matrix_tt,
     _coupling_matrix_tt_toeplitz,
     _expanded_binning_operators,
+    _left_contract,
+    _RowPieces,
 )
 
 
@@ -519,3 +522,111 @@ def test_workspace_fits_interoperability(tmp_path):
     loaded = nmt.NmtWorkspace.from_file(ref_path)
     np.testing.assert_allclose(loaded.mcm, ref.mcm, atol=0)
     np.testing.assert_allclose(loaded.bpws, ref.bpws, atol=2e-14)
+
+
+def test_spin2_pipeline_survives_releasing_the_first_field():
+    """The Nside-4096 spin-2 bench must drop the compile-time field before the warm run.
+
+    Holding the first field+workspace while building a second one is what OOM'd the
+    overlapping stage timings (8 GiB chirp-Z with 70.9/71.2 GiB in use).  Two
+    sequential pipelines after deleting the first must both finish finite.
+    """
+    rng = np.random.default_rng(21)
+    nside, lmax = 8, 16
+    npix = 12 * nside ** 2
+    mask = rng.uniform(0.3, 1, npix)
+    maps = rng.normal(size=(2, npix))
+    bins = nmt.NmtBin.from_lmax_linear(lmax, 4)
+
+    def once():
+        field = nmt.NmtField(mask, maps, lmax=lmax, lmax_mask=lmax, n_iter=1, spin=2)
+        w = nmt.NmtWorkspace()
+        w.compute_coupling_matrix(field, field, bins)
+        dec = np.asarray(w.decouple_cell(nmt.compute_coupled_cell(field, field)))
+        return field, w, dec
+
+    f1, w1, d1 = once()
+    assert np.isfinite(d1).all()
+    del f1, w1
+    f2, w2, d2 = once()
+    assert np.isfinite(d2).all()
+    np.testing.assert_allclose(d2, d1, atol=1e-10)
+
+
+def test_nside4096_spin2_matrix_exceeds_the_pieced_threshold():
+    """The Nside-4096 spin-2 operator is past `_MCM_PIECED_BYTES`; small cells are not.
+
+    `ncls=4`, `lmax=12287` is `5.4e9` elements, past `2**31` (the NaMaster segfault)
+    and past the 4 GiB pieced-assembly gate.  A nside-4 auto-spectrum is not.
+    """
+    ncls, lmax = 4, 3 * 4096 - 1
+    n = ncls * (lmax + 1)
+    assert n * n * 8 > ws._MCM_PIECED_BYTES
+    n_small = 4 * (7 + 1)
+    assert n_small * n_small * 8 <= ws._MCM_PIECED_BYTES
+
+
+def test_pieced_coupling_matrix_matches_dense_and_decouples(monkeypatch):
+    """Forcing the Nside-4096 `_RowPieces` path at nside=4 keeps NaMaster agreement.
+
+    `_assemble_mcm` is Python-gated on `_MCM_PIECED_BYTES`.  Zeroing the gate takes
+    the shipped piece assembly, `couple_cell`, `decouple_cell` and
+    `get_coupling_matrix` at a geometry the suite already compares to pymaster.
+    """
+    rng = np.random.default_rng(14)
+    nside, lmax = 4, 7
+    npix = 12 * nside ** 2
+    mask = rng.uniform(0.3, 1, npix)
+    maps = rng.normal(size=(2, npix))
+    field = nmt.NmtField(mask, maps, lmax=lmax, lmax_mask=lmax, n_iter=0)
+    bins = nmt.NmtBin.from_lmax_linear(lmax, 2)
+    dense = nmt.NmtWorkspace()
+    dense.compute_coupling_matrix(field, field, bins)
+    assert not isinstance(dense.mcm, _RowPieces)
+
+    monkeypatch.setattr(ws, "_MCM_PIECED_BYTES", 0)
+    pieced = nmt.NmtWorkspace()
+    pieced.compute_coupling_matrix(field, field, bins)
+    assert isinstance(pieced.mcm, _RowPieces)
+    np.testing.assert_allclose(
+        np.asarray(pieced.get_coupling_matrix()),
+        np.asarray(dense.get_coupling_matrix()),
+        atol=1e-14,
+    )
+    cl = nmt.compute_coupled_cell(field, field)
+    d_dense = np.asarray(dense.decouple_cell(cl))
+    d_pieced = np.asarray(pieced.decouple_cell(cl))
+    assert np.isfinite(d_pieced).all()
+    np.testing.assert_allclose(d_pieced, d_dense, atol=1e-13)
+    theory = rng.normal(size=(pieced.ncls, lmax + 1))
+    np.testing.assert_allclose(
+        np.asarray(pieced.couple_cell(theory)),
+        np.asarray(dense.couple_cell(theory)),
+        atol=1e-13,
+    )
+
+
+def test_chunked_left_contract_matches_single_gemm(monkeypatch):
+    """The 4 GiB GEMM split is the same product as `output @ mcm`, up to summation order.
+
+    `n=32` has a divisor at every power of two, so a threshold that asks for
+    three chunks still finds `nchunk=4` rather than walking off `range(target, n+1)`.
+    """
+    rng = np.random.default_rng(0)
+    n, n_out = 32, 5
+    mcm = jax.numpy.asarray(rng.normal(size=(n, n)))
+    output = jax.numpy.asarray(rng.normal(size=(n_out, n)))
+    one = np.asarray(_left_contract(output, mcm))
+    bytes_ = n * n * 8
+    monkeypatch.setattr(ws, "_LEFT_CONTRACT_CHUNK_BYTES", bytes_ // 3)
+    assert mcm.size * 8 > ws._LEFT_CONTRACT_CHUNK_BYTES
+    chunked = np.asarray(_left_contract(output, mcm))
+    np.testing.assert_allclose(chunked, one, atol=1e-14)
+
+
+def test_large_wigner_cache_is_dropped_above_keep_bytes(monkeypatch):
+    """A quadrature cache past `_WD_CACHE_KEEP_BYTES` is forgotten after the workspace."""
+    monkeypatch.setattr(ws, "_WD_CACHE_KEEP_BYTES", 1)
+    ws._WD_TRIPLE_CACHE[("probe",)] = jax.numpy.zeros(8)
+    ws._drop_large_wigner_cache()
+    assert len(ws._WD_TRIPLE_CACHE) == 0

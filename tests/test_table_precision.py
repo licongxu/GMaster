@@ -278,7 +278,10 @@ def test_float32_scalar_coupling_keeps_the_matrix():
     magnitude better than the polarised arm above because the log-cumsum table and the offset
     accumulator stay float64 and only the per-term products are rounded.
     """
-    lmax = 127
+    # lmax=127 segfaults the CPU XLA backend in float32 (isolated repro:
+    # `_coupling_matrix_tt` at lmax>=47).  The GPU path is the published board;
+    # 43 is the largest CPU size that still drives the shipped function.
+    lmax = 127 if any(d.platform == "gpu" for d in jax.devices()) else 43
     rng = np.random.default_rng(17)
     ell = np.arange(2 * lmax + 1)
     pcl = np.exp(-ell / 90.0) * (1.0 + 0.1 * rng.normal(size=ell.size))

@@ -1108,3 +1108,131 @@ def test_traced_refinement_loop_matches_the_eager_loop(nside):
             analysis_slab=a_slab, synthesis_slab=s_slab)
     np.testing.assert_array_equal(np.asarray(traced), np.asarray(eager))
 
+
+def test_chunked_rows_concatenates_static_slices():
+    """Polar-cap chirp-Z batches are a concatenate of static row slices, not a rewrite."""
+    rows = jnp.arange(10, dtype=jnp.float64)[:, None] * jnp.array([1.0, 2.0, 3.0])
+    got = utils._chunked_rows(10, 3, lambda lo, hi: rows[lo:hi])
+    np.testing.assert_array_equal(np.asarray(got), np.asarray(rows))
+
+
+def test_polar_cap_chunking_matches_the_unchunked_ring_stage():
+    """Forcing `_CAP_CHUNK_ROWS` below the cap count is bit-identical to one batch.
+
+    At Nside 4096 the polarised chirp-Z used to run all 8190 cap rows at once
+    (8.6 GiB per intermediate).  The shipped helper splits that batch; this
+    drives `_forward_ring_fft_full` and `_inverse_ring_fft_complex` at nside=16
+    (30 cap rows) with a 4-row chunk against the default unchunked path.
+    """
+    nside, L = 16, 47
+    npix = 12 * nside ** 2
+    ntheta = 4 * nside - 1
+    rng = np.random.default_rng(7)
+    signal = jnp.asarray(rng.normal(size=npix) + 1j * rng.normal(size=npix))
+    centered = jnp.asarray(
+        rng.normal(size=(ntheta, 2 * L - 1))
+        + 1j * rng.normal(size=(ntheta, 2 * L - 1))
+    )
+    a_tables = utils._spin_ring_analysis_tables(L, nside)
+    s_tables = utils._spin_ring_synthesis_tables(L, nside)
+    fwd0 = np.asarray(utils._forward_ring_fft_full(signal, a_tables, L=L, nside=nside))
+    inv0 = np.asarray(utils._inverse_ring_fft_complex(centered, s_tables, L=L, nside=nside))
+    orig = utils._CAP_CHUNK_ROWS
+    try:
+        utils._CAP_CHUNK_ROWS = 4
+        utils._forward_ring_fft_full.clear_cache()
+        utils._inverse_ring_fft_complex.clear_cache()
+        fwd1 = np.asarray(utils._forward_ring_fft_full(signal, a_tables, L=L, nside=nside))
+        inv1 = np.asarray(utils._inverse_ring_fft_complex(centered, s_tables, L=L, nside=nside))
+    finally:
+        utils._CAP_CHUNK_ROWS = orig
+        utils._forward_ring_fft_full.clear_cache()
+        utils._inverse_ring_fft_complex.clear_cache()
+    np.testing.assert_array_equal(fwd1, fwd0)
+    np.testing.assert_array_equal(inv1, inv0)
+
+
+def test_iteration_split_engages_at_nside_4096_and_not_at_nside_8():
+    """XLA's one-temp fused iteration is 26 GiB at Nside 4096; the gate is that footprint."""
+    nside, L_work = 4096, 3 * 4096
+    assert (4 * nside - 1) * 2 * L_work * 16 > utils._ITERATION_SPLIT_BYTES
+    nside_s, L_s = 8, 24
+    assert (4 * nside_s - 1) * 2 * L_s * 16 <= utils._ITERATION_SPLIT_BYTES
+
+
+def test_split_refinement_iteration_matches_fused_program(monkeypatch):
+    """Splitting `_map2alm_iteration` into two programs does not change the alms.
+
+    Above `_ITERATION_SPLIT_BYTES` the fused refinement is two shipped calls
+    (`_alm2map_core_impl` then `_map2alm_once_impl`) instead of one jit.  Zeroing
+    the gate at nside=8 takes that path through `map2alm` with `n_iter=1`.
+    """
+    reference = pytest.importorskip("pymaster")
+    nside, lmax = 8, 10
+    npix = 12 * nside ** 2
+    minfo = nmt.NmtMapInfo(None, (npix,))
+    ainfo = nmt.NmtAlmInfo(lmax)
+    rng = np.random.default_rng(3)
+    maps = jnp.asarray(rng.normal(size=(2, npix)))
+    fused = np.asarray(nmt.map2alm(maps, 2, minfo, ainfo, n_iter=1))
+    monkeypatch.setattr(utils, "_ITERATION_SPLIT_BYTES", 0)
+    split = np.asarray(nmt.map2alm(maps, 2, minfo, ainfo, n_iter=1))
+    np.testing.assert_allclose(split, fused, atol=3e-13)
+    ref_minfo = reference.NmtMapInfo(None, (npix,))
+    ref_ainfo = reference.NmtAlmInfo(lmax)
+    ref = reference.map2alm(np.asarray(maps), 2, ref_minfo, ref_ainfo, n_iter=1)
+    np.testing.assert_allclose(split, ref, atol=3e-13)
+
+
+def test_make_room_drops_ring_tables_only_when_the_pool_is_short(monkeypatch):
+    """`make_room` is the Nside-4096 coupling eviction; the tables rebuild on the next call.
+
+    Wrap the live device rather than replacing it: `Device.memory_stats` is read-only,
+    and a dummy device object is what segfaulted later tests in this process.
+    """
+    nside, L = 8, 16
+    utils.drop_ring_tables()
+    utils._spin_ring_analysis_tables(L, nside)
+    assert utils._spin_ring_analysis_tables.cache_info().currsize > 0
+    inner = jax.devices()[0]
+
+    class _Wrap:
+        def __init__(self, stats):
+            self._stats = stats
+
+        def memory_stats(self):
+            return self._stats
+
+        def __getattr__(self, name):
+            return getattr(inner, name)
+
+    monkeypatch.setattr(jax, "devices", lambda: [_Wrap({"bytes_limit": 10 ** 12, "bytes_in_use": 10})])
+    utils.make_room(10 ** 6)
+    assert utils._spin_ring_analysis_tables.cache_info().currsize > 0
+
+    monkeypatch.setattr(jax, "devices", lambda: [_Wrap({"bytes_limit": 100, "bytes_in_use": 90})])
+    utils.make_room(50)
+    assert utils._spin_ring_analysis_tables.cache_info().currsize == 0
+
+
+def test_legendre_pool_bytes_is_unbounded_when_the_backend_is_silent(monkeypatch):
+    """`_theta_matrix._pool_bytes` must match `_pool_headroom`: None means +inf, not crash.
+
+    The CPU backend returns None from `memory_stats()`.  The synth-band fit test used
+    to raise `AttributeError: 'NoneType' object has no attribute 'get'` out of
+    `_synth_band`, which is the first thing `test_contracts_reduce_*` calls.
+    """
+    from gmaster import _theta_matrix
+
+    class _Silent:
+        def memory_stats(self):
+            return None
+
+    class _Raises:
+        def memory_stats(self):
+            raise RuntimeError("no statistics here")
+
+    for device in (_Silent(), _Raises()):
+        monkeypatch.setattr(jax, "local_devices", lambda: [device])
+        assert _theta_matrix._pool_bytes() == float("inf")
+

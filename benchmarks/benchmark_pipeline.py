@@ -5,6 +5,7 @@ and decoupled cell. Reports warmed medians and decoupled-spectrum parity.
 """
 
 import argparse
+import gc
 import time
 
 import healpy as hp
@@ -72,14 +73,48 @@ def _make_field(module, mask, maps_t, maps_q, maps_u, spin):
     return module.NmtField(mask, [maps_q, maps_u], n_iter=3, spin=2)
 
 
-def _run_pipeline(module, nside, spin, nlb, repeats, mask, maps_t, maps_q, maps_u):
+def _run_pipeline(
+    module, nside, spin, nlb, repeats, mask, maps_t, maps_q, maps_u,
+    release_after_first=False,
+):
     lmax = 3 * nside - 1
     bins = module.NmtBin.from_lmax_linear(lmax, nlb)
+
+    def full_pipeline():
+        ff = _make_field(module, mask, maps_t, maps_q, maps_u, spin)
+        ww = module.NmtWorkspace()
+        ww.compute_coupling_matrix(ff, ff, bins)
+        cc = module.compute_coupled_cell(ff, ff)
+        return ww.decouple_cell(cc)
+
     f = _make_field(module, mask, maps_t, maps_q, maps_u, spin)
     w = module.NmtWorkspace()
     w.compute_coupling_matrix(f, f, bins)
     cl_coupled = module.compute_coupled_cell(f, f)
     cl_decoupled = w.decouple_cell(cl_coupled)
+    result_host = np.asarray(cl_decoupled)
+
+    # Nside 4096 spin 2 cannot hold the first field+workspace and a second field
+    # at once (8 GiB chirp-Z request with 70.9/71.2 GiB in use).  Release the
+    # compile-time objects and time only a fresh full pipeline.
+    if release_after_first:
+        del f, w, cl_coupled, cl_decoupled
+        gc.collect()
+        try:
+            nmt.utils.drop_ring_tables()
+            nmt.utils.make_room(16 * 1024 ** 3)
+        except Exception:
+            pass
+        _, t_total = _timed(full_pipeline, repeats)
+        times = {
+            "field": float("nan"),
+            "mask": float("nan"),
+            "coupling": float("nan"),
+            "coupled_cell": float("nan"),
+            "decouple": float("nan"),
+            "total": t_total,
+        }
+        return result_host, times
 
     t_field = _timed(
         lambda: _make_field(module, mask, maps_t, maps_q, maps_u, spin),
@@ -109,13 +144,6 @@ def _run_pipeline(module, nside, spin, nlb, repeats, mask, maps_t, maps_q, maps_
     _, t_coupling = _timed(fresh_coupling, repeats)
     _, t_coupled_cell = _timed(lambda: module.compute_coupled_cell(f, f), repeats)
     _, t_decouple = _timed(lambda: w.decouple_cell(cl_coupled), repeats)
-
-    def full_pipeline():
-        ff = _make_field(module, mask, maps_t, maps_q, maps_u, spin)
-        ww = module.NmtWorkspace()
-        ww.compute_coupling_matrix(ff, ff, bins)
-        cc = module.compute_coupled_cell(ff, ff)
-        return ww.decouple_cell(cc)
 
     _, t_total = _timed(full_pipeline, repeats)
     times = {
@@ -151,6 +179,12 @@ if __name__ == "__main__":
         "shipped coupling and what every published row used; 'fp64' keeps the map exact "
         "under fp32 tables, which is the route that passes the suite.",
     )
+    parser.add_argument(
+        "--skip-reference",
+        action="store_true",
+        help="Time GMaster only. NaMaster's compute_coupling_matrix segfaults at "
+        "Nside=4096 spin 2, so that cell has no reference TOTAL or rel.",
+    )
     args = parser.parse_args()
     nmt.set_table_precision(args.precision)
     nmt.set_ring_precision(args.ring_precision)
@@ -169,31 +203,57 @@ if __name__ == "__main__":
         f"nside={nside} precision={args.precision} ring={nmt.ring_dtype().__name__} "
         f"devices={[str(d) for d in jax.devices()]}"
     )
+    stages = ("field", "mask", "coupling", "coupled_cell", "decouple")
+    import resource
     for spin in [int(s) for s in args.spins.split(',') if s.strip()]:
+        rss_gb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1e6
+        stats = jax.devices()[0].memory_stats() or {}
+        gpu_peak = stats.get("peak_bytes_in_use", stats.get("bytes_in_use", 0)) / 2**30
+        gm_maps = (
+            jnp.asarray(mask_np), jnp.asarray(map_t),
+            jnp.asarray(map_q), jnp.asarray(map_u),
+        )
+        if args.skip_reference:
+            gm_out, gm_times = _run_pipeline(
+                nmt, nside, spin, 30, args.repeats, *gm_maps,
+                release_after_first=True,
+            )
+            rss_gb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1e6
+            stats = jax.devices()[0].memory_stats() or {}
+            gpu_peak = stats.get("peak_bytes_in_use", stats.get("bytes_in_use", 0)) / 2**30
+            gm_arr = np.asarray(gm_out)
+            finite = bool(np.isfinite(gm_arr).all())
+            def _ms(name):
+                t = gm_times[name]
+                return f"{name} n/a" if t != t else f"{name} {t*1e3:.0f}ms"
+            line = "  ".join(_ms(s) for s in stages)
+            print(
+                f"spin={spin}: GMaster-only TOTAL {gm_times['total']*1e3:.0f}ms | "
+                f"{line} | finite={finite} shape={tuple(gm_arr.shape)} | "
+                f"peakRSS={rss_gb:.1f}GB GPUpeak={gpu_peak:.1f}GiB"
+            )
+            continue
         ref_out, ref_times = _run_pipeline(
             reference, nside, spin, 30, args.repeats,
             mask_np, map_t, map_q, map_u,
         )
         gm_out, gm_times = _run_pipeline(
-            nmt, nside, spin, 30, args.repeats,
-            jnp.asarray(mask_np), jnp.asarray(map_t),
-            jnp.asarray(map_q), jnp.asarray(map_u),
+            nmt, nside, spin, 30, args.repeats, *gm_maps,
         )
+        rss_gb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1e6
+        stats = jax.devices()[0].memory_stats() or {}
+        gpu_peak = stats.get("peak_bytes_in_use", stats.get("bytes_in_use", 0)) / 2**30
         diff = float(np.max(np.abs(np.asarray(gm_out) - np.asarray(ref_out))))
         scale = float(np.max(np.abs(ref_out))) or 1.0
-        stages = ("field", "mask", "coupling", "coupled_cell", "decouple")
         line = "  ".join(
             f"{s} {ref_times[s]*1e3:.0f}->{gm_times[s]*1e3:.0f}ms "
             f"({ref_times[s]/max(gm_times[s], 1e-12):.0f}x)"
             for s in stages
         )
-        import resource
-        rss_gb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1e6
-        gmem = jax.devices()[0].memory_stats()
         print(
             f"spin={spin}: TOTAL {ref_times['total']*1e3:.0f}->"
             f"{gm_times['total']*1e3:.0f}ms "
             f"({ref_times['total']/gm_times['total']:.1f}x) | {line} | "
             f"max|dCl|={diff:.2e} rel={diff/scale:.2e} | "
-            f"peakRSS={rss_gb:.1f}GB GPUpeak={gmem.get('bytes_in_use', 0)/2**30:.1f}GiB"
+            f"peakRSS={rss_gb:.1f}GB GPUpeak={gpu_peak:.1f}GiB"
         )

@@ -8716,14 +8716,51 @@ workspace/field/covariance 60 passed after the last two edits (`chain_s36v.log`)
 |---|---|---|
 | 1024 | 2.6–2.9x | 2.8–2.9x |
 | 2048 | 2.5–2.7x | 2.4x |
-| 4096 | 2.1x (fp64 coupling; ~3.0x with `GMASTER_COUPLING_PRECISION=fp32`) | runs (50.7 s warm); reference cannot |
+| 4096 | 2.1x (fp64 coupling; ~3.0x with `GMASTER_COUPLING_PRECISION=fp32`) | 50.6 s warm, finite (4, 409); reference segfaults |
 
-Per pass the transforms are now 1.05–1.78x ducc0 at Nside ≥ 2048 in both directions (§5), up
-from 0.86–1.28x, and the accuracy against the reference is unchanged to the printed digit at
-every geometry.  What remains is the wall §8 and `docs/latitudinal_march_maths.md` §7 state and
+Per pass the transforms are now 1.13–1.91x ducc0 at Nside ≥ 1024 in both directions
+(13 September 2026 GPU1 board, shipped `jax` calculator), up from 0.86–1.28x, and the
+accuracy against the reference is unchanged to the printed digit at every geometry.
+Nside 4096 spin 2 map2alm/alm2map is 1.38x / 1.74x ducc0.  What remains is the wall
+§8 and `docs/latitudinal_march_maths.md` §7 state and
 `formal/lean/GMasterMarch/Wall.lean` proves: on a card whose float64 rate is 1/64 of float32,
 no float64 kernel can beat the 96-core reference at Nside 4096, and the compensated-float32
 march that beats it is at ~60 % recurrence / 40 % emit after this session.  The next lever there
 is arithmetic, not memory or dispatch: fewer instructions per marched degree (seed peel,
 block-granularity range guard, a transpose-reduce for the emit's shuffle trees), each worth
 5–15 % of the kernel by the ablations on file.
+
+## Addendum 33 (13 September 2026): one-GPU board through Nside 4096, both spins
+
+Single tenant, `CUDA_VISIBLE_DEVICES=1`, shipped fp64 default,
+`benchmarks/benchmark_pipeline.py` and `benchmarks/benchmark_sht.py`.  Every
+NaMaster-completable MASTER cell has GMaster TOTAL strictly below NaMaster TOTAL.
+Nside 4096 spin 2 is GMaster-only (`--skip-reference`, first field released before
+the warm TOTAL; overlapping stage timings OOM at 71.2 GiB).
+
+Pipeline first-run TOTAL (ms), GPU1:
+
+| Nside | spin 0 NM/GM | x | rel | spin 2 NM/GM | x | rel |
+|---|---|---|---|---|---|---|
+| 64 | 9/2 | 4.2 | 6.2e-14 | 13/3 | 3.9 | 1.1e-10 |
+| 128 | 16/5 | 3.0 | 1.0e-13 | 34/10 | 3.5 | 4.9e-09 |
+| 256 | 59/23 | 2.5 | 4.8e-13 | 133/49 | 2.7 | 2.7e-08 |
+| 512 | 305/157 | 1.9 | 1.7e-12 | 632/333 | 1.9 | 3.6e-07 |
+| 1024 | 1666/585 | 2.8 | 7.7e-07 | 3018/1056 | 2.9 | 3.6e-06 |
+| 2048 | 10123/3794 | 2.7 | 1.3e-06 | 17240/7179 | 2.4 | 1.1e-05 |
+| 4096 | 70809/33504 | 2.1 | 1.5e-06 | ---/50562 | --- | finite (4, 409), peak 77.5 GiB |
+
+Isolated SHT, shipped `jax` march (spin 0 2048/4096) and jax-single march (spin 2),
+warmed map2alm / alm2map vs ducc0:
+
+| Nside | s | DUCC a | GM a | x | DUCC m | GM m | x | rel alm |
+|---|---|---|---|---|---|---|---|---|
+| 1024 | 2 | 105.7 | 66.6 | 1.59 | 108.3 | 56.5 | 1.92 | 3.8e-05 |
+| 2048 | 0 | 314.5 | 247.5 | 1.27 | 300.9 | 170.6 | 1.76 | 7.2e-05 |
+| 2048 | 2 | 580.7 | 457.3 | 1.27 | 576.6 | 308.5 | 1.87 | 6.1e-05 |
+| 4096 | 0 | 1838 | 1633 | 1.13 | 1914 | 1005 | 1.90 | 2.1e-04 |
+| 4096 | 2 | 3680 | 2676 | 1.38 | 3804 | 2182 | 1.74 | 1.6e-04 |
+
+CPU pytest: 165 passed, 50 skipped. GPU SHT/utils: 89 passed, 3 skipped.
+`_theta_matrix._pool_bytes` now treats silent `memory_stats()` as unbounded (CPU).
+The Overleaf paper (`paper/gmaster_paper`) is updated from this board.

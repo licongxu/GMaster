@@ -43,6 +43,13 @@ if __name__ == "__main__":
     parser.add_argument("--spin", type=int, default=0)
     parser.add_argument("--n-iter", type=int, default=0)
     parser.add_argument("--repeats", type=int, default=5)
+    parser.add_argument(
+        "--calculators",
+        type=str,
+        default="",
+        help="Comma-separated SHT calculators. Empty uses jax,jax-single,jax-generic "
+        "(and jax-mgpu when two GPUs are visible). One-GPU 4096 runs use jax-single.",
+    )
     args = parser.parse_args()
 
     nside = args.nside
@@ -77,9 +84,12 @@ if __name__ == "__main__":
     )
 
     rows = []
-    calculators = ["jax", "jax-single", "jax-generic"]
-    if len([device for device in jax.devices() if device.platform == "gpu"]) >= 2:
-        calculators.append("jax-mgpu")
+    if args.calculators.strip():
+        calculators = [c.strip() for c in args.calculators.split(",") if c.strip()]
+    else:
+        calculators = ["jax", "jax-single", "jax-generic"]
+        if len([device for device in jax.devices() if device.platform == "gpu"]) >= 2:
+            calculators.append("jax-mgpu")
     for calculator in calculators:
         nmt.set_sht_calculator(calculator)
         analysis, analysis_compile_s, analysis_s = _timed(

@@ -518,7 +518,8 @@ def _pool_bytes():
     growable up to `bytes_limit`, which is the number the fit test actually wants.
     """
     try:
-        stats = jax.local_devices()[0].memory_stats()
+        # CPU returns None rather than raising (same trap as `_spin_slice._pool_headroom`).
+        stats = jax.local_devices()[0].memory_stats() or {}
     except Exception:  # pragma: no cover - backend without statistics
         return float("inf")
     for key in ("pool_bytes", "bytes_limit"):
