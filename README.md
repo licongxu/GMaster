@@ -9,10 +9,12 @@ CPU reference: `/home/lxu/scratch/agent_dev/auto_research_agent/NaMaster`
 ## Status
 
 The one-GPU HEALPix MASTER comparison through `Nside=4096` is closed (HANDOFF
-addendum 33). GMaster TOTAL is strictly below NaMaster TOTAL on every cell the
-reference can run (1.9–4.2× at 64–512, 2.1–2.9× at 1024–4096, both spins).
-`Nside=4096` spin 2 is GMaster-only: NaMaster segfaults; GMaster finishes in
-50.6 s with finite decoupled bandpowers. Isolated SHT on the shipped march
+addendum 33, 4096 spin-2 pair in addendum 34). GMaster TOTAL is strictly below
+NaMaster TOTAL on every completed cell (1.9–4.2× at 64–512, 2.1–2.9× at
+1024–4096, both spins).
+`Nside=4096` spin 2: stock NaMaster segfaults on 32-bit MCM indices; with
+GMaster's 64-bit binning fallback the same estimator is 107.6 s vs GMaster
+50.6 s (2.1×, rel \(1.6\times10^{-4}\)). Isolated SHT on the shipped march
 beats DUCC at 1024–4096 in both spins, including the polarised 4096 pass
 (1.38× / 1.74×).
 

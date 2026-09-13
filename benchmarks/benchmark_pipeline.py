@@ -17,6 +17,7 @@ import pymaster as reference
 jax.config.update("jax_enable_x64", True)
 
 import gmaster as nmt
+from gmaster._nmt_bin64 import patch_pymaster
 
 
 def _block(result):
@@ -75,10 +76,15 @@ def _make_field(module, mask, maps_t, maps_q, maps_u, spin):
 
 def _run_pipeline(
     module, nside, spin, nlb, repeats, mask, maps_t, maps_q, maps_u,
-    release_after_first=False,
+    release_after_first=False, verbose=False,
 ):
     lmax = 3 * nside - 1
     bins = module.NmtBin.from_lmax_linear(lmax, nlb)
+    label = getattr(module, "__name__", type(module).__name__)
+
+    def _note(msg):
+        if verbose:
+            print(f"  [{label}] {msg}", flush=True)
 
     def full_pipeline():
         ff = _make_field(module, mask, maps_t, maps_q, maps_u, spin)
@@ -87,11 +93,16 @@ def _run_pipeline(
         cc = module.compute_coupled_cell(ff, ff)
         return ww.decouple_cell(cc)
 
+    t0 = time.perf_counter()
+    _note("field")
     f = _make_field(module, mask, maps_t, maps_q, maps_u, spin)
+    _note(f"field done {time.perf_counter()-t0:.1f}s; coupling")
     w = module.NmtWorkspace()
     w.compute_coupling_matrix(f, f, bins)
+    _note(f"coupling done {time.perf_counter()-t0:.1f}s; coupled_cell")
     cl_coupled = module.compute_coupled_cell(f, f)
     cl_decoupled = w.decouple_cell(cl_coupled)
+    _note(f"first pipeline done {time.perf_counter()-t0:.1f}s")
     result_host = np.asarray(cl_decoupled)
 
     # Nside 4096 spin 2 cannot hold the first field+workspace and a second field
@@ -182,12 +193,13 @@ if __name__ == "__main__":
     parser.add_argument(
         "--skip-reference",
         action="store_true",
-        help="Time GMaster only. NaMaster's compute_coupling_matrix segfaults at "
-        "Nside=4096 spin 2, so that cell has no reference TOTAL or rel.",
+        help="Time GMaster only. Default is both codes; Nside=4096 spin 2 uses "
+        "gmaster._nmt_bin64 so pymaster can bin the MCM past INT_MAX.",
     )
     args = parser.parse_args()
     nmt.set_table_precision(args.precision)
     nmt.set_ring_precision(args.ring_precision)
+    patch_pymaster()
 
     nside = args.nside
     npix = 12 * nside**2
@@ -213,10 +225,11 @@ if __name__ == "__main__":
             jnp.asarray(mask_np), jnp.asarray(map_t),
             jnp.asarray(map_q), jnp.asarray(map_u),
         )
+        large_spin2 = nside >= 4096 and spin == 2
         if args.skip_reference:
             gm_out, gm_times = _run_pipeline(
                 nmt, nside, spin, 30, args.repeats, *gm_maps,
-                release_after_first=True,
+                release_after_first=True, verbose=large_spin2,
             )
             rss_gb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1e6
             stats = jax.devices()[0].memory_stats() or {}
@@ -236,20 +249,30 @@ if __name__ == "__main__":
         ref_out, ref_times = _run_pipeline(
             reference, nside, spin, 30, args.repeats,
             mask_np, map_t, map_q, map_u,
+            release_after_first=large_spin2, verbose=large_spin2,
         )
+        if large_spin2:
+            gc.collect()
+            try:
+                nmt.utils.drop_ring_tables()
+                nmt.utils.make_room(16 * 1024 ** 3)
+            except Exception:
+                pass
         gm_out, gm_times = _run_pipeline(
             nmt, nside, spin, 30, args.repeats, *gm_maps,
+            release_after_first=large_spin2, verbose=large_spin2,
         )
         rss_gb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1e6
         stats = jax.devices()[0].memory_stats() or {}
         gpu_peak = stats.get("peak_bytes_in_use", stats.get("bytes_in_use", 0)) / 2**30
         diff = float(np.max(np.abs(np.asarray(gm_out) - np.asarray(ref_out))))
         scale = float(np.max(np.abs(ref_out))) or 1.0
-        line = "  ".join(
-            f"{s} {ref_times[s]*1e3:.0f}->{gm_times[s]*1e3:.0f}ms "
-            f"({ref_times[s]/max(gm_times[s], 1e-12):.0f}x)"
-            for s in stages
-        )
+        def _pair(s):
+            a, b = ref_times[s], gm_times[s]
+            if a != a or b != b:
+                return f"{s} n/a"
+            return f"{s} {a*1e3:.0f}->{b*1e3:.0f}ms ({a/max(b, 1e-12):.0f}x)"
+        line = "  ".join(_pair(s) for s in stages)
         print(
             f"spin={spin}: TOTAL {ref_times['total']*1e3:.0f}->"
             f"{gm_times['total']*1e3:.0f}ms "

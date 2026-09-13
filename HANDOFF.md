@@ -5,7 +5,8 @@
 GMaster is a NaMaster-compatible Python/JAX implementation. Correctness against
 `/home/lxu/scratch/agent_dev/auto_research_agent/NaMaster` is the first
 constraint. The one-GPU MASTER comparison through `Nside=4096` (both spins) is
-closed: see Addendum 33. Treat the NaMaster, S2FFT, and threej_cosmo source
+closed: see Addendum 33; the Nside=4096 spin-2 NaMaster pair is Addendum 34.
+Treat the NaMaster, S2FFT, and threej_cosmo source
 trees listed in `AGENTS.md` as read-only. Read the relevant papers and
 derivations in `ref_paper/` and `ref_derivation/` before changing MASTER or SHT
 mathematics.
@@ -8839,5 +8840,49 @@ through 4096 both spins.
 Nside > 4096; flat-sky / catalog / CAR / covariance at 4096; a float64
 latitudinal kernel that beats 96-core ducc0 at 4096 (the wall forbids it);
 changing the shipped default to fp32 tables or fp32 coupling; arXiv / MNRAS
-submission.  Those are other jobs.  This file does not need another addendum
-for beating NaMaster through Nside=4096.
+submission.  Those are other jobs.  Addendum 34 is the 4096 spin-2 NaMaster
+pair (64-bit binning fallback), not a reopening of the 4096-vs-NaMaster bar.
+
+## Addendum 34 (13 September 2026): Nside 4096 spin 2 NaMaster finishes; 2.1x vs GMaster
+
+Stock pymaster still segfaults at this cell: `nmt_bin_mcm` / SWIG `int DIM1`
+index the flattened MCM with a signed 32-bit int.  Spin-2 auto is `ncls=4`,
+`nls=12288`, length `ncls^2 nls^2 = 2.416e9 > INT_MAX`.  (Addendum 25 quoted
+`ncls=6` / 5.4e9; pymaster's auto-spectrum is four spectra, not six.  Either
+count is past 2^31.)  `get_xis` already uses `long` and is not the crash.
+The 0x2 cross (`ncls=2`, 6.04e8 elements) was already known to finish.
+
+`gmaster/_nmt_bin64.py` monkeypatches `pymaster.NmtBin._bin_mcm` with a
+64-bit NumPy tensordot of the same C layout when that product overflows.
+The NaMaster tree is not modified.  Small nside still calls the C kernel.
+Tests: `tests/test_nmt_bin64.py` (15 passed), including forced-i64
+end-to-end vs C at nside=16 spin 2.
+
+Paired run, GPU1, `OMP_NUM_THREADS=96`, `--nside 4096 --spins 2 --repeats 1`,
+`release_after_first` on both, log `.qwen/tmp/nmt4096_s2_patched.log`:
+
+```text
+[pymaster] field done 27.7s; coupling done 104.9s; first pipeline 107.4s
+nmt_bin64: numpy i64 binning nls=12288 ncls=4 flat=2415919104
+spin=2: TOTAL 107593->50556ms (2.1x) | max|dCl|=1.03e-11 rel=1.59e-04
+        peakRSS=70.2GB GPUpeak=77.5GiB
+exit=0  2026-09-13T04:38:57+01:00
+```
+
+| | NaMaster (i64 bin) | GMaster | x |
+|---|---|---|---|
+| warmed TOTAL | **107.593 s** | **50.556 s** | **2.1x** |
+| first pipeline (includes GMaster compile) | 107.4 s | 1337.8 s | — |
+| decoupled shape | (4, 409) | (4, 409) | — |
+| rel max\|dCl\| / max\|Cl_ref\| | — | 1.59e-4 | — |
+
+GMaster's warmed TOTAL matches the GMaster-only 50.562 s of addendum 33 to
+6 ms.  The reference time is the missing cell, not a new GMaster board.
+`--skip-reference` is no longer required at this geometry; the pipeline
+bench always installs the patch and uses `release_after_first` at
+nside>=4096 spin 2 so the 18 GiB host MCM is dropped before the GPU
+pipeline.
+
+```bash
+CUDA_VISIBLE_DEVICES=1 python -m benchmarks.benchmark_pipeline --nside 4096 --spins 2 --repeats 1
+```
