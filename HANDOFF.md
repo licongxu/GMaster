@@ -8825,10 +8825,10 @@ CUDA_VISIBLE_DEVICES=1 python -m benchmarks.benchmark_sht --nside 4096 --spin 0 
 
 ### Remotes (this close)
 
-| Tree | SHA | Remote |
-|---|---|---|
-| GMaster `main` | `2126aef` | `github` (`licongxu/GMaster`) `refs/heads/main` |
-| `paper/gmaster_paper` | `17b033f` | Overleaf `origin/main` (`git.overleaf.com/6a9b7e6f30290767963c6afe`) |
+The board and bench changes are `2126aef` on `github/main` (`licongxu/GMaster`).
+This HANDOFF close sits on top of that commit on the same branch.  The Overleaf
+paper is `17b033f` on `origin/main` (`git.overleaf.com/6a9b7e6f30290767963c6afe`).
+Do not treat a later docs SHA as a missing board.
 
 The Overleaf manuscript tables/figures are this board, including Nside=4096
 spin 0 vs NaMaster, Nside=4096 spin 2 GMaster-only, and the isolated SHT ladder
