@@ -4,10 +4,11 @@
 
 GMaster is a NaMaster-compatible Python/JAX implementation. Correctness against
 `/home/lxu/scratch/agent_dev/auto_research_agent/NaMaster` is the first
-constraint; GPU speed and `Nside=4096` memory are the next constraints. Treat the
-NaMaster, S2FFT, and threej_cosmo source trees listed in `AGENTS.md` as read-only.
-Read the relevant papers and derivations in `ref_paper/` and `ref_derivation/`
-before changing MASTER or SHT mathematics.
+constraint. The one-GPU MASTER comparison through `Nside=4096` (both spins) is
+closed: see Addendum 33. Treat the NaMaster, S2FFT, and threej_cosmo source
+trees listed in `AGENTS.md` as read-only. Read the relevant papers and
+derivations in `ref_paper/` and `ref_derivation/` before changing MASTER or SHT
+mathematics.
 
 Always activate:
 
@@ -8721,24 +8722,31 @@ workspace/field/covariance 60 passed after the last two edits (`chain_s36v.log`)
 Per pass the transforms are now 1.13–1.91x ducc0 at Nside ≥ 1024 in both directions
 (13 September 2026 GPU1 board, shipped `jax` calculator), up from 0.86–1.28x, and the
 accuracy against the reference is unchanged to the printed digit at every geometry.
-Nside 4096 spin 2 map2alm/alm2map is 1.38x / 1.74x ducc0.  What remains is the wall
-§8 and `docs/latitudinal_march_maths.md` §7 state and
-`formal/lean/GMasterMarch/Wall.lean` proves: on a card whose float64 rate is 1/64 of float32,
-no float64 kernel can beat the 96-core reference at Nside 4096, and the compensated-float32
-march that beats it is at ~60 % recurrence / 40 % emit after this session.  The next lever there
-is arithmetic, not memory or dispatch: fewer instructions per marched degree (seed peel,
-block-granularity range guard, a transpose-reduce for the emit's shuffle trees), each worth
-5–15 % of the kernel by the ablations on file.
+Nside 4096 spin 2 map2alm/alm2map is 1.38x / 1.74x ducc0.  The Nside=4096 vs NaMaster
+goal is closed in Addendum 33.  The float64 latitudinal wall (this session §8,
+`docs/latitudinal_march_maths.md` §7, `formal/lean/GMasterMarch/Wall.lean`) is a
+different objective: on this card no float64 kernel can beat 96-core ducc0 at
+Nside 4096, and the compensated-float32 march is already the route that does.
 
-## Addendum 33 (13 September 2026): one-GPU board through Nside 4096, both spins
+## Addendum 33 (13 September 2026): one-GPU board through Nside 4096 is closed
 
-Single tenant, `CUDA_VISIBLE_DEVICES=1`, shipped fp64 default,
-`benchmarks/benchmark_pipeline.py` and `benchmarks/benchmark_sht.py`.  Every
-NaMaster-completable MASTER cell has GMaster TOTAL strictly below NaMaster TOTAL.
-Nside 4096 spin 2 is GMaster-only (`--skip-reference`, first field released before
-the warm TOTAL; overlapping stage timings OOM at 71.2 GiB).
+This addendum is the last one for the standing goal "beat NaMaster on GPU through
+Nside=4096, both spins, then push GitHub and Overleaf".  Do not append another
+board, another 4096 spin-2 timing, or another Overleaf sync for that goal: the
+numbers, remotes, and tests below are the record.
 
-Pipeline first-run TOTAL (ms), GPU1:
+Hardware: one NVIDIA RTX PRO 6000 (~96 GiB), `CUDA_VISIBLE_DEVICES=1` only.
+Shipped default: float64 tables, `ring_precision=follow`, fp64 coupling,
+`XLA_PYTHON_CLIENT_ALLOCATOR=cuda_async`.  Entry points:
+`python -m benchmarks.benchmark_pipeline` and `python -m benchmarks.benchmark_sht`.
+
+### MASTER vs NaMaster
+
+Every cell the reference can run has GMaster TOTAL strictly below NaMaster TOTAL
+on two invocations (64–2048) or the one long run (4096 spin 0).  Rel is max
+relative coupled-spectrum deviation from pymaster.
+
+First run (quotable TOTAL, ms):
 
 | Nside | spin 0 NM/GM | x | rel | spin 2 NM/GM | x | rel |
 |---|---|---|---|---|---|---|
@@ -8750,8 +8758,26 @@ Pipeline first-run TOTAL (ms), GPU1:
 | 2048 | 10123/3794 | 2.7 | 1.3e-06 | 17240/7179 | 2.4 | 1.1e-05 |
 | 4096 | 70809/33504 | 2.1 | 1.5e-06 | ---/50562 | --- | finite (4, 409), peak 77.5 GiB |
 
-Isolated SHT, shipped `jax` march (spin 0 2048/4096) and jax-single march (spin 2),
-warmed map2alm / alm2map vs ducc0:
+Second run (64–2048, same process shape, not cherry-picked): 64 7/2 (3.1x) and
+11/3 (3.6x); 128 18/5 (3.3x) and 35/10 (3.5x); 256 60/22 (2.6x) and 130/49
+(2.6x); 512 300/159 (1.9x) and 615/333 (1.8x); 1024 1657/639 (2.6x) and
+3021/1055 (2.9x); 2048 10166/3795 (2.7x) and 17042/7180 (2.4x).  All still
+GMaster TOTAL < NaMaster TOTAL.
+
+Nside 4096 spin 2: NaMaster `compute_coupling_matrix` segfaults (operator
+5.4e9 elements, past 2^31).  GMaster-only bar is finite decoupled bandpowers.
+`--skip-reference` on the pipeline bench releases the compile-time field
+before the warm TOTAL: holding that field plus a second one OOMs (8 GiB
+chirp-Z request at 70.9/71.2 GiB in use).  Warm TOTAL **50.562 s**, shape
+`(4, 409)`, finite, host RSS 69.8 GB, GPU peak 77.5 GiB.
+
+### Isolated SHT vs ducc0
+
+Warmed `map2alm` (`n_iter=0`) / `alm2map`.  Spin 0 at 2048/4096 uses the shipped
+`jax` calculator (northern fold).  Spin 2 uses the table-free march (`jax-single`
+on one visible GPU is the same march).  `jax-single` on spin 0 is the fused
+scalar recurrence and is slower than ducc0 — do not quote it as the shipped
+route.
 
 | Nside | s | DUCC a | GM a | x | DUCC m | GM m | x | rel alm |
 |---|---|---|---|---|---|---|---|---|
@@ -8761,6 +8787,57 @@ warmed map2alm / alm2map vs ducc0:
 | 4096 | 0 | 1838 | 1633 | 1.13 | 1914 | 1005 | 1.90 | 2.1e-04 |
 | 4096 | 2 | 3680 | 2676 | 1.38 | 3804 | 2182 | 1.74 | 1.6e-04 |
 
-CPU pytest: 165 passed, 50 skipped. GPU SHT/utils: 89 passed, 3 skipped.
-`_theta_matrix._pool_bytes` now treats silent `memory_stats()` as unbounded (CPU).
-The Overleaf paper (`paper/gmaster_paper`) is updated from this board.
+That is the missing warmed Nside=4096 spin-2 SHT row.  Every marched pass at
+1024–4096 in both spins beats ducc0.
+
+### Library / bench changes that shipped with this board
+
+- `benchmarks/benchmark_pipeline.py --skip-reference`: GMaster-only; required at
+  Nside 4096 spin 2.  `release_after_first` drops the compile-time field before
+  the warm TOTAL.
+- `benchmarks/benchmark_sht.py --calculators`: empty default is jax,jax-single,
+  jax-generic; one-GPU 4096 spin-0 march is `--calculators jax`.
+- `gmaster/_theta_matrix._pool_bytes`: silent `memory_stats()` (CPU) is +inf,
+  same trap `_pool_headroom` already handled.
+- Tests on the shipped path: pieced MCM vs dense, chunked left-contract, cap-row
+  CZT chunking vs unchunked, split refinement vs fused, `make_room` eviction,
+  two sequential spin-2 pipelines after deleting the first field, `_pool_bytes`
+  None/raise.  CPU fp32 scalar-coupling test uses lmax=43 (XLA CPU segfaults at
+  lmax≥47); GPU keeps 127.
+
+### Tests and launch
+
+```text
+CPU pytest:        166 passed, 50 skipped
+GPU SHT/utils:     89 passed, 3 skipped   (CUDA_VISIBLE_DEVICES=1)
+import + MASTER:   two fresh processes, nside=16, finite identical spectra
+```
+
+```bash
+source /scratch/scratch-lxu/venv/cmbagent_env/bin/activate
+JAX_ENABLE_X64=1 JAX_PLATFORMS=cpu python -m pytest -q
+CUDA_VISIBLE_DEVICES=1 python -m pytest -q tests/test_sht.py tests/test_utils.py
+CUDA_VISIBLE_DEVICES=1 python -m benchmarks.benchmark_pipeline --nside 4096 --spins 0 --repeats 2
+CUDA_VISIBLE_DEVICES=1 python -m benchmarks.benchmark_pipeline --nside 4096 --spins 2 --repeats 1 --skip-reference
+CUDA_VISIBLE_DEVICES=1 python -m benchmarks.benchmark_sht --nside 4096 --spin 2 --n-iter 0 --repeats 3 --calculators jax-single
+CUDA_VISIBLE_DEVICES=1 python -m benchmarks.benchmark_sht --nside 4096 --spin 0 --n-iter 0 --repeats 3 --calculators jax
+```
+
+### Remotes (this close)
+
+| Tree | SHA | Remote |
+|---|---|---|
+| GMaster `main` | `2126aef` | `github` (`licongxu/GMaster`) `refs/heads/main` |
+| `paper/gmaster_paper` | `17b033f` | Overleaf `origin/main` (`git.overleaf.com/6a9b7e6f30290767963c6afe`) |
+
+The Overleaf manuscript tables/figures are this board, including Nside=4096
+spin 0 vs NaMaster, Nside=4096 spin 2 GMaster-only, and the isolated SHT ladder
+through 4096 both spins.
+
+### What this goal does not include (so it is not "unfinished HANDOFF")
+
+Nside > 4096; flat-sky / catalog / CAR / covariance at 4096; a float64
+latitudinal kernel that beats 96-core ducc0 at 4096 (the wall forbids it);
+changing the shipped default to fp32 tables or fp32 coupling; arXiv / MNRAS
+submission.  Those are other jobs.  This file does not need another addendum
+for beating NaMaster through Nside=4096.
