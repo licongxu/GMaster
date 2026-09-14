@@ -8886,3 +8886,191 @@ pipeline.
 ```bash
 CUDA_VISIBLE_DEVICES=1 python -m benchmarks.benchmark_pipeline --nside 4096 --spins 2 --repeats 1
 ```
+
+## Addendum 34 (session 37, 13 September 2026): the v2 CUDA march — a difference-form float32 Wigner-d recurrence behind the JAX FFI, and the levers it unlocked
+
+Addendum 33 closed the standing goal at 1.9–2.9x NaMaster with the Pallas march.  This session
+replaced that kernel's arithmetic and its host plumbing.  The board is now **10–49x NaMaster** at
+`Nside >= 128` in both spins, the isolated transform is **5.6–8.5x ducc0** (it was 1.13–1.92x), and
+the `Nside=4096` spin-2 pipeline runs in **8.8 s** where addendum 32 needed 50.6 s.  Every number
+below is a single-tenant run on GPU1 unless stated.
+
+### 1. The mathematics: difference form and reflection
+
+`docs/march_v2_maths.md` is the note; `formal/lean/GMasterMarch/DiffForm.lean` and `EmitV2.lean`
+are the proofs (Lake builds, no `sorry`).  For the Jacobi row `v_n = (c1 x + c0) v_{n-1} - cb v_{n-2}`
+of addendum 32 §2, the kernel now marches the pair `(v, D)` with `D_n = v_n - v_{n-1}`:
+
+    C_n = c1_n (x - 1) + (c1_n - 1 - cb_n + c0_n),    D <- cb D + C v,    v <- v + D
+
+(`DiffForm.diff_march_eq_march`), and the southern hemisphere marches the reflected row
+`(-1)^n v_n`, which obeys the same recurrence with `x -> |x|` and `c0 -> -c0`
+(`DiffForm.reflect_recurrence`, `south_march_eq_reflect`).  Why it matters: near the poles and at
+every turning point the characteristic roots of the three-term recurrence collide, and a plain
+float32 march amplifies each rounding by `1/sin(phase step)`.  The difference form injects error at
+the scale of `D ~ phi v` rather than `v`, and `v <- v + D` adds it unamplified.  With the lane
+coordinate `|x| - 1` and the coefficients `c1`, `E = c1 - 1 - cb +- c0` carried as (hi, lo) float32
+pairs, the dominant rounding of `C` vanishes where `C` does.  Measured against the float64
+recurrence over every lane:
+
+| | m = 0 | m = 1000 | m = L/2 |
+|---|---|---|---|
+| plain single-word float32 | 4.2e-02 | 8.8e-05 | 3.1e-05 |
+| difference form, single-word `C` | 4.1e-05 | 8.6e-05 | 5.1e-05 |
+| difference form, two-word `C` (shipped) | 2.8e-06 | 2.9e-06 | 1.6e-05 |
+
+(`.qwen/tmp/fp32_dform_acc_s37.py`, `dform_dissect2_s37.py`, Nside 1024 spin 0; 5.7e-06 at 4096.)
+The emit is a plain float32 number: the normalisation is split as `2^(ex + floor(log2 N(base)))`
+times a per-degree `u(ell) = 2^(log2 N(ell) - floor(log2 N(base)))` folded into the tables
+(`EmitV2.emit_factorisation`, `u_range`), so no exponent lane leaves the kernel.
+
+### 2. The kernel and how JAX calls it
+
+`gmaster/_cuda/march_v2.cu` (nvcc, built on first use into `~/.cache/gmaster`, hashed on source +
+compute capability + jax version) with six XLA FFI handlers, and `gmaster/_march_v2.py` as the
+driver.  One warp owns one `(order m, tile of 32 x LPT rings)`; `LPT = 16` for analysis, `8` for
+synthesis, `UNR = 8` degrees per iteration, `reduce_scatter` over the unrolled block so one warp
+reduction serves every degree and channel.  The polar skip and the hemisphere fold of addendum 32
+carry over unchanged.  A parameter sweep found the shipped `(16, 8, 8)` is the best of six
+`(LPT_ANA, LPT_SYN, UNR)` combinations at Nside 2048.
+
+**Pairing.** A field and its mask are two transforms of the same rows.  The analysis kernel takes
+`NM = 2` maps as extra emit channels (half-size theta tile, so it is not free: 1.35x over two
+launches) and the spin-0 synthesis kernel takes the second map in the accumulator lanes the spin-2
+kernel uses for its second helicity, which costs nothing and is **bit-identical** to two separate
+launches.  `NmtField` at Nside 4096 spin 0: 4006 ms as two transforms, 3596 with the synthesis
+paired, **3107 with both** — so there is no size cap.
+
+### 3. Four fusion traps, each worth more than the kernel change
+
+1. **A `jit` inside a `jit` is not a fusion boundary.**  `_forward_impl` is inlined into the
+   caller's trace, and XLA then re-derived the transposed ring spectrum inside every window's lane
+   gather: 48 strided passes over a 1.6 GiB array, **73 ms of a 156 ms** Nside 2048 spin-2 analysis
+   that did not appear when the march was timed alone.  `lax.optimization_barrier` on `dirT`/`negT`
+   (and on the folded right-hand side) fixes it; the pass went 155.7 -> 82.2 ms.
+2. **The forward finish was three passes over a 1.2 GiB block.**  The degree normalisation, the
+   spin sign and the sub-spin zeroing are all diagonal in `ell`, so they multiply into one `(L,)`
+   vector: one read, one write.
+3. **The spin-2 output assembly reversed the assembled matrix.**  Stacking the mirror half in
+   descending order at float32, before the transpose, removes the reversal entirely.
+4. **The table builder recompiled per window.**  `jax.jit(partial(...))` per window is a new
+   callable each call; with `m0` traced and only `mbp` static the geometry compiles once.  This was
+   a **57 s** pass at Nside 4096 (24 windows x ~2 s).
+
+### 4. Routing: what the march now serves, and the memory rules
+
+- `_spin_slabs` declines when v2 is on: the Nside 512 spin-2 slab route was 41.5 ms per pass with a
+  **43.9 GiB** device peak; the march is 3.9 ms with 1.1 GiB.
+- `_prefer_theta_band` declines: the march beats the resident Legendre band at every size.
+- `_MIN_L = 192` (Nside 64).  Below that the exact fp64 routes keep the call — the geometry pads to
+  one 512-lane tile whatever the ring count, so the march stops paying, and the small-geometry
+  tests pin those routes to 1e-13.
+- Window tables stay resident while `nbytes + 6 x (one ring spectrum) <= half the pool`.  That
+  admits Nside 4096 spin 0 (7.5 GiB of tables) and refuses Nside 4096 spin 2 (8.25 GiB beside a
+  pipeline that peaks above 56 GiB), whose mask geometry at `L = 24575` would be 30 GiB if
+  materialised at once — building those windows inside the trace instead is what let the polarised
+  pipeline finish.  `make_room` frees them **last**, after the Wigner-d cache and the ring tables.
+
+### 5. Precision defaults are now size-gated, and the exact route is one flag away
+
+`ring_precision="auto"` and `coupling_precision="auto"` use float32 exactly where the march serves
+(`lmax + 1 >= _march_v2._MIN_L`) and float64 below.  The ring stage was 55 % of a polarised pass and
+halves in complex64; the coupling matrix's float64 contractions run at 1/64 rate on this card.
+
+**The exact route still exists and still agrees to the old digit** — this is the correctness
+statement of the session (`.qwen/tmp/accuracy_s37.py`):
+
+| Nside | spin | shipped (max rel) | `GMASTER_MARCH_V2=0` + fp64 rings + fp64 coupling |
+|---|---|---|---|
+| 256 | 0 | 7.1e-07 | **4.8e-13** (addendum 33: 4.8e-13) |
+| 256 | 2 | 6.3e-07 | 2.7e-08 |
+| 512 | 0 | 6.2e-07 | **1.7e-12** (addendum 33: 1.7e-12) |
+| 512 | 2 | 3.1e-06 | 3.6e-07 |
+
+### 6. The coupling stage: the binning contraction was the whole of it
+
+`output @ mcm` is `(1636, 24576) @ (24576, 24576)` at Nside 2048 spin 2 — 2.0 TFLOP, and in float64
+on this card **567 ms of the 661 ms stage**, against 58 ms for the coupling matrices it contracts.
+Under the same `auto` rule it runs with float32 operands and `Precision.HIGHEST`: the stage is
+**141 ms**.  A rewrite of the scalar `_coupling_matrix_tt` into an upper-triangle form with three of
+its four per-element gathers turned into broadcasts was written, verified to 4.8e-16 and **rejected**
+on measurement (223 vs 200 ms at lmax 6143, 1895 vs 1761 at 12287) — the pass is not gather-issue
+bound the way the operand count suggests.  The comment in the source records it so nobody writes it
+again.
+
+### 7. What is NOT claimed
+
+This session measured GMaster against **NaMaster** (the MASTER pipeline) and against **CPU ducc0**
+(the isolatitude HEALPix transform), both on this box.  It did **not** time cunuSHT
+(arXiv:2406.14542), SHTns-GPU, s2fft or cuHPX, and it did not run anyone's arbitrary-point /
+non-uniform transform.  No claim about being the fastest GPU spherical-harmonic code is supported by
+anything in this repository.  The v2 march is the `S` factor of an isolatitude transform on HEALPix
+rings; a general-grid comparison needs the doubling, FFT and NUFFT factors that GMaster does not
+have.  See addendum 35 for the scoping of that work.
+
+## Addendum 35 (session 37): a second operator — the general (non-uniform) SHT, and where it stands against ducc0 and cunuSHT
+
+Addendum 34 closed the HEALPix pseudo-Cl work.  This addendum records a *different* operator, added
+because the papers the project had been reading (Reinecke, Belkner & Carron 2023, A&A 678 A165 —
+ducc0 `synthesis_general` and `lenspyx`; and cunuSHT, arXiv:2406.14542) benchmark it and GMaster
+did not implement it at all.  **Evaluating a band-limited field at arbitrary points on the sphere,
+and its adjoint** is not the isolatitude HEALPix transform; reading the cunuSHT paper and declining
+to adopt its method for full-sky rings (session 5d-5e) was an algorithm-selection argument, not a
+benchmark, and must never again be written up as one.
+
+### 1. What was built
+
+`gmaster/nusht.py`, `benchmarks/benchmark_nusht.py`, `tests/test_nusht.py` (12 tests).  The
+factorisation is the standard double-Fourier-sphere one, `Y = N F D S`, with the v2 march of
+addendum 34 as the `S` factor:
+
+1. **S.** The march is geometry-agnostic once its lane layout is built from an arbitrary symmetric
+   latitude grid.  On a Fejer-1 grid `theta_j = (2j+1) pi / (2 ntheta)` it agrees with ducc0's
+   isolatitude synthesis on the same rings to 2.9e-07 at lmax 255 (`.qwen/tmp/nu_step1_s37.py`).
+2. **D, F.** Doubling `F(2pi - theta, m) = (-1)^(m+s) F(theta, m)` and a latitude FFT with a
+   half-sample phase give the 2-D Fourier series on the torus.  Verified against ducc0's own
+   general synthesis at arbitrary points to **4.9e-14** (`.qwen/tmp/nu_step2_s37.py`), i.e. this
+   part is exact.  `ntheta >= lmax + 1` is the right bound (the doubled stack carries `2 lmax + 1`
+   modes), which at `lmax = 2^k - 1` makes the FFT a power of two.
+3. **N.** cufinufft 2-D type 2 (type 1 for the adjoint), `upsampfac = 1.25`, tolerance 1e-6.
+
+Two things had to be established numerically rather than assumed, and are tested: the analysis
+march is the transpose of the synthesis march only after an explicit `(-1)^(ell+s)` on the mirror
+channel; and ducc0's `adjoint_synthesis_general` is the analysis-shaped adjoint, not the transpose
+of its own synthesis (a factor 2 on `m > 0`).  We match ducc0.
+
+### 2. The one-address scatter
+
+`_pack` built the packed alm with `zeros(nalm).at[idx.ravel()].add(...)`, and the `ell < m` half of
+the `(L, L)` block indexes 0 — so 8.4 million complex128 atomic adds hit **a single address**:
+26.75 ms of a 45.4 ms adjoint at lmax 4095.  Replaced by the inverse gather: 0.31 ms.  Two smaller
+levers: the grid bound above, and running the latitude FFT in complex64 (the doubled stack is
+1.07 GiB in complex128), which is free at the march's accuracy.  Adjoint 83.4 -> 47.6 ms.
+
+### 3. The board (`.qwen/tmp/cunusht_compare_s37.md` has the full tables)
+
+Measured against ducc0 0.39.1 on this host, at matched *measured* effective accuracy
+(cunuSHT eq. 9; the match lands at ducc0 `epsilon=1e-4` in every cell):
+
+| | vs ducc0, 96 threads | vs ducc0, 32 threads |
+|---|---|---|
+| type 2 (synthesis) | **2.8-6.0x** | 3.4-5.2x |
+| type 1 (adjoint) | **2.7-5.1x** | 3.0-4.3x |
+
+`eps_eff` is 1.9-6.4e-06 (synthesis) and 4.5-1.7e-05 (adjoint).  **ducc0 is 1.3-5x more accurate in
+every cell** — it is run at the epsilon whose realised error is nearest ours and it overshoots.
+GMaster cannot go below that floor at all: it is the float32 march, not the NUFFT (`eps_eff` does
+not move across cufinufft tolerances 1e-6 to 1e-8 or upsampling factors 1.25 and 2.0).  ducc0
+reaches 1e-13.  Both directions are now NUFFT-bound (76-77 % at lmax 4095).
+
+### 4. cunuSHT: still not timed
+
+cunuSHT is **not installed and was not run** — not on PyPI, needs pyCUDA plus a CUDA build of
+SHTns plus nanobind, unmaintained since 2024.  What can be said is that its Table D1 fit (the only
+hard numbers in that paper) at `eps = 1e-6` puts its A100 at 3.7 / 16.3 / 72.9 ms for type 2 at
+lmax 1023 / 2047 / 4095, against GMaster's measured 3.0 / 9.3 / 41.3 ms on one RTX PRO 6000, and
+at 6.4 / 28.3 / 123.5 ms for type 1 against 2.8 / 10.8 / 47.6 ms.  The transferable quantity is the
+speed-up over a 32-core CPU, which cancels part of the hardware difference: theirs 2.4-4.3x, ours
+3.0-5.2x.  Different GPUs, and our 32-core ducc0 is ~1.5x faster than their 32-core ducc0, so this
+is evidence that the two codes are in the same class with GMaster ahead — **not** a head-to-head
+result, and it must not be written as one.  A real head-to-head needs cunuSHT built on this box.

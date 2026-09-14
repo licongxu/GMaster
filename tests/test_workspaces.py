@@ -625,8 +625,8 @@ def test_chunked_left_contract_matches_single_gemm(monkeypatch):
 
 
 def test_large_wigner_cache_is_dropped_above_keep_bytes(monkeypatch):
-    """A quadrature cache past `_WD_CACHE_KEEP_BYTES` is forgotten after the workspace."""
-    monkeypatch.setattr(ws, "_WD_CACHE_KEEP_BYTES", 1)
+    """A quadrature cache past the keep threshold is forgotten after the workspace."""
+    monkeypatch.setattr(ws, "_wd_cache_keep_bytes", lambda: 1)
     ws._WD_TRIPLE_CACHE[("probe",)] = jax.numpy.zeros(8)
     ws._drop_large_wigner_cache()
     assert len(ws._WD_TRIPLE_CACHE) == 0

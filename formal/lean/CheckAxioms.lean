@@ -18,3 +18,9 @@ import GMasterMarch
 #print axioms GMasterMarch.time_lower_bound
 #print axioms GMasterMarch.mlim_is_root
 #print axioms GMasterMarch.skipped_degrees
+#print axioms GMasterMarch.diff_march_eq_march
+#print axioms GMasterMarch.south_march_eq_reflect
+#print axioms GMasterMarch.reflect_recurrence
+#print axioms GMasterMarch.diff_march_scaled
+#print axioms GMasterMarch.emit_factorisation
+#print axioms GMasterMarch.step_bound_ge

@@ -42,15 +42,17 @@ class NmtParams:
         # Storage precision of the precomputed transform tables.  Every
         # contraction accumulates in float64 whatever this is.
         self.table_dtype = "fp64"
-        # Element type of the azimuthal transforms.  "follow" keeps the historical
-        # coupling to the table precision; "fp64"/"fp32" pin it independently.
-        self.ring_precision = "follow"
+        # Element type of the azimuthal transforms.  "auto" is complex64 where the v2
+        # march serves the latitudinal stage and complex128 below it; "follow" keeps the
+        # historical coupling to the table precision; "fp64"/"fp32" pin it independently.
+        self.ring_precision = "auto"
 
 
 nmt_params = NmtParams()
 
 _TABLE_DTYPES = {"fp64": jnp.float64, "fp32": jnp.float32}
-_RING_DTYPES = {"follow": None, "fp64": jnp.complex128, "fp32": jnp.complex64}
+_RING_DTYPES = {"follow": None, "auto": None, "fp64": jnp.complex128,
+                "fp32": jnp.complex64}
 
 
 def table_dtype():
@@ -58,7 +60,7 @@ def table_dtype():
     return _TABLE_DTYPES[nmt_params.table_dtype]
 
 
-def ring_dtype():
+def ring_dtype(L=None):
     """Element type of the azimuthal (ring) transforms.
 
     The ring stage is a batched FFT, and on this card a double-precision FFT is
@@ -66,8 +68,9 @@ def ring_dtype():
     path: the same length transform is ~4.5x cheaper in `complex64` (`.qwen/tmp/ring_fp32_ab.py`:
     0.91 -> 0.21 ms at Nside 512, 4.08 -> 0.83 ms at 1024).
 
-    With the default ``nmt_params.ring_precision == "follow"`` it tracks
-    `set_table_precision`, which is what every published number used.  The cast is not
+    The shipped default is ``"auto"``: complex64 exactly where the v2 march serves the
+    latitudinal stage, complex128 below it.  ``"follow"`` tracks `set_table_precision`, which
+    is what every pre-v2 published number used.  The cast is not
     confined to the chirp tables: `_forward_ring_fft_positive` casts the *pixels* to the
     chirp's real dtype too, so ``"follow"`` with fp32 tables analyzes the map itself in
     float32.  ``set_ring_precision("fp64")`` keeps the azimuthal stage exact under fp32
@@ -76,6 +79,15 @@ def ring_dtype():
     forced = _RING_DTYPES[nmt_params.ring_precision]
     if forced is not None:
         return forced
+    if nmt_params.ring_precision == "auto" and L is not None:
+        # The shipped default: complex64 exactly where the v2 march serves the latitudinal stage
+        # (`lmax + 1 >= _march_v2._MIN_L`).  There the pass already carries the march's
+        # float32-class 1e-6, the ring stage is 55 % of it (10.4 of 18.7 ms at Nside 1024 spin 2)
+        # and complex64 halves that; below the gate the transform is exact and stays so.
+        from . import _march_v2
+
+        if _march_v2.enabled(L):
+            return jnp.complex64
     return jnp.complex64 if table_dtype() == jnp.float32 else jnp.complex128
 
 
@@ -90,7 +102,8 @@ def set_ring_precision(name):
     Clears the ring table caches for the same reason `set_table_precision` does.
     """
     if name not in _RING_DTYPES:
-        raise KeyError("GMaster ring precision must be 'follow', 'fp64' or 'fp32'")
+        raise KeyError(
+            "GMaster ring precision must be 'auto', 'follow', 'fp64' or 'fp32'")
     if name == nmt_params.ring_precision:
         return
     nmt_params.ring_precision = name
@@ -106,6 +119,7 @@ def drop_ring_tables():
 
 
 _ROOM_HOOKS = []       # extra callables that free device caches (registered by workspaces)
+_ROOM_HOOKS_LAST = []  # freed only when the steps above did not make room (v2 march tables)
 
 
 def make_room(nbytes):
@@ -125,11 +139,20 @@ def make_room(nbytes):
     if not short():
         return
     # Cheapest first: the Wigner-d quadrature cache (9 GiB at Nside 4096, seconds to rebuild),
-    # then the ring tables (30 GiB, which the next transform rebuilds).
+    # then the ring tables (30 GiB, which the next transform rebuilds), and only then the v2
+    # march's window tables.  Those are last because dropping them costs the most: the Nside 4096
+    # spin-0 `NmtField` is 2.00 s with them resident and 3.26 s without
+    # (`.qwen/tmp/field_s37.py`), and the benchmark's repeated field builds were freeing them on
+    # every call, which is the whole difference between that stage measuring 2.0 s and 2.6 s.
     for hook in _ROOM_HOOKS:
         hook()
-    if short():
-        drop_ring_tables()
+    if not short():
+        return
+    drop_ring_tables()
+    if not short():
+        return
+    for hook in _ROOM_HOOKS_LAST:
+        hook()
 
 
 def set_table_precision(name):
@@ -649,22 +672,33 @@ def _forward_latitudinal(ftm, *, L, spin, nside, reality, L_lower):
 
 @partial(jax.jit, static_argnames=("L", "spin", "reality"))
 def _finish_forward_s2fft(flm, *, L, spin, reality):
+    """Degree normalisation, the spin sign and the sub-spin zeroing, in one elementwise pass.
+
+    Written as an einsum, a `where` and a multiply this was three separate passes over the
+    `(L, 2L-1)` complex128 block -- 1.2 GiB at Nside 2048 spin 2, measured 72.7 ms of a 155 ms
+    analysis pass, against 58 ms for the march that produced it
+    (`.qwen/tmp/s2split_s37.py`).  The three factors are diagonal in `ell`, so they multiply into
+    one `(L,)` vector and the whole finish is one read and one write.
+    """
     m_start = L - 1 if reality else 0
-    flm = jnp.einsum(
-        "lm,l->lm",
-        flm,
-        jnp.sqrt((2 * jnp.arange(L) + 1) / (4 * jnp.pi)),
-        optimize=True,
+    ell = jnp.arange(L)
+    factor = (
+        jnp.sqrt((2 * ell + 1) / (4 * jnp.pi))
+        * jnp.where(ell < abs(spin), 0.0, 1.0)
+        * (-1.0) ** abs(spin)
     )
     if reality:
+        # The negative-order half is filled from the positive one, so the scaling has to land
+        # before the mirror: keep the two steps, but each is still a single pass.
+        flm = flm * jnp.sqrt((2 * ell + 1) / (4 * jnp.pi))[:, None]
         flm = flm.at[:, :m_start].set(
             jnp.flip(
                 (-1) ** (jnp.arange(1, L) % 2) * jnp.conj(flm[:, m_start + 1 :]),
                 axis=-1,
             )
         )
-    flm = jnp.where(jnp.arange(L)[:, None] < abs(spin), 0, flm)
-    return flm * (-1) ** abs(spin)
+        return flm * (jnp.where(ell < abs(spin), 0.0, 1.0) * (-1.0) ** abs(spin))[:, None]
+    return flm * factor[:, None]
 
 
 def _forward_s2fft(maps, *, L, spin, nside, reality):
@@ -821,6 +855,10 @@ def _spin_slabs(L_work, spin, *, nside):
     """
     if nmt_params.sht_calculator in ("jax-generic", "jax-mgpu"):
         return None, None
+    if _spin_march._march_v2.enabled(L_work):
+        # The v2 CUDA march beats the resident slab and needs none of its memory: at Nside 512
+        # spin 2 the slab route is 41.5 ms per pass with a 43.9 GiB device peak, the march 2.7 ms.
+        return None, None
     return _spin_slice.slabs_for(
         _stable_thetas(L_work, nside), L=L_work, spin=spin, nside=nside
     )
@@ -911,6 +949,9 @@ def _prefer_theta_band(nside, L, m_start):
     if m_start != 0:
         return False
     if nmt_params.sht_calculator not in ("jax", "jax-matrix"):
+        return False
+    if _spin_march._march_v2.enabled(L):
+        # The v2 CUDA march beats the resident band at every size (2.8x at Nside 1024).
         return False
     return _theta_band_bytes(nside, L, dtype=table_dtype()) <= _MATRIX_BAND_BUDGET
 
@@ -1114,7 +1155,7 @@ def _ring_analysis_tables(L, nside, device=None):
             jnp.fft.fft(jnp.exp(1j * _chirp_angle(shift, two_nphi, False)), axis=-1),
             jnp.exp(-1j * _chirp_angle(m_index, two_nphi, False)),
         )
-        cplx = ring_dtype()
+        cplx = ring_dtype(L)
         tables = tuple(t.astype(cplx) for t in tables)
     return tables if device is None else tuple(
         jax.device_put(t, device) for t in tables
@@ -1233,7 +1274,7 @@ def _ring_synthesis_tables(L, nside, device=None):
             jnp.fft.fft(jnp.exp(-1j * _chirp_angle(shift, two_nphi, False)), axis=-1),
             jnp.exp(1j * _chirp_angle(p_index, two_nphi, False)),
         )
-        cplx = ring_dtype()
+        cplx = ring_dtype(L)
         tables = tuple(t.astype(cplx) for t in tables)
     return tables if device is None else tuple(
         jax.device_put(t, device) for t in tables
@@ -1314,7 +1355,7 @@ def _spin_ring_analysis_tables(L, nside, device=None):
             jnp.fft.fft(jnp.exp(1j * _chirp_angle(shift, two_nphi, False)), axis=-1),
             jnp.exp(-1j * _chirp_angle(m_index, two_nphi, False)),
         )
-        cplx = ring_dtype()
+        cplx = ring_dtype(L)
         tables = tuple(t.astype(cplx) for t in tables)
     return tables if device is None else tuple(
         jax.device_put(t, device) for t in tables
@@ -1416,7 +1457,7 @@ def _spin_ring_synthesis_tables(L, nside, device=None):
             jnp.fft.fft(jnp.exp(-1j * _chirp_angle(shift, two_nphi, False)), axis=-1),
             jnp.exp(1j * _chirp_angle(p_index, two_nphi, False)),
         )
-        cplx = ring_dtype()
+        cplx = ring_dtype(L)
         tables = tuple(t.astype(cplx) for t in tables)
     return tables if device is None else tuple(
         jax.device_put(t, device) for t in tables
@@ -2103,6 +2144,15 @@ def _map2alm_pair_once_pallas(maps_a, maps_b, ell, order, *, nside, L_work, marc
     if march_pair:
         positive_a, positive_b = _spin_march.forward_latitudinal_positive_pair(
             ftm_a, ftm_b, weights, phase, L=L_work, nside=nside)
+    elif _spin_march._march_v2.enabled(L_work) and not _prefer_theta_band(nside, L_work, 0):
+        # The pair route was taken for the *synthesis* alone: above `_march_v2._PAIR_MAX_L` the
+        # paired analysis kernel loses (it needs the half-size theta tile, so it writes four times
+        # a single launch's tile partials), while the paired synthesis is free and bit-identical.
+        # The two analyses then run as two ordinary marched calls.
+        positive_a = _spin_march.forward_latitudinal_positive(
+            ftm_a, weights, phase, L=L_work, nside=nside)
+        positive_b = _spin_march.forward_latitudinal_positive(
+            ftm_b, weights, phase, L=L_work, nside=nside)
     else:
         positive_a, positive_b = _theta_matrix_latitudinal_pair(
             ftm_a, ftm_b, L=L_work, nside=nside, weights=weights, phase=phase)
@@ -2110,13 +2160,18 @@ def _map2alm_pair_once_pallas(maps_a, maps_b, ell, order, *, nside, L_work, marc
 
 
 def _alm2map_core_pallas_pair_eager(alm_a, alm_b, *, nside, L, L_work):
-    """Two scalar syntheses over one sweep of the synthesis band."""
+    """Two scalar syntheses over one sweep of the row source (band or v2 march)."""
     theta = _stable_thetas(L_work, nside)
     phase = healpix_ffts.p2phi_rings_jax(jnp.arange(len(theta)), nside)
-    ftm_a, ftm_b = _theta_matrix_inverse_latitudinal_pair(
-        _positive_alm(alm_a[0], L=L, L_work=L_work),
-        _positive_alm(alm_b[0], L=L, L_work=L_work),
-        L=L_work, nside=nside, weights=jnp.ones_like(theta), phase=phase)
+    positive_a = _positive_alm(alm_a[0], L=L, L_work=L_work)
+    positive_b = _positive_alm(alm_b[0], L=L, L_work=L_work)
+    if _spin_march._march_v2.enabled(L_work):
+        ftm_a, ftm_b = _spin_march._march_v2.inverse_latitudinal_positive_pair(
+            positive_a, positive_b, phase, L=L_work, nside=nside)
+    else:
+        ftm_a, ftm_b = _theta_matrix_inverse_latitudinal_pair(
+            positive_a, positive_b,
+            L=L_work, nside=nside, weights=jnp.ones_like(theta), phase=phase)
     return (
         jnp.real(_finish_inverse_pallas(ftm_a, L=L_work, nside=nside))[None, :],
         jnp.real(_finish_inverse_pallas(ftm_b, L=L_work, nside=nside))[None, :],
@@ -2657,7 +2712,13 @@ def map2alm_pair(map_a, map_b, map_info, alm_info, *, n_iter):
     march_pair = False
     if not analysis:
         march_pair = _march_pair_route(map_info.nside, L_work)
-        analysis = march_pair
+        # The v2 march pairs the synthesis too: its spin-0 kernel leaves the accumulators the
+        # spin-2 kernel uses for its second helicity idle, so the second map is free of registers
+        # and the paired launch is bit-identical to two separate ones (1.25x at Nside 1024).  That
+        # holds at every size, so above the paired *analysis* limit the route is still worth
+        # taking with the analyses unpaired -- a field and its mask then share one refinement.
+        pair_synth = _spin_march._march_v2.enabled(L_work)
+        analysis = march_pair or pair_synth
     if not analysis:
         return None
     return _map2alm_core_pallas_pair(

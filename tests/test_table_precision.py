@@ -20,7 +20,7 @@ def _restore_precision():
     yield
     utils.set_table_precision("fp64")
     utils.set_ring_precision("follow")
-    nmt.set_coupling_precision("fp64")
+    nmt.set_coupling_precision("auto")     # the shipped default: fp32 where the v2 march serves
     _theta_matrix.release()
     _spin_slice.clear_cache()
 

@@ -19,10 +19,24 @@ from .utils import alm2map, map2alm
 # (`.qwen/tmp/coupling_prec_1024c_s29.log`) at a cost of rel 2.1e-06 of the matrix.  The scalar
 # builder `_coupling_matrix_tt` has no dot at all -- five table lookups and a few elementwise ops
 # over ~n^3/3 elements -- and is worth 7.5-9.4x for rel 1.9e-07
-# (`.qwen/tmp/ttknob_s30.log`), since only its per-term products are rounded.  The agreement bar
-# here is float64 (`tests/test_workspaces.py` holds the MCM to `atol=2e-14`), so fp64 stays the
-# default and this is opt-in: `GMASTER_COUPLING_PRECISION=fp32`.
-_COUPLING_F32 = os.environ.get("GMASTER_COUPLING_PRECISION", "fp64") == "fp32"
+# (`.qwen/tmp/ttknob_s30.log`), since only its per-term products are rounded.
+#
+# The default is "auto": float32 operands exactly where the v2 march already serves the
+# transforms (`lmax + 1 >= _march_v2._MIN_L`, i.e. Nside >= 256), float64 below that.  Above the
+# gate the pipeline's own accuracy is the march's float32-class 1e-6 and the coupling matrix's
+# 2e-06 is inside it; below it the transforms are exact and `tests/test_workspaces.py` holds the
+# matrix to `atol=2e-14`, which only float64 meets.  `GMASTER_COUPLING_PRECISION=fp64|fp32`
+# (or :func:`set_coupling_precision`) forces one width at every size.
+_COUPLING_PRECISION = os.environ.get("GMASTER_COUPLING_PRECISION", "auto")
+
+
+def _coupling_f32(lmax):
+    """Whether this coupling build uses float32 operands."""
+    if _COUPLING_PRECISION != "auto":
+        return _COUPLING_PRECISION == "fp32"
+    from . import _march_v2
+
+    return _march_v2.enabled(int(lmax) + 1)
 
 
 def set_coupling_precision(name):
@@ -37,14 +51,14 @@ def set_coupling_precision(name):
     already-compiled program keeps the precision it was traced with (``jax.clear_caches()`` after
     the call if any coupling matrix has already been built in this process).
     """
-    global _COUPLING_F32
-    if name not in ("fp64", "fp32"):
-        raise KeyError("GMaster coupling precision must be 'fp64' or 'fp32'")
-    _COUPLING_F32 = name == "fp32"
+    global _COUPLING_PRECISION
+    if name not in ("fp64", "fp32", "auto"):
+        raise KeyError("GMaster coupling precision must be 'fp64', 'fp32' or 'auto'")
+    _COUPLING_PRECISION = name
 
 
 def coupling_precision():
-    return "fp32" if _COUPLING_F32 else "fp64"
+    return _COUPLING_PRECISION
 
 
 @partial(jax.jit, static_argnames="lmax")
@@ -133,7 +147,7 @@ _MCM_PIECED_BYTES = 4 * 1024 ** 3
 
 
 @partial(jax.jit, static_argnames=("dtype", "lmax", "ncls", "slots", "signs"))
-def _assemble_mcm_program(dtype, blocks, *, lmax, ncls, slots, signs):
+def _assemble_mcm_program(blocks, *, dtype, lmax, ncls, slots, signs):
     """Place the coupling blocks into the mode-coupling matrix in one program.
 
     The chain of ``matrix.at[:, i, :, j].set(...)`` this replaces was up to eight host
@@ -172,7 +186,10 @@ def _assemble_mcm(dtype, blocks, *, lmax, ncls, slots, signs):
     """
     n = ncls * (lmax + 1)
     if n * n * jnp.dtype(dtype).itemsize <= _MCM_PIECED_BYTES:
-        return _assemble_mcm_program(dtype, blocks, lmax=lmax, ncls=ncls, slots=slots,
+        # `dtype` is passed by keyword: a static argument given *positionally* drops jax's C++
+        # fast path, and this call then costs 1.54 ms of host dispatch at Nside 128 spin 0 --
+        # a third of that pipeline's whole 4.09 ms enqueue (`.qwen/tmp/jitcount_s37.py`).
+        return _assemble_mcm_program(blocks, dtype=dtype, lmax=lmax, ncls=ncls, slots=slots,
                                      signs=signs)
     placed = {slot: (block, sign) for block, slot, sign in zip(blocks, slots, signs)}
     rows = []
@@ -207,20 +224,18 @@ def _coupling_matrix_tt(window_cls, *, lmax):
     measured slower than the shipped 16 at lmax 1535 (27.03/27.42 ms,
     `.qwen/tmp/tt1535_s30.log`).
     """
-    element_dtype = jnp.float32 if _COUPLING_F32 else window_cls.dtype
+    use_f32 = _coupling_f32(lmax)
+    element_dtype = jnp.float32 if use_f32 else window_cls.dtype
     # The accumulator keeps float64 even in the float32 arm: a row of a block sums
     # up to `lmax` terms, and rounding that partial in float32 would put the error
     # in the sum rather than in the products.
-    accumulator_dtype = jnp.float64 if _COUPLING_F32 else window_cls.dtype
-    table_dtype = jnp.float64 if _COUPLING_F32 else window_cls.dtype
+    accumulator_dtype = jnp.float64 if use_f32 else window_cls.dtype
+    table_dtype = jnp.float64 if use_f32 else window_cls.dtype
 
     n_ell = lmax + 1
     multipoles = jnp.arange(n_ell)
     row = multipoles[:, None]
     column = multipoles[None, :]
-    lower = jnp.minimum(row, column)
-    upper = jnp.maximum(row, column)
-
     p = jnp.arange(1, 2 * lmax + 1, dtype=table_dtype)
     log_g = jnp.concatenate(
         [jnp.zeros(1, dtype=table_dtype), jnp.cumsum(jnp.log((p - 0.5) / p))]
@@ -230,6 +245,16 @@ def _coupling_matrix_tt(window_cls, *, lmax):
         window_cls * (2 * jnp.arange(2 * lmax + 1) + 1) / (4 * jnp.pi)
     ).astype(element_dtype)
 
+    # The summand is symmetric in `(l1, l2)` and depends on them only through `min`, `max` and the
+    # difference, so an upper-triangle-only form exists in which three of the four per-element
+    # gathers become row/column broadcasts.  It was written and measured and is NOT shipped: at
+    # lmax 6143 it is 223 ms against 200 ms here and at lmax 12287 1895 ms against 1761 ms.  The
+    # pass is not gather-issue bound the way the operand count suggests -- `lower`/`upper` are
+    # hoisted out of the offset loop and XLA fuses the four lookups into one pass -- and the
+    # triangular form pays a transpose and a diagonal without removing any elements, because the
+    # discarded half is still inside the rectangle XLA evaluates.
+    lower = jnp.minimum(row, column)
+    upper = jnp.maximum(row, column)
     matrix = jnp.zeros((n_ell, n_ell), dtype=accumulator_dtype)
     for o0 in range(0, n_ell, _OFFSET_CHUNK):
         offs = jnp.arange(o0, min(o0 + _OFFSET_CHUNK, n_ell))[:, None, None]
@@ -407,12 +432,13 @@ def _general_coupling_matrix_quadrature(
         (2 * mask_ell + 1) * mask_cls[: lmax_mask + 1] / (4 * jnp.pi)
     )
     column_factor = 2 * jnp.arange(lmax + 1) + 1
-    first_l = first.T.astype(jnp.float32) if _COUPLING_F32 else first.T
-    second_l = second.astype(jnp.float32) if _COUPLING_F32 else second
-    weights_l = weights.astype(jnp.float32) if _COUPLING_F32 else weights
+    use_f32 = _coupling_f32(lmax)
+    first_l = first.T.astype(jnp.float32) if use_f32 else first.T
+    second_l = second.astype(jnp.float32) if use_f32 else second
+    weights_l = weights.astype(jnp.float32) if use_f32 else weights
 
     def integrate(correlation):
-        if _COUPLING_F32:
+        if use_f32:
             # `HIGHEST` keeps the products off the tf32 units: at DEFAULT the same call is another
             # 1.7x faster and the matrix error grows from 2.1e-06 to 5.5e-04.
             left = first_l * (weights_l * correlation.astype(jnp.float32))
@@ -438,7 +464,40 @@ def _general_coupling_matrix_quadrature(
 
 _WD_TRIPLE_CACHE = {}
 utils._ROOM_HOOKS.append(_WD_TRIPLE_CACHE.clear)   # 9 GiB of device tables at Nside 4096
-_WD_CACHE_KEEP_BYTES = 2 * 1024 ** 3
+# The Wigner-d quadrature tables are kept between workspace builds while they are small against
+# the device pool.  A fixed 2 GiB threshold dropped them at every geometry that matters: at
+# Nside 2048 spin 2 the three `(12287, 12287)` float64 tables are 3.6 GiB, so every
+# `compute_coupling_matrix` rebuilt them through a 12287-step scan -- about 650 ms of the 709 ms
+# coupling stage, for tables that never change.  The threshold is now the larger of 2 GiB and a
+# tenth of the pool, so a 96 GiB card keeps them and a small one still evicts.
+_WD_CACHE_KEEP_FRACTION = float(os.environ.get("GMASTER_WD_CACHE_FRACTION", "0.10"))
+
+
+# The cache is also dropped when the free pool is no longer a comfortable multiple of it: at Nside
+# 4096 spin 2 the coupling stage asks for an 11 GiB block with the polarised field resident and
+# failed with 55 GiB in use of 71.2 GiB while these tables were kept.  Keeping them where there is
+# room is worth most of the stage: at Nside 2048 spin 2 rebuilding the three tables through their
+# 12287-step scan was ~600 ms of a 660 ms `compute_coupling_matrix`.
+_WD_POOL_HEADROOM = float(os.environ.get("GMASTER_WD_POOL_HEADROOM", "4.0"))
+
+
+def _pool_is_tight(total):
+    try:
+        stats = jax.devices()[0].memory_stats() or {}
+        limit = stats.get("bytes_limit") or 0
+        in_use = stats.get("bytes_in_use") or 0
+    except Exception:  # noqa: BLE001 - a backend without pool accounting
+        return False
+    return bool(limit) and (limit - in_use) < _WD_POOL_HEADROOM * total
+
+
+def _wd_cache_keep_bytes():
+    try:
+        stats = jax.devices()[0].memory_stats() or {}
+        limit = stats.get("bytes_limit") or 0
+    except Exception:  # noqa: BLE001 - a backend without pool accounting
+        limit = 0
+    return max(2 * 1024 ** 3, int(limit * _WD_CACHE_KEEP_FRACTION))
 
 
 def _drop_large_wigner_cache():
@@ -449,7 +508,7 @@ def _drop_large_wigner_cache():
     (`.qwen/tmp/chain_s36u.log`, cuFFT plan allocation aborting the process).
     """
     total = sum(int(t.size) * int(t.dtype.itemsize) for t in _WD_TRIPLE_CACHE.values())
-    if total > _WD_CACHE_KEEP_BYTES:
+    if total and (total > _wd_cache_keep_bytes() or _pool_is_tight(total)):
         _WD_TRIPLE_CACHE.clear()
 
 
@@ -1048,7 +1107,7 @@ def _mcm_dense(mcm):
 _LEFT_CONTRACT_CHUNK_BYTES = 4 * 1024 ** 3
 
 
-def _left_contract(output, mcm):
+def _left_contract(output, mcm, *, f32=False):
     """`output @ mcm`, in row chunks of `mcm` when the matrix is large.
 
     XLA autotunes the GEMM with duplicate operand buffers; at Nside 4096 spin 2 the 18 GiB
@@ -1057,18 +1116,26 @@ def _left_contract(output, mcm):
     `sum_k output[:, rows_k] @ mcm[rows_k, :]` over contiguous row blocks has the same value up
     to summation order; below `_LEFT_CONTRACT_CHUNK_BYTES` the single GEMM is kept.
     """
+    def dot(a, b):
+        if not f32:
+            return a @ b
+        # `HIGHEST` keeps the products off the tf32 units, as in the quadrature: the binned
+        # operator inherits the matrix's own ~2e-06, and tf32 would put 5e-04 there instead.
+        return jnp.matmul(a.astype(jnp.float32), b.astype(jnp.float32),
+                          precision=jax.lax.Precision.HIGHEST).astype(jnp.float64)
+
     if isinstance(mcm, tuple):
         # Row-channel pieces (`_RowPieces`): rows `(l1, c1)` of the matrix are piece `c1`,
         # and the matching columns of `output` are `c1::ncls`.
         ncls = len(mcm)
         lmax1 = mcm[0].shape[0]
-        acc = output[:, 0::ncls] @ mcm[0].reshape((lmax1, lmax1 * ncls))
+        acc = dot(output[:, 0::ncls], mcm[0].reshape((lmax1, lmax1 * ncls)))
         for c1 in range(1, ncls):
-            acc = acc + output[:, c1::ncls] @ mcm[c1].reshape((lmax1, lmax1 * ncls))
+            acc = acc + dot(output[:, c1::ncls], mcm[c1].reshape((lmax1, lmax1 * ncls)))
         return acc
     n = mcm.shape[0]
     if mcm.size * jnp.dtype(mcm.dtype).itemsize <= _LEFT_CONTRACT_CHUNK_BYTES:
-        return output @ mcm
+        return dot(output, mcm)
     # The chunk count is the smallest divisor of `n` at or above the byte target, so no row is
     # padded: padding would copy the whole matrix, which is the allocation this avoids.
     target = -(-(mcm.size * jnp.dtype(mcm.dtype).itemsize) // _LEFT_CONTRACT_CHUNK_BYTES)
@@ -1077,21 +1144,29 @@ def _left_contract(output, mcm):
     # Static slices, not a `fori_loop`: XLA's copy insertion duplicates a jit parameter that
     # enters a while loop, and for this operand that duplicate is the matrix itself
     # (`.qwen/tmp/chain_s36n2.log`: a second 18 GiB request with the matrix already resident).
-    acc = output[:, 0:chunk] @ mcm[0:chunk, :]
+    acc = dot(output[:, 0:chunk], mcm[0:chunk, :])
     for k in range(1, nchunk):
-        acc = acc + output[:, k * chunk:(k + 1) * chunk] @ mcm[k * chunk:(k + 1) * chunk, :]
+        acc = acc + dot(output[:, k * chunk:(k + 1) * chunk], mcm[k * chunk:(k + 1) * chunk, :])
     return acc
 
 
-@partial(jax.jit, static_argnames=("ncls", "norm_type"))
-def _banded_operators(mcm, beam1, beam2, output, theory, wawb, *, ncls, norm_type):
+@partial(jax.jit, static_argnames=("ncls", "norm_type", "lmax"))
+def _banded_operators(mcm, beam1, beam2, output, theory, wawb, *, ncls, norm_type, lmax):
+    """Bandpower operators from the mode-coupling matrix.
+
+    `output @ mcm` is the largest contraction of the whole pipeline: at Nside 2048 spin 2 it is
+    `(1636, 24576) @ (24576, 24576)`, 2.0 TFLOP, and in float64 on this card (1.8 TFLOP/s) it was
+    **567 ms of the 661 ms coupling stage** while the matrices it contracts cost 58 ms
+    (`.qwen/tmp/cprof_coup_s37.py`).  Under the same `auto` rule as the matrix build it runs with
+    float32 operands and `Precision.HIGHEST`, which is the accuracy the matrix already carries.
+    """
     beam = jnp.repeat(beam1 * beam2, ncls)
     # The beam scales columns of the mode-coupling matrix, and a column scaling commutes past a
     # left matmul, so it is applied after the contraction instead of before it.  Written the other
     # way XLA has to materialise `mcm * beam` before the dot: a second full copy of the largest
     # tensor in the stage (18.0 GiB for the polarised matrix at Nside 4096, where the very next
     # allocation is what fails -- `.qwen/tmp/s2_4096_s31.log`).
-    one_sided = _left_contract(output, mcm) * beam[None, :]
+    one_sided = _left_contract(output, mcm, f32=_coupling_f32(lmax)) * beam[None, :]
     if norm_type:
         mcm_binned = wawb * jnp.eye(output.shape[0])
     else:
@@ -1200,8 +1275,14 @@ class NmtWorkspace:
         # sets (30 GiB) are still cached and the quadrature's Wigner-d transpose could not even be
         # autotuned (`.qwen/tmp/chain_s36q.log`).  Evict them up front if the pool is short.
         nside = getattr(fl1.minfo, "nside", None) or 0
+        # The mask transform is spin 0 whatever the field is, so its ring spectrum is
+        # `(ntheta, lmax_mask+1)` complex128 -- the `2 (lmax_mask+1)` width belongs to the
+        # polarised transform alone.  Asking for twice what the stage needs made `make_room`
+        # evict the march's window tables during a scalar Nside 4096 pipeline, and rebuilding
+        # them is 1.2 s a time.
+        ring_width = 2 * (self.lmax_mask + 1) if self.spin1 or self.spin2 else self.lmax_mask + 1
         utils.make_room(2 * (self.ncls * (self.lmax + 1)) ** 2 * 8
-                        + 6 * (4 * nside - 1) * 2 * (self.lmax_mask + 1) * 16)
+                        + 6 * (4 * nside - 1) * ring_width * 16)
         self.pcl_mask = _compute_coupled_cell(
             alm1,
             alm2,
@@ -1415,6 +1496,7 @@ class NmtWorkspace:
             self.wawb,
             ncls=self.ncls,
             norm_type=self.norm_type,
+            lmax=self.lmax,
         )
         self.bpws = jnp.linalg.solve(self.mcm_binned, one_sided)
 

@@ -49,6 +49,8 @@ from jax.experimental.pallas import triton as plt
 from jax.scipy.special import gammaln
 from s2fft.sampling import s2_samples
 
+from gmaster import _march_v2
+
 SPIN = 2
 NC = 4                       # direct re/im, mirror re/im -- the same split as `_rhs_forward`
 BLO, BHI, JUMP = 2.0 ** -24, 2.0 ** 24, 24
@@ -113,6 +115,8 @@ def march_requested(spin, *, L=None, nside=None) -> bool:
     flag = os.environ.get("GMASTER_SPIN2_MARCH")
     if flag is not None:
         return flag == "1"
+    if _march_v2.enabled(L):
+        return True
     return L is not None and nside is not None and slice_declined(L, nside)
 
 
@@ -166,6 +170,8 @@ def synth_requested(spin, *, L=None, nside=None) -> bool:
     flag = os.environ.get("GMASTER_SPIN2_MARCH_SYNTH")
     if flag is not None:
         return flag == "1"
+    if _march_v2.enabled(L):
+        return True
     return L is not None and nside is not None and slice_declined(L, nside)
 
 
@@ -617,6 +623,8 @@ def forward_latitudinal(ftm, *, L, spin, nside):
     """
     if int(spin) != SPIN:
         raise ValueError(f"march route implements spin=+{SPIN}, got spin={spin}")
+    if _march_v2.enabled(L):
+        return _march_v2.forward_latitudinal(ftm, L=L, spin=spin, nside=nside)
     return _forward_impl(ftm, L=L, spin=spin, nside=nside)
 
 
@@ -646,6 +654,8 @@ def fold_requested(nside, L) -> bool:
     flag = os.environ.get("GMASTER_SPIN0_MARCH")
     if flag is not None:
         return flag == "1" and on_gpu
+    if on_gpu and _march_v2.enabled(L):
+        return True
     return on_gpu and not utils._prefer_theta_band(nside, L, 0)
 
 
@@ -698,6 +708,10 @@ def fold_pair_fits(nside, L) -> bool:
     limit = stats.get("bytes_limit") if stats else None
     if not limit:
         return True
+    if _march_v2.enabled(L):
+        # The v2 pair carries no Wigner-d slab, so its own gate decides (memory *and* the band
+        # limit above which the paired kernel's tile partials cost more than the march it shares).
+        return _march_v2.pair_fits(L, nside)
     return fold_pair_bytes(nside, L) * _PAIR_POOL_FACTOR <= limit
 
 
@@ -718,6 +732,8 @@ def fold_synth_requested(nside, L) -> bool:
         flag = os.environ.get("GMASTER_SPIN0_MARCH")
     if flag is not None:
         return flag == "1" and on_gpu
+    if on_gpu and _march_v2.enabled(L):
+        return True
     return on_gpu and not utils._prefer_theta_band(nside, L, 0)
 
 
@@ -825,6 +841,8 @@ def forward_latitudinal_positive(positive, weights, phase, *, L, nside):
     to the caller.  Negative orders never appear here: for spin 0 they follow from the real-map
     symmetry in ``_finish_forward_s2fft``, which is why this route needs no mirror channel.
     """
+    if _march_v2.enabled(L):
+        return _march_v2.forward_latitudinal_positive(positive, weights, phase, L=L, nside=nside)
     return _forward_fold_impl(positive, weights, phase, L=L, nside=nside)
 
 
@@ -839,6 +857,9 @@ def forward_latitudinal_positive_pair(positive_a, positive_b, weights, phase, *,
     Same contract as `forward_latitudinal_positive` applied to each map; the two rows are the same
     rows, so the second map costs its emit contraction and its fp64 partials and not its recurrence.
     """
+    if _march_v2.enabled(L):
+        return _march_v2.forward_latitudinal_positive_pair(
+            positive_a, positive_b, weights, phase, L=L, nside=nside)
     return _forward_fold_pair_impl(positive_a, positive_b, weights, phase, L=L, nside=nside)
 
 
@@ -1327,6 +1348,8 @@ def inverse_latitudinal_positive(positive, phase, *, L, nside):
     Same contract as `_theta_matrix.inverse_latitudinal` / `utils.scalar_inverse_latitudinal`
     (ring phi phase applied, `sqrt((2l+1)/4pi)` baked in), without the Legendre band.
     """
+    if _march_v2.enabled(L):
+        return _march_v2.inverse_latitudinal_positive(positive, phase, L=L, nside=nside)
     return _inverse_fold_impl(positive, phase, L=L, nside=nside)
 
 
@@ -1340,6 +1363,8 @@ def inverse_latitudinal(flm, *, L, spin, nside):
     """
     if int(spin) != SPIN:
         raise ValueError(f"march route implements spin=+{SPIN}, got spin={spin}")
+    if _march_v2.enabled(L):
+        return _march_v2.inverse_latitudinal(flm, L=L, spin=spin, nside=nside)
     return _inverse_impl(flm, L=L, spin=spin, nside=nside)
 
 

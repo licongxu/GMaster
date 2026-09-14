@@ -6,7 +6,27 @@ and decoupled cell. Reports warmed medians and decoupled-spectrum parity.
 
 import argparse
 import gc
+import os
+import sys
 import time
+
+if __name__ == "__main__":          # before numpy/ducc0/JAX start their thread pools
+    import os as _os
+    import sys as _sys
+
+    if "--reference-cpus" in _sys.argv and _os.environ.get("GMASTER_BENCH_PINNED") != "1":
+        _n = int(_sys.argv[_sys.argv.index("--reference-cpus") + 1])
+        if _n > 0:
+            _cpus = sorted(_os.sched_getaffinity(0))[:_n]
+            if len(_cpus) < _n:
+                raise SystemExit(f"only {len(_cpus)} cores available, asked for {_n}")
+            _env = dict(_os.environ)
+            _env["GMASTER_BENCH_PINNED"] = "1"
+            for _name in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS",
+                          "NUMEXPR_NUM_THREADS"):
+                _env[_name] = str(_n)
+            _os.sched_setaffinity(0, _cpus)
+            _os.execve(_sys.executable, [_sys.executable] + _sys.argv, _env)
 
 import healpy as hp
 import jax
@@ -156,6 +176,12 @@ def _run_pipeline(
     _, t_coupled_cell = _timed(lambda: module.compute_coupled_cell(f, f), repeats)
     _, t_decouple = _timed(lambda: w.decouple_cell(cl_coupled), repeats)
 
+    # At Nside 4096 spin 0 this TOTAL is 7.46 s while the same pipeline on its own
+    # (`--skip-reference`, which releases the compile-time field) is 4.90 s.  The difference is
+    # the repeats themselves: each `full_pipeline` builds a field and a workspace while the
+    # previous one is still bound, and under that pressure the march's window tables are evicted
+    # and rebuilt.  A `gc.collect()` here was measured and does not help (7.459 -> 7.456 s), so
+    # the harness is left alone and both numbers are reported.
     _, t_total = _timed(full_pipeline, repeats)
     times = {
         "field": t_field,
@@ -184,11 +210,21 @@ if __name__ == "__main__":
     parser.add_argument(
         "--ring-precision",
         type=str,
-        default="follow",
-        choices=("follow", "fp64", "fp32"),
-        help="azimuthal transform precision independently of the tables.  'follow' is the "
-        "shipped coupling and what every published row used; 'fp64' keeps the map exact "
-        "under fp32 tables, which is the route that passes the suite.",
+        default="auto",
+        choices=("auto", "follow", "fp64", "fp32"),
+        help="azimuthal transform precision independently of the tables.  'auto' is the "
+        "shipped default (complex64 where the v2 march serves the latitudinal stage); "
+        "'follow' tracks the tables and is what the pre-v2 rows used; 'fp64' keeps the map "
+        "exact at every size.",
+    )
+    parser.add_argument(
+        "--reference-cpus",
+        type=int,
+        default=0,
+        help="Pin the whole benchmark to this many CPU cores (affinity + OMP_NUM_THREADS) "
+        "and re-exec once.  The published board is the unpinned 96-core host; `--reference-cpus "
+        "32` is the smaller-host comparison, where NaMaster gets 32 cores and GMaster's host "
+        "side is limited the same way.",
     )
     parser.add_argument(
         "--skip-reference",
@@ -212,7 +248,9 @@ if __name__ == "__main__":
     map_u = rng.normal(size=npix)
 
     print(
-        f"nside={nside} precision={args.precision} ring={nmt.ring_dtype().__name__} "
+        f"nside={nside} precision={args.precision} ring={args.ring_precision} "
+        f"coupling={nmt.coupling_precision()} cpus={len(os.sched_getaffinity(0))} "
+        f"omp={os.environ.get('OMP_NUM_THREADS', 'unset')} "
         f"devices={[str(d) for d in jax.devices()]}"
     )
     stages = ("field", "mask", "coupling", "coupled_cell", "decouple")
