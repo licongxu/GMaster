@@ -4,7 +4,7 @@ Locked scope for the next public-facing drop on `act-dr6-demo`. Everything else 
 
 ## Ship now
 
-1. **Methods-trust note (~4 pages)** — `paper/gmaster_paper/main.tex` / `main.pdf`
+1. **MNRAS Letter (4 pages)** — `paper/gmaster_letter/main.tex` / `main.pdf`; Overleaf `6a9b7e6f30290767963c6afe`
    - Verifiable problem: masked pseudo-\(C_\ell\) (MASTER) on GPU vs NaMaster CPU reference.
    - Key equations and pipeline steps (map \(\leftrightarrow\) alms, coupling, decouple).
    - Short agentic-methods sketch (how the implementation was built and checked).
@@ -41,7 +41,7 @@ TT at 4096 **did not** require “NaMaster N/A” for this demo — both estimat
 ## Done checklist
 
 - [x] `plan/README.md` matches this scope
-- [x] `paper/gmaster_paper/main.pdf` rebuilt (~4 pp) with trust figs
+- [x] `paper/gmaster_letter/main.pdf` (4 pp MNRAS Letter, difference-form march + ACT/FLAMINGO timings)
 - [x] `examples/namaster_vs_gmaster_timings.ipynb` loads artifacts only
 - [x] PR on `act-dr6-demo` (or branch off it)
 
