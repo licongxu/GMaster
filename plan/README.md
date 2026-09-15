@@ -40,10 +40,10 @@ TT at 4096 **did not** require “NaMaster N/A” for this demo — both estimat
 
 ## Done checklist
 
-- [ ] `plan/README.md` matches this scope
-- [ ] `paper/gmaster_paper/main.pdf` rebuilt (~4 pp) with trust figs
-- [ ] `examples/namaster_vs_gmaster_timings.ipynb` loads artifacts only
-- [ ] PR on `act-dr6-demo` (or branch off it)
+- [x] `plan/README.md` matches this scope
+- [x] `paper/gmaster_paper/main.pdf` rebuilt (~4 pp) with trust figs
+- [x] `examples/namaster_vs_gmaster_timings.ipynb` loads artifacts only
+- [x] PR on `act-dr6-demo` (or branch off it)
 
 ## Reproduce figures from committed npy (no MASTER rerun)
 
