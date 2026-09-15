@@ -6,6 +6,31 @@ pseudo-\(C_\ell\) (MASTER) power spectra of masked spin fields.
 CPU reference: `/home/lxu/scratch/agent_dev/auto_research_agent/NaMaster`
 (LSSTDESC/NaMaster, `pymaster` 3.0).
 
+## Install
+
+```bash
+source /scratch/scratch-lxu/venv/cmbagent_env/bin/activate
+pip install -e .
+export JAX_ENABLE_X64=1
+```
+
+## Examples
+
+Real-map MASTER overlays (not the synthetic scoreboard) live under `examples/`.
+
+```bash
+# ACT DR6 night PA4 f150 srcfree, nside 4096 (maps already on Orion)
+python examples/act_dr6_prepare.py
+python examples/act_dr6_tt_overlay.py
+# FLAMINGO L2p8 Compton-y, nside 4096, full-sky mask
+python examples/act_dr6_tt_overlay.py --T .qwen/tmp/flamingo/y_nside4096.npy \
+  --full-sky --nside 4096 --out examples/flamingo_y_tt_example \
+  --map-path /rds/rds-lxu/flamingo/L2p8_m9/lightcone0/healpix_map/y_unlensed_L2p8_m9_lc0.fits
+```
+
+Shipped ACT overlay (`examples/act_dr6_tt_example/`): GMaster 7.63 s vs NaMaster 70.4 s (192 cores), rms(GM/NM − 1) = 1.41e-5.
+FLAMINGO L2p8 y (`examples/flamingo_y_tt_example/`): GMaster 8.64 s vs NaMaster 69.5 s, rms(GM/NM − 1) = 2.32e-7.
+
 ## Status
 
 The one-GPU HEALPix MASTER comparison through `Nside=4096` is closed (HANDOFF
