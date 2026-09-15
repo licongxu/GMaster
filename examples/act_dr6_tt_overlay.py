@@ -104,21 +104,34 @@ def main():
     # available without a covariance, so the README reports the plain rms and the max over bins.
     t_nm_s = "N/A" if t_nm is None else f"{t_nm:.3f}s"
 
-    fig, ax = plt.subplots(2, 1, sharex=True, figsize=(6, 5), gridspec_kw={"height_ratios": [2, 1]})
+    plt.rcParams.update({
+        "text.usetex": True,
+        "text.latex.preamble": r"\usepackage[T1]{fontenc}\usepackage{amsmath}\usepackage{mathptmx}",
+        "font.family": "serif",
+        "font.serif": ["Times"],
+        "pdf.fonttype": 42,
+        "axes.spines.top": False,
+        "axes.spines.right": False,
+    })
+    BLUE, GREY, BLACK = "#0072B2", "#666666", "#000000"
+    fig, ax = plt.subplots(2, 1, sharex=True, figsize=(7.16, 4.6),
+                           gridspec_kw={"height_ratios": [2.2, 1]})
     dl = ell * (ell + 1) / (2 * np.pi)
-    ax[0].plot(ell, dl * cl_gm, label=f"GMaster (GPU) {t_gm:.2f} s")
+    t_nm_lab = r"N/A" if t_nm is None else rf"{t_nm:.1f}\,\mathrm{{s}}"
+    ax[0].plot(ell, dl * cl_gm, color=BLUE, lw=1.35,
+               label=rf"GMaster ${t_gm:.2f}\,\mathrm{{s}}$")
     if t_nm is not None:
-        ax[0].plot(ell, dl * cl_nm, "--", label=f"NaMaster ({len(os.sched_getaffinity(0))} cores) {t_nm:.1f} s")
-    ax[0].set_ylabel(r"$\ell(\ell+1)C_\ell/2\pi$")
+        ax[0].plot(ell, dl * cl_nm, color=GREY, lw=1.15, ls="--",
+                   label=rf"NaMaster ({len(os.sched_getaffinity(0))} cores) ${t_nm_lab}$")
+    ax[0].set_ylabel(r"$D_\ell=\ell(\ell+1)C_\ell/2\pi$")
     ax[0].set_yscale("log")
-    ax[0].legend()
-    ax[0].set_title(f"{args.map_path.rsplit('/', 1)[-1]}, TT, nside {nside}, nlb {nlb}")
-    ax[1].axhline(0, color="k", lw=0.5)
+    ax[0].legend(frameon=False)
+    ax[1].axhline(0, color=BLACK, lw=0.6)
     if t_nm is not None:
-        ax[1].plot(ell, ratio)
-        ax[1].set_ylabel("GM/NM − 1")
+        ax[1].plot(ell, 1e5 * ratio, color=BLUE, lw=0.9)
+        ax[1].set_ylabel(r"$(C_\ell^{\mathrm{GM}}/C_\ell^{\mathrm{NM}}-1)\times 10^{5}$")
     else:
-        ax[1].text(0.5, 0.5, "NaMaster N/A at this nside", ha="center", transform=ax[1].transAxes)
+        ax[1].text(0.5, 0.5, r"NaMaster N/A", ha="center", transform=ax[1].transAxes)
     ax[1].set_xlabel(r"$\ell$")
     fig.tight_layout()
     fig.savefig(f"{args.out}/overlay.pdf")
