@@ -9074,3 +9074,26 @@ speed-up over a 32-core CPU, which cancels part of the hardware difference: thei
 3.0-5.2x.  Different GPUs, and our 32-core ducc0 is ~1.5x faster than their 32-core ducc0, so this
 is evidence that the two codes are in the same class with GMaster ahead — **not** a head-to-head
 result, and it must not be written as one.  A real head-to-head needs cunuSHT built on this box.
+
+## Addendum 36 (16 September 2026, branch `exp/cpu-dform`): the CPU float32 difference-form march is not excluded — it beats NaMaster's `map2alm` by 1.7–2.0x
+
+Boris's question: "have we excluded that we can't win on CPU with the difference recursion
+trick and fp32?"  Answer: no, the opposite; full record in `docs/cpu_dform_verdict.md`.
+
+`gmaster/_cpu/dform_rings.c` is now a port of the CUDA spin-0 folded analysis to AVX-512
+(OpenMP over m, 16 northern rings per instruction, ell in blocks of 8, the same seed / two-word
+coefficients / block emit scale / normalisation as `march_v2.cu`), with the per-m coefficient
+rows and seeds computed inside the call.  `gmaster/cpu_dform.py` drives it as a full transform:
+ducc0 `map2leg` (NaMaster's own ring-FFT stage, weights included) + C fold + C march, and times
+it against `pymaster.map2alm` in one process per `OMP_NUM_THREADS`.  Board (same map, medians
+of 3): nside 1024, 1 thread 1028 vs 1744 ms (0.59x); 96 threads 28.0 vs 55.3 ms (0.51x); nside
+2048, 6989 vs 12840 ms and 160 vs 309 ms; nside 512, 0.68x / 0.36x.  March alone 0.47–0.53x
+ducc0 `leg2alm` float64.  ducc0's own float32 `leg2alm` is no faster than its float64 and is
+5e-8 accurate; ours is 1e-6 (nside 128) to 1.8e-5 (2048) relative — the march's sqrt(n) floor.
+Finite everywhere; 96-thread and 1-thread outputs bit-identical.  Test:
+`tests/test_cpu_dform.py`.  Logs `.qwen/tmp/cpu_dform/full_96.log`, `full_1.log`.
+
+Two harness lessons: the first 96-thread board sat at a 65 ms floor from 16 threads up, which
+was the single-threaded numpy post-scaling of a 3072x3072 complex array in the harness, not the
+kernel (moved into the C emit); and `_mm512_load_ps` on numpy buffers segfaults (use `loadu`).
+Not on `main`; plan/README.md ("Boris lock") parks this spike.
