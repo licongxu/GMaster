@@ -905,6 +905,7 @@ def _pallas_block_size(nside):
 # `AttributeError: 'block_until_ready' is not available on traced array
 # float32[160, 64, 512]` (`.qwen/tmp/s24_256_0.log`).
 _PALLAS_TRACED_MAX_L = 768
+_MARCH_TRACED_MAX_L = int(os.environ.get("GMASTER_MARCH_TRACED_MAX_L", "4096"))
 
 
 def _trace_route_ready(nside, L_work):
@@ -917,12 +918,10 @@ def _trace_route_ready(nside, L_work):
     is therefore built here, at top level, before the route is chosen -- so a
     program never carries a table build, which XLA would then re-run on every call.
     """
+    if not _prefer_theta_band(nside, L_work, 0):
+        return L_work <= _MARCH_TRACED_MAX_L
     if L_work > _PALLAS_TRACED_MAX_L:
         return False
-    if not _prefer_theta_band(nside, L_work, 0):
-        # No band is in this program's future (too big, an m-split, or the folded
-        # march serves it), so there is nothing to hoist and tracing is safe.
-        return True
     from . import _theta_matrix
 
     return _theta_matrix.warm(nside, L_work)

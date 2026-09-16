@@ -266,7 +266,7 @@ def _coupling_matrix_tt(window_cls, *, lmax):
     upper = jnp.maximum(row, column)
     lane = jnp.arange(_OFFSET_CHUNK)[:, None, None]
 
-    def add_chunk(chunk, matrix):
+    def add_chunk(matrix, chunk):
         # Pad the last chunk to width 16 so every iteration has the same gather
         # shape; indices past lmax are clamped for the lookup and then masked.
         offs = chunk * _OFFSET_CHUNK + lane
@@ -280,16 +280,13 @@ def _coupling_matrix_tt(window_cls, *, lmax):
             * g[jnp.maximum(lower - offs_g, 0)]
             / (g[p_total] * (2 * p_total + 1))
         )
-        return matrix + jnp.sum(
-            jnp.where(in_range & (offs <= lower), term, 0), axis=0
-        )
+        contrib = jnp.sum(jnp.where(in_range & (offs <= lower), term, 0), axis=0)
+        return matrix + contrib, None
 
-    matrix = jax.lax.fori_loop(
-        0,
-        n_chunks,
+    matrix, _ = jax.lax.scan(
         add_chunk,
         jnp.zeros((n_ell, n_ell), dtype=accumulator_dtype),
-        unroll=False,
+        jnp.arange(n_chunks),
     )
     return matrix * (2 * column + 1)
 

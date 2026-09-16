@@ -153,7 +153,7 @@ def test_scalar_coupling_jaxpr_does_not_grow_with_lmax():
 
     small = lowered(47)
     large = lowered(95)
-    assert "while" in large
+    assert ("while" in large) or ("scan" in large.lower())
     assert len(large) < 1.4 * len(small), (len(small), len(large))
 
 
