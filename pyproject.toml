@@ -15,3 +15,8 @@ testpaths = ["tests"]
 
 [tool.setuptools]
 packages = ["gmaster"]
+
+# The v2 march compiles gmaster/_cuda/march_v2.cu with nvcc on first use; without this a
+# non-editable install (pip install git+...) ships no .cu and the march is silently unavailable.
+[tool.setuptools.package-data]
+gmaster = ["_cuda/*.cu"]
