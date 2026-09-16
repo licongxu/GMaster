@@ -25,7 +25,9 @@ in the session, then prints wall-clock, peak host and device memory, and
 `C_ell^GM / C_ell^NM - 1` side by side. Form fields choose `NSIDE` (512-4096), spin
 0 or 2, the mask, and a synthetic CAMB + noise map or your own HEALPix FITS. The free
 T4 (15 GB, 2 vCPU) runs `NSIDE = 1024` in a few minutes and holds 2048; L4 / A100
-take 4096. GMaster's v2 CUDA march is built with `nvcc` on first use; the notebook
+take 4096. On a free T4 the live 1024 run is an accuracy and VRAM check
+(NaMaster on two vCPUs can still win wall-clock); the ~9× figures are the shipped
+nside-4096 overlays on a workstation GPU against 192 CPU cores. GMaster's v2 CUDA march is built with `nvcc` on first use; the notebook
 reports if it is unavailable (TPU or CPU runtimes) instead of timing a fallback.
 
 ## Examples
