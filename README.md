@@ -14,6 +14,20 @@ pip install -e .
 export JAX_ENABLE_X64=1
 ```
 
+## Run it yourself on Colab
+
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/licongxu/GMaster/blob/act-dr6-demo/examples/gmaster_colab_demo.ipynb)
+
+`examples/gmaster_colab_demo.ipynb` installs GMaster and `pymaster` in a Colab GPU
+runtime and runs the same MASTER estimator (`NmtField(n_iter=3)`, coupling matrix,
+coupled cell, decouple; same `lmax`, bins and mask) through both codes on a map made
+in the session, then prints wall-clock, peak host and device memory, and
+`C_ell^GM / C_ell^NM - 1` side by side. Form fields choose `NSIDE` (512-4096), spin
+0 or 2, the mask, and a synthetic CAMB + noise map or your own HEALPix FITS. The free
+T4 (15 GB, 2 vCPU) runs `NSIDE = 1024` in a few minutes and holds 2048; L4 / A100
+take 4096. GMaster's v2 CUDA march is built with `nvcc` on first use; the notebook
+reports if it is unavailable (TPU or CPU runtimes) instead of timing a fallback.
+
 ## Examples
 
 Real-map MASTER overlays (not the synthetic scoreboard) live under `examples/`.
