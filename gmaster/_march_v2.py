@@ -143,17 +143,19 @@ def _build():
     return _LIB
 
 
-# Below this working band limit (Nside 64) the exact fp64 band / slice routes keep the call.  The
-# march is a float32 route (1e-6-class against NaMaster, against 1e-13 for the band), and below
-# Nside 64 it also stops paying: the geometry pads to one 512-lane tile whatever the ring count,
-# so at Nside 32 three quarters of every lane is padding.  `GMASTER_MARCH_V2_MIN_L=0` serves every
-# size, `GMASTER_MARCH_V2=0` none; either restores the exact routes that the small-geometry tests
-# pin to 1e-13.
-_MIN_L = int(os.environ.get("GMASTER_MARCH_V2_MIN_L", "192"))
+# Default 0: the v2 march serves every band limit when the CUDA library builds.
+# `GMASTER_MARCH_V2=0` restores the exact fp64 band / slice routes (the small-geometry tests
+# pin those to 1e-13).  `GMASTER_MARCH_V2_MIN_L` can raise the floor again; below Nside 64 the
+# geometry pads to one 512-lane tile, so small maps spend most of each tile on padding.
+_MIN_L = int(os.environ.get("GMASTER_MARCH_V2_MIN_L", "0"))
 
 
 def enabled(L=None) -> bool:
-    """True when the v2 march serves the marched latitudinal routes at band limit ``L``."""
+    """True when the v2 march serves the marched latitudinal routes at band limit ``L``.
+
+    Default is every ``L`` once the CUDA library has built.  ``GMASTER_MARCH_V2=0`` disables
+    it; ``GMASTER_MARCH_V2_MIN_L`` raises a floor if one is wanted.
+    """
     flag = os.environ.get("GMASTER_MARCH_V2", "1")
     if flag != "1":
         return False

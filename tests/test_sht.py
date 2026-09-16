@@ -1260,6 +1260,7 @@ def test_legendre_pool_bytes_is_unbounded_when_the_backend_is_silent(monkeypatch
 
 
 
+@pytest.mark.march_v2
 @pytest.mark.skipif(not _HAS_NVIDIA_GPU, reason="requires an NVIDIA GPU")
 @pytest.mark.parametrize("nside", [256, 512])
 def test_v2_march_pair_matches_two_transforms(nside):
@@ -1298,15 +1299,16 @@ def test_v2_march_pair_matches_two_transforms(nside):
         np.testing.assert_array_equal(np.asarray(got), np.asarray(ref))
 
 
+@pytest.mark.march_v2
 @pytest.mark.skipif(not _HAS_NVIDIA_GPU, reason="requires an NVIDIA GPU")
-@pytest.mark.parametrize("nside, spin", [(64, 0), (64, 2), (128, 0), (128, 2)])
+@pytest.mark.parametrize("nside, spin", [(32, 0), (32, 2), (64, 0), (64, 2), (128, 0), (128, 2)])
 def test_default_route_agrees_with_namaster_at_small_geometries(nside, spin):
-    """The shipped (v2 march) route has to stay a 1e-5-class transform at the small sizes.
+    """The shipped (v2 march) route has to stay a 1e-5-class transform at every size.
 
-    Those geometries used to be served by the exact fp64 band, which agrees with NaMaster to
-    1e-13; the march is float32 and agrees to ~1e-6.  The exact routes are still there and are
-    still pinned to 1e-13 by the tests above (`GMASTER_MARCH_V2=0`), so what this adds is a bar on
-    the *default*: whatever the routing decides, the alms a user gets must be this close.
+    The exact fp64 band agrees with NaMaster to 1e-13; the march is float32 and agrees to ~1e-6.
+    The exact routes are still there and are still pinned to 1e-13 by the tests above
+    (`GMASTER_MARCH_V2=0`), so what this adds is a bar on the *default*: whatever the routing
+    decides, the alms a user gets must be this close.
     """
     ref = pytest.importorskip("pymaster")
     lmax = 3 * nside - 1

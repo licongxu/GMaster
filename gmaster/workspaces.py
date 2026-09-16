@@ -22,11 +22,11 @@ from .utils import alm2map, map2alm
 # over ~n^3/3 elements -- and is worth 7.5-9.4x for rel 1.9e-07
 # (`.qwen/tmp/ttknob_s30.log`), since only its per-term products are rounded.
 #
-# The default is "auto": float32 operands exactly where the v2 march already serves the
-# transforms (`lmax + 1 >= _march_v2._MIN_L`, i.e. Nside >= 256), float64 below that.  Above the
-# gate the pipeline's own accuracy is the march's float32-class 1e-6 and the coupling matrix's
-# 2e-06 is inside it; below it the transforms are exact and `tests/test_workspaces.py` holds the
-# matrix to `atol=2e-14`, which only float64 meets.  `GMASTER_COUPLING_PRECISION=fp64|fp32`
+# The default is "auto": float32 operands exactly where the v2 march serves the transforms
+# (the shipped default: every band limit with a CUDA build).  There the pipeline's own
+# accuracy is the march's float32-class 1e-6 and the coupling matrix's 2e-06 is inside it.
+# `GMASTER_MARCH_V2=0` keeps the exact transforms and this builder in float64, which is what
+# `tests/test_workspaces.py` pins to `atol=2e-14`.  `GMASTER_COUPLING_PRECISION=fp64|fp32`
 # (or :func:`set_coupling_precision`) forces one width at every size.
 _COUPLING_PRECISION = os.environ.get("GMASTER_COUPLING_PRECISION", "auto")
 

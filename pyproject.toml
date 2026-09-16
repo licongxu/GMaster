@@ -24,6 +24,9 @@ dependencies = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "march_v2: exercise the shipped v2 CUDA march (unit tests otherwise pin GMASTER_MARCH_V2=0)",
+]
 
 [tool.setuptools]
 packages = ["gmaster"]

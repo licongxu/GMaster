@@ -100,6 +100,17 @@ def pytest_configure(config):
 
 
 @pytest.fixture(autouse=True)
+def _exact_sht_unless_v2(request, monkeypatch):
+    """Unit tests pin NaMaster to 1e-13 on the exact fp64 routes.
+
+    The shipped default is the v2 CUDA march at every band limit.  Tests that exercise that
+    default mark `@pytest.mark.march_v2`; everything else opts out via `GMASTER_MARCH_V2=0`.
+    """
+    if request.node.get_closest_marker("march_v2") is None:
+        monkeypatch.setenv("GMASTER_MARCH_V2", "0")
+
+
+@pytest.fixture(autouse=True)
 def _session_table_precision(request):
     wanted = request.config.getoption("--gm-precision")
     wanted_ring = request.config.getoption("--gm-ring-precision")

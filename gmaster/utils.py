@@ -82,9 +82,9 @@ def ring_dtype(L=None):
         return forced
     if nmt_params.ring_precision == "auto" and L is not None:
         # The shipped default: complex64 exactly where the v2 march serves the latitudinal stage
-        # (`lmax + 1 >= _march_v2._MIN_L`).  There the pass already carries the march's
+        # (every band limit with a CUDA build).  There the pass already carries the march's
         # float32-class 1e-6, the ring stage is 55 % of it (10.4 of 18.7 ms at Nside 1024 spin 2)
-        # and complex64 halves that; below the gate the transform is exact and stays so.
+        # and complex64 halves that; `GMASTER_MARCH_V2=0` keeps the exact transform.
         from . import _march_v2
 
         if _march_v2.enabled(L):
