@@ -204,8 +204,93 @@ def _assemble_mcm(dtype, blocks, *, lmax, ncls, slots, signs):
     return _RowPieces(rows)
 
 
-@partial(jax.jit, static_argnames="lmax")
+# Below this lmax the threej recurrence is cheap and the workspace tests pin it
+# to 2e-14.  At T4-sized maps the recurrence (CUDA or XLA scan) is ~n^3/3 serial
+# offset work and stayed at ~390 s warmed; Gauss-Legendre d^l_00 is P_l(x) and
+# the same GEMM the polarised path already uses.
+_TT_QUADRATURE_LMAX = int(os.environ.get("GMASTER_TT_QUADRATURE_LMAX", "48"))
+
+
 def _coupling_matrix_tt(window_cls, *, lmax):
+    """Scalar MASTER matrix: threej recurrence at small lmax, quadrature above."""
+    lmax = int(lmax)
+    if lmax >= _TT_QUADRATURE_LMAX:
+        return _coupling_matrix_tt_quadrature(window_cls, lmax=lmax)
+    return _coupling_matrix_tt_recurrence(window_cls, lmax=lmax)
+
+
+@partial(jax.jit, static_argnames="lmax")
+def _legendre_p(x, *, lmax):
+    """``P_l(x)`` for ``l = 0 .. lmax``, shape ``(x.size, lmax + 1)``.
+
+    ``d^l_{00}(arccos x) = P_l(x)``, so this is the m = n = 0 Wigner-d table
+    without the general recurrence's 3071-step scan over a heavy body.
+    """
+    p0 = jnp.ones_like(x)
+    if lmax == 0:
+        return p0[:, None]
+    p1 = jnp.asarray(x, dtype=x.dtype)
+    if lmax == 1:
+        return jnp.stack([p0, p1], axis=1)
+
+    def body(carry, ell):
+        prev, curr = carry
+        order = ell.astype(x.dtype)
+        following = ((2.0 * order - 1.0) * x * curr - (order - 1.0) * prev) / order
+        return (curr, following), following
+
+    _, rest = jax.lax.scan(body, (p0, p1), jnp.arange(2, lmax + 1))
+    return jnp.concatenate([p0[:, None], p1[:, None], rest.T], axis=1)
+
+
+@partial(jax.jit, static_argnames=("lmax", "lmax_mask"))
+def _tt_quadrature_kernel(window_cls, nodes, weights, *, lmax, lmax_mask):
+    """Even-parity MASTER TT matrix from Gauss-Legendre nodes (fp64 GEMM)."""
+    table = _legendre_p(nodes, lmax=lmax_mask)
+    mask_ell = jnp.arange(lmax_mask + 1, dtype=window_cls.dtype)
+    coefficients = (2 * mask_ell + 1) * window_cls[: lmax_mask + 1] / (4 * jnp.pi)
+    column_factor = 2 * jnp.arange(lmax + 1, dtype=window_cls.dtype) + 1
+    first = table[:, : lmax + 1]
+    weights = weights.astype(window_cls.dtype)
+    first_t = first.T
+
+    def integrate(correlation):
+        left = first_t * (weights * correlation)
+        return (
+            jnp.matmul(left, first, precision=jax.lax.Precision.HIGHEST)
+            * column_factor[None]
+            / 2
+        )
+
+    total = integrate(table @ coefficients)
+    mask_sign = jnp.where(mask_ell % 2, -1, 1).astype(window_cls.dtype)
+    signed = integrate(table @ (coefficients * mask_sign))
+    multipoles = jnp.arange(lmax + 1)
+    pair_sign = jnp.where((multipoles[:, None] + multipoles[None]) % 2, -1, 1)
+    signed = signed * pair_sign.astype(window_cls.dtype)
+    return (total + signed) / 2
+
+
+def _coupling_matrix_tt_quadrature(window_cls, *, lmax):
+    """Gauss-Legendre TT matrix; matches the threej recurrence to ~1e-11 at lmax 31."""
+    lmax = int(lmax)
+    lmax_mask = 2 * lmax
+    order = (2 * lmax + lmax_mask) // 2 + 1
+    nodes, weights = _gauss_legendre(order)
+    window = jnp.asarray(window_cls, dtype=jnp.float64)
+    window = jnp.pad(window, (0, max(0, lmax_mask + 1 - int(window.shape[0]))))
+    window = window[: lmax_mask + 1]
+    return _tt_quadrature_kernel(
+        window,
+        jnp.asarray(nodes, dtype=jnp.float64),
+        jnp.asarray(weights, dtype=jnp.float64),
+        lmax=lmax,
+        lmax_mask=lmax_mask,
+    )
+
+
+@partial(jax.jit, static_argnames="lmax")
+def _coupling_matrix_tt_recurrence(window_cls, *, lmax):
     """Exact scalar MASTER matrix using the threej_cosmo recurrence.
 
     Offsets are accumulated in blocks rather than one at a time.  A term with a

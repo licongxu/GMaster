@@ -278,11 +278,10 @@ def test_float32_scalar_coupling_keeps_the_matrix():
     magnitude better than the polarised arm above because the log-cumsum table and the offset
     accumulator stay float64 and only the per-term products are rounded.
 
-    The fori_loop form of `_coupling_matrix_tt` no longer unrolls one XLA
-    kernel per offset chunk, so the CPU backend can run the published lmax=127
-    size that used to segfault at lmax>=47.
+    Above ``_TT_QUADRATURE_LMAX`` the dispatched builder is the fp64 GEMM, so
+    this pins the recurrence's float32 arm below that gate.
     """
-    lmax = 127
+    lmax = 31
     rng = np.random.default_rng(17)
     ell = np.arange(2 * lmax + 1)
     pcl = np.exp(-ell / 90.0) * (1.0 + 0.1 * rng.normal(size=ell.size))

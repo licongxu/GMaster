@@ -905,7 +905,11 @@ def _pallas_block_size(nside):
 # `AttributeError: 'block_until_ready' is not available on traced array
 # float32[160, 64, 512]` (`.qwen/tmp/s24_256_0.log`).
 _PALLAS_TRACED_MAX_L = 768
-_MARCH_TRACED_MAX_L = int(os.environ.get("GMASTER_MARCH_TRACED_MAX_L", "4096"))
+# Tracing n_iter at L=3072 (Nside 1024) compiled for ~20 min on a Colab T4 and
+# the warmed field was still minutes; the already-jitted per-transform march
+# programs are the T4 route.  768 is Nside 256, where one program over the
+# refinement loop was measured 9.4 % faster.
+_MARCH_TRACED_MAX_L = int(os.environ.get("GMASTER_MARCH_TRACED_MAX_L", "768"))
 
 
 def _trace_route_ready(nside, L_work):

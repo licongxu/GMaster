@@ -4,6 +4,7 @@ import subprocess
 import jax
 import numpy as np
 import pytest
+from numpy.polynomial.legendre import legvander
 
 jax.config.update("jax_enable_x64", True)
 
@@ -13,9 +14,11 @@ from gmaster.workspaces import (
     _apply_toeplitz,
     _binning_operators,
     _coupling_matrix_tt,
+    _coupling_matrix_tt_recurrence,
     _coupling_matrix_tt_toeplitz,
     _expanded_binning_operators,
     _left_contract,
+    _legendre_p,
     _RowPieces,
 )
 
@@ -215,16 +218,23 @@ def test_coupling_tt_cuda_source_compiles_with_nvcc():
 
 
 def test_scalar_coupling_jaxpr_does_not_grow_with_lmax():
-    """A Python chunk loop unrolls with n_ell; the fori_loop HLO must not."""
+    """A Python chunk loop unrolls with n_ell; the scan HLO must not."""
 
     def lowered(lmax):
         window = jax.numpy.ones(2 * lmax + 1)
-        return _coupling_matrix_tt.lower(window, lmax=lmax).as_text()
+        return _coupling_matrix_tt_recurrence.lower(window, lmax=lmax).as_text()
 
     small = lowered(47)
     large = lowered(95)
     assert ("while" in large) or ("scan" in large.lower())
     assert len(large) < 1.4 * len(small), (len(small), len(large))
+
+
+def test_legendre_p_matches_numpy():
+    x = np.linspace(-1.0, 1.0, 17)
+    lmax = 8
+    got = np.asarray(_legendre_p(jax.numpy.asarray(x), lmax=lmax))
+    np.testing.assert_allclose(got, legvander(x, lmax), atol=1e-12, rtol=1e-12)
 
 
 def test_scalar_quadrature_tt_matches_recurrence():
@@ -233,13 +243,30 @@ def test_scalar_quadrature_tt_matches_recurrence():
     nmt.set_coupling_precision("fp64")
     jax.clear_caches()
     try:
-        rec = np.asarray(_coupling_matrix_tt(window, lmax=lmax))
+        rec = np.asarray(_coupling_matrix_tt_recurrence(window, lmax=lmax))
         quad = np.asarray(
             ws._general_coupling_matrix(
                 window, s1=0, s2=0, n1=0, n2=0, lmax=lmax, lmax_mask=2 * lmax
             )[0]
         )
         np.testing.assert_allclose(quad, rec, atol=1e-11, rtol=1e-11)
+        dispatched = np.asarray(_coupling_matrix_tt(window, lmax=lmax))
+        np.testing.assert_allclose(dispatched, rec, atol=2e-14)
+    finally:
+        nmt.set_coupling_precision("auto")
+        jax.clear_caches()
+
+
+def test_dispatched_quadrature_tt_matches_recurrence():
+    """lmax >= 48 takes the Legendre GEMM; it must still match threej."""
+    lmax = 63
+    window = np.random.default_rng(24).uniform(size=2 * lmax + 1)
+    nmt.set_coupling_precision("fp64")
+    jax.clear_caches()
+    try:
+        rec = np.asarray(_coupling_matrix_tt_recurrence(window, lmax=lmax))
+        got = np.asarray(_coupling_matrix_tt(window, lmax=lmax))
+        np.testing.assert_allclose(got, rec, atol=1e-10, rtol=1e-10)
     finally:
         nmt.set_coupling_precision("auto")
         jax.clear_caches()
