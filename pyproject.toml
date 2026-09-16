@@ -8,14 +8,17 @@ version = "0.1.0"
 description = "JAX implementation of NaMaster"
 readme = "README.md"
 requires-python = ">=3.10"
-# gmaster.utils imports s2fft.transforms._ftm_flm_primitive, which is on s2fft main after the
-# 1.4.0 release (PyPI's latest), so the dependency points at the repository.
+# PyPI s2fft 1.4.0 does `from s2fft_lib import _s2fft` at import (breaks Colab
+# Python 3.13, where the CUDA extension is a namespace without `_s2fft`) and
+# lacks `s2fft.transforms._ftm_flm_primitive` (gmaster.utils). Pin the first
+# revision that has both the optional import (astro-informatics/s2fft#362) and
+# the primitive (astro-informatics/s2fft#380).
 dependencies = [
     "fitsio",
     "healpy",
     "jax",
     "numpy",
-    "s2fft @ git+https://github.com/astro-informatics/s2fft.git",
+    "s2fft @ git+https://github.com/astro-informatics/s2fft.git@86a4dff303539202ebbfa28661d85331e0e2bff4",
     "scipy",
 ]
 

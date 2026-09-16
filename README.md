@@ -16,7 +16,7 @@ export JAX_ENABLE_X64=1
 
 ## Run it yourself on Colab
 
-[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/licongxu/GMaster/blob/act-dr6-demo/examples/gmaster_colab_demo.ipynb)
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/licongxu/GMaster/blob/cursor/colab-demo-1a91/examples/gmaster_colab_demo.ipynb)
 
 `examples/gmaster_colab_demo.ipynb` installs GMaster and `pymaster` in a Colab GPU
 runtime and runs the same MASTER estimator (`NmtField(n_iter=3)`, coupling matrix,
