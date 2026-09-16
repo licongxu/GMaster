@@ -32,9 +32,9 @@ methods: numerical -- cosmology: cosmic microwave background -- cosmology: large
 
 The MASTER estimator \citep{hivon2002} recovers binned angular power spectra from masked spherical maps by analysing the masked fields, forming coupled pseudo-spectra, building a mode-coupling matrix from the mask, and decoupling. NaMaster \citep{alonso2019} is the CPU reference. Its transforms run through DUCC, the successor of libsharp \citep{reinecke2013}, on the HEALPix pixelisation \citep{gorski2005}. The coupling algebra has a structured Wigner-$3j$ recurrence \citep{kiddier2026}.
 
-On a GPU the same two cubic stages remain. An on-the-fly associated-Legendre recurrence, as in SHTns \citep{schaeffer2013} and DUCC, is a serial chain in $\ell$ with a reduction over colatitude at every degree. That pattern matches AVX-512 CPUs and mismatches GPU SIMT. A precomputed Legendre matrix, as in the precompute mode of s2fft \citep{price2024}, inverts the bottleneck provided the table fits. Related GPU work for non-iso-latitude or partial-sky problems \citep{belkner2024,reinecke2023} retains an on-the-fly latitudinal factor and is not a drop-in replacement for a full-sky HEALPix MASTER pipeline.
+On a GPU the same two cubic stages remain. An on-the-fly associated-Legendre recurrence, as in SHTns \citep{schaeffer2013} and DUCC, is a serial chain in $\ell$ with a reduction over colatitude at every degree. That pattern matches AVX-512 CPUs and mismatches GPU SIMT. A precomputed Legendre matrix, as in the precompute mode of s2fft \citep{price2024}, inverts the bottleneck provided the table fits. Related GPU work \citep{belkner2024,reinecke2023} retains an on-the-fly latitudinal factor and is not a drop-in for a full-sky HEALPix MASTER pipeline.
 
-GMaster is a JAX implementation of the NaMaster public API. This Letter isolates one change that made a table-free float32 latitudinal kernel accurate enough to be the default at every $N_{\mathrm{side}}\ge64$: marching the difference pair of the Jacobi row attached to $d^\ell_{m,-s}(\theta)$ rather than the consecutive values. The recurrence, a reflection that sends the southern hemisphere through the same instructions, and the exactness of a per-block power-of-two rescale are proved in Lean~4 \citep{demoura2021,mathlib2020}. The error argument is asymptotic and is checked numerically. We then report the end-to-end MASTER board against NaMaster and two real-map overlays. This is not a cosmological analysis: no beam, split cross-spectrum, or covariance is applied to the survey maps.
+GMaster is a JAX implementation of the NaMaster public API. This Letter isolates one change that made a table-free float32 latitudinal kernel accurate enough to be the default at every $N_{\mathrm{side}}\ge64$: marching the difference pair of the Jacobi row attached to $d^\ell_{m,-s}(\theta)$ rather than the consecutive values. The recurrence, a reflection that sends the southern hemisphere through the same instructions, and the exactness of a per-block power-of-two rescale are proved in Lean~4 \citep{demoura2021,mathlib2020}. We report the end-to-end MASTER board and two real-map overlays. This is not a cosmological analysis: no beam, split cross-spectrum, or covariance is applied to the survey maps.
 
 \section{Difference-form march}
 
@@ -96,7 +96,7 @@ Difference form, 2-word $C$ & $2.8\times10^{-6}$ & $2.9\times10^{-6}$ & $1.6\tim
 \end{tabular}
 \end{table}
 
-The kernel is CUDA, one warp per $(m$, ring tile), exposed as XLA FFI handlers inside \texttt{jit}. A field and its mask are two transforms of the same rows: the analysis kernel takes both as emit channels, so an \texttt{NmtField} is not two launches. For $s=0$ the southern hemisphere is folded into the northern recurrence. The default at $L=\ell_{\max}+1\ge192$ ($N_{\mathrm{side}}\ge64$) is this march; an exact float64 route remains available by flag.
+The kernel is CUDA, one warp per $(m$, ring tile), exposed as XLA FFI handlers inside \texttt{jit}. A field and its mask are two transforms of the same rows: the analysis kernel takes both as emit channels, so an \texttt{NmtField} is not two launches. For $s=0$ the southern hemisphere is folded into the northern recurrence. The default at $L=\ell_{\max}+1\ge192$ ($N_{\mathrm{side}}\ge64$) is this march; an exact float64 route remains available by flag. The difference-form $D_n$ march is not GPU-intrinsic; only the shipped latitudinal operator is CUDA. A fair CPU timing of the same algorithm requires porting that kernel, not the JAX CPU fallback with the CUDA path gated out.
 
 \section{Performance}
 
@@ -159,7 +159,7 @@ Figure~\ref{fig:act} is the same estimator on the ACT DR6 night PA4 $f150$ sourc
 
 A three-term Jacobi recurrence in float32 is limited by $1/\sin\phi$ amplification, not by the width of its words. Marching $(v,v-v_{\mathrm{prev}})$ moves the injection of every rounding onto a difference that already vanishes at the turning points, and a two-word $C$ removes the residual coherent drift. Carried as a CUDA kernel behind NaMaster's API, that rewrite is the default latitudinal operator in GMaster and is $10$--$21\times$ NaMaster at $N_{\mathrm{side}}=128$--$2048$ on the board of Table~\ref{tab:e2e}. The same pipeline on an ACT DR6 coadd and a FLAMINGO Compton-$y$ map at $N_{\mathrm{side}}=4096$ agrees at $10^{-5}$--$10^{-7}$ in under nine seconds.
 
-What is not shown is specific. No other GPU spherical-harmonic implementation was timed. The shipped default trades NaMaster's float64 contract for $\sim10^{-6}$ relative agreement; the exact route is one flag. The overlays are methods comparisons, not science products.
+No other GPU spherical-harmonic implementation was timed. The shipped default trades NaMaster's float64 contract for $\sim10^{-6}$ relative agreement; the exact route is one flag. The overlays are methods comparisons, not science products.
 
 \section*{Acknowledgements}
 
