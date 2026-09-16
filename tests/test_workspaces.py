@@ -149,7 +149,7 @@ def test_scalar_coupling_jaxpr_does_not_grow_with_lmax():
 
     def lowered(lmax):
         window = jax.numpy.ones(2 * lmax + 1)
-        return ws._coupling_matrix_tt_recurrence.lower(window, lmax=lmax).as_text()
+        return _coupling_matrix_tt.lower(window, lmax=lmax).as_text()
 
     small = lowered(47)
     large = lowered(95)
@@ -163,7 +163,7 @@ def test_scalar_quadrature_tt_matches_recurrence():
     nmt.set_coupling_precision("fp64")
     jax.clear_caches()
     try:
-        rec = np.asarray(ws._coupling_matrix_tt_recurrence(window, lmax=lmax))
+        rec = np.asarray(_coupling_matrix_tt(window, lmax=lmax))
         quad = np.asarray(
             ws._general_coupling_matrix(
                 window, s1=0, s2=0, n1=0, n2=0, lmax=lmax, lmax_mask=2 * lmax
