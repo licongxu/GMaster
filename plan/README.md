@@ -28,8 +28,14 @@ Locked scope for the next public-facing drop on `act-dr6-demo`. Everything else 
 
 TT at 4096 **did not** require “NaMaster N/A” for this demo — both estimators ran.
 
+## Locked claims (Letter-only, Thu)
+
+- **CPU vs CUDA:** the difference-form $D_n$ march is not GPU-intrinsic; the shipped kernel is CUDA-only. The Letter states that a fair CPU comparison needs a real port of the same march (OpenMP/C++), not JAX CPU fallback timings with the CUDA path gated out. No claim that the algorithm requires GPU forever.
+- **Rotate/patch counterexample:** parked for a separate spike (not in this PR).
+
 ## Parked (explicitly out of scope)
 
+- Real CPU-$D_n$ OpenMP/C++ port of `march_v2` (future spike; not this Letter drop)
 - Stranger-README polish and “public package stranger-ship complete” claims
 - fp32-stock-NaMaster probe
 - Dual-GPU end-to-end package numbers

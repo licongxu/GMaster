@@ -26,9 +26,10 @@ in the session, then prints wall-clock, peak host and device memory, and
 0 or 2, the mask, and a synthetic CAMB + noise map or your own HEALPix FITS. The free
 T4 (15 GB, 2 vCPU) runs `NSIDE = 1024` in a few minutes and holds 2048; L4 / A100
 take 4096. The notebook times a warmed GMaster pass against NaMaster on the same
-map; the ~9× figures are the shipped nside-4096 overlays on a workstation GPU
-against 192 CPU cores. GMaster's v2 CUDA march is built with `nvcc` on first use; the notebook
-reports if it is unavailable (TPU or CPU runtimes) instead of timing a fallback.
+map. The ~9× figures are the shipped nside-4096 overlays on a workstation GPU
+against 192 CPU cores, not a free T4. GMaster's v2 CUDA march is built with
+`nvcc` on first use; the notebook reports if it is unavailable (TPU or CPU
+runtimes) instead of timing a fallback.
 
 ## Examples
 
