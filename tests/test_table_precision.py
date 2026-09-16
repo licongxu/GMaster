@@ -277,11 +277,12 @@ def test_float32_scalar_coupling_keeps_the_matrix():
     (159.05 -> 21.19 ms) for rel 1.885e-07 (`.qwen/tmp/ttknob_s30.log`).  That is an order of
     magnitude better than the polarised arm above because the log-cumsum table and the offset
     accumulator stay float64 and only the per-term products are rounded.
+
+    The fori_loop form of `_coupling_matrix_tt` no longer unrolls one XLA
+    kernel per offset chunk, so the CPU backend can run the published lmax=127
+    size that used to segfault at lmax>=47.
     """
-    # lmax=127 segfaults the CPU XLA backend in float32 (isolated repro:
-    # `_coupling_matrix_tt` at lmax>=47).  The GPU path is the published board;
-    # 43 is the largest CPU size that still drives the shipped function.
-    lmax = 127 if any(d.platform == "gpu" for d in jax.devices()) else 43
+    lmax = 127
     rng = np.random.default_rng(17)
     ell = np.arange(2 * lmax + 1)
     pcl = np.exp(-ell / 90.0) * (1.0 + 0.1 * rng.normal(size=ell.size))

@@ -208,13 +208,20 @@ def _coupling_matrix_tt(window_cls, *, lmax):
     """Exact scalar MASTER matrix using the threej_cosmo recurrence.
 
     Offsets are accumulated in blocks rather than one at a time.  A term with a
-    given offset vanishes unless ``offset <= min(l1, l2)``, so the block starting
-    at ``o0`` can only touch the sub-matrix ``[o0:, o0:]``: chunking visits
-    ~n^3/3 elements instead of n^3.  Measured 3.0-3.6x over the per-offset loop
-    at lmax 383/767/1535 (10.05 -> 3.23 ms at lmax 767), values agreeing to 1e-16.
+    given offset vanishes unless ``offset <= min(l1, l2)``, so a shrinking
+    ``[o0:, o0:]`` slice visits ~n^3/3 elements.  That form is a Python loop of
+    distinct shapes, which XLA unrolls into one kernel per chunk: at lmax 3071
+    that is 192 compiles, and on a Colab T4 with ~12 GB host RAM the unrolled
+    graph thrashes (first call ~30 min, warmed ~13 min vs NaMaster ~3 min).
+    The body keeps a uniform ``(chunk, n, n)`` shape and a ``fori_loop``, so one
+    compile serves every chunk.  Invalid lanes (offset past ``lmax``, or
+    ``offset > min(l1, l2)``) are masked; kept entries match the shrinking form.
 
-    The block body is five table lookups and a few elementwise ops over ~n^3/3
-    elements, so it has no `dot` to move onto tensor units; its cost is the
+    Chunking was 3.0-3.6x over the per-offset loop at lmax 383/767/1535
+    (10.05 -> 3.23 ms at lmax 767), values agreeing to 1e-16.
+
+    The block body is five table lookups and a few elementwise ops over the
+    chunk, so it has no `dot` to move onto tensor units; its cost is the
     elementwise pass itself, and the only lever on that is the operand width.
     Under :func:`set_coupling_precision` ("fp32") the lookup tables and the term
     are float32 while the log-cumsum table and the offset accumulator stay
@@ -233,6 +240,8 @@ def _coupling_matrix_tt(window_cls, *, lmax):
     table_dtype = jnp.float64 if use_f32 else window_cls.dtype
 
     n_ell = lmax + 1
+    n_chunks = (n_ell + _OFFSET_CHUNK - 1) // _OFFSET_CHUNK
+    last_offset = n_ell - 1
     multipoles = jnp.arange(n_ell)
     row = multipoles[:, None]
     column = multipoles[None, :]
@@ -255,22 +264,33 @@ def _coupling_matrix_tt(window_cls, *, lmax):
     # discarded half is still inside the rectangle XLA evaluates.
     lower = jnp.minimum(row, column)
     upper = jnp.maximum(row, column)
-    matrix = jnp.zeros((n_ell, n_ell), dtype=accumulator_dtype)
-    for o0 in range(0, n_ell, _OFFSET_CHUNK):
-        offs = jnp.arange(o0, min(o0 + _OFFSET_CHUNK, n_ell))[:, None, None]
-        low = lower[o0:, o0:]
-        up = upper[o0:, o0:]
-        p_total = up + offs
+    lane = jnp.arange(_OFFSET_CHUNK)[:, None, None]
+
+    def add_chunk(chunk, matrix):
+        # Pad the last chunk to width 16 so every iteration has the same gather
+        # shape; indices past lmax are clamped for the lookup and then masked.
+        offs = chunk * _OFFSET_CHUNK + lane
+        in_range = offs <= last_offset
+        offs_g = jnp.minimum(offs, last_offset)
+        p_total = upper + offs_g
         term = (
-            mask_power[jnp.minimum(up - low + 2 * offs, 2 * lmax)]
-            * g[up - low + offs]
-            * g[offs]
-            * g[jnp.maximum(low - offs, 0)]
+            mask_power[jnp.minimum(upper - lower + 2 * offs_g, 2 * lmax)]
+            * g[upper - lower + offs_g]
+            * g[offs_g]
+            * g[jnp.maximum(lower - offs_g, 0)]
             / (g[p_total] * (2 * p_total + 1))
         )
-        matrix = matrix.at[o0:, o0:].add(
-            jnp.sum(jnp.where(offs <= low, term, 0), axis=0)
+        return matrix + jnp.sum(
+            jnp.where(in_range & (offs <= lower), term, 0), axis=0
         )
+
+    matrix = jax.lax.fori_loop(
+        0,
+        n_chunks,
+        add_chunk,
+        jnp.zeros((n_ell, n_ell), dtype=accumulator_dtype),
+        unroll=False,
+    )
     return matrix * (2 * column + 1)
 
 

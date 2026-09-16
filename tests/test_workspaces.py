@@ -106,6 +106,57 @@ def test_selective_scalar_toeplitz_matches_full_kernel():
     np.testing.assert_allclose(got, expected, atol=2e-14)
 
 
+def _shrinking_offset_tt(window_cls, lmax):
+    """Per-offset threej recurrence the chunked kernel must match."""
+    n_ell = lmax + 1
+    p = np.arange(1, 2 * lmax + 1, dtype=np.float64)
+    log_g = np.concatenate([[0.0], np.cumsum(np.log((p - 0.5) / p))])
+    g = np.exp(log_g)
+    mask_power = window_cls * (2 * np.arange(2 * lmax + 1) + 1) / (4 * np.pi)
+    row = np.arange(n_ell)[:, None]
+    column = np.arange(n_ell)[None, :]
+    lower = np.minimum(row, column)
+    upper = np.maximum(row, column)
+    matrix = np.zeros((n_ell, n_ell), dtype=np.float64)
+    for offset in range(n_ell):
+        p_total = upper + offset
+        term = (
+            mask_power[np.minimum(upper - lower + 2 * offset, 2 * lmax)]
+            * g[upper - lower + offset]
+            * g[offset]
+            * g[np.maximum(lower - offset, 0)]
+            / (g[p_total] * (2 * p_total + 1))
+        )
+        matrix += np.where(offset <= lower, term, 0)
+    return matrix * (2 * column + 1)
+
+
+@pytest.mark.parametrize("lmax", [15, 16, 17, 31])
+def test_scalar_coupling_matches_per_offset_recurrence(lmax):
+    window = np.random.default_rng(20 + lmax).uniform(size=2 * lmax + 1)
+    nmt.set_coupling_precision("fp64")
+    jax.clear_caches()
+    try:
+        got = np.asarray(_coupling_matrix_tt(window, lmax=lmax))
+        np.testing.assert_allclose(got, _shrinking_offset_tt(window, lmax), atol=2e-14)
+    finally:
+        nmt.set_coupling_precision("auto")
+        jax.clear_caches()
+
+
+def test_scalar_coupling_jaxpr_does_not_grow_with_lmax():
+    """A Python chunk loop unrolls with n_ell; the fori_loop HLO must not."""
+
+    def lowered(lmax):
+        window = jax.numpy.ones(2 * lmax + 1)
+        return _coupling_matrix_tt.lower(window, lmax=lmax).as_text()
+
+    small = lowered(47)
+    large = lowered(95)
+    assert "while" in large
+    assert len(large) < 1.4 * len(small), (len(small), len(large))
+
+
 def test_uncorrelated_noise_deprojection_bias_matches_namaster():
     reference = pytest.importorskip("pymaster")
     rng = np.random.default_rng(10)
