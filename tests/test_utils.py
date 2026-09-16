@@ -7,6 +7,7 @@ jax.config.update("jax_enable_x64", True)
 
 import gmaster as nmt
 from gmaster import utils
+from gmaster._cuda_gpu import is_cuda_device_kind
 
 
 def test_mask_apodization_matches_namaster():
@@ -112,3 +113,14 @@ def test_default_parameters_control_new_fields():
         nmt.set_n_iter_default(original["n_iter_mask_default"], mask=True)
         nmt.set_tol_pinv_default(original["tol_pinv_default"])
         nmt.set_sht_calculator(original["sht_calculator"])
+
+
+def test_cuda_gpu_gate_accepts_colab_tesla_t4():
+    """Colab T4 is ``Tesla T4``; requiring ``NVIDIA`` silently skipped the march."""
+    assert is_cuda_device_kind("Tesla T4")
+    assert is_cuda_device_kind("Tesla L4")
+    assert is_cuda_device_kind("NVIDIA RTX PRO 6000 Blackwell Workstation Edition")
+    assert is_cuda_device_kind("cuda")
+    assert "NVIDIA" not in "Tesla T4".upper()
+    assert not is_cuda_device_kind("TPU v5")
+    assert not is_cuda_device_kind("AMD Instinct MI250")

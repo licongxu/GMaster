@@ -16,7 +16,7 @@ export JAX_ENABLE_X64=1
 
 ## Run it yourself on Colab
 
-[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/licongxu/GMaster/blob/cursor/colab-demo-1a91/examples/gmaster_colab_demo.ipynb)
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/licongxu/GMaster/blob/cursor/t4-coupling-jit-1a91/examples/gmaster_colab_demo.ipynb)
 
 `examples/gmaster_colab_demo.ipynb` installs GMaster and `pymaster` in a Colab GPU
 runtime and runs the same MASTER estimator (`NmtField(n_iter=3)`, coupling matrix,
@@ -25,10 +25,11 @@ in the session, then prints wall-clock, peak host and device memory, and
 `C_ell^GM / C_ell^NM - 1` side by side. Form fields choose `NSIDE` (512-4096), spin
 0 or 2, the mask, and a synthetic CAMB + noise map or your own HEALPix FITS. The free
 T4 (15 GB, 2 vCPU) runs `NSIDE = 1024` in a few minutes and holds 2048; L4 / A100
-take 4096. On a free T4 the live 1024 run is an accuracy and VRAM check
-(NaMaster on two vCPUs can still win wall-clock); the ~9× figures are the shipped
-nside-4096 overlays on a workstation GPU against 192 CPU cores. GMaster's v2 CUDA march is built with `nvcc` on first use; the notebook
-reports if it is unavailable (TPU or CPU runtimes) instead of timing a fallback.
+take 4096. The notebook times a warmed GMaster pass against NaMaster on the same
+map. The ~9× figures are the shipped nside-4096 overlays on a workstation GPU
+against 192 CPU cores, not a free T4. GMaster's v2 CUDA march is built with
+`nvcc` on first use; the notebook reports if it is unavailable (TPU or CPU
+runtimes) instead of timing a fallback.
 
 ## Examples
 

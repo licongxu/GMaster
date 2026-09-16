@@ -34,6 +34,7 @@ import jax
 import jax.numpy as jnp
 from jax import lax
 
+from gmaster._cuda_gpu import on_cuda_gpu
 from gmaster._sht_pallas import (
     _diagonal_normalization,
     _initial_factor,
@@ -63,10 +64,8 @@ def band_builder():
 
 @lru_cache(maxsize=1)
 def _has_nvidia_gpu():
-    return any(
-        device.platform == "gpu" and "NVIDIA" in device.device_kind.upper()
-        for device in jax.devices()
-    )
+    """True on a CUDA GPU. Colab reports ``Tesla T4`` without ``NVIDIA``."""
+    return on_cuda_gpu()
 
 
 def _build_slab(theta, L, diag, c1, c2, m0, mb, store_name="float64"):

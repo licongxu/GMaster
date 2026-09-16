@@ -8,11 +8,9 @@ jax.config.update("jax_enable_x64", True)
 
 import gmaster as nmt
 from gmaster import _spin_slice, _theta_matrix, utils, workspaces
+from gmaster._cuda_gpu import on_cuda_gpu
 
-_HAS_NVIDIA_GPU = any(
-    device.platform == "gpu" and "NVIDIA" in device.device_kind.upper()
-    for device in jax.devices()
-)
+_HAS_NVIDIA_GPU = on_cuda_gpu()
 
 
 @pytest.fixture(autouse=True)
@@ -277,11 +275,11 @@ def test_float32_scalar_coupling_keeps_the_matrix():
     (159.05 -> 21.19 ms) for rel 1.885e-07 (`.qwen/tmp/ttknob_s30.log`).  That is an order of
     magnitude better than the polarised arm above because the log-cumsum table and the offset
     accumulator stay float64 and only the per-term products are rounded.
+
+    Above ``_TT_QUADRATURE_LMAX`` the dispatched builder is the fp64 GEMM, so
+    this pins the recurrence's float32 arm below that gate.
     """
-    # lmax=127 segfaults the CPU XLA backend in float32 (isolated repro:
-    # `_coupling_matrix_tt` at lmax>=47).  The GPU path is the published board;
-    # 43 is the largest CPU size that still drives the shipped function.
-    lmax = 127 if any(d.platform == "gpu" for d in jax.devices()) else 43
+    lmax = 31
     rng = np.random.default_rng(17)
     ell = np.arange(2 * lmax + 1)
     pcl = np.exp(-ell / 90.0) * (1.0 + 0.1 * rng.normal(size=ell.size))
