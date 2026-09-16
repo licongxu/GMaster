@@ -11,6 +11,7 @@ from scipy.special import roots_legendre
 
 from .bins import NmtBin, NmtBinFlat
 from . import utils
+from . import _coupling_tt_cuda
 from .utils import alm2map, map2alm
 
 # Operand precision of the coupling-matrix builders.  The polarised quadrature is two
@@ -216,6 +217,9 @@ def _coupling_matrix_tt(window_cls, *, lmax):
     The body keeps a uniform ``(chunk, n, n)`` shape and a ``fori_loop``, so one
     compile serves every chunk.  Invalid lanes (offset past ``lmax``, or
     ``offset > min(l1, l2)``) are masked; kept entries match the shrinking form.
+    On a GPU the float32 arm is the CUDA kernel in ``_cuda/coupling_tt.cu``:
+    one launch, no ``(chunk, n, n)`` temps (those were ~576 MiB at lmax 3071
+    and minutes on a Colab T4).  The scan remains the CPU / no-nvcc fallback.
 
     Chunking was 3.0-3.6x over the per-offset loop at lmax 383/767/1535
     (10.05 -> 3.23 ms at lmax 767), values agreeing to 1e-16.
@@ -240,11 +244,6 @@ def _coupling_matrix_tt(window_cls, *, lmax):
     table_dtype = jnp.float64 if use_f32 else window_cls.dtype
 
     n_ell = lmax + 1
-    n_chunks = (n_ell + _OFFSET_CHUNK - 1) // _OFFSET_CHUNK
-    last_offset = n_ell - 1
-    multipoles = jnp.arange(n_ell)
-    row = multipoles[:, None]
-    column = multipoles[None, :]
     p = jnp.arange(1, 2 * lmax + 1, dtype=table_dtype)
     log_g = jnp.concatenate(
         [jnp.zeros(1, dtype=table_dtype), jnp.cumsum(jnp.log((p - 0.5) / p))]
@@ -253,6 +252,19 @@ def _coupling_matrix_tt(window_cls, *, lmax):
     mask_power = (
         window_cls * (2 * jnp.arange(2 * lmax + 1) + 1) / (4 * jnp.pi)
     ).astype(element_dtype)
+
+    if use_f32 and _coupling_tt_cuda.enabled():
+        return _coupling_tt_cuda.coupling_tt(
+            mask_power.astype(jnp.float32),
+            g.astype(jnp.float32),
+            lmax=lmax,
+        )
+
+    n_chunks = (n_ell + _OFFSET_CHUNK - 1) // _OFFSET_CHUNK
+    last_offset = n_ell - 1
+    multipoles = jnp.arange(n_ell)
+    row = multipoles[:, None]
+    column = multipoles[None, :]
 
     # The summand is symmetric in `(l1, l2)` and depends on them only through `min`, `max` and the
     # difference, so an upper-triangle-only form exists in which three of the four per-element

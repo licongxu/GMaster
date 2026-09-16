@@ -1,3 +1,6 @@
+import os
+import subprocess
+
 import jax
 import numpy as np
 import pytest
@@ -142,6 +145,73 @@ def test_scalar_coupling_matches_per_offset_recurrence(lmax):
     finally:
         nmt.set_coupling_precision("auto")
         jax.clear_caches()
+
+
+def _triangle_cuda_indexing(window_cls, lmax, *, use_f32):
+    """Host replica of ``gmaster/_cuda/coupling_tt.cu`` (upper triangle, f32 products)."""
+    n_ell = lmax + 1
+    table_dtype = np.float64
+    element_dtype = np.float32 if use_f32 else np.float64
+    p = np.arange(1, 2 * lmax + 1, dtype=table_dtype)
+    log_g = np.concatenate([[0.0], np.cumsum(np.log((p - 0.5) / p))])
+    g = np.exp(log_g).astype(element_dtype)
+    mask_power = (
+        window_cls * (2 * np.arange(2 * lmax + 1) + 1) / (4 * np.pi)
+    ).astype(element_dtype)
+    matrix = np.zeros((n_ell, n_ell), dtype=np.float64)
+    for l1 in range(n_ell):
+        for l2 in range(l1, n_ell):
+            acc = 0.0
+            for offs in range(l1 + 1):
+                p_total = l2 + offs
+                d = l2 - l1
+                num = (
+                    mask_power[min(d + 2 * offs, 2 * lmax)]
+                    * g[d + offs]
+                    * g[offs]
+                    * g[l1 - offs]
+                )
+                den = g[p_total] * (2 * p_total + 1)
+                acc += np.float64(num / den)
+            matrix[l1, l2] = acc * (2 * l2 + 1)
+            if l2 != l1:
+                matrix[l2, l1] = acc * (2 * l1 + 1)
+    return matrix
+
+
+def test_cuda_triangle_indexing_matches_per_offset_recurrence():
+    lmax = 24
+    window = np.random.default_rng(23).uniform(size=2 * lmax + 1)
+    expected = _shrinking_offset_tt(window, lmax)
+    got64 = _triangle_cuda_indexing(window, lmax, use_f32=False)
+    np.testing.assert_allclose(got64, expected, atol=2e-14)
+    got32 = _triangle_cuda_indexing(window, lmax, use_f32=True)
+    scale = float(np.max(np.abs(expected)))
+    assert float(np.max(np.abs(got32 - expected))) / scale < 1e-5
+
+
+def test_coupling_tt_cuda_source_compiles_with_nvcc():
+    import shutil
+    from pathlib import Path
+
+    nvcc = os.environ.get("GMASTER_NVCC") or (
+        "/usr/local/cuda/bin/nvcc" if os.path.exists("/usr/local/cuda/bin/nvcc")
+        else shutil.which("nvcc")
+    )
+    if not nvcc:
+        pytest.skip("nvcc not available")
+    src = Path(__file__).resolve().parents[1] / "gmaster" / "_cuda" / "coupling_tt.cu"
+    inc = jax.ffi.include_dir()
+    out = Path(os.environ.get("TEST_TMPDIR", "/tmp")) / f"gm_coupling_tt_{os.getpid()}.o"
+    cmd = [
+        nvcc, "-O3", "-std=c++17", "-c", "-Xcompiler", "-fPIC",
+        "-arch=sm_75", "-diag-suppress", "940,2473",
+        "-I", inc, "-o", str(out), str(src),
+    ]
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+    assert proc.returncode == 0, proc.stderr[-4000:]
+    assert out.exists() and out.stat().st_size > 0
+    out.unlink(missing_ok=True)
 
 
 def test_scalar_coupling_jaxpr_does_not_grow_with_lmax():
