@@ -1,8 +1,9 @@
-"""The v2 latitudinal march: a CUDA difference-form float32 Wigner-d recurrence behind the JAX FFI.
+"""The v2 latitudinal march: a difference-form float32 Wigner-d recurrence behind the JAX FFI.
 
 Same contracts as the Pallas march in :mod:`gmaster._spin_march_pallas` (spin-0 folded analysis /
 synthesis of the positive-m block, spin-2 analysis / synthesis of the full ``(L, 2L-1)`` block),
-served by four CUDA kernels in ``gmaster/_cuda/march_v2.cu`` that ``nvcc`` builds on first use.
+served by CUDA kernels in ``gmaster/_cuda/march_v2.cu`` (``nvcc`` on first GPU use) and the
+OpenMP CPU port in ``gmaster/_cpu/march_v2_cpu.cc`` (``g++`` when JAX is on CPU).
 
 The mathematics (docs/march_v2_maths.md): for the Jacobi row ``v_n = (c1 x + c0) v_{n-1} - cb v_{n-2}``
 the kernel marches the pair ``(v, D = v_n - v_{n-1})`` as
@@ -72,10 +73,13 @@ _GEO_CACHE = {}
 _TABLE_CACHE_SIZE = [0]
 
 _CU = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_cuda", "march_v2.cu")
+_CPU_CC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_cpu", "march_v2_cpu.cc")
 _NAMES = ("gm_march_ana_s0", "gm_march_ana_s0_pair", "gm_march_ana_s2",
           "gm_march_syn_s0", "gm_march_syn_s0_pair", "gm_march_syn_s2")
 _LIB = None
 _LIB_ERROR = None
+_CPU_LIB = None
+_CPU_LIB_ERROR = None
 
 
 def _nvcc():
@@ -143,6 +147,48 @@ def _build():
     return _LIB
 
 
+def _build_cpu():
+    """Compile the OpenMP CPU march (same recurrence as the CUDA kernels)."""
+    global _CPU_LIB, _CPU_LIB_ERROR
+    if _CPU_LIB is not None or _CPU_LIB_ERROR is not None:
+        return _CPU_LIB
+    try:
+        src = open(_CPU_CC).read()
+        digest = hashlib.sha1((src + "cpu" + jax.__version__).encode()).hexdigest()[:12]
+        cache = os.environ.get("GMASTER_CUDA_CACHE",
+                               os.path.join(os.path.expanduser("~"), ".cache", "gmaster"))
+        os.makedirs(cache, exist_ok=True)
+        so = os.path.join(cache, f"libgm_march_v2_cpu_{digest}.so")
+        if not os.path.exists(so):
+            inc = jax.ffi.include_dir()
+            tmp = so + f".{os.getpid()}.tmp"
+            cmd = ["g++", "-O3", "-std=c++17", "-shared", "-fPIC", "-fopenmp",
+                   "-I", inc, "-o", tmp, _CPU_CC]
+            out = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+            if out.returncode != 0:
+                raise RuntimeError("g++ cpu march failed:\n" + out.stderr[-4000:])
+            os.replace(tmp, so)
+        lib = ctypes.CDLL(so)
+        for name in _NAMES:
+            jax.ffi.register_ffi_target(name, jax.ffi.pycapsule(getattr(lib, name)),
+                                        platform="cpu")
+        _CPU_LIB = lib
+    except Exception as exc:  # noqa: BLE001
+        _CPU_LIB_ERROR = exc
+        if os.environ.get("GMASTER_MARCH_V2_VERBOSE"):
+            print(f"[gmaster] v2 cpu march unavailable: {exc}")
+    return _CPU_LIB
+
+
+def _want_cpu():
+    if os.environ.get("GMASTER_MARCH_V2_CPU") == "1":
+        return True
+    try:
+        return jax.default_backend() == "cpu"
+    except Exception:  # noqa: BLE001
+        return True
+
+
 # Default 0: the v2 march serves every band limit when the CUDA library builds.
 # `GMASTER_MARCH_V2=0` restores the exact fp64 band / slice routes (the small-geometry tests
 # pin those to 1e-13).  `GMASTER_MARCH_V2_MIN_L` can raise the floor again; below Nside 64 the
@@ -153,19 +199,22 @@ _MIN_L = int(os.environ.get("GMASTER_MARCH_V2_MIN_L", "0"))
 def enabled(L=None) -> bool:
     """True when the v2 march serves the marched latitudinal routes at band limit ``L``.
 
-    Default is every ``L`` once the CUDA library has built.  ``GMASTER_MARCH_V2=0`` disables
-    it; ``GMASTER_MARCH_V2_MIN_L`` raises a floor if one is wanted.
+    Default is every ``L`` once the CUDA or CPU library has built.  ``GMASTER_MARCH_V2=0``
+    disables it; ``GMASTER_MARCH_V2_MIN_L`` raises a floor if one is wanted.
+    ``GMASTER_MARCH_V2_CPU=1`` forces the OpenMP CPU kernels even if a GPU is present.
     """
     flag = os.environ.get("GMASTER_MARCH_V2", "1")
     if flag != "1":
         return False
     if L is not None and int(L) < _MIN_L:
         return False
+    if _want_cpu():
+        return _build_cpu() is not None
     return _build() is not None
 
 
 def unavailable_reason():
-    return _LIB_ERROR
+    return _CPU_LIB_ERROR if _want_cpu() else _LIB_ERROR
 
 
 # ------------------------------------------------------------------------------------ geometry
@@ -449,8 +498,8 @@ def _register_room_hook():
 def _ffi_analysis(spin, geo, m0, mbp, L, man, ex0, tab, rhs, nmaps=1):
     """One analysis launch.  ``rhs`` is ``(mbp, npad, 4 * nmaps)``; the result is
     ``(mbp, L - m0, nch * nmaps)`` summed over theta tiles."""
-    if _build() is None:
-        raise RuntimeError(f"v2 march unavailable: {_LIB_ERROR}")
+    if not enabled():
+        raise RuntimeError(f"v2 march unavailable: {unavailable_reason()}")
     nch = 2 if spin == 0 else 4
     tile = TILE_ANA_PAIR if nmaps > 1 else TILE_ANA
     ntile = geo["npad"] // tile
@@ -466,8 +515,8 @@ def _ffi_analysis(spin, geo, m0, mbp, L, man, ex0, tab, rhs, nmaps=1):
 
 
 def _ffi_synthesis(spin, geo, m0, mbp, L, man, ex0, tab, coef, nmaps=1):
-    if _build() is None:
-        raise RuntimeError(f"v2 march unavailable: {_LIB_ERROR}")
+    if not enabled():
+        raise RuntimeError(f"v2 march unavailable: {unavailable_reason()}")
     out_t = jax.ShapeDtypeStruct((mbp, geo["npad"], 4 * nmaps), jnp.float32)
     if spin == 0:
         name = "gm_march_syn_s0_pair" if nmaps == 2 else "gm_march_syn_s0"

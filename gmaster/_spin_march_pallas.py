@@ -111,13 +111,15 @@ def march_requested(spin, *, L=None, nside=None) -> bool:
     and neither flag changes anything there: counting calls from the E/B entry points returns zero
     with `GMASTER_SPIN2_MARCH=1` set (`.qwen/tmp/route_probe_512.log`).
     """
-    if int(spin) != SPIN or not _on_nvidia():
+    if int(spin) != SPIN:
         return False
     flag = os.environ.get("GMASTER_SPIN2_MARCH")
     if flag is not None:
-        return flag == "1"
+        return flag == "1" and (_on_nvidia() or _march_v2.enabled(L))
     if _march_v2.enabled(L):
         return True
+    if not _on_nvidia():
+        return False
     return L is not None and nside is not None and slice_declined(L, nside)
 
 
@@ -166,13 +168,15 @@ def synth_requested(spin, *, L=None, nside=None) -> bool:
     defect is a lane-growth law rather than a single bad ring: 1.3e-07 at the equator against 6.5e-05
     at the pole for m=0 at `ell=760`, north and south agreeing to the digit.
     """
-    if int(spin) != SPIN or not _on_nvidia():
+    if int(spin) != SPIN:
         return False
     flag = os.environ.get("GMASTER_SPIN2_MARCH_SYNTH")
     if flag is not None:
-        return flag == "1"
+        return flag == "1" and (_on_nvidia() or _march_v2.enabled(L))
     if _march_v2.enabled(L):
         return True
+    if not _on_nvidia():
+        return False
     return L is not None and nside is not None and slice_declined(L, nside)
 
 
@@ -654,8 +658,8 @@ def fold_requested(nside, L) -> bool:
     on_gpu = _on_nvidia()
     flag = os.environ.get("GMASTER_SPIN0_MARCH")
     if flag is not None:
-        return flag == "1" and on_gpu
-    if on_gpu and _march_v2.enabled(L):
+        return flag == "1" and (on_gpu or _march_v2.enabled(L))
+    if _march_v2.enabled(L):
         return True
     return on_gpu and not utils._prefer_theta_band(nside, L, 0)
 
@@ -732,8 +736,8 @@ def fold_synth_requested(nside, L) -> bool:
     if flag is None:
         flag = os.environ.get("GMASTER_SPIN0_MARCH")
     if flag is not None:
-        return flag == "1" and on_gpu
-    if on_gpu and _march_v2.enabled(L):
+        return flag == "1" and (on_gpu or _march_v2.enabled(L))
+    if _march_v2.enabled(L):
         return True
     return on_gpu and not utils._prefer_theta_band(nside, L, 0)
 
