@@ -14,6 +14,7 @@ from s2fft.recursions import turok_jax
 from s2fft.transforms import _ftm_flm_primitive
 from s2fft.utils import healpix_ffts, quadrature_jax
 
+from ._cuda_gpu import on_cuda_gpu as _on_cuda_gpu
 from ._sht_pallas import (
     scalar_forward_latitudinal,
     scalar_inverse_latitudinal,
@@ -879,10 +880,7 @@ def _use_pallas_sht(L, spin):
     # kernels adopt a renormalized sideways recursion (Turok-Bucher class).
     if spin != 0:
         return False
-    return any(
-        device.platform == "gpu" and "NVIDIA" in device.device_kind.upper()
-        for device in jax.devices()
-    )
+    return _on_cuda_gpu()
 
 
 def _pallas_block_size(nside):

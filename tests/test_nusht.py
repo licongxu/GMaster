@@ -16,12 +16,10 @@ jax.config.update("jax_enable_x64", True)
 import ducc0
 
 from gmaster import nusht
+from gmaster._cuda_gpu import on_cuda_gpu
 
 
-_HAS_NVIDIA_GPU = any(
-    device.platform == "gpu" and "NVIDIA" in device.device_kind.upper()
-    for device in jax.devices()
-)
+_HAS_NVIDIA_GPU = on_cuda_gpu()
 pytestmark = pytest.mark.skipif(not _HAS_NVIDIA_GPU, reason="needs an NVIDIA GPU")
 
 L = 64

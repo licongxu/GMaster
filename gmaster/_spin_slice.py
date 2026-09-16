@@ -65,6 +65,8 @@ from jax import lax
 
 from s2fft.recursions.price_mcewen import generate_precomputes_jax
 
+from gmaster._cuda_gpu import on_cuda_gpu
+
 THETA_CONTIG = "theta_contig"  # (m, ell, theta) -- analysis reduces over theta
 ELL_CONTIG = "ell_contig"  # (m, theta, ell) -- synthesis reduces over ell
 
@@ -98,8 +100,8 @@ def polar_contract():
 
 @lru_cache(maxsize=1)
 def _pallas_ok():
-    return any(device.platform == "gpu" and "NVIDIA" in device.device_kind.upper()
-               for device in jax.devices())
+    """True on a CUDA GPU. Colab reports ``Tesla T4`` without ``NVIDIA``."""
+    return on_cuda_gpu()
 
 
 def _kernel_contract(slab, *, synthesis=False):
