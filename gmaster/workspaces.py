@@ -203,8 +203,31 @@ def _assemble_mcm(dtype, blocks, *, lmax, ncls, slots, signs):
     return _RowPieces(rows)
 
 
-@partial(jax.jit, static_argnames="lmax")
+# Gauss-Legendre TT is the same GEMM the polarised path already uses.  The threej
+# recurrence is exact and cheaper on a workstation at lmax 3071 (21 ms), but its
+# `(chunk, n, n)` gathers ran in ~393 s warmed on a Colab T4.  Small lmax keeps
+# the recurrence so `tests/test_workspaces.py` can pin it to 2e-14.
+_TT_QUADRATURE_LMAX = int(os.environ.get("GMASTER_TT_QUADRATURE_LMAX", "48"))
+
+
 def _coupling_matrix_tt(window_cls, *, lmax):
+    """Exact scalar MASTER matrix (threej recurrence, or quadrature at large lmax)."""
+    lmax = int(lmax)
+    if lmax >= _TT_QUADRATURE_LMAX:
+        return _general_coupling_matrix(
+            window_cls,
+            s1=0,
+            s2=0,
+            n1=0,
+            n2=0,
+            lmax=lmax,
+            lmax_mask=2 * lmax,
+        )[0]
+    return _coupling_matrix_tt_recurrence(window_cls, lmax=lmax)
+
+
+@partial(jax.jit, static_argnames="lmax")
+def _coupling_matrix_tt_recurrence(window_cls, *, lmax):
     """Exact scalar MASTER matrix using the threej_cosmo recurrence.
 
     Offsets are accumulated in blocks rather than one at a time.  A term with a

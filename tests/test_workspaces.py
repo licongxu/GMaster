@@ -149,12 +149,30 @@ def test_scalar_coupling_jaxpr_does_not_grow_with_lmax():
 
     def lowered(lmax):
         window = jax.numpy.ones(2 * lmax + 1)
-        return _coupling_matrix_tt.lower(window, lmax=lmax).as_text()
+        return ws._coupling_matrix_tt_recurrence.lower(window, lmax=lmax).as_text()
 
     small = lowered(47)
     large = lowered(95)
     assert "while" in large
     assert len(large) < 1.4 * len(small), (len(small), len(large))
+
+
+def test_scalar_quadrature_tt_matches_recurrence():
+    lmax = 31
+    window = np.random.default_rng(22).uniform(size=2 * lmax + 1)
+    nmt.set_coupling_precision("fp64")
+    jax.clear_caches()
+    try:
+        rec = np.asarray(ws._coupling_matrix_tt_recurrence(window, lmax=lmax))
+        quad = np.asarray(
+            ws._general_coupling_matrix(
+                window, s1=0, s2=0, n1=0, n2=0, lmax=lmax, lmax_mask=2 * lmax
+            )[0]
+        )
+        np.testing.assert_allclose(quad, rec, atol=1e-11, rtol=1e-11)
+    finally:
+        nmt.set_coupling_precision("auto")
+        jax.clear_caches()
 
 
 def test_uncorrelated_noise_deprojection_bias_matches_namaster():
