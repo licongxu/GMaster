@@ -3,6 +3,10 @@
 GPU implementation of [NaMaster](https://github.com/LSSTDESC/NaMaster):
 pseudo-\(C_\ell\) (MASTER) power spectra of masked spin fields.
 
+This is a **methods-trust** package: GMaster and NaMaster agree on the same maps
+and the same masks (ratio rms \(\sim 10^{-5}\)–\(10^{-7}\)) at about \(9\times\)
+wallclock. It is not a cosmology analysis.
+
 CPU reference: `/home/lxu/scratch/agent_dev/auto_research_agent/NaMaster`
 (LSSTDESC/NaMaster, `pymaster` 3.0).
 
@@ -14,39 +18,58 @@ pip install -e .
 export JAX_ENABLE_X64=1
 ```
 
-## Run it yourself on Colab
+The overlay demos also need `matplotlib`, `astropy`, and `pymaster` (already in
+that venv). Set `JAX_ENABLE_X64=1` for scientific calculations.
 
-[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/licongxu/GMaster/blob/cursor/t4-coupling-jit-1a91/examples/gmaster_colab_demo.ipynb)
+## Demos
 
-`examples/gmaster_colab_demo.ipynb` installs GMaster and `pymaster` in a Colab GPU
-runtime and runs the same MASTER estimator (`NmtField(n_iter=3)`, coupling matrix,
-coupled cell, decouple; same `lmax`, bins and mask) through both codes on a map made
-in the session, then prints wall-clock, peak host and device memory, and
-`C_ell^GM / C_ell^NM - 1` side by side. Form fields choose `NSIDE` (512-4096), spin
-0 or 2, the mask, and a synthetic CAMB + noise map or your own HEALPix FITS. The free
-T4 (15 GB, 2 vCPU) runs `NSIDE = 1024` in a few minutes and holds 2048; L4 / A100
-take 4096. The notebook times a warmed GMaster pass against NaMaster on the same
-map. The ~9× figures are the shipped nside-4096 overlays on a workstation GPU
-against 192 CPU cores, not a free T4. GMaster's v2 CUDA march is built with
-`nvcc` on first use; the notebook reports if it is unavailable (TPU or CPU
-runtimes) instead of timing a fallback.
+Two published MASTER overlays live under `examples/`. Prepare caches **once** so
+FITS I/O is off the clock; the overlay scripts time only the estimator. Each
+overlay writes five files: `cl_gmaster.npy`, `cl_namaster.npy`, `bins.npy`,
+`overlay.pdf`, `README.txt`.
 
-## Examples
+Maps sit on this machine; caches go under `.qwen/tmp/` (not shipped).
 
-Real-map MASTER overlays (not the synthetic scoreboard) live under `examples/`.
+### ACT DR6 TT
+
+Night PA4 f150 source-free coadd, native nside **8192**, cached / `ud_grade`d to
+**4096**. Mask: finite and nonzero pixels (`f_sky\approx0.48`), the same array
+for both estimators.
 
 ```bash
-# ACT DR6 night PA4 f150 srcfree, nside 4096 (maps already on Orion)
 python examples/act_dr6_prepare.py
 python examples/act_dr6_tt_overlay.py
-# FLAMINGO L2p8 Compton-y, nside 4096, full-sky mask
-python examples/act_dr6_tt_overlay.py --T .qwen/tmp/flamingo/y_nside4096.npy \
-  --full-sky --nside 4096 --out examples/flamingo_y_tt_example \
+```
+
+Shipped (`examples/act_dr6_tt_example/`): GMaster **7.63 s** vs NaMaster **70.4 s**
+(192 cores), rms(GM/NM − 1) = **1.41e-5**.
+
+### FLAMINGO L2p8 Compton-y
+
+Full-sky nside **4096** Compton-y lightcone. Same overlay script, full-sky mask.
+
+```bash
+python examples/flamingo_y_prepare.py
+python examples/act_dr6_tt_overlay.py \
+  --T .qwen/tmp/flamingo/y_nside4096.npy --full-sky --nside 4096 \
+  --out examples/flamingo_y_tt_example \
   --map-path /rds/rds-lxu/flamingo/L2p8_m9/lightcone0/healpix_map/y_unlensed_L2p8_m9_lc0.fits
 ```
 
-Shipped ACT overlay (`examples/act_dr6_tt_example/`): GMaster 7.63 s vs NaMaster 70.4 s (192 cores), rms(GM/NM − 1) = 1.41e-5.
-FLAMINGO L2p8 y (`examples/flamingo_y_tt_example/`): GMaster 8.64 s vs NaMaster 69.5 s, rms(GM/NM − 1) = 2.32e-7.
+Shipped (`examples/flamingo_y_tt_example/`): GMaster **8.64 s** vs NaMaster **69.5 s**,
+rms(GM/NM − 1) = **2.32e-7**.
+
+`examples/act_dr6_tt_cross.py` is a split-cross experiment. It is not part of
+this trust narrative.
+
+### Optional: small-nside Gaussian covariance
+
+```bash
+python examples/gaussian_cov_demo.py
+```
+
+Uses `NmtCovarianceWorkspace` / `gaussian_covariance` already in GMaster. This
+is an API check, not a 4096 covariance board.
 
 ## Status
 
