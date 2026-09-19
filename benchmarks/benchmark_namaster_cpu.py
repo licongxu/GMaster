@@ -1,10 +1,10 @@
 """NaMaster (pymaster) CPU wallclock benchmark for spin-0 TT MASTER.
 
-Matches the GMaster trust-demo timing scope: field + coupling matrix +
-coupled cell + decouple; I/O excluded.  Synthetic full-sky Gaussian map
-with a ones mask (FLAMINGO-style f_sky=1).
-
-Warm time = last of 2 timed runs after one cold discard.
+Research Ops checklist:
+  - nside sweep with fixed RNG seed, nlb=50 linear bins, n_iter=3, ones mask
+  - warm = last of >=2 timed runs after one untimed discard
+  - timer covers field + coupling matrix + coupled cell + decouple only
+  - logs nproc, OMP_NUM_THREADS, CPU model, pymaster + ducc0 versions
 """
 
 from __future__ import annotations
@@ -13,10 +13,10 @@ import argparse
 import gc
 import os
 import platform
-import subprocess
 import sys
 import time
 
+import ducc0
 import numpy as np
 import pymaster as nmt
 
@@ -36,7 +36,12 @@ def _pymaster_version() -> str:
     return getattr(nmt, "__version__", getattr(nmt, "version", "unknown"))
 
 
+def _ducc0_version() -> str:
+    return getattr(ducc0, "__version__", "unknown")
+
+
 def _run_pipeline(mask: np.ndarray, map_t: np.ndarray, lmax: int, nlb: int, n_iter: int):
+    """Timed scope: field + coupling + coupled cell + decouple (no I/O)."""
     field = nmt.NmtField(mask, [map_t], n_iter=n_iter)
     bins = nmt.NmtBin.from_lmax_linear(lmax, nlb)
     workspace = nmt.NmtWorkspace()
@@ -51,7 +56,7 @@ def benchmark_nside(
     nlb: int,
     n_iter: int,
     seed: int,
-    warm_repeats: int = 2,
+    timed_repeats: int = 2,
 ) -> dict:
     lmax = 3 * nside - 1
     npix = 12 * nside**2
@@ -59,51 +64,45 @@ def benchmark_nside(
     mask = np.ones(npix, dtype=np.float64)
     map_t = rng.normal(size=npix).astype(np.float64)
 
-    # Cold discard (not reported as warm).
+    # Untimed discard.
     _run_pipeline(mask, map_t, lmax, nlb, n_iter)
     gc.collect()
 
-    cold_times: list[float] = []
-    warm_times: list[float] = []
-    for i in range(warm_repeats):
+    timed: list[float] = []
+    for _ in range(timed_repeats):
         t0 = time.perf_counter()
         _run_pipeline(mask, map_t, lmax, nlb, n_iter)
-        elapsed = time.perf_counter() - t0
-        if i == 0:
-            cold_times.append(elapsed)
-        else:
-            warm_times.append(elapsed)
+        timed.append(time.perf_counter() - t0)
 
     return {
         "nside": nside,
         "lmax": lmax,
-        "npix": npix,
-        "cold_s": cold_times[0] if cold_times else float("nan"),
-        "warm_s": warm_times[-1] if warm_times else float("nan"),
-        "runs_s": cold_times + warm_times,
+        "warm_s": timed[-1],
+        "timed_s": timed,
     }
 
 
 def _markdown_table(rows: list[dict], meta: dict) -> str:
     lines = [
-        "## NaMaster CPU wallclock (spin-0 TT MASTER)",
+        "## NaMaster Cloud-CPU warm wallclock (spin-0 TT MASTER)",
         "",
         f"- **CPU:** {meta['cpu_model']}",
-        f"- **Threads:** {meta['threads']} (`OMP_NUM_THREADS={meta['omp']}`)",
+        f"- **nproc:** {meta['nproc']}",
+        f"- **OMP_NUM_THREADS:** {meta['omp']}",
         f"- **pymaster:** {meta['pymaster']}",
-        f"- **nlb:** {meta['nlb']}, **n_iter:** {meta['n_iter']}, **mask:** ones (f_sky=1)",
+        f"- **ducc0:** {meta['ducc0']}",
+        f"- **map seed:** {meta['seed']} (same at every nside)",
+        f"- **nlb:** {meta['nlb']} linear, **n_iter:** {meta['n_iter']}, **mask:** full-sky ones",
         f"- **lmax:** 3×nside−1",
-        f"- **Timed:** field + coupling matrix + coupled cell + decouple (I/O excluded)",
-        f"- **Warm:** last of {meta['warm_repeats']} runs after 1 cold discard",
+        f"- **Timed:** field + coupling matrix + coupled cell + decouple (no I/O)",
+        f"- **Warm:** last of {meta['timed_repeats']} timed runs after 1 untimed discard",
         f"- **GPU:** disabled (`CUDA_VISIBLE_DEVICES={meta['cuda']!r}`)",
         "",
-        "| nside | lmax | cold (s) | warm (s) |",
-        "|------:|-----:|---------:|---------:|",
+        "| nside | lmax | warm (s) |",
+        "|------:|-----:|---------:|",
     ]
     for row in rows:
-        lines.append(
-            f"| {row['nside']} | {row['lmax']} | {row['cold_s']:.3f} | {row['warm_s']:.3f} |"
-        )
+        lines.append(f"| {row['nside']} | {row['lmax']} | {row['warm_s']:.3f} |")
     if meta.get("stopped"):
         lines.extend(["", f"**Stopped at nside {meta['stopped']}:** {meta['stop_reason']}"])
     return "\n".join(lines)
@@ -120,38 +119,53 @@ def main() -> int:
     parser.add_argument("--nlb", type=int, default=50)
     parser.add_argument("--n-iter", type=int, default=3)
     parser.add_argument("--seed", type=int, default=5)
-    parser.add_argument("--warm-repeats", type=int, default=2)
+    parser.add_argument(
+        "--timed-repeats",
+        type=int,
+        default=2,
+        help="Number of timed runs; warm = last (must be >= 2).",
+    )
     parser.add_argument(
         "--max-warm-minutes",
         type=float,
         default=60.0,
-        help="Abort remaining nsides if warm run exceeds this many minutes.",
+        help="Stop sweep if warm run exceeds this many minutes.",
     )
     parser.add_argument("--out", type=str, default=".qwen/tmp/namaster_cpu_timings.md")
     args = parser.parse_args()
+    if args.timed_repeats < 2:
+        parser.error("--timed-repeats must be >= 2")
 
     os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
+    nproc = os.cpu_count() or 0
     threads = len(os.sched_getaffinity(0))
     if "OMP_NUM_THREADS" not in os.environ:
         os.environ["OMP_NUM_THREADS"] = str(threads)
 
     meta = {
         "cpu_model": _cpu_model(),
+        "nproc": nproc,
         "threads": threads,
         "omp": os.environ.get("OMP_NUM_THREADS", "unset"),
         "pymaster": _pymaster_version(),
+        "ducc0": _ducc0_version(),
+        "seed": args.seed,
         "nlb": args.nlb,
         "n_iter": args.n_iter,
-        "warm_repeats": args.warm_repeats,
+        "timed_repeats": args.timed_repeats,
         "cuda": os.environ.get("CUDA_VISIBLE_DEVICES", ""),
     }
 
     print(
-        f"NaMaster CPU benchmark: threads={meta['threads']} omp={meta['omp']} "
-        f"pymaster={meta['pymaster']}",
+        f"NaMaster CPU: nproc={meta['nproc']} threads={meta['threads']} "
+        f"OMP_NUM_THREADS={meta['omp']}",
         flush=True,
     )
-    print(f"CPU: {meta['cpu_model']}", flush=True)
+    print(
+        f"CPU: {meta['cpu_model']} | pymaster={meta['pymaster']} ducc0={meta['ducc0']} "
+        f"seed={meta['seed']} n_iter={meta['n_iter']}",
+        flush=True,
+    )
 
     rows: list[dict] = []
     for nside in sorted(args.nsides):
@@ -162,7 +176,7 @@ def main() -> int:
                 nlb=args.nlb,
                 n_iter=args.n_iter,
                 seed=args.seed,
-                warm_repeats=args.warm_repeats,
+                timed_repeats=args.timed_repeats,
             )
         except MemoryError as exc:
             meta["stopped"] = nside
@@ -170,19 +184,17 @@ def main() -> int:
             print(f"OOM at nside={nside}: {exc}", flush=True)
             break
 
-        runs_str = ", ".join(f"{t:.3f}" for t in row["runs_s"])
+        runs_str = ", ".join(f"{t:.3f}" for t in row["timed_s"])
         print(
-            f"nside={nside} lmax={row['lmax']} runs=[{runs_str}] "
-            f"cold={row['cold_s']:.3f}s warm={row['warm_s']:.3f}s",
+            f"nside={nside} lmax={row['lmax']} timed=[{runs_str}] warm={row['warm_s']:.3f}s",
             flush=True,
         )
         rows.append(row)
 
-        warm_min = row["warm_s"] / 60.0
-        if warm_min > args.max_warm_minutes:
+        if row["warm_s"] / 60.0 > args.max_warm_minutes:
             meta["stopped"] = nside
             meta["stop_reason"] = (
-                f"warm run {row['warm_s']:.1f}s exceeds --max-warm-minutes={args.max_warm_minutes}"
+                f"warm {row['warm_s']:.1f}s exceeds --max-warm-minutes={args.max_warm_minutes}"
             )
             print(meta["stop_reason"], flush=True)
             break
