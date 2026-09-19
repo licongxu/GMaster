@@ -50,6 +50,7 @@ from jax.scipy.special import gammaln
 from s2fft.sampling import s2_samples
 
 from gmaster import _march_v2
+from gmaster._cuda_gpu import on_cuda_gpu
 
 SPIN = 2
 NC = 4                       # direct re/im, mirror re/im -- the same split as `_rhs_forward`
@@ -71,8 +72,8 @@ _CALLS: dict = {}
 
 
 def _on_nvidia() -> bool:
-    return any(d.platform == "gpu" and "NVIDIA" in d.device_kind.upper()
-               for d in jax.devices())
+    """True on a CUDA GPU. Colab reports ``Tesla T4`` without ``NVIDIA``."""
+    return on_cuda_gpu()
 
 
 def slice_declined(L, nside) -> bool:

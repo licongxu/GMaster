@@ -14,6 +14,7 @@ from s2fft.recursions import turok_jax
 from s2fft.transforms import _ftm_flm_primitive
 from s2fft.utils import healpix_ffts, quadrature_jax
 
+from ._cuda_gpu import on_cuda_gpu as _on_cuda_gpu
 from ._sht_pallas import (
     scalar_forward_latitudinal,
     scalar_inverse_latitudinal,
@@ -879,10 +880,7 @@ def _use_pallas_sht(L, spin):
     # kernels adopt a renormalized sideways recursion (Turok-Bucher class).
     if spin != 0:
         return False
-    return any(
-        device.platform == "gpu" and "NVIDIA" in device.device_kind.upper()
-        for device in jax.devices()
-    )
+    return _on_cuda_gpu()
 
 
 def _pallas_block_size(nside):
@@ -905,6 +903,11 @@ def _pallas_block_size(nside):
 # `AttributeError: 'block_until_ready' is not available on traced array
 # float32[160, 64, 512]` (`.qwen/tmp/s24_256_0.log`).
 _PALLAS_TRACED_MAX_L = 768
+# Tracing n_iter at L=3072 (Nside 1024) compiled for ~20 min on a Colab T4 and
+# the warmed field was still minutes; the already-jitted per-transform march
+# programs are the T4 route.  768 is Nside 256, where one program over the
+# refinement loop was measured 9.4 % faster.
+_MARCH_TRACED_MAX_L = int(os.environ.get("GMASTER_MARCH_TRACED_MAX_L", "768"))
 
 
 def _trace_route_ready(nside, L_work):
@@ -917,12 +920,10 @@ def _trace_route_ready(nside, L_work):
     is therefore built here, at top level, before the route is chosen -- so a
     program never carries a table build, which XLA would then re-run on every call.
     """
+    if not _prefer_theta_band(nside, L_work, 0):
+        return L_work <= _MARCH_TRACED_MAX_L
     if L_work > _PALLAS_TRACED_MAX_L:
         return False
-    if not _prefer_theta_band(nside, L_work, 0):
-        # No band is in this program's future (too big, an m-split, or the folded
-        # march serves it), so there is nothing to hoist and tracing is safe.
-        return True
     from . import _theta_matrix
 
     return _theta_matrix.warm(nside, L_work)

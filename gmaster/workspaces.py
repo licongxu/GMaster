@@ -11,6 +11,7 @@ from scipy.special import roots_legendre
 
 from .bins import NmtBin, NmtBinFlat
 from . import utils
+from . import _coupling_tt_cuda
 from .utils import alm2map, map2alm
 
 # Operand precision of the coupling-matrix builders.  The polarised quadrature is two
@@ -203,18 +204,113 @@ def _assemble_mcm(dtype, blocks, *, lmax, ncls, slots, signs):
     return _RowPieces(rows)
 
 
-@partial(jax.jit, static_argnames="lmax")
+# Below this lmax the threej recurrence is cheap and the workspace tests pin it
+# to 2e-14.  At T4-sized maps the recurrence (CUDA or XLA scan) is ~n^3/3 serial
+# offset work and stayed at ~390 s warmed; Gauss-Legendre d^l_00 is P_l(x) and
+# the same GEMM the polarised path already uses.
+_TT_QUADRATURE_LMAX = int(os.environ.get("GMASTER_TT_QUADRATURE_LMAX", "48"))
+
+
 def _coupling_matrix_tt(window_cls, *, lmax):
+    """Scalar MASTER matrix: threej recurrence at small lmax, quadrature above."""
+    lmax = int(lmax)
+    if lmax >= _TT_QUADRATURE_LMAX:
+        return _coupling_matrix_tt_quadrature(window_cls, lmax=lmax)
+    return _coupling_matrix_tt_recurrence(window_cls, lmax=lmax)
+
+
+@partial(jax.jit, static_argnames="lmax")
+def _legendre_p(x, *, lmax):
+    """``P_l(x)`` for ``l = 0 .. lmax``, shape ``(x.size, lmax + 1)``.
+
+    ``d^l_{00}(arccos x) = P_l(x)``, so this is the m = n = 0 Wigner-d table
+    without the general recurrence's 3071-step scan over a heavy body.
+    """
+    p0 = jnp.ones_like(x)
+    if lmax == 0:
+        return p0[:, None]
+    p1 = jnp.asarray(x, dtype=x.dtype)
+    if lmax == 1:
+        return jnp.stack([p0, p1], axis=1)
+
+    def body(carry, ell):
+        prev, curr = carry
+        order = ell.astype(x.dtype)
+        following = ((2.0 * order - 1.0) * x * curr - (order - 1.0) * prev) / order
+        return (curr, following), following
+
+    _, rest = jax.lax.scan(body, (p0, p1), jnp.arange(2, lmax + 1))
+    return jnp.concatenate([p0[:, None], p1[:, None], rest.T], axis=1)
+
+
+@partial(jax.jit, static_argnames=("lmax", "lmax_mask"))
+def _tt_quadrature_kernel(window_cls, nodes, weights, *, lmax, lmax_mask):
+    """Even-parity MASTER TT matrix from Gauss-Legendre nodes (fp64 GEMM)."""
+    table = _legendre_p(nodes, lmax=lmax_mask)
+    mask_ell = jnp.arange(lmax_mask + 1, dtype=window_cls.dtype)
+    coefficients = (2 * mask_ell + 1) * window_cls[: lmax_mask + 1] / (4 * jnp.pi)
+    column_factor = 2 * jnp.arange(lmax + 1, dtype=window_cls.dtype) + 1
+    first = table[:, : lmax + 1]
+    weights = weights.astype(window_cls.dtype)
+    first_t = first.T
+
+    def integrate(correlation):
+        left = first_t * (weights * correlation)
+        return (
+            jnp.matmul(left, first, precision=jax.lax.Precision.HIGHEST)
+            * column_factor[None]
+            / 2
+        )
+
+    total = integrate(table @ coefficients)
+    mask_sign = jnp.where(mask_ell % 2, -1, 1).astype(window_cls.dtype)
+    signed = integrate(table @ (coefficients * mask_sign))
+    multipoles = jnp.arange(lmax + 1)
+    pair_sign = jnp.where((multipoles[:, None] + multipoles[None]) % 2, -1, 1)
+    signed = signed * pair_sign.astype(window_cls.dtype)
+    return (total + signed) / 2
+
+
+def _coupling_matrix_tt_quadrature(window_cls, *, lmax):
+    """Gauss-Legendre TT matrix; matches the threej recurrence to ~1e-11 at lmax 31."""
+    lmax = int(lmax)
+    lmax_mask = 2 * lmax
+    order = (2 * lmax + lmax_mask) // 2 + 1
+    nodes, weights = _gauss_legendre(order)
+    window = jnp.asarray(window_cls, dtype=jnp.float64)
+    window = jnp.pad(window, (0, max(0, lmax_mask + 1 - int(window.shape[0]))))
+    window = window[: lmax_mask + 1]
+    return _tt_quadrature_kernel(
+        window,
+        jnp.asarray(nodes, dtype=jnp.float64),
+        jnp.asarray(weights, dtype=jnp.float64),
+        lmax=lmax,
+        lmax_mask=lmax_mask,
+    )
+
+
+@partial(jax.jit, static_argnames="lmax")
+def _coupling_matrix_tt_recurrence(window_cls, *, lmax):
     """Exact scalar MASTER matrix using the threej_cosmo recurrence.
 
     Offsets are accumulated in blocks rather than one at a time.  A term with a
-    given offset vanishes unless ``offset <= min(l1, l2)``, so the block starting
-    at ``o0`` can only touch the sub-matrix ``[o0:, o0:]``: chunking visits
-    ~n^3/3 elements instead of n^3.  Measured 3.0-3.6x over the per-offset loop
-    at lmax 383/767/1535 (10.05 -> 3.23 ms at lmax 767), values agreeing to 1e-16.
+    given offset vanishes unless ``offset <= min(l1, l2)``, so a shrinking
+    ``[o0:, o0:]`` slice visits ~n^3/3 elements.  That form is a Python loop of
+    distinct shapes, which XLA unrolls into one kernel per chunk: at lmax 3071
+    that is 192 compiles, and on a Colab T4 with ~12 GB host RAM the unrolled
+    graph thrashes (first call ~30 min, warmed ~13 min vs NaMaster ~3 min).
+    The body keeps a uniform ``(chunk, n, n)`` shape and a ``fori_loop``, so one
+    compile serves every chunk.  Invalid lanes (offset past ``lmax``, or
+    ``offset > min(l1, l2)``) are masked; kept entries match the shrinking form.
+    On a GPU the float32 arm is the CUDA kernel in ``_cuda/coupling_tt.cu``:
+    one launch, no ``(chunk, n, n)`` temps (those were ~576 MiB at lmax 3071
+    and minutes on a Colab T4).  The scan remains the CPU / no-nvcc fallback.
 
-    The block body is five table lookups and a few elementwise ops over ~n^3/3
-    elements, so it has no `dot` to move onto tensor units; its cost is the
+    Chunking was 3.0-3.6x over the per-offset loop at lmax 383/767/1535
+    (10.05 -> 3.23 ms at lmax 767), values agreeing to 1e-16.
+
+    The block body is five table lookups and a few elementwise ops over the
+    chunk, so it has no `dot` to move onto tensor units; its cost is the
     elementwise pass itself, and the only lever on that is the operand width.
     Under :func:`set_coupling_precision` ("fp32") the lookup tables and the term
     are float32 while the log-cumsum table and the offset accumulator stay
@@ -233,9 +329,6 @@ def _coupling_matrix_tt(window_cls, *, lmax):
     table_dtype = jnp.float64 if use_f32 else window_cls.dtype
 
     n_ell = lmax + 1
-    multipoles = jnp.arange(n_ell)
-    row = multipoles[:, None]
-    column = multipoles[None, :]
     p = jnp.arange(1, 2 * lmax + 1, dtype=table_dtype)
     log_g = jnp.concatenate(
         [jnp.zeros(1, dtype=table_dtype), jnp.cumsum(jnp.log((p - 0.5) / p))]
@@ -244,6 +337,19 @@ def _coupling_matrix_tt(window_cls, *, lmax):
     mask_power = (
         window_cls * (2 * jnp.arange(2 * lmax + 1) + 1) / (4 * jnp.pi)
     ).astype(element_dtype)
+
+    if use_f32 and _coupling_tt_cuda.enabled():
+        return _coupling_tt_cuda.coupling_tt(
+            mask_power.astype(jnp.float32),
+            g.astype(jnp.float32),
+            lmax=lmax,
+        )
+
+    n_chunks = (n_ell + _OFFSET_CHUNK - 1) // _OFFSET_CHUNK
+    last_offset = n_ell - 1
+    multipoles = jnp.arange(n_ell)
+    row = multipoles[:, None]
+    column = multipoles[None, :]
 
     # The summand is symmetric in `(l1, l2)` and depends on them only through `min`, `max` and the
     # difference, so an upper-triangle-only form exists in which three of the four per-element
@@ -255,22 +361,30 @@ def _coupling_matrix_tt(window_cls, *, lmax):
     # discarded half is still inside the rectangle XLA evaluates.
     lower = jnp.minimum(row, column)
     upper = jnp.maximum(row, column)
-    matrix = jnp.zeros((n_ell, n_ell), dtype=accumulator_dtype)
-    for o0 in range(0, n_ell, _OFFSET_CHUNK):
-        offs = jnp.arange(o0, min(o0 + _OFFSET_CHUNK, n_ell))[:, None, None]
-        low = lower[o0:, o0:]
-        up = upper[o0:, o0:]
-        p_total = up + offs
+    lane = jnp.arange(_OFFSET_CHUNK)[:, None, None]
+
+    def add_chunk(matrix, chunk):
+        # Pad the last chunk to width 16 so every iteration has the same gather
+        # shape; indices past lmax are clamped for the lookup and then masked.
+        offs = chunk * _OFFSET_CHUNK + lane
+        in_range = offs <= last_offset
+        offs_g = jnp.minimum(offs, last_offset)
+        p_total = upper + offs_g
         term = (
-            mask_power[jnp.minimum(up - low + 2 * offs, 2 * lmax)]
-            * g[up - low + offs]
-            * g[offs]
-            * g[jnp.maximum(low - offs, 0)]
+            mask_power[jnp.minimum(upper - lower + 2 * offs_g, 2 * lmax)]
+            * g[upper - lower + offs_g]
+            * g[offs_g]
+            * g[jnp.maximum(lower - offs_g, 0)]
             / (g[p_total] * (2 * p_total + 1))
         )
-        matrix = matrix.at[o0:, o0:].add(
-            jnp.sum(jnp.where(offs <= low, term, 0), axis=0)
-        )
+        contrib = jnp.sum(jnp.where(in_range & (offs <= lower), term, 0), axis=0)
+        return matrix + contrib, None
+
+    matrix, _ = jax.lax.scan(
+        add_chunk,
+        jnp.zeros((n_ell, n_ell), dtype=accumulator_dtype),
+        jnp.arange(n_chunks),
+    )
     return matrix * (2 * column + 1)
 
 
