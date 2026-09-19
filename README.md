@@ -14,21 +14,23 @@ pip install -e .
 export JAX_ENABLE_X64=1
 ```
 
-## Run it yourself on Colab
+## Run it yourself on Colab or Kaggle
 
-[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/licongxu/GMaster/blob/cursor/t4-coupling-jit-1a91/examples/gmaster_colab_demo.ipynb)
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/licongxu/GMaster/blob/cursor/kaggle-demo-1a91/examples/gmaster_colab_demo.ipynb)
+[![Open in Kaggle](https://kaggle.com/static/images/open-in-kaggle.svg)](https://kaggle.com/kernels/welcome?src=https://github.com/licongxu/GMaster/blob/cursor/kaggle-demo-1a91/examples/gmaster_colab_demo.ipynb)
 
-`examples/gmaster_colab_demo.ipynb` installs GMaster and `pymaster` in a Colab GPU
-runtime and runs the same MASTER estimator (`NmtField(n_iter=3)`, coupling matrix,
-coupled cell, decouple; same `lmax`, bins and mask) through both codes on a map made
-in the session, then prints wall-clock, peak host and device memory, and
+`examples/gmaster_colab_demo.ipynb` installs GMaster and `pymaster` in a Colab or
+Kaggle GPU runtime and runs the same MASTER estimator (`NmtField(n_iter=3)`, coupling
+matrix, coupled cell, decouple; same `lmax`, bins and mask) through both codes on a
+map made in the session, then prints wall-clock, peak host and device memory, and
 `C_ell^GM / C_ell^NM - 1` side by side. Form fields choose `NSIDE` (512-4096), spin
 0 or 2, the mask, and a synthetic CAMB + noise map or your own HEALPix FITS. The free
-T4 (15 GB, 2 vCPU) runs `NSIDE = 1024` in a few minutes and holds 2048; L4 / A100
-take 4096. The notebook times a warmed GMaster pass against NaMaster on the same
-map. The ~9× figures are the shipped nside-4096 overlays on a workstation GPU
-against 192 CPU cores, not a free T4. GMaster's v2 CUDA march is built with
-`nvcc` on first use; the notebook reports if it is unavailable (TPU or CPU
+Colab T4 (15 GB, 2 vCPU) and Kaggle GPU T4 x2 / P100 run `NSIDE = 1024` in a few
+minutes and hold 2048; L4 / A100 take 4096. On Kaggle turn **Internet on** and pick a
+GPU accelerator before Run All. The notebook times a warmed GMaster pass against
+NaMaster on the same map. The ~9× figures are the shipped nside-4096 overlays on a
+workstation GPU against 192 CPU cores, not a free T4. GMaster's v2 CUDA march is
+built with `nvcc` on first use; the notebook reports if it is unavailable (TPU or CPU
 runtimes) instead of timing a fallback.
 
 ## Examples
