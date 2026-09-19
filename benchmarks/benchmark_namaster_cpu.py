@@ -191,6 +191,11 @@ def main() -> int:
         )
         rows.append(row)
 
+        out_path = args.out
+        os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+        with open(out_path, "w") as fh:
+            fh.write(_markdown_table(rows, meta) + "\n")
+
         if row["warm_s"] / 60.0 > args.max_warm_minutes:
             meta["stopped"] = nside
             meta["stop_reason"] = (
@@ -201,12 +206,7 @@ def main() -> int:
 
     table = _markdown_table(rows, meta)
     print("\n" + table, flush=True)
-
-    out_path = args.out
-    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
-    with open(out_path, "w") as fh:
-        fh.write(table + "\n")
-    print(f"\nWrote {out_path}", flush=True)
+    print(f"\nWrote {args.out}", flush=True)
     return 0
 
 
