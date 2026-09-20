@@ -1,6 +1,10 @@
+import os
+import subprocess
+
 import jax
 import numpy as np
 import pytest
+from numpy.polynomial.legendre import legvander
 
 jax.config.update("jax_enable_x64", True)
 
@@ -10,9 +14,11 @@ from gmaster.workspaces import (
     _apply_toeplitz,
     _binning_operators,
     _coupling_matrix_tt,
+    _coupling_matrix_tt_recurrence,
     _coupling_matrix_tt_toeplitz,
     _expanded_binning_operators,
     _left_contract,
+    _legendre_p,
     _RowPieces,
 )
 
@@ -104,6 +110,166 @@ def test_selective_scalar_toeplitz_matches_full_kernel():
     ) * columns[None]
     got = _coupling_matrix_tt_toeplitz(window, lmax=lmax, **options)
     np.testing.assert_allclose(got, expected, atol=2e-14)
+
+
+def _shrinking_offset_tt(window_cls, lmax):
+    """Per-offset threej recurrence the chunked kernel must match."""
+    n_ell = lmax + 1
+    p = np.arange(1, 2 * lmax + 1, dtype=np.float64)
+    log_g = np.concatenate([[0.0], np.cumsum(np.log((p - 0.5) / p))])
+    g = np.exp(log_g)
+    mask_power = window_cls * (2 * np.arange(2 * lmax + 1) + 1) / (4 * np.pi)
+    row = np.arange(n_ell)[:, None]
+    column = np.arange(n_ell)[None, :]
+    lower = np.minimum(row, column)
+    upper = np.maximum(row, column)
+    matrix = np.zeros((n_ell, n_ell), dtype=np.float64)
+    for offset in range(n_ell):
+        p_total = upper + offset
+        term = (
+            mask_power[np.minimum(upper - lower + 2 * offset, 2 * lmax)]
+            * g[upper - lower + offset]
+            * g[offset]
+            * g[np.maximum(lower - offset, 0)]
+            / (g[p_total] * (2 * p_total + 1))
+        )
+        matrix += np.where(offset <= lower, term, 0)
+    return matrix * (2 * column + 1)
+
+
+@pytest.mark.parametrize("lmax", [15, 16, 17, 31])
+def test_scalar_coupling_matches_per_offset_recurrence(lmax):
+    window = np.random.default_rng(20 + lmax).uniform(size=2 * lmax + 1)
+    nmt.set_coupling_precision("fp64")
+    jax.clear_caches()
+    try:
+        got = np.asarray(_coupling_matrix_tt(window, lmax=lmax))
+        np.testing.assert_allclose(got, _shrinking_offset_tt(window, lmax), atol=2e-14)
+    finally:
+        nmt.set_coupling_precision("auto")
+        jax.clear_caches()
+
+
+def _triangle_cuda_indexing(window_cls, lmax, *, use_f32):
+    """Host replica of ``gmaster/_cuda/coupling_tt.cu`` (upper triangle, f32 products)."""
+    n_ell = lmax + 1
+    table_dtype = np.float64
+    element_dtype = np.float32 if use_f32 else np.float64
+    p = np.arange(1, 2 * lmax + 1, dtype=table_dtype)
+    log_g = np.concatenate([[0.0], np.cumsum(np.log((p - 0.5) / p))])
+    g = np.exp(log_g).astype(element_dtype)
+    mask_power = (
+        window_cls * (2 * np.arange(2 * lmax + 1) + 1) / (4 * np.pi)
+    ).astype(element_dtype)
+    matrix = np.zeros((n_ell, n_ell), dtype=np.float64)
+    for l1 in range(n_ell):
+        for l2 in range(l1, n_ell):
+            acc = 0.0
+            for offs in range(l1 + 1):
+                p_total = l2 + offs
+                d = l2 - l1
+                num = (
+                    mask_power[min(d + 2 * offs, 2 * lmax)]
+                    * g[d + offs]
+                    * g[offs]
+                    * g[l1 - offs]
+                )
+                den = g[p_total] * (2 * p_total + 1)
+                acc += np.float64(num / den)
+            matrix[l1, l2] = acc * (2 * l2 + 1)
+            if l2 != l1:
+                matrix[l2, l1] = acc * (2 * l1 + 1)
+    return matrix
+
+
+def test_cuda_triangle_indexing_matches_per_offset_recurrence():
+    lmax = 24
+    window = np.random.default_rng(23).uniform(size=2 * lmax + 1)
+    expected = _shrinking_offset_tt(window, lmax)
+    got64 = _triangle_cuda_indexing(window, lmax, use_f32=False)
+    np.testing.assert_allclose(got64, expected, atol=2e-14)
+    got32 = _triangle_cuda_indexing(window, lmax, use_f32=True)
+    scale = float(np.max(np.abs(expected)))
+    assert float(np.max(np.abs(got32 - expected))) / scale < 1e-5
+
+
+def test_coupling_tt_cuda_source_compiles_with_nvcc():
+    import shutil
+    from pathlib import Path
+
+    nvcc = os.environ.get("GMASTER_NVCC") or (
+        "/usr/local/cuda/bin/nvcc" if os.path.exists("/usr/local/cuda/bin/nvcc")
+        else shutil.which("nvcc")
+    )
+    if not nvcc:
+        pytest.skip("nvcc not available")
+    src = Path(__file__).resolve().parents[1] / "gmaster" / "_cuda" / "coupling_tt.cu"
+    inc = jax.ffi.include_dir()
+    out = Path(os.environ.get("TEST_TMPDIR", "/tmp")) / f"gm_coupling_tt_{os.getpid()}.o"
+    cmd = [
+        nvcc, "-O3", "-std=c++17", "-c", "-Xcompiler", "-fPIC",
+        "-arch=sm_75", "-diag-suppress", "940,2473",
+        "-I", inc, "-o", str(out), str(src),
+    ]
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+    assert proc.returncode == 0, proc.stderr[-4000:]
+    assert out.exists() and out.stat().st_size > 0
+    out.unlink(missing_ok=True)
+
+
+def test_scalar_coupling_jaxpr_does_not_grow_with_lmax():
+    """A Python chunk loop unrolls with n_ell; the scan HLO must not."""
+
+    def lowered(lmax):
+        window = jax.numpy.ones(2 * lmax + 1)
+        return _coupling_matrix_tt_recurrence.lower(window, lmax=lmax).as_text()
+
+    small = lowered(47)
+    large = lowered(95)
+    assert ("while" in large) or ("scan" in large.lower())
+    assert len(large) < 1.4 * len(small), (len(small), len(large))
+
+
+def test_legendre_p_matches_numpy():
+    x = np.linspace(-1.0, 1.0, 17)
+    lmax = 8
+    got = np.asarray(_legendre_p(jax.numpy.asarray(x), lmax=lmax))
+    np.testing.assert_allclose(got, legvander(x, lmax), atol=1e-12, rtol=1e-12)
+
+
+def test_scalar_quadrature_tt_matches_recurrence():
+    lmax = 31
+    window = np.random.default_rng(22).uniform(size=2 * lmax + 1)
+    nmt.set_coupling_precision("fp64")
+    jax.clear_caches()
+    try:
+        rec = np.asarray(_coupling_matrix_tt_recurrence(window, lmax=lmax))
+        quad = np.asarray(
+            ws._general_coupling_matrix(
+                window, s1=0, s2=0, n1=0, n2=0, lmax=lmax, lmax_mask=2 * lmax
+            )[0]
+        )
+        np.testing.assert_allclose(quad, rec, atol=1e-11, rtol=1e-11)
+        dispatched = np.asarray(_coupling_matrix_tt(window, lmax=lmax))
+        np.testing.assert_allclose(dispatched, rec, atol=2e-14)
+    finally:
+        nmt.set_coupling_precision("auto")
+        jax.clear_caches()
+
+
+def test_dispatched_quadrature_tt_matches_recurrence():
+    """lmax >= 48 takes the Legendre GEMM; it must still match threej."""
+    lmax = 63
+    window = np.random.default_rng(24).uniform(size=2 * lmax + 1)
+    nmt.set_coupling_precision("fp64")
+    jax.clear_caches()
+    try:
+        rec = np.asarray(_coupling_matrix_tt_recurrence(window, lmax=lmax))
+        got = np.asarray(_coupling_matrix_tt(window, lmax=lmax))
+        np.testing.assert_allclose(got, rec, atol=1e-10, rtol=1e-10)
+    finally:
+        nmt.set_coupling_precision("auto")
+        jax.clear_caches()
 
 
 def test_uncorrelated_noise_deprojection_bias_matches_namaster():

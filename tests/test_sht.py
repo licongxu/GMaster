@@ -11,12 +11,10 @@ jax.config.update("jax_enable_x64", True)
 
 import gmaster as nmt
 from gmaster import _theta_matrix, utils
+from gmaster._cuda_gpu import on_cuda_gpu
 
 
-_HAS_NVIDIA_GPU = any(
-    device.platform == "gpu" and "NVIDIA" in device.device_kind.upper()
-    for device in jax.devices()
-)
+_HAS_NVIDIA_GPU = on_cuda_gpu()
 
 
 def _random_alms(rng, nmaps, ainfo, spin):
