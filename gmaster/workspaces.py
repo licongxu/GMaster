@@ -219,56 +219,52 @@ def _coupling_matrix_tt(window_cls, *, lmax):
     return _coupling_matrix_tt_recurrence(window_cls, lmax=lmax)
 
 
-@partial(jax.jit, static_argnames="lmax")
-def _legendre_p(x, *, lmax):
-    """``P_l(x)`` for ``l = 0 .. lmax``, shape ``(x.size, lmax + 1)``.
-
-    ``d^l_{00}(arccos x) = P_l(x)``, so this is the m = n = 0 Wigner-d table
-    without the general recurrence's 3071-step scan over a heavy body.
-    """
-    p0 = jnp.ones_like(x)
-    if lmax == 0:
-        return p0[:, None]
-    p1 = jnp.asarray(x, dtype=x.dtype)
-    if lmax == 1:
-        return jnp.stack([p0, p1], axis=1)
-
-    def body(carry, ell):
-        prev, curr = carry
-        order = ell.astype(x.dtype)
-        following = ((2.0 * order - 1.0) * x * curr - (order - 1.0) * prev) / order
-        return (curr, following), following
-
-    _, rest = jax.lax.scan(body, (p0, p1), jnp.arange(2, lmax + 1))
-    return jnp.concatenate([p0[:, None], p1[:, None], rest.T], axis=1)
-
-
 @partial(jax.jit, static_argnames=("lmax", "lmax_mask"))
-def _tt_quadrature_kernel(window_cls, nodes, weights, *, lmax, lmax_mask):
-    """Even-parity MASTER TT matrix from Gauss-Legendre nodes (fp64 GEMM)."""
-    table = _legendre_p(nodes, lmax=lmax_mask)
-    mask_ell = jnp.arange(lmax_mask + 1, dtype=window_cls.dtype)
+def _tt_quadrature_kernel(window_cls, weights, table, *, lmax, lmax_mask):
+    """MASTER TT matrix from the ``x >= 0`` half of the Gauss-Legendre nodes.
+
+    ``table`` holds ``P_l(x_i)``, ``l <= lmax_mask``, on the non-negative nodes.  Since
+    ``P_l(-x) = (-1)^l P_l(x)`` and the nodes are symmetric, the full-node sum
+    ``sum_i w_i P_l1 P_l2 C(x_i)`` equals ``sum_{x_i >= 0} w_i P_l1 P_l2 [C(x_i) + (-1)^(l1+l2) C(-x_i)]``
+    (the caller halves the ``x = 0`` weight), so even ``l1 + l2`` pairs contract against
+    ``C+ = C(x) + C(-x)`` and odd pairs against ``C-``, each over same-parity columns only:
+    three quarter-size GEMMs over half the nodes.  The previous form ran two full-node GEMMs
+    whose second (the ``(-1)^L``-signed window) is identical to the first for symmetric nodes.
+    Operand width follows :func:`set_coupling_precision`, like the polarised quadrature.
+    """
+    mask_ell = jnp.arange(lmax_mask + 1)
     coefficients = (2 * mask_ell + 1) * window_cls[: lmax_mask + 1] / (4 * jnp.pi)
-    column_factor = 2 * jnp.arange(lmax + 1, dtype=window_cls.dtype) + 1
+    mask_sign = jnp.where(mask_ell % 2, -1.0, 1.0)
+    north = table @ coefficients
+    south = table @ (coefficients * mask_sign)
+    plus = weights * (north + south)
+    minus = weights * (north - south)
     first = table[:, : lmax + 1]
-    weights = weights.astype(window_cls.dtype)
-    first_t = first.T
+    even, odd = first[:, 0::2], first[:, 1::2]
+    use_f32 = _coupling_f32(lmax)
 
-    def integrate(correlation):
-        left = first_t * (weights * correlation)
-        return (
-            jnp.matmul(left, first, precision=jax.lax.Precision.HIGHEST)
-            * column_factor[None]
-            / 2
-        )
+    def gram(left, weight, right):
+        left = (left * weight[:, None]).T
+        if use_f32:
+            # `HIGHEST` keeps the products off the tf32 units, as in the polarised quadrature.
+            return jnp.matmul(
+                left.astype(jnp.float32), right.astype(jnp.float32),
+                precision=jax.lax.Precision.HIGHEST,
+            ).astype(jnp.float64)
+        return jnp.matmul(left, right, precision=jax.lax.Precision.HIGHEST)
 
-    total = integrate(table @ coefficients)
-    mask_sign = jnp.where(mask_ell % 2, -1, 1).astype(window_cls.dtype)
-    signed = integrate(table @ (coefficients * mask_sign))
-    multipoles = jnp.arange(lmax + 1)
-    pair_sign = jnp.where((multipoles[:, None] + multipoles[None]) % 2, -1, 1)
-    signed = signed * pair_sign.astype(window_cls.dtype)
-    return (total + signed) / 2
+    even_even = gram(even, plus, even)
+    odd_odd = gram(odd, plus, odd)
+    even_odd = gram(even, minus, odd)
+    size = lmax + 1
+    matrix = (
+        jnp.zeros((size, size), dtype=window_cls.dtype)
+        .at[0::2, 0::2].set(even_even)
+        .at[1::2, 1::2].set(odd_odd)
+        .at[0::2, 1::2].set(even_odd)
+        .at[1::2, 0::2].set(even_odd.T)
+    )
+    return matrix * (2 * jnp.arange(size) + 1)[None] / 2
 
 
 def _coupling_matrix_tt_quadrature(window_cls, *, lmax):
@@ -277,13 +273,19 @@ def _coupling_matrix_tt_quadrature(window_cls, *, lmax):
     lmax_mask = 2 * lmax
     order = (2 * lmax + lmax_mask) // 2 + 1
     nodes, weights = _gauss_legendre(order)
+    half = order // 2                     # nodes ascend, so nodes[half:] are the x >= 0 half
+    nodes, weights = nodes[half:], np.array(weights[half:])
+    if order % 2:
+        weights[0] *= 0.5                 # x = 0 is its own mirror and is counted twice below
     window = jnp.asarray(window_cls, dtype=jnp.float64)
     window = jnp.pad(window, (0, max(0, lmax_mask + 1 - int(window.shape[0]))))
     window = window[: lmax_mask + 1]
+    # d^l_00 = P_l; the table is geometry only, so it shares the polarised tables' cache.
+    table = _wigner_d_shared(jnp.arccos(jnp.asarray(nodes)), 0, 0, lmax_mask)
     return _tt_quadrature_kernel(
         window,
-        jnp.asarray(nodes, dtype=jnp.float64),
         jnp.asarray(weights, dtype=jnp.float64),
+        table,
         lmax=lmax,
         lmax_mask=lmax_mask,
     )

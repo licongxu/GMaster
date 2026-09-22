@@ -4,7 +4,6 @@ import subprocess
 import jax
 import numpy as np
 import pytest
-from numpy.polynomial.legendre import legvander
 
 jax.config.update("jax_enable_x64", True)
 
@@ -18,7 +17,6 @@ from gmaster.workspaces import (
     _coupling_matrix_tt_toeplitz,
     _expanded_binning_operators,
     _left_contract,
-    _legendre_p,
     _RowPieces,
 )
 
@@ -228,13 +226,6 @@ def test_scalar_coupling_jaxpr_does_not_grow_with_lmax():
     large = lowered(95)
     assert ("while" in large) or ("scan" in large.lower())
     assert len(large) < 1.4 * len(small), (len(small), len(large))
-
-
-def test_legendre_p_matches_numpy():
-    x = np.linspace(-1.0, 1.0, 17)
-    lmax = 8
-    got = np.asarray(_legendre_p(jax.numpy.asarray(x), lmax=lmax))
-    np.testing.assert_allclose(got, legvander(x, lmax), atol=1e-12, rtol=1e-12)
 
 
 def test_scalar_quadrature_tt_matches_recurrence():
