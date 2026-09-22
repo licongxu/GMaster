@@ -624,12 +624,26 @@ def _forward_fold_pair_impl(positive_a, positive_b, weights, phase, garr, tabs, 
     return _fold_analyze([positive_a, positive_b], weights, phase, garr, tabs, L=L, nside=nside)
 
 
+def _dc(L):
+    """The sub-cubic divide-and-conquer engine (`_dc_lat`) when it serves this bandlimit."""
+    from . import _dc_lat
+
+    return _dc_lat if _dc_lat.enabled(L) else None
+
+
 def forward_latitudinal_positive(positive, weights, phase, *, L, nside):
+    dc = _dc(L)
+    if dc is not None:
+        return dc.forward_latitudinal_positive(positive, weights, phase, L=L, nside=nside)
     return _forward_fold_impl(positive, weights, phase, geo_arrays(L, nside, 0),
                               tables_for(L, nside, 0), L=L, nside=nside)
 
 
 def forward_latitudinal_positive_pair(positive_a, positive_b, weights, phase, *, L, nside):
+    dc = _dc(L)
+    if dc is not None:
+        return (dc.forward_latitudinal_positive(positive_a, weights, phase, L=L, nside=nside),
+                dc.forward_latitudinal_positive(positive_b, weights, phase, L=L, nside=nside))
     return _forward_fold_pair_impl(positive_a, positive_b, weights, phase,
                                    geo_arrays(L, nside, 0), tables_for(L, nside, 0),
                                    L=L, nside=nside)
@@ -690,12 +704,19 @@ def _fold_synthesise(positives, phase, garr, tabs, *, L, nside):
 
 
 def inverse_latitudinal_positive(positive, phase, *, L, nside):
+    dc = _dc(L)
+    if dc is not None:
+        return dc.inverse_latitudinal_positive(positive, phase, L=L, nside=nside)
     return _inverse_fold_impl(positive, phase, geo_arrays(L, nside, 0), tables_for(L, nside, 0),
                               L=L, nside=nside)
 
 
 def inverse_latitudinal_positive_pair(positive_a, positive_b, phase, *, L, nside):
     """Two folded scalar syntheses, one march (same contract as the single form, applied twice)."""
+    dc = _dc(L)
+    if dc is not None:
+        return (dc.inverse_latitudinal_positive(positive_a, phase, L=L, nside=nside),
+                dc.inverse_latitudinal_positive(positive_b, phase, L=L, nside=nside))
     return _inverse_fold_pair_impl(positive_a, positive_b, phase, geo_arrays(L, nside, 0),
                                    tables_for(L, nside, 0), L=L, nside=nside)
 

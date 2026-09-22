@@ -1346,3 +1346,39 @@ def test_ring_fold_residual_is_fft_of_ifft(nside):
         maps, utils._ring_analysis_tables(L, nside), L=L, nside=nside)) - np.asarray(Mf)
     folded = np.asarray(_march_v2.ring_fold_residual(F, Mf, nside=nside))
     assert np.max(np.abs(folded - explicit)) < 2e-6 * np.max(np.abs(explicit))
+
+
+@pytest.mark.march_v2
+@pytest.mark.skipif(not _HAS_NVIDIA_GPU, reason="requires an NVIDIA GPU")
+@pytest.mark.parametrize("nside", [32, 128])
+def test_dc_latitudinal_matches_march(nside):
+    """The sub-cubic divide-and-conquer engine has the folded march's contract and accuracy.
+
+    The router only hands it L >= 6144, so it is exercised here directly on small geometries:
+    both engines are float32-class, and their distance is that of the two against fp64.
+    """
+    from gmaster import _dc_lat, _march_v2
+    from gmaster.utils import _stable_thetas
+    from s2fft.utils import healpix_ffts, quadrature_jax
+
+    L = 3 * nside
+    if _dc_lat._build() is None or not _march_v2.fold_available():
+        pytest.skip("CUDA libraries unavailable")
+    rng = np.random.default_rng(nside)
+    nring = 4 * nside - 1
+    alm = np.tril(rng.normal(size=(L, L)) + 1j * rng.normal(size=(L, L)))
+    alm = jax.numpy.asarray(alm)
+    phase = healpix_ffts.p2phi_rings_jax(jax.numpy.arange(nring), nside)
+    weights = quadrature_jax.quad_weights_transform(L, "healpix", nside)
+    ring = jax.numpy.asarray(rng.normal(size=(nring, L)) + 1j * rng.normal(size=(nring, L)))
+    pairs = (
+        (_march_v2._inverse_fold_impl(alm, phase, _march_v2.geo_arrays(L, nside, 0),
+                                      _march_v2.tables_for(L, nside, 0), L=L, nside=nside),
+         _dc_lat.inverse_latitudinal_positive(alm, phase, L=L, nside=nside)),
+        (_march_v2._forward_fold_impl(ring, weights, -phase, _march_v2.geo_arrays(L, nside, 0),
+                                      _march_v2.tables_for(L, nside, 0), L=L, nside=nside),
+         _dc_lat.forward_latitudinal_positive(ring, weights, -phase, L=L, nside=nside)),
+    )
+    for march, dc in pairs:
+        march, dc = np.asarray(march), np.asarray(dc)
+        assert np.max(np.abs(dc - march)) < 2e-5 * np.max(np.abs(march))
