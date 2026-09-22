@@ -44,6 +44,11 @@ __device__ __forceinline__ float lam_minus_d(const float* dh, const float* dl, c
     return pole_diff(dh, dl, gp, org_of(j, tau), i) + tau;
 }
 __device__ __forceinline__ float rcp(float x) { return __fdividef(1.0f, x); }   // MUFU.RCP
+// Hot-loop reciprocal of a double-float pole difference, clamped: the <= 3 terms nearest each
+// target (origin pole and its neighbours) are then replaced by their exact values (tau, gap + tau)
+// after the loop, which cancels the loop's term to rounding; the clamp only bounds what a
+// near-coincident pair, or a root within 1e-17 of its pole, can inject into the running sum.
+__device__ __forceinline__ float rcp_c(float x) { return fminf(fmaxf(rcp(x), -1e17f), 1e17f); }
 __device__ __forceinline__ void fma2(float2& a, float f, float2 b) { a.x = fmaf(f, b.x, a.x); a.y = fmaf(f, b.y, a.y); }
 __device__ __forceinline__ float2 mul2(float f, float2 b) { return make_float2(f * b.x, f * b.y); }
 // Boxes are (centre c, radius r): c is any float inside the box and r bounds |(h - c) + l| over its
@@ -104,13 +109,19 @@ __global__ void merge_direct(
             const float tk = tau[k];
             const int o = org_of(k, tk);
             const float oh = dh[o], ol = dl[o];
-            const float gdn = o > 0 ? gp[o - 1] : 0.f, gup = -gp[o];
             for (int i = 0; i < nk; ++i) {
-                float dd = (oh - dh[i]) + (ol - dl[i]);
-                dd = i == o - 1 ? gdn : (i == o + 1 ? gup : dd);
-                const float inv = rcp(dd + tk);
+                const float inv = rcp_c(((oh - dh[i]) + (ol - dl[i])) + tk);
                 #pragma unroll
                 for (int r = 0; r < NR; ++r) fma2(acc[r], inv, q[i * NR + r]);
+            }
+            #pragma unroll
+            for (int e = -1; e <= 1; ++e) {                    // poles o-1, o, o+1: exact gap / 0
+                const int i = o + e;
+                if (i < 0 || i >= nk) continue;
+                const float ex = e < 0 ? gp[i] : (e > 0 ? -gp[o] : 0.f);
+                const float corr = rcp(ex + tk) - rcp_c(((oh - dh[i]) + (ol - dl[i])) + tk);
+                #pragma unroll
+                for (int r = 0; r < NR; ++r) fma2(acc[r], corr, q[i * NR + r]);
             }
             const float cc = -gc[nd.poff + k];
             const int dst = nd.base + gslot[nd.poff + k];
@@ -118,15 +129,21 @@ __global__ void merge_direct(
             for (int r = 0; r < NR; ++r) w[dst * NR + r] = mul2(cc, acc[r]);
         } else {                       // target pole k, sources roots j
             const float kh = dh[k], kl = dl[k];
-            const float gk = gp[k], gkm = k > 0 ? gp[k - 1] : 0.f;
             for (int j = 0; j < nk; ++j) {
                 const float tj = tau[j];
                 const int o = org_of(j, tj);
-                float dd = (kh - dh[o]) + (kl - dl[o]);                 // d_k - d_o
-                dd = k == o - 1 ? -gk : (k == o + 1 ? gkm : dd);
-                const float inv = rcp(dd - tj);
+                const float inv = rcp_c((kh - dh[o]) + ((kl - dl[o]) - tj));
                 #pragma unroll
                 for (int r = 0; r < NR; ++r) fma2(acc[r], inv, q[j * NR + r]);
+            }
+            for (int j = max(k - 2, 0); j < min(k + 2, nk); ++j) {   // roots whose origin is k-1, k, k+1
+                const float tj = tau[j];
+                const int o = org_of(j, tj);
+                if (o < k - 1 || o > k + 1) continue;
+                const float ex = o == k + 1 ? -gp[k] : (o == k - 1 ? gp[o] : 0.f);   // d_k - d_o
+                const float corr = rcp(ex - tj) - rcp_c((kh - dh[o]) + ((kl - dl[o]) - tj));
+                #pragma unroll
+                for (int r = 0; r < NR; ++r) fma2(acc[r], corr, q[j * NR + r]);
             }
             const float zz = gz[nd.poff + k];
             const int dst = nd.base + ggidx[nd.poff + k];
@@ -352,20 +369,41 @@ __global__ void merge_fmm(
         const int s0 = max(FL * (b - 1), 0), s1 = min(FL * (b + 2), nk);
         if (dir == 0) {
             const float tk = pt[k];
+            const int o = org_of(k, tk);
+            const float oh = pdh[o], ol = pdl[o];
             for (int s = s0; s < s1; ++s) {
-                const float inv = rcp(lam_minus_d(pdh, pdl, pgp, k, tk, s));
+                const float inv = rcp_c(((oh - pdh[s]) + (ol - pdl[s])) + tk);
                 #pragma unroll
                 for (int r = 0; r < NR; ++r) fma2(acc[r], inv, q[s * NR + r]);
+            }
+            #pragma unroll
+            for (int e = -1; e <= 1; ++e) {
+                const int i = o + e;
+                if (i < s0 || i >= s1) continue;
+                const float ex = e < 0 ? pgp[i] : (e > 0 ? -pgp[o] : 0.f);
+                const float corr = rcp(ex + tk) - rcp_c(((oh - pdh[i]) + (ol - pdl[i])) + tk);
+                #pragma unroll
+                for (int r = 0; r < NR; ++r) fma2(acc[r], corr, q[i * NR + r]);
             }
             const float cc = -gc[nd.poff + k];
             const int d = nd.base + gslot[nd.poff + k];
             #pragma unroll
             for (int r = 0; r < NR; ++r) w[d * NR + r] = mul2(cc, acc[r]);
         } else {
+            const float kh = pdh[k], kl = pdl[k];
             for (int s = s0; s < s1; ++s) {
-                const float inv = rcp(-lam_minus_d(pdh, pdl, pgp, s, pt[s], k));
+                const float ts = pt[s]; const int o = org_of(s, ts);
+                const float inv = rcp_c((kh - pdh[o]) + ((kl - pdl[o]) - ts));
                 #pragma unroll
                 for (int r = 0; r < NR; ++r) fma2(acc[r], inv, q[s * NR + r]);
+            }
+            for (int s = max(k - 2, s0); s < min(k + 2, s1); ++s) {
+                const float ts = pt[s]; const int o = org_of(s, ts);
+                if (o < k - 1 || o > k + 1) continue;
+                const float ex = o == k + 1 ? -pgp[k] : (o == k - 1 ? pgp[o] : 0.f);
+                const float corr = rcp(ex - ts) - rcp_c((kh - pdh[o]) + ((kl - pdl[o]) - ts));
+                #pragma unroll
+                for (int r = 0; r < NR; ++r) fma2(acc[r], corr, q[s * NR + r]);
             }
             const float zz = gz[nd.poff + k];
             const int d = nd.base + ggidx[nd.poff + k];
