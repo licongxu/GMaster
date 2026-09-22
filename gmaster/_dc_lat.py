@@ -10,7 +10,7 @@ ring ``y_r`` into
     f(y_r) = sum_k c_k phi_k(y_r) = E_{n-1} phi_n(y_r) sum_j V[n-1, j] (V^T c)_j / (y_r - y_j).
 
 ``V^T`` is applied through Cuppen's divide-and-conquer tree of ``T`` (Gu & Eisenstat's stable form):
-16 x 16 dense leaves, then one Cauchy-like rank-one-update merge per level, each a 1-D Cauchy sum
+16 x 16 leaves (eigenvectors rebuilt on the fly from stored eigenvalues), then one Cauchy-like rank-one-update merge per level, each a 1-D Cauchy sum
 ``sum_i q_i / (lam_j - d_i)`` done directly for small nodes and by a 1-D FMM for large ones; the
 final sum over ``j`` is another 1-D FMM from the Gauss nodes to the rings.  Every step costs
 ``O(n)`` or ``O(n log n)`` for an ``n``-term order, so a transform is ``O(L^2 log L)`` against the
@@ -47,10 +47,11 @@ _DIRECT_MAX = 256
 _DIRECT_THREADS = 128        # merge_direct's block size: a direct node carries <= this many deflations
 _CD_SKIP = 1e-9              # CD rings where |E phi_n| < skip * max are in the forbidden region
 _P = 12                      # FMM expansion order (dc_lat.cu)
-_FIELDS = ("leaf_off", "leaf_sz", "leaf_Q", "nodes", "sbase", "dh", "dl", "tau", "z", "c",
+_FL, _CDF = 32, 4            # merge FMM leaf size and CD leaf coarsening (dc_lat.cu defaults)
+_FIELDS = ("leaf_off", "leaf_sz", "leaf_mk", "leaf_lam", "nodes", "sbase", "dh", "dl", "gap", "tau", "z", "c",
            "gidx", "slot", "dsrc", "ddst", "cd_desc", "cd_ln", "cd_lr", "cd_nh", "cd_nl",
            "vlast", "scale", "ring_h", "ring_l")
-_DTYPES = dict(leaf_off=np.int32, leaf_sz=np.int32, nodes=np.int32, sbase=np.int32, cd_desc=np.int32,
+_DTYPES = dict(leaf_off=np.int32, leaf_sz=np.int32, leaf_mk=np.int32, nodes=np.int32, sbase=np.int32, cd_desc=np.int32,
                cd_ln=np.int32, cd_lr=np.int32, gidx=np.int16, slot=np.int16, dsrc=np.int16,
                ddst=np.int16, lev_kind=np.int32, lev_nnode=np.int32, lev_node0=np.int32,
                lev_maxk=np.int32, lev_sb0=np.int32)
@@ -168,13 +169,8 @@ class _Plan:
         self.R = 2 * nside
         self.nprob = 2 * L - 1
         self.ntot = int(h["vlast"].size)
+        self._layout(h)
         self.args = tuple(jnp.asarray(h[k]) for k in _FIELDS)
-        self.levels = np.stack([h["lev_kind"], h["lev_nnode"], h["lev_node0"], h["lev_maxk"],
-                                h["lev_sb0"]], axis=1).astype(np.int64).ravel()
-        # scratch element counts per right-hand side: FMM boxes, staged strengths, deflations, kept roots
-        self.sizes = (int(max(h["nbox"], h["cd_nbox"], 1)),
-                      int(max(h["tau"].size, self.ntot, self.nprob * self.R, 1)),
-                      max(int(h["dsrc"].size), 1), max(int(h["tau"].size), 1))
         # packing: problem t = 2 m + p holds ell = m + p + 2 k at offset off[t] + k
         n = np.array([len(range(m + p, L, 2)) for m in range(L) for p in (0, 1) if m + p < L])
         off = np.concatenate([[0], np.cumsum(n)])
@@ -195,12 +191,54 @@ class _Plan:
         # alm_CS = (-1)^m psi / sqrt(2 pi) on both sides of the transform
         self.fac = jnp.asarray(((-1.0) ** order / math.sqrt(2.0 * math.pi)).astype(np.float32))
 
+    def _layout(self, h):
+        """Level-local scratch layout, recomputed from the plan's node table.
+
+        The tree levels run one after another, so every per-level scratch (FMM boxes, staged
+        strengths, deflations, root positions) is sized for the largest single level and reused;
+        the CD step sizes its boxes for its own (coarsened) leaves.  ``h['sbase']`` and the CD
+        box offsets in ``h['cd_desc']`` are rewritten here.
+        """
+        defs = dict(d.split("=") for d in os.environ.get("GMASTER_DC_DEFS", "").split() if "=" in d)
+        fl, cdf = int(defs.get("FL", _FL)), int(defs.get("CDF", _CDF))
+        nodes = h["nodes"].reshape(-1, 8)
+        sbase = np.zeros_like(h["sbase"])
+        lev, nbox, nkept, ndefl = [], 1, 1, 1
+        for kind, nn, node0, maxk, sb0 in zip(h["lev_kind"], h["lev_nnode"], h["lev_node0"],
+                                              h["lev_maxk"], h["lev_sb0"]):
+            rec = nodes[node0:node0 + nn]
+            if kind == 1:
+                nb = np.array([_nbox(-(-int(k) // fl)) for k in rec[:, 1]], np.int64)
+                sbase[sb0:sb0 + nn] = np.concatenate([[0], np.cumsum(nb)[:-1]])
+                nbox = max(nbox, int(nb.sum()))
+            nkept = max(nkept, int(rec[:, 1].sum()))
+            ndefl = max(ndefl, int(rec[:, 2].sum()))
+            lev.append((int(kind), int(nn), int(node0), int(maxk), int(sb0), int(rec[0, 3]), int(rec[0, 4])))
+        h["sbase"] = sbase
+        cd = h["cd_desc"].reshape(-1, 8).copy()
+        nb = np.array([_nbox(-(-int(n) // cdf)) for n in cd[:, 3]], np.int64)
+        cd[:, 4] = np.concatenate([[0], np.cumsum(nb)[:-1]])
+        h["cd_desc"] = cd.ravel().astype(np.int32)
+        self.levels = np.asarray(lev, np.int64).ravel()
+        # scratch element counts per right-hand side: FMM boxes, staged strengths, deflations, kept roots
+        self.sizes = (max(nbox, int(nb.sum())), nkept, ndefl, nkept)
+
     def nbytes(self):
         return sum(int(a.size) * a.dtype.itemsize for a in self.args)
 
     def static(self):
         """Hashable description for the jitted wrappers (the arrays go in as arguments)."""
         return (self.nprob, self.R, self.ntot, tuple(int(v) for v in self.levels), self.sizes)
+
+
+def _nbox(nleaf):
+    """Boxes of a binary 1-D FMM tree over ``nleaf`` leaves (the kernels' own level loop)."""
+    total, size = 0, max(int(nleaf), 1)
+    while True:
+        total += size
+        if size <= 3:
+            return total
+        size = (size + 1) // 2
 
 
 def _scratch(static, nr):

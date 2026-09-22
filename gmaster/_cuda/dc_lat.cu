@@ -4,7 +4,7 @@
 // of y = cos^2 theta satisfy a symmetric three-term recurrence with Jacobi matrix T = V Y V^T.
 // Synthesis f(y_r) = sum_k c_k phi_k(y_r) is applied as (Christoffel-Darboux)
 //     f(y_r) = E_{n-1} phi_n(y_r) sum_j V[n-1, j] (V^T c)_j / (y_r - y_j),
-// with V^T applied by the Cuppen divide-and-conquer tree of T: dense 16 x 16 leaf blocks, then one
+// with V^T applied by the Cuppen divide-and-conquer tree of T: 16 x 16 leaf blocks (rebuilt on the fly), then one
 // Cauchy-like merge per level (direct below DIRECT_MAX kept poles, a 1-D FMM above), and the last
 // step a 1-D FMM from the Gauss nodes y_j to the rings.  Every step is O(n) or O(n log n) per
 // (m, p), so the transform is O(L^2 log L) instead of the march's O(L^2 N_ring).  Analysis is the
@@ -30,15 +30,33 @@ struct Node { int base, nk, nd, poff, doff, pad0, pad1, pad2; };
 
 __device__ __forceinline__ int org_of(int j, float tau) { return tau > 0.f ? j : j + 1; }
 
-// lam_j - d_i = ((d_o - d_i) + tau_j), o = org(j): exactly tau_j when i == o, with no branch.
-__device__ __forceinline__ float lam_minus_d(const float* dh, const float* dl, int j, float tau, int i) {
-    int o = org_of(j, tau);
-    return ((dh[o] - dh[i]) + (dl[o] - dl[i])) + tau;
+// d_o - d_i.  Adjacent poles use the stored gap: at the upper merge levels a pole of the left child
+// and one of the right can nearly coincide (gaps far below 1e-7 near y = 1 at small m), where the
+// double-float difference is only good to ~4e-15 absolute -- 8.8e-6 in the m = 0 analysis at
+// Nside 2048 (LAPACK removes such pairs by Givens deflation instead).
+__device__ __forceinline__ float pole_diff(const float* dh, const float* dl, const float* gp, int o, int i) {
+    if (i == o - 1) return gp[i];
+    if (i == o + 1) return -gp[o];
+    return (dh[o] - dh[i]) + (dl[o] - dl[i]);
+}
+// lam_j - d_i = (d_o - d_i) + tau_j, o = org(j): exactly tau_j when i == o.
+__device__ __forceinline__ float lam_minus_d(const float* dh, const float* dl, const float* gp, int j, float tau, int i) {
+    return pole_diff(dh, dl, gp, org_of(j, tau), i) + tau;
 }
 __device__ __forceinline__ float rcp(float x) { return __fdividef(1.0f, x); }   // MUFU.RCP
 __device__ __forceinline__ void fma2(float2& a, float f, float2 b) { a.x = fmaf(f, b.x, a.x); a.y = fmaf(f, b.y, a.y); }
 __device__ __forceinline__ float2 mul2(float f, float2 b) { return make_float2(f * b.x, f * b.y); }
-__device__ __forceinline__ float box_r(float lo, float hi) { return fmaxf(0.5f * (hi - lo), 1e-6f * fabsf(0.5f * (lo + hi)) + 1e-30f); }
+// Boxes are (centre c, radius r): c is any float inside the box and r bounds |(h - c) + l| over its
+// double-float points, measured exactly.  (A box measured from float high parts needed a radius floor,
+// 1e-6 |c|, that inflated the boxes where the Gauss nodes crowd towards y = 1 -- spacings ~1e-7 at
+// small m -- and cost the separation the index-based interaction lists rely on: 1.6e-4 at Nside 4096.)
+// s + c accumulates x with the rounding error of every addition carried in c (Knuth two-sum)
+__device__ __forceinline__ void two_sum_acc(float& s, float& c, float x) {
+    const float t = s + x, bp = t - s;
+    c += (s - (t - bp)) + (x - bp);
+    s = t;
+}
+__device__ __forceinline__ float up(float r) { return fmaxf(r * 1.0000010f, 1e-30f); }
 
 __constant__ float BIN[P * P] = {1.0f,1.0f,1.0f,1.0f,1.0f,1.0f,1.0f,1.0f,1.0f,1.0f,1.0f,1.0f,1.0f,2.0f,3.0f,4.0f,5.0f,6.0f,7.0f,8.0f,9.0f,10.0f,11.0f,12.0f,1.0f,3.0f,6.0f,10.0f,15.0f,21.0f,28.0f,36.0f,45.0f,55.0f,66.0f,78.0f,1.0f,4.0f,10.0f,20.0f,35.0f,56.0f,84.0f,120.0f,165.0f,220.0f,286.0f,364.0f,1.0f,5.0f,15.0f,35.0f,70.0f,126.0f,210.0f,330.0f,495.0f,715.0f,1001.0f,1365.0f,1.0f,6.0f,21.0f,56.0f,126.0f,252.0f,462.0f,792.0f,1287.0f,2002.0f,3003.0f,4368.0f,1.0f,7.0f,28.0f,84.0f,210.0f,462.0f,924.0f,1716.0f,3003.0f,5005.0f,8008.0f,12376.0f,1.0f,8.0f,36.0f,120.0f,330.0f,792.0f,1716.0f,3432.0f,6435.0f,11440.0f,19448.0f,31824.0f,1.0f,9.0f,45.0f,165.0f,495.0f,1287.0f,3003.0f,6435.0f,12870.0f,24310.0f,43758.0f,75582.0f,1.0f,10.0f,55.0f,220.0f,715.0f,2002.0f,5005.0f,11440.0f,24310.0f,48620.0f,92378.0f,167960.0f,1.0f,11.0f,66.0f,286.0f,1001.0f,3003.0f,8008.0f,19448.0f,43758.0f,92378.0f,184756.0f,352716.0f,1.0f,12.0f,78.0f,364.0f,1365.0f,4368.0f,12376.0f,31824.0f,75582.0f,167960.0f,352716.0f,705432.0f};      // BIN[j*P + k] = C(j+k, j)
 __constant__ float CKJ[P * P] = {1.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,1.0f,1.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,1.0f,2.0f,1.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,1.0f,3.0f,3.0f,1.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,1.0f,4.0f,6.0f,4.0f,1.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,1.0f,5.0f,10.0f,10.0f,5.0f,1.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,1.0f,6.0f,15.0f,20.0f,15.0f,6.0f,1.0f,0.0f,0.0f,0.0f,0.0f,0.0f,1.0f,7.0f,21.0f,35.0f,35.0f,21.0f,7.0f,1.0f,0.0f,0.0f,0.0f,0.0f,1.0f,8.0f,28.0f,56.0f,70.0f,56.0f,28.0f,8.0f,1.0f,0.0f,0.0f,0.0f,1.0f,9.0f,36.0f,84.0f,126.0f,126.0f,84.0f,36.0f,9.0f,1.0f,0.0f,0.0f,1.0f,10.0f,45.0f,120.0f,210.0f,252.0f,210.0f,120.0f,45.0f,10.0f,1.0f,0.0f,1.0f,11.0f,55.0f,165.0f,330.0f,462.0f,462.0f,330.0f,165.0f,55.0f,11.0f,1.0f};      // CKJ[k*P + j] = C(k, j)
@@ -49,8 +67,8 @@ __constant__ float CKJ[P * P] = {1.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.
 template <int NR>
 __global__ void merge_direct(
     const Node* __restrict__ nodes, int nnode, int dir,
-    const float* __restrict__ gdh, const float* __restrict__ gdl, const float* __restrict__ gtau,
-    const float* __restrict__ gz, const float* __restrict__ gc,
+    const float* __restrict__ gdh, const float* __restrict__ gdl, const float* __restrict__ ggap,
+    const float* __restrict__ gtau, const float* __restrict__ gz, const float* __restrict__ gc,
     const short* __restrict__ ggidx, const short* __restrict__ gslot,
     const short* __restrict__ gdsrc, const short* __restrict__ gddst,
     float2* __restrict__ w)
@@ -60,11 +78,11 @@ __global__ void merge_direct(
     if (nb >= nnode) return;
     Node nd = nodes[nb];
     const int nk = nd.nk;
-    float* dh = sm; float* dl = sm + nk; float* tau = sm + 2 * nk;
-    float2* q = reinterpret_cast<float2*>(sm + 3 * nk + (nk & 1));
+    float* dh = sm; float* dl = sm + nk; float* tau = sm + 2 * nk; float* gp = sm + 3 * nk;
+    float2* q = reinterpret_cast<float2*>(sm + 4 * nk + 2);
     const float* pdh = gdh + nd.poff; const float* pdl = gdl + nd.poff; const float* pt = gtau + nd.poff;
     for (int i = threadIdx.x; i < nk; i += blockDim.x) {
-        dh[i] = pdh[i]; dl[i] = pdl[i]; tau[i] = pt[i];
+        dh[i] = pdh[i]; dl[i] = pdl[i]; tau[i] = pt[i]; gp[i] = ggap[nd.poff + i];
         const int src = dir == 0 ? ggidx[nd.poff + i] : gslot[nd.poff + i];
         const float f = dir == 0 ? gz[nd.poff + i] : gc[nd.poff + i];
         #pragma unroll
@@ -86,8 +104,11 @@ __global__ void merge_direct(
             const float tk = tau[k];
             const int o = org_of(k, tk);
             const float oh = dh[o], ol = dl[o];
+            const float gdn = o > 0 ? gp[o - 1] : 0.f, gup = -gp[o];
             for (int i = 0; i < nk; ++i) {
-                const float inv = rcp(((oh - dh[i]) + (ol - dl[i])) + tk);
+                float dd = (oh - dh[i]) + (ol - dl[i]);
+                dd = i == o - 1 ? gdn : (i == o + 1 ? gup : dd);
+                const float inv = rcp(dd + tk);
                 #pragma unroll
                 for (int r = 0; r < NR; ++r) fma2(acc[r], inv, q[i * NR + r]);
             }
@@ -97,10 +118,13 @@ __global__ void merge_direct(
             for (int r = 0; r < NR; ++r) w[dst * NR + r] = mul2(cc, acc[r]);
         } else {                       // target pole k, sources roots j
             const float kh = dh[k], kl = dl[k];
+            const float gk = gp[k], gkm = k > 0 ? gp[k - 1] : 0.f;
             for (int j = 0; j < nk; ++j) {
                 const float tj = tau[j];
                 const int o = org_of(j, tj);
-                const float inv = rcp((kh - dh[o]) + ((kl - dl[o]) - tj));
+                float dd = (kh - dh[o]) + (kl - dl[o]);                 // d_k - d_o
+                dd = k == o - 1 ? -gk : (k == o + 1 ? gkm : dd);
+                const float inv = rcp(dd - tj);
                 #pragma unroll
                 for (int r = 0; r < NR; ++r) fma2(acc[r], inv, q[j * NR + r]);
             }
@@ -132,18 +156,19 @@ __device__ void fmm_passes_one(int nlev, const int* lof, int bo, float* __restri
         const int nbx = lof[l + 1] - lof[l], cb0 = lof[l - 1], pb0 = lof[l], nc = lof[l] - lof[l - 1];
         for (int b = tid; b < nbx; b += nth) {
             const int c1 = 2 * b, c2 = min(2 * b + 1, nc - 1);
-            const float lo = fminf(geo[2 * (bo + cb0 + c1)], geo[2 * (bo + cb0 + c2)]);
-            const float hi = fmaxf(geo[2 * (bo + cb0 + c1) + 1], geo[2 * (bo + cb0 + c2) + 1]);
+            const float ca = geo[2 * (bo + cb0 + c1)], ra = geo[2 * (bo + cb0 + c1) + 1];
+            const float cb = geo[2 * (bo + cb0 + c2)], rb = geo[2 * (bo + cb0 + c2) + 1];
+            const float c = 0.5f * (ca + cb);             // children are close: c - ca is exact
+            const float rp = up(fmaxf(fabsf(ca - c) + ra, fabsf(cb - c) + rb));
             const int g = bo + pb0 + b;
-            if (write_geo) { geo[2 * g] = lo; geo[2 * g + 1] = hi; }
-            const float c = 0.5f * (lo + hi), ir = 1.0f / box_r(lo, hi);
+            if (write_geo) { geo[2 * g] = c; geo[2 * g + 1] = rp; }
+            const float ir = 1.0f / rp;
             float2 Mp[P];
             #pragma unroll
             for (int k = 0; k < P; ++k) Mp[k] = make_float2(0.f, 0.f);
             for (int ch = c1; ch <= c2; ++ch) {
                 const int gc_ = bo + cb0 + ch;
-                const float clo = geo[2 * gc_], chi = geo[2 * gc_ + 1];
-                const float al = box_r(clo, chi) * ir, be = (0.5f * (clo + chi) - c) * ir;
+                const float al = geo[2 * gc_ + 1] * ir, be = (geo[2 * gc_] - c) * ir;
                 float2 A[P]; float bp[P];
                 float ap = 1.f; bp[0] = 1.f;
                 #pragma unroll
@@ -163,8 +188,7 @@ __device__ void fmm_passes_one(int nlev, const int* lof, int bo, float* __restri
         const int nbx = lof[l + 1] - lof[l], b0 = lof[l];
         for (int b = tid; b < nbx; b += nth) {
             const int g = bo + b0 + b;
-            const float lo = geo[2 * g], hi = geo[2 * g + 1];
-            const float C = 0.5f * (lo + hi), R = box_r(lo, hi);
+            const float C = geo[2 * g], R = geo[2 * g + 1];
             float2 La[P];
             #pragma unroll
             for (int j = 0; j < P; ++j) La[j] = make_float2(0.f, 0.f);
@@ -173,8 +197,7 @@ __device__ void fmm_passes_one(int nlev, const int* lof, int bo, float* __restri
             for (int cand = max(c0, 0); cand <= min(c1, nbx - 1); ++cand) {
                 if (cand >= b - 1 && cand <= b + 1) continue;
                 const int gs = bo + b0 + cand;
-                const float slo = geo[2 * gs], shi = geo[2 * gs + 1];
-                const float iD = 1.0f / (C - 0.5f * (slo + shi)), a = box_r(slo, shi) * iD, bb = -R * iD;
+                const float iD = 1.0f / (C - geo[2 * gs]), a = geo[2 * gs + 1] * iD, bb = -R * iD;
                 float2 A[P];
                 float ak = 1.f;
                 #pragma unroll
@@ -199,10 +222,8 @@ __device__ void fmm_passes_one(int nlev, const int* lof, int bo, float* __restri
         const int nbx = lof[l + 1] - lof[l], b0 = lof[l], pb0 = lof[l + 1];
         for (int b = tid; b < nbx; b += nth) {
             const int g = bo + b0 + b, gp = bo + pb0 + (b >> 1);
-            const float lo = geo[2 * g], hi = geo[2 * g + 1];
-            const float plo = geo[2 * gp], phi = geo[2 * gp + 1];
-            const float iR = 1.0f / box_r(plo, phi);
-            const float al = box_r(lo, hi) * iR, be = (0.5f * (lo + hi) - 0.5f * (plo + phi)) * iR;
+            const float iR = 1.0f / geo[2 * gp + 1];
+            const float al = geo[2 * g + 1] * iR, be = (geo[2 * g] - geo[2 * gp]) * iR;
             float2 Lp[P]; float bp[P]; bp[0] = 1.f;
             #pragma unroll
             for (int j = 0; j < P; ++j) { Lp[j] = loc[(gp * P + j) * NR + r]; if (j) bp[j] = bp[j - 1] * be; }
@@ -269,22 +290,24 @@ __device__ __forceinline__ void l2p(float eta, const float2* loc_g, float2* acc)
 template <int NR>
 __global__ void merge_fmm(
     const Node* __restrict__ nodes, int nnode, int dir,
-    const float* __restrict__ gdh, const float* __restrict__ gdl, const float* __restrict__ gtau,
-    const float* __restrict__ gz, const float* __restrict__ gc,
+    const float* __restrict__ gdh, const float* __restrict__ gdl, const float* __restrict__ ggap,
+    const float* __restrict__ gtau, const float* __restrict__ gz, const float* __restrict__ gc,
     const short* __restrict__ ggidx, const short* __restrict__ gslot,
     const short* __restrict__ gdsrc, const short* __restrict__ gddst,
     float2* __restrict__ w,
     const int* __restrict__ sbase, float* __restrict__ geo, float2* __restrict__ mom, float2* __restrict__ loc,
-    float2* __restrict__ qs, float2* __restrict__ dstage, float* __restrict__ rpos)
+    float2* __restrict__ qs, float2* __restrict__ dstage, float* __restrict__ rpos, int poff0, int doff0)
 {
     const int nb = blockIdx.x;
     if (nb >= nnode) return;
     const Node nd = nodes[nb];
     const int nk = nd.nk, tid = threadIdx.x, nth = blockDim.x;
     const float* pdh = gdh + nd.poff; const float* pdl = gdl + nd.poff; const float* pt = gtau + nd.poff;
-    float2* q = qs + (size_t)nd.poff * NR;
-    float2* dst = dstage + (size_t)nd.doff * NR;
-    float* rh = rpos + 2 * (size_t)nd.poff;          // root positions (hi, lo) for this node
+    const float* pgp = ggap + nd.poff;
+    // scratch is level-local: levels run one after another, so it holds one level at a time
+    float2* q = qs + (size_t)(nd.poff - poff0) * NR;
+    float2* dst = dstage + (size_t)(nd.doff - doff0) * NR;
+    float* rh = rpos + 2 * (size_t)(nd.poff - poff0);  // root positions (hi, lo) for this node
     float* rl = rh + nk;
     for (int i = tid; i < nk; i += nth) {
         const int src = dir == 0 ? ggidx[nd.poff + i] : gslot[nd.poff + i];
@@ -311,24 +334,26 @@ __global__ void merge_fmm(
     __syncthreads();
     for (int b = tid; b < nleaf; b += nth) {
         const int i0 = FL * b, i1 = min(FL * b + FL, nk);
-        const float lo = fminf(sh[i0], th[i0]), hi = fmaxf(sh[i1 - 1], th[i1 - 1]);
+        const float c = 0.5f * (fminf(sh[i0], th[i0]) + fmaxf(sh[i1 - 1], th[i1 - 1]));
+        float r = 0.f;
+        for (int i = i0; i < i1; ++i) r = fmaxf(r, fmaxf(fabsf((sh[i] - c) + sl[i]), fabsf((th[i] - c) + tl[i])));
+        r = up(r);
         const int g = bo + b;
-        geo[2 * g] = lo; geo[2 * g + 1] = hi;
-        p2m<NR>(0.5f * (lo + hi), 1.0f / box_r(lo, hi), sh, sl, q, i0, i1, mom + (size_t)g * P * NR);
+        geo[2 * g] = c; geo[2 * g + 1] = r;
+        p2m<NR>(c, 1.0f / r, sh, sl, q, i0, i1, mom + (size_t)g * P * NR);
     }
     __syncthreads();
     fmm_passes<NR>(nlev, lof, bo, geo, mom, loc);
     for (int k = tid; k < nk; k += nth) {
         const int b = k / FL, g = bo + b;
-        const float lo = geo[2 * g], hi = geo[2 * g + 1];
-        const float eta = ((th[k] - 0.5f * (lo + hi)) + tl[k]) / box_r(lo, hi);
+        const float eta = ((th[k] - geo[2 * g]) + tl[k]) / geo[2 * g + 1];
         float2 acc[NR];
         l2p<NR>(eta, loc + (size_t)g * P * NR, acc);
         const int s0 = max(FL * (b - 1), 0), s1 = min(FL * (b + 2), nk);
         if (dir == 0) {
             const float tk = pt[k];
             for (int s = s0; s < s1; ++s) {
-                const float inv = rcp(lam_minus_d(pdh, pdl, k, tk, s));
+                const float inv = rcp(lam_minus_d(pdh, pdl, pgp, k, tk, s));
                 #pragma unroll
                 for (int r = 0; r < NR; ++r) fma2(acc[r], inv, q[s * NR + r]);
             }
@@ -338,7 +363,7 @@ __global__ void merge_fmm(
             for (int r = 0; r < NR; ++r) w[d * NR + r] = mul2(cc, acc[r]);
         } else {
             for (int s = s0; s < s1; ++s) {
-                const float inv = rcp(-lam_minus_d(pdh, pdl, s, pt[s], k));
+                const float inv = rcp(-lam_minus_d(pdh, pdl, pgp, s, pt[s], k));
                 #pragma unroll
                 for (int r = 0; r < NR; ++r) fma2(acc[r], inv, q[s * NR + r]);
             }
@@ -355,29 +380,93 @@ __global__ void merge_fmm(
     }
 }
 
-// ------------------------------------------------------------------ leaves (warp per 16 x 16 block)
+// ------------------------------------------------------------------ leaves (warp per <= 16 x 16 block)
+// A leaf is the diagonal block [k0, k0 + s) of order (m, p)'s Jacobi matrix after the tree's tears
+// (each internal boundary k subtracts E_{k-1} from both neighbours' diagonals), so its entries are
+// closed-form.  Its eigenvectors are not stored: lane j rebuilds eigenvector j from the stored
+// eigenvalue by a twisted factorisation (forward and backward LDL^T of T - lambda, started from
+// the twist index of smallest |gamma|), normalised with first component positive -- the plan's
+// convention.  Against fp64 eigh that is 2-4e-6 on unit vectors; the dense fp32 block it replaces
+// was 64 bytes per coefficient (1.6 GiB at Nside 2048).
+__device__ __forceinline__ float acoef(int l, int m) {
+    return l > m ? sqrtf((float)(l - m) * (float)(l + m) / (4.f * (float)l * (float)l - 1.f)) : 0.f;
+}
+
+// One leaf per half-warp (s <= 16), 8 per 128-thread block; the rebuilt block is staged in
+// shared memory so both directions read it row- or column-wise.
 template <int NR>
-__global__ void leaves(const int* __restrict__ off, const int* __restrict__ sz,
-                       const float* __restrict__ Q, float2* __restrict__ w, int nleaf, int dir) {
-    const int warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5, lane = threadIdx.x & 31;
-    if (warp >= nleaf) return;
-    const int o = off[warp], s = sz[warp];
-    const float* q = Q + 256 * warp;
-    float2 x[NR], acc[NR];
-    #pragma unroll
-    for (int r = 0; r < NR; ++r) {
-        x[r] = lane < s ? w[(o + lane) * NR + r] : make_float2(0.f, 0.f);
-        acc[r] = make_float2(0.f, 0.f);
-    }
-    for (int k = 0; k < s; ++k) {
-        const float v = lane < s ? (dir == 0 ? q[16 * k + lane] : q[16 * lane + k]) : 0.f;
+__global__ void __launch_bounds__(128) leaves(const int* __restrict__ off, const int* __restrict__ sz,
+                       const int* __restrict__ mk, const float* __restrict__ lam, float2* __restrict__ w,
+                       int nleaf, int dir) {
+    __shared__ float Qs[8][16][17];
+    const int hw = threadIdx.x >> 4, lane = threadIdx.x & 15;
+    const int leaf = blockIdx.x * 8 + hw;
+    const bool live = leaf < nleaf;
+    const int o = live ? off[leaf] : 0, s = live ? sz[leaf] : 0;
+    float v[16];
+    if (live) {
+        const int m = mk[4 * leaf], p = mk[4 * leaf + 1], k0 = mk[4 * leaf + 2], n = mk[4 * leaf + 3];
+        float D[16], E[16];
         #pragma unroll
-        for (int r = 0; r < NR; ++r)
-            fma2(acc[r], v, make_float2(__shfl_sync(0xffffffffu, x[r].x, k), __shfl_sync(0xffffffffu, x[r].y, k)));
+        for (int k = 0; k < 16; ++k) {
+            const int l = m + p + 2 * (k0 + k);
+            const float a1 = acoef(l + 1, m), a0 = acoef(l, m);
+            D[k] = a1 * a1 + a0 * a0;
+            E[k] = a1 * acoef(l + 2, m);
+        }
+        if (k0 > 0) { const int l = m + p + 2 * (k0 - 1); D[0] -= acoef(l + 1, m) * acoef(l + 2, m); }
+        #pragma unroll
+        for (int k = 0; k < 16; ++k) if (k == s - 1 && k0 + s < n) D[k] -= E[k];
+        const float lj = lane < s ? lam[o + lane] : 0.f;
+        float dp[16], dm[16];
+        #pragma unroll
+        for (int k = 0; k < 16; ++k) {
+            const float sh = D[k] - lj;
+            dp[k] = k == 0 ? sh : sh - E[k - 1] * E[k - 1] * rcp(dp[k - 1]);
+            if (dp[k] == 0.f) dp[k] = 1e-30f;
+        }
+        #pragma unroll
+        for (int k = 15; k >= 0; --k) {
+            const float sh = D[k] - lj;
+            dm[k] = (k >= s - 1) ? sh : sh - E[k] * E[k] * rcp(dm[k + 1]);
+            if (dm[k] == 0.f) dm[k] = 1e-30f;
+        }
+        int r = 0; float best = 3.4e38f;
+        #pragma unroll
+        for (int k = 0; k < 16; ++k) {
+            const float g = fabsf(dp[k] + dm[k] - (D[k] - lj));
+            if (k < s && g < best) { best = g; r = k; }
+        }
+        #pragma unroll
+        for (int k = 15; k >= 0; --k) v[k] = (k == r) ? 1.f : ((k < r) ? -E[k] * v[min(k + 1, 15)] * rcp(dp[k]) : 0.f);
+        #pragma unroll
+        for (int k = 0; k < 16; ++k) if (k > r && k < s) v[k] = -E[k - 1] * v[k - 1] * rcp(dm[k]);
+        float nrm = 0.f;
+        #pragma unroll
+        for (int k = 0; k < 16; ++k) nrm += k < s ? v[k] * v[k] : 0.f;
+        const float scl = copysignf(rsqrtf(nrm), v[0]);
+        #pragma unroll
+        for (int k = 0; k < 16; ++k) { v[k] = (k < s && lane < s) ? v[k] * scl : 0.f; Qs[hw][k][lane] = v[k]; }
+    }
+    __syncthreads();
+    if (!live) return;
+    float2 x[NR];
+    #pragma unroll
+    for (int rr = 0; rr < NR; ++rr) x[rr] = lane < s ? w[(o + lane) * NR + rr] : make_float2(0.f, 0.f);
+    float2 acc[NR];
+    #pragma unroll
+    for (int rr = 0; rr < NR; ++rr) acc[rr] = make_float2(0.f, 0.f);
+    #pragma unroll
+    for (int k = 0; k < 16; ++k) {
+        // dir 0: out_j = sum_k Q[k, j] x_k;  dir 1: out_k = sum_j Q[k, j] x_j  (lane = output index)
+        const float q = dir == 0 ? v[k] : Qs[hw][lane][k];
+        #pragma unroll
+        for (int rr = 0; rr < NR; ++rr)
+            fma2(acc[rr], q, make_float2(__shfl_sync(0xffffffffu, x[rr].x, k, 16), __shfl_sync(0xffffffffu, x[rr].y, k, 16)));
     }
     if (lane < s)
         #pragma unroll
-        for (int r = 0; r < NR; ++r) w[(o + lane) * NR + r] = acc[r];
+        for (int rr = 0; rr < NR; ++rr) w[(o + lane) * NR + rr] = acc[rr];
 }
 
 // ------------------------------------------------------------------ Christoffel-Darboux step
@@ -395,7 +484,7 @@ __global__ void cd_fmm(
     const float* __restrict__ ryh, const float* __restrict__ ryl, int R,
     const int* __restrict__ ln0, const int* __restrict__ lr0, const float* __restrict__ scale,
     float2* __restrict__ w, float2* __restrict__ ring,
-    float* __restrict__ geo, float2* __restrict__ mom, float2* __restrict__ loc, float2* __restrict__ qs)
+    float* __restrict__ geo, float2* __restrict__ mom, float2* __restrict__ loc)
 {
     const int pb = blockIdx.x;
     if (pb >= nprob) return;
@@ -406,19 +495,13 @@ __global__ void cd_fmm(
     const float* sc = scale + (size_t)pb * R;
     float2* rg = ring + (size_t)pb * R * NR;
     const float* nh = yh + pr.so; const float* nl = yl + pr.so;
-    const int ns = dir == 0 ? pr.n : pr.nt;
-    float2* q = qs + (dir == 0 ? (size_t)pr.so : (size_t)pb * R) * NR;
-    for (int i = tid; i < ns; i += nth) {
-        if (dir == 0) {
-            const float f = vlast[pr.so + i];
-            #pragma unroll
-            for (int r = 0; r < NR; ++r) q[i * NR + r] = mul2(f, w[(pr.so + i) * NR + r]);
-        } else {
-            const int rr = R - 1 - i; const float f = sc[rr];
-            #pragma unroll
-            for (int r = 0; r < NR; ++r) q[i * NR + r] = mul2(f, rg[rr * NR + r]);
-        }
-    }
+    // source strengths are formed where they are read (no staged copy): q_s = vlast w (dir 0) or
+    // scale * ring (dir 1), both indexed in the ascending order of this direction's sources
+    auto qv = [&](int s, int r) -> float2 {
+        if (dir == 0) return mul2(vlast[pr.so + s], w[(pr.so + s) * NR + r]);
+        const int rr = R - 1 - s;
+        return mul2(sc[rr], rg[rr * NR + r]);
+    };
     if (dir == 0)
         for (int t = pr.nt + tid; t < R; t += nth)
             #pragma unroll
@@ -440,9 +523,28 @@ __global__ void cd_fmm(
         float lo = 1e30f, hi = -1e30f;
         if (n1 > n0) { lo = fminf(lo, nh[n0]); hi = fmaxf(hi, nh[n1 - 1]); }
         if (r1 > r0) { lo = fminf(lo, ryh[r0]); hi = fmaxf(hi, ryh[r1 - 1]); }
+        const float c = 0.5f * (lo + hi);
+        float rad = 0.f;
+        for (int i = n0; i < n1; ++i) rad = fmaxf(rad, fabsf((nh[i] - c) + nl[i]));
+        for (int i = r0; i < r1; ++i) rad = fmaxf(rad, fabsf((ryh[i] - c) + ryl[i]));
+        rad = up(rad);
         const int g = bo + b;
-        geo[2 * g] = lo; geo[2 * g + 1] = hi;
-        p2m<NR>(0.5f * (lo + hi), 1.0f / box_r(lo, hi), sh, sl, q, S0[b], S0[b + 1], mom + (size_t)g * P * NR);
+        geo[2 * g] = c; geo[2 * g + 1] = rad;
+        const float ir = 1.0f / rad;
+        for (int r = 0; r < NR; ++r) {
+            float2 M[P];
+            #pragma unroll
+            for (int k = 0; k < P; ++k) M[k] = make_float2(0.f, 0.f);
+            for (int s = S0[b]; s < S0[b + 1]; ++s) {
+                const float xi = ((sh[s] - c) + sl[s]) * ir;
+                const float2 qq = qv(s, r);
+                float pw = 1.f;
+                #pragma unroll
+                for (int k = 0; k < P; ++k) { fma2(M[k], pw, qq); pw *= xi; }
+            }
+            #pragma unroll
+            for (int k = 0; k < P; ++k) mom[((size_t)g * P + k) * NR + r] = M[k];
+        }
     }
     __syncthreads();
     fmm_passes<NR>(nlev, lof, bo, geo, mom, loc);
@@ -451,16 +553,27 @@ __global__ void cd_fmm(
         int lo_b = 0, hi_b = nleaf;
         while (hi_b - lo_b > 1) { const int mid = (lo_b + hi_b) >> 1; if (T0[mid] <= t) lo_b = mid; else hi_b = mid; }
         const int b = lo_b, g = bo + b;
-        const float lo = geo[2 * g], hi = geo[2 * g + 1];
-        const float eta = ((th[t] - 0.5f * (lo + hi)) + tl[t]) / box_r(lo, hi);
+        const float eta = ((th[t] - geo[2 * g]) + tl[t]) / geo[2 * g + 1];
         float2 acc[NR];
         l2p<NR>(eta, loc + (size_t)g * P * NR, acc);
+        // Near field with compensated (two-sum) accumulation: at small m the Gauss nodes and the
+        // dense polar rings interleave where phi_n' ~ n^2, so the analysis direction sums terms
+        // ~1e7 that cancel to O(1) (m = 0 analysis was 1.3e-5 at Nside 2048 with a plain sum).
         const int s0 = S0[max(b - 1, 0)], s1 = S0[min(b + 1, nleaf - 1) + 1];
+        float2 cmp[NR];
+        #pragma unroll
+        for (int r = 0; r < NR; ++r) cmp[r] = make_float2(0.f, 0.f);
         for (int s = s0; s < s1; ++s) {
             const float inv = rcp((th[t] - sh[s]) + (tl[t] - sl[s]));
             #pragma unroll
-            for (int r = 0; r < NR; ++r) fma2(acc[r], inv, q[s * NR + r]);
+            for (int r = 0; r < NR; ++r) {
+                const float2 qq = qv(s, r);
+                two_sum_acc(acc[r].x, cmp[r].x, inv * qq.x);
+                two_sum_acc(acc[r].y, cmp[r].y, inv * qq.y);
+            }
         }
+        #pragma unroll
+        for (int r = 0; r < NR; ++r) { acc[r].x += cmp[r].x; acc[r].y += cmp[r].y; }
         if (dir == 0) {
             const int rr = R - 1 - t; const float f = sc[rr];
             #pragma unroll
@@ -478,27 +591,29 @@ static constexpr int DIRECT_THREADS = 128;
 static constexpr int FMM_THREADS = 256;
 
 #define PLAN_ARGS \
-    ffi::Buffer<ffi::S32> leaf_off, ffi::Buffer<ffi::S32> leaf_sz, ffi::Buffer<ffi::F32> leaf_Q, \
-    ffi::Buffer<ffi::S32> nodes, ffi::Buffer<ffi::S32> sbase, ffi::Buffer<ffi::F32> dh, ffi::Buffer<ffi::F32> dl, \
+    ffi::Buffer<ffi::S32> leaf_off, ffi::Buffer<ffi::S32> leaf_sz, ffi::Buffer<ffi::S32> leaf_mk, ffi::Buffer<ffi::F32> leaf_lam, \
+    ffi::Buffer<ffi::S32> nodes, ffi::Buffer<ffi::S32> sbase, ffi::Buffer<ffi::F32> dh, ffi::Buffer<ffi::F32> dl, ffi::Buffer<ffi::F32> gap, \
     ffi::Buffer<ffi::F32> tau, ffi::Buffer<ffi::F32> z, ffi::Buffer<ffi::F32> c, \
     ffi::Buffer<ffi::S16> gidx, ffi::Buffer<ffi::S16> slot, ffi::Buffer<ffi::S16> dsrc, ffi::Buffer<ffi::S16> ddst, \
     ffi::Buffer<ffi::S32> cd_desc, ffi::Buffer<ffi::S32> cd_ln, ffi::Buffer<ffi::S32> cd_lr, \
     ffi::Buffer<ffi::F32> cd_nh, ffi::Buffer<ffi::F32> cd_nl, ffi::Buffer<ffi::F32> vlast, ffi::Buffer<ffi::F32> scale, \
     ffi::Buffer<ffi::F32> ring_h, ffi::Buffer<ffi::F32> ring_l
 
-#define PLAN_PASS leaf_off, leaf_sz, leaf_Q, nodes, sbase, dh, dl, tau, z, c, gidx, slot, dsrc, ddst, \
+#define PLAN_PASS leaf_off, leaf_sz, leaf_mk, leaf_lam, nodes, sbase, dh, dl, gap, tau, z, c, gidx, slot, dsrc, ddst, \
     cd_desc, cd_ln, cd_lr, cd_nh, cd_nl, vlast, scale, ring_h, ring_l
 
 #define PLAN_BIND \
-    .Arg<ffi::Buffer<ffi::S32>>().Arg<ffi::Buffer<ffi::S32>>().Arg<ffi::Buffer<ffi::F32>>() \
+    .Arg<ffi::Buffer<ffi::S32>>().Arg<ffi::Buffer<ffi::S32>>().Arg<ffi::Buffer<ffi::S32>>().Arg<ffi::Buffer<ffi::F32>>() \
     .Arg<ffi::Buffer<ffi::S32>>().Arg<ffi::Buffer<ffi::S32>>().Arg<ffi::Buffer<ffi::F32>>().Arg<ffi::Buffer<ffi::F32>>() \
+    .Arg<ffi::Buffer<ffi::F32>>() \
     .Arg<ffi::Buffer<ffi::F32>>().Arg<ffi::Buffer<ffi::F32>>().Arg<ffi::Buffer<ffi::F32>>() \
     .Arg<ffi::Buffer<ffi::S16>>().Arg<ffi::Buffer<ffi::S16>>().Arg<ffi::Buffer<ffi::S16>>().Arg<ffi::Buffer<ffi::S16>>() \
     .Arg<ffi::Buffer<ffi::S32>>().Arg<ffi::Buffer<ffi::S32>>().Arg<ffi::Buffer<ffi::S32>>() \
     .Arg<ffi::Buffer<ffi::F32>>().Arg<ffi::Buffer<ffi::F32>>().Arg<ffi::Buffer<ffi::F32>>().Arg<ffi::Buffer<ffi::F32>>() \
     .Arg<ffi::Buffer<ffi::F32>>().Arg<ffi::Buffer<ffi::F32>>()
 
-// scratch: geo (2 nbox), mom / loc (P nbox NR), qs (nq NR), dstage (ndefl NR), rpos (2 nkept)
+// scratch (all sized for the largest single tree level, or for the CD step if larger):
+// geo (2 nbox), mom / loc (P nbox NR), qs (nkept NR), dstage (ndefl NR), rpos (2 nkept)
 #define SCRATCH_ARGS \
     ffi::ResultBuffer<ffi::F32> geo, ffi::ResultBuffer<ffi::C64> mom, ffi::ResultBuffer<ffi::C64> loc, \
     ffi::ResultBuffer<ffi::C64> qs, ffi::ResultBuffer<ffi::C64> dstage, ffi::ResultBuffer<ffi::F32> rpos
@@ -515,38 +630,40 @@ static ffi::Error apply(cudaStream_t s, int dir, const float2* in, float2* w, fl
                         const float2* ring_in, int nprob, int R, ffi::Span<const int64_t> lev, PLAN_ARGS,
                         float* g, float2* mo, float2* lo, float2* q, float2* dst, float* rp) {
     const int nleaf = leaf_off.element_count();
-    const int lgrid = (nleaf * 32 + 127) / 128;
+    const int lgrid = (nleaf + 7) / 8;
     const CDProb* cdp = reinterpret_cast<const CDProb*>(cd_desc.typed_data());
     if (dir == 0) {
         cudaMemcpyAsync(w, in, sizeof(float2) * NR * vlast.element_count(), cudaMemcpyDeviceToDevice, s);
-        leaves<NR><<<lgrid, 128, 0, s>>>(leaf_off.typed_data(), leaf_sz.typed_data(), leaf_Q.typed_data(), w, nleaf, 0);
+        leaves<NR><<<lgrid, 128, 0, s>>>(leaf_off.typed_data(), leaf_sz.typed_data(), leaf_mk.typed_data(), leaf_lam.typed_data(), w, nleaf, 0);
     } else {
         cd_fmm<NR><<<nprob, 256, 0, s>>>(cdp, nprob, 1, cd_nh.typed_data(), cd_nl.typed_data(), vlast.typed_data(),
             ring_h.typed_data(), ring_l.typed_data(), R, cd_ln.typed_data(), cd_lr.typed_data(), scale.typed_data(),
-            w, const_cast<float2*>(ring_in), g, mo, lo, q);
+            w, const_cast<float2*>(ring_in), g, mo, lo);
     }
-    const int nlev = lev.size() / 5;
+    // levels: (kind, nnode, node0, maxk, sb0, poff0, doff0) per tree level
+    const int nlev = lev.size() / 7;
     for (int qq = 0; qq < nlev; ++qq) {
         const int i = dir == 0 ? qq : nlev - 1 - qq;
-        const int kind = lev[5 * i], nn = lev[5 * i + 1], node0 = lev[5 * i + 2], maxk = lev[5 * i + 3], sb0 = lev[5 * i + 4];
+        const int kind = lev[7 * i], nn = lev[7 * i + 1], node0 = lev[7 * i + 2], maxk = lev[7 * i + 3], sb0 = lev[7 * i + 4];
+        const int poff0 = lev[7 * i + 5], doff0 = lev[7 * i + 6];
         const Node* nd = reinterpret_cast<const Node*>(nodes.typed_data()) + node0;
         if (kind == 0) {
-            const int smem = 4 * (3 * maxk + 1) + 8 * NR * maxk;
+            const int smem = 4 * (4 * maxk + 2) + 8 * NR * maxk;
             merge_direct<NR><<<nn, DIRECT_THREADS, smem, s>>>(nd, nn, dir, dh.typed_data(), dl.typed_data(),
-                tau.typed_data(), z.typed_data(), c.typed_data(), gidx.typed_data(), slot.typed_data(),
+                gap.typed_data(), tau.typed_data(), z.typed_data(), c.typed_data(), gidx.typed_data(), slot.typed_data(),
                 dsrc.typed_data(), ddst.typed_data(), w);
         } else {
             merge_fmm<NR><<<nn, FMM_THREADS, 0, s>>>(nd, nn, dir, dh.typed_data(), dl.typed_data(),
-                tau.typed_data(), z.typed_data(), c.typed_data(), gidx.typed_data(), slot.typed_data(),
-                dsrc.typed_data(), ddst.typed_data(), w, sbase.typed_data() + sb0, g, mo, lo, q, dst, rp);
+                gap.typed_data(), tau.typed_data(), z.typed_data(), c.typed_data(), gidx.typed_data(), slot.typed_data(),
+                dsrc.typed_data(), ddst.typed_data(), w, sbase.typed_data() + sb0, g, mo, lo, q, dst, rp, poff0, doff0);
         }
     }
     if (dir == 0) {
         cd_fmm<NR><<<nprob, 256, 0, s>>>(cdp, nprob, 0, cd_nh.typed_data(), cd_nl.typed_data(), vlast.typed_data(),
             ring_h.typed_data(), ring_l.typed_data(), R, cd_ln.typed_data(), cd_lr.typed_data(), scale.typed_data(),
-            w, ring_out, g, mo, lo, q);
+            w, ring_out, g, mo, lo);
     } else {
-        leaves<NR><<<lgrid, 128, 0, s>>>(leaf_off.typed_data(), leaf_sz.typed_data(), leaf_Q.typed_data(), w, nleaf, 1);
+        leaves<NR><<<lgrid, 128, 0, s>>>(leaf_off.typed_data(), leaf_sz.typed_data(), leaf_mk.typed_data(), leaf_lam.typed_data(), w, nleaf, 1);
     }
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) return ffi::Error::Internal(cudaGetErrorString(err));

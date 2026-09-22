@@ -71,6 +71,10 @@ void tql2(int n, std::vector<double>& d, std::vector<double> e, std::vector<doub
         d2[j] = d[idx[j]];
         for (int k = 0; k < n; ++k) Z2[k * n + j] = Z[k * n + idx[j]];
     }
+    // sign convention: first component positive (nonzero for an unreduced tridiagonal), which is
+    // what the apply kernel reproduces when it rebuilds a leaf's eigenvectors on the fly
+    for (int j = 0; j < n; ++j)
+        if (Z2[j] < 0) for (int k = 0; k < n; ++k) Z2[k * n + j] = -Z2[k * n + j];
     d = d2; Z = Z2;
 }
 
@@ -80,7 +84,7 @@ struct Merge {
     std::vector<float> tau, z, c;
     std::vector<int16_t> kept, slot_kept, defl, slot_defl;
 };
-struct Leaf { int off, s; float Q[256]; };
+struct Leaf { int off, s; float lam[16]; };
 
 struct Node {
     int n, height;
@@ -159,8 +163,7 @@ Node build(const std::vector<double>& D, const std::vector<double>& E, int lo, i
         std::vector<double> d(D.begin() + lo, D.begin() + hi), e(E.begin() + lo, E.begin() + hi - 1), Z;
         tql2(node.n, d, e, Z);
         Leaf lf; lf.off = base + lo; lf.s = node.n;
-        std::memset(lf.Q, 0, sizeof(lf.Q));
-        for (int k = 0; k < node.n; ++k) for (int j = 0; j < node.n; ++j) lf.Q[16 * k + j] = (float)Z[k * node.n + j];
+        for (int j = 0; j < 16; ++j) lf.lam[j] = j < node.n ? (float)d[j] : 0.f;
         leaves.push_back(lf);
         node.height = 0; node.lam = d;
         node.first.resize(node.n); node.last.resize(node.n);
@@ -260,13 +263,13 @@ struct Problem {
 
 // Flat device layout (see _dc_lat.py for the field meanings).
 struct Packed {
-    std::vector<int32_t> leaf_off, leaf_sz;
-    std::vector<float> leaf_Q;
+    std::vector<int32_t> leaf_off, leaf_sz, leaf_mk;   // leaf_mk: (m, p, k0, n) per leaf
+    std::vector<float> leaf_lam;                       // leaf eigenvalues, one per coefficient
     // levels
     std::vector<int32_t> lev_kind, lev_nnode, lev_node0, lev_maxk, lev_sb0;
     std::vector<int32_t> nodes;                 // 8 per node: base nk nd poff doff 0 0 0
     std::vector<int32_t> sbase;                 // fmm nodes: first scratch box
-    std::vector<float> dh, dl, tau, z, c;
+    std::vector<float> dh, dl, gap, tau, z, c;   // gap[i] = d[i+1] - d[i] (exact to fp32; 0 at the end)
     std::vector<int16_t> gidx, slot, dsrc, ddst;
     int64_t nbox = 0;
     // Christoffel-Darboux
@@ -359,10 +362,13 @@ int64_t dc_plan(int L, const double* xr, int R, int nthreads, int direct_max, in
     std::vector<int64_t> off(probs.size() + 1, 0);
     for (size_t t = 0; t < probs.size(); ++t) off[t + 1] = off[t] + probs[t].n;
     P.ntot = off.back();
+    P.leaf_lam.assign(P.ntot, 0.f);
     for (size_t t = 0; t < probs.size(); ++t)
         for (const Leaf& lf : probs[t].leaves) {
             P.leaf_off.push_back((int32_t)(off[t] + lf.off)); P.leaf_sz.push_back(lf.s);
-            P.leaf_Q.insert(P.leaf_Q.end(), lf.Q, lf.Q + 256);
+            const int32_t mk[4] = {probs[t].m, probs[t].p, lf.off, probs[t].n};
+            P.leaf_mk.insert(P.leaf_mk.end(), mk, mk + 4);
+            for (int j = 0; j < lf.s; ++j) P.leaf_lam[off[t] + lf.off + j] = lf.lam[j];
         }
     int H = 0;
     for (const auto& pr : probs) for (const auto& mg : pr.merges) H = std::max(H, mg.height);
@@ -381,6 +387,7 @@ int64_t dc_plan(int L, const double* xr, int R, int nthreads, int direct_max, in
                     P.nodes.insert(P.nodes.end(), rec, rec + 8);
                     for (int i = 0; i < nk; ++i) {
                         float a, b; split(mg.d[i], a, b); P.dh.push_back(a); P.dl.push_back(b);
+                        P.gap.push_back(i + 1 < nk ? (float)(mg.d[i + 1] - mg.d[i]) : 0.f);
                     }
                     P.tau.insert(P.tau.end(), mg.tau.begin(), mg.tau.end());
                     P.z.insert(P.z.end(), mg.z.begin(), mg.z.end());
@@ -431,8 +438,8 @@ int64_t dc_plan(int L, const double* xr, int R, int nthreads, int direct_max, in
 
 // Sizes and copies of the packed arrays, by name.
 #define DC_FIELDS(X) \
-    X(leaf_off) X(leaf_sz) X(leaf_Q) X(lev_kind) X(lev_nnode) X(lev_node0) X(lev_maxk) X(lev_sb0) \
-    X(nodes) X(sbase) X(dh) X(dl) X(tau) X(z) X(c) X(gidx) X(slot) X(dsrc) X(ddst) \
+    X(leaf_off) X(leaf_sz) X(leaf_mk) X(leaf_lam) X(lev_kind) X(lev_nnode) X(lev_node0) X(lev_maxk) X(lev_sb0) \
+    X(nodes) X(sbase) X(dh) X(dl) X(gap) X(tau) X(z) X(c) X(gidx) X(slot) X(dsrc) X(ddst) \
     X(cd_desc) X(cd_ln) X(cd_lr) X(cd_nh) X(cd_nl) X(vlast) X(scale) X(ring_h) X(ring_l)
 
 int64_t dc_size(const char* name) {
