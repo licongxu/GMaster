@@ -2119,11 +2119,13 @@ def _march_pair_route(nside, L_work):
             and _spin_march.fold_pair_fits(nside, L_work))
 
 
-def _map2alm_pair_once_pallas(maps_a, maps_b, ell, order, *, nside, L_work, march_pair):
+def _map2alm_pair_once_pallas(maps_a, maps_b, ell, order, *, nside, L_work, march_pair,
+                              return_ftm=False):
     """Two scalar analyses, one ring FFT per map and one sweep of the row source.
 
     The azimuthal stage is per-map work and is done twice; only the latitudinal contraction is
-    shared, which is where the bytes (band) or the recurrence (march) are.
+    shared, which is where the bytes (band) or the recurrence (march) are.  ``return_ftm`` also
+    hands back the two ring spectra, which the folded refinement loop reuses.
     """
     ftm_a = _forward_ring_fft_positive(
         maps_a[0],
@@ -2139,6 +2141,15 @@ def _map2alm_pair_once_pallas(maps_a, maps_b, ell, order, *, nside, L_work, marc
             getattr(maps_b, "device", None) or getattr(maps_b[0], "device", None)),
         L=L_work, nside=nside,
     )
+    alm_a, alm_b = _pair_latitudinal_analysis(ftm_a, ftm_b, ell, order, nside=nside,
+                                              L_work=L_work, march_pair=march_pair)
+    if return_ftm:
+        return alm_a, alm_b, ftm_a, ftm_b
+    return alm_a, alm_b
+
+
+def _pair_latitudinal_analysis(ftm_a, ftm_b, ell, order, *, nside, L_work, march_pair):
+    """The latitudinal half of `_map2alm_pair_once_pallas`, from two ring spectra."""
     theta = _stable_thetas(L_work, nside)
     weights = quadrature_jax.quad_weights_transform(L_work, "healpix", nside)
     phase = -healpix_ffts.p2phi_rings_jax(jnp.arange(len(theta)), nside)
@@ -2160,23 +2171,56 @@ def _map2alm_pair_once_pallas(maps_a, maps_b, ell, order, *, nside, L_work, marc
     return positive_a[ell, order][None, :], positive_b[ell, order][None, :]
 
 
-def _alm2map_core_pallas_pair_eager(alm_a, alm_b, *, nside, L, L_work):
-    """Two scalar syntheses over one sweep of the row source (band or v2 march)."""
+def _pair_latitudinal_synthesis(alm_a, alm_b, *, nside, L, L_work):
+    """The latitudinal half of `_alm2map_core_pallas_pair_eager`: two positive ring spectra."""
     theta = _stable_thetas(L_work, nside)
     phase = healpix_ffts.p2phi_rings_jax(jnp.arange(len(theta)), nside)
     positive_a = _positive_alm(alm_a[0], L=L, L_work=L_work)
     positive_b = _positive_alm(alm_b[0], L=L, L_work=L_work)
     if _spin_march._march_v2.enabled(L_work):
-        ftm_a, ftm_b = _spin_march._march_v2.inverse_latitudinal_positive_pair(
+        return _spin_march._march_v2.inverse_latitudinal_positive_pair(
             positive_a, positive_b, phase, L=L_work, nside=nside)
-    else:
-        ftm_a, ftm_b = _theta_matrix_inverse_latitudinal_pair(
-            positive_a, positive_b,
-            L=L_work, nside=nside, weights=jnp.ones_like(theta), phase=phase)
+    return _theta_matrix_inverse_latitudinal_pair(
+        positive_a, positive_b,
+        L=L_work, nside=nside, weights=jnp.ones_like(theta), phase=phase)
+
+
+def _alm2map_core_pallas_pair_eager(alm_a, alm_b, *, nside, L, L_work):
+    """Two scalar syntheses over one sweep of the row source (band or v2 march)."""
+    ftm_a, ftm_b = _pair_latitudinal_synthesis(alm_a, alm_b, nside=nside, L=L, L_work=L_work)
     return (
         jnp.real(_finish_inverse_pallas(ftm_a, L=L_work, nside=nside))[None, :],
         jnp.real(_finish_inverse_pallas(ftm_b, L=L_work, nside=nside))[None, :],
     )
+
+
+# The Richardson residual `FFT(IFFT(F) - map)` of a HEALPix ring is the n_phi-periodic fold of F
+# minus the map's own spectrum (`_march_v2.ring_fold_residual`), so the refinement loop keeps the
+# spectra from its first analysis and never runs a ring FFT again.  `GMASTER_RING_FOLD=0` restores
+# the synthesise-to-pixels form.
+_RING_FOLD = os.environ.get("GMASTER_RING_FOLD", "1") != "0"
+
+
+def _ring_fold_ready(L_work):
+    return _RING_FOLD and _spin_march._march_v2.fold_available()
+
+
+def _single_latitudinal_synthesis(alm, *, nside, L, L_work):
+    """The latitudinal half of the scalar `_alm2map_core_pallas_eager`: one positive ring spectrum."""
+    theta = _stable_thetas(L_work, nside)
+    phase = healpix_ffts.p2phi_rings_jax(jnp.arange(len(theta)), nside)
+    return _fused_inverse_sht(_positive_alm(alm[0], L=L, L_work=L_work), theta, phase,
+                              L=L_work, nside=nside, block_size=_pallas_block_size(nside))
+
+
+def _single_latitudinal_analysis(ftm, ell, order, *, nside, L_work):
+    """The latitudinal half of the scalar `_map2alm_once_pallas`, from a ring spectrum."""
+    theta = _stable_thetas(L_work, nside)
+    weights = quadrature_jax.quad_weights_transform(L_work, "healpix", nside)
+    phase = -healpix_ffts.p2phi_rings_jax(jnp.arange(len(theta)), nside)
+    positive = _fused_forward_sht(ftm, theta, weights, phase, L=L_work,
+                                  block_size=_pallas_block_size(nside))
+    return positive[ell, order][None, :]
 
 
 def _map2alm_core_pallas_pair_eager(
@@ -2191,6 +2235,24 @@ def _map2alm_core_pallas_pair_eager(
     a table cache; the two also select different kernels, so neither can become a
     runtime value.
     """
+    if n_iter and _ring_fold_ready(L_work):
+        alm_a, alm_b, ftm_a, ftm_b = _map2alm_pair_once_pallas(
+            maps_a, maps_b, ell, order, nside=nside, L_work=L_work, march_pair=march_pair,
+            return_ftm=True)
+        for _ in range(n_iter):
+            if pair_synth:
+                syn_a, syn_b = _pair_latitudinal_synthesis(alm_a, alm_b, nside=nside, L=L,
+                                                           L_work=L_work)
+            else:
+                syn_a = _single_latitudinal_synthesis(alm_a, nside=nside, L=L, L_work=L_work)
+                syn_b = _single_latitudinal_synthesis(alm_b, nside=nside, L=L, L_work=L_work)
+            delta_a, delta_b = _pair_latitudinal_analysis(
+                _spin_march._march_v2.ring_fold_residual(syn_a, ftm_a, nside=nside),
+                _spin_march._march_v2.ring_fold_residual(syn_b, ftm_b, nside=nside),
+                ell, order, nside=nside, L_work=L_work, march_pair=march_pair)
+            alm_a -= delta_a
+            alm_b -= delta_b
+        return alm_a, alm_b
     alm_a, alm_b = _map2alm_pair_once_pallas(
         maps_a, maps_b, ell, order, nside=nside, L_work=L_work, march_pair=march_pair
     )
@@ -2352,6 +2414,21 @@ def _map2alm_core_pallas(
 def _map2alm_core_pallas_eager(
     maps, ell, order, *, nside, L, L_work, n_iter, spin=0
 ):
+    if spin == 0 and n_iter and _ring_fold_ready(L_work):
+        ftm = _forward_ring_fft_positive(
+            maps[0],
+            _ring_analysis_tables(
+                L_work, nside,
+                getattr(maps, "device", None) or getattr(maps[0], "device", None)),
+            L=L_work, nside=nside,
+        )
+        alm = _single_latitudinal_analysis(ftm, ell, order, nside=nside, L_work=L_work)
+        for _ in range(n_iter):
+            syn = _single_latitudinal_synthesis(alm, nside=nside, L=L, L_work=L_work)
+            alm -= _single_latitudinal_analysis(
+                _spin_march._march_v2.ring_fold_residual(syn, ftm, nside=nside),
+                ell, order, nside=nside, L_work=L_work)
+        return alm
     alm = _map2alm_once_pallas(
         maps, ell, order, nside=nside, L_work=L_work, spin=spin
     )

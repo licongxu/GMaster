@@ -136,7 +136,7 @@ def _build():
                 raise RuntimeError("nvcc failed:\n" + out.stderr[-4000:])
             os.replace(tmp, so)
         lib = ctypes.CDLL(so)
-        for name in _NAMES:
+        for name in _NAMES + ("gm_ring_fold",):
             jax.ffi.register_ffi_target(name, jax.ffi.pycapsule(getattr(lib, name)),
                                         platform="CUDA")
         _LIB = lib
@@ -525,6 +525,31 @@ def _ffi_synthesis(spin, geo, m0, mbp, L, man, ex0, tab, coef, nmaps=1):
     return jax.ffi.ffi_call(name, out_t)(
         geo["xs_hi"], geo["xs_lo"], man, ex0, tab, coef, geo["mlim"], geo["hemi"],
         m0=np.int64(m0), L=np.int64(L))
+
+
+@lru_cache(maxsize=8)
+def _ring_nphi(nside):
+    i = np.arange(1, 4 * nside)
+    return np.where(i < nside, 4 * i, np.where(i <= 3 * nside, 4 * nside, 4 * (4 * nside - i))).astype(np.int32)
+
+
+def fold_available() -> bool:
+    """True when the CUDA library (which carries ``gm_ring_fold``) is loaded."""
+    return enabled() and _LIB is not None
+
+
+def ring_fold_residual(ftm_synth, ftm_map, *, nside):
+    """Ring spectrum of ``IFFT(ftm_synth) - map`` without either ring FFT (CUDA only).
+
+    For a HEALPix ring with ``n_phi`` pixels the forward FFT of the inverse FFT of a Hermitian
+    band-limited spectrum is its ``n_phi``-periodic fold, ``n_phi * sum_{m = k mod n_phi} F[m]``, so
+    the Richardson residual needs only the map's own spectrum ``ftm_map`` (taken once, by the first
+    analysis) and one pass over ``ftm_synth``.  Both are ``(4 nside - 1, L)`` positive-order blocks.
+    """
+    F = jnp.asarray(ftm_synth).astype(jnp.complex64)
+    Mf = jnp.asarray(ftm_map).astype(jnp.complex64)
+    nphi = jnp.asarray(_ring_nphi(int(nside)))
+    return jax.ffi.ffi_call("gm_ring_fold", jax.ShapeDtypeStruct(F.shape, jnp.complex64))(F, Mf, nphi)
 
 
 # ------------------------------------------------------------------------------- spin 0, folded

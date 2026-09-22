@@ -1320,3 +1320,29 @@ def test_default_route_agrees_with_namaster_at_small_geometries(nside, spin):
     want = ref.map2alm(maps, spin, ref.NmtMapInfo(None, (npix,)), ref.NmtAlmInfo(lmax), n_iter=3)
     scale = float(np.max(np.abs(want)))
     assert float(np.max(np.abs(got - want))) < 1e-5 * scale
+
+
+@pytest.mark.march_v2
+@pytest.mark.skipif(not _HAS_NVIDIA_GPU, reason="requires an NVIDIA GPU")
+@pytest.mark.parametrize("nside", [16, 64, 256])
+def test_ring_fold_residual_is_fft_of_ifft(nside):
+    """`ring_fold_residual(F, Mf)` is the ring FFT of the ring IFFT of F, minus Mf.
+
+    A ring with fewer pixels than 2L aliases, so the check runs through the polar caps as well as
+    the belt; the fold sums in float64 and the bar is the complex64 rounding of the ring stage.
+    """
+    from gmaster import _march_v2
+    from gmaster import utils
+
+    L = 3 * nside
+    if not _march_v2.fold_available():
+        pytest.skip("CUDA march library unavailable")
+    rng = np.random.default_rng(nside)
+    shape = (4 * nside - 1, L)
+    F = jax.numpy.asarray(rng.normal(size=shape) + 1j * rng.normal(size=shape))
+    Mf = jax.numpy.asarray((rng.normal(size=shape) + 1j * rng.normal(size=shape)).astype(np.complex64))
+    maps = jax.numpy.real(utils._finish_inverse_pallas(F, L=L, nside=nside))
+    explicit = np.asarray(utils._forward_ring_fft_positive(
+        maps, utils._ring_analysis_tables(L, nside), L=L, nside=nside)) - np.asarray(Mf)
+    folded = np.asarray(_march_v2.ring_fold_residual(F, Mf, nside=nside))
+    assert np.max(np.abs(folded - explicit)) < 2e-6 * np.max(np.abs(explicit))

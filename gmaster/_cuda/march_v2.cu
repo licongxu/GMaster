@@ -406,6 +406,43 @@ march_synthesis(const float* __restrict__ xs_hi, const float* __restrict__ xs_lo
     }
 }
 
+// ======================================================================= ring-Fourier residual
+// A HEALPix ring's forward FFT of its inverse FFT is the n_phi-periodic fold of the Hermitian
+// spectrum, so the Richardson residual FFT(map - IFFT(F)) never needs either FFT:
+//   R[r, k] = n_phi(r) * sum_{m = k mod n_phi(r), |m| < L} Ft_r[m] - Mf[r, k],
+//   Ft_r[m] = F[r, m] (m > 0), Re F[r, 0] (m = 0), conj F[r, -m] (m < 0),
+// with Mf the map's own ring spectrum (the analysis FFT the first pass already took).  One thread
+// per (ring, residue); the fold sums in float64 before the difference is rounded.
+__global__ void ring_fold_residual(const float2* __restrict__ F, const float2* __restrict__ Mf,
+                                   const int* __restrict__ nphi, float2* __restrict__ R, int L)
+{
+    const int r = blockIdx.x;
+    const int n = nphi[r];
+    const float2* f = F + (size_t)r * L;
+    const float2* mf = Mf + (size_t)r * L;
+    float2* out = R + (size_t)r * L;
+    const int nres = min(n, L);
+    for (int rho = threadIdx.x; rho < nres; rho += blockDim.x) {
+        double sx = 0.0, sy = 0.0;
+        for (int m = rho; m < L; m += n) {
+            const float2 v = f[m];
+            sx += v.x;
+            if (m) sy += v.y;
+        }
+        for (int m = n - rho; m < L; m += n) {        // negative orders -m = rho - t n
+            const float2 v = f[m];
+            sx += v.x;
+            sy -= v.y;
+        }
+        sx *= n;
+        sy *= n;
+        for (int k = rho; k < L; k += n) {
+            const float2 q = mf[k];
+            out[k] = make_float2((float)(sx - (double)q.x), (float)(sy - (double)q.y));
+        }
+    }
+}
+
 // ================================================================================ FFI handlers
 template <int SPIN, int NCH, int NM>
 ffi::Error AnalysisImpl(cudaStream_t stream,
@@ -468,3 +505,23 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(gm_march_ana_s2, (AnalysisImpl<2, 4, 1>), ANA_BIND
 XLA_FFI_DEFINE_HANDLER_SYMBOL(gm_march_syn_s0, (SynthesisImpl<0, 1>), ANA_BIND);
 XLA_FFI_DEFINE_HANDLER_SYMBOL(gm_march_syn_s0_pair, (SynthesisImpl<0, 2>), ANA_BIND);
 XLA_FFI_DEFINE_HANDLER_SYMBOL(gm_march_syn_s2, (SynthesisImpl<2, 1>), ANA_BIND);
+
+ffi::Error RingFoldImpl(cudaStream_t stream, ffi::Buffer<ffi::C64> F, ffi::Buffer<ffi::C64> Mf,
+                        ffi::Buffer<ffi::S32> nphi, ffi::ResultBuffer<ffi::C64> R)
+{
+    const auto fd = F.dimensions();              // (nring, L)
+    const int nring = fd[0], L = fd[1];
+    if (Mf.dimensions()[0] != nring || Mf.dimensions()[1] != L || nphi.dimensions()[0] != nring)
+        return ffi::Error::InvalidArgument("gm_ring_fold: shape mismatch");
+    ring_fold_residual<<<nring, 256, 0, stream>>>(
+        reinterpret_cast<const float2*>(F.typed_data()), reinterpret_cast<const float2*>(Mf.typed_data()),
+        nphi.typed_data(), reinterpret_cast<float2*>(R->typed_data()), L);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) return ffi::Error::Internal(cudaGetErrorString(err));
+    return ffi::Error::Success();
+}
+
+XLA_FFI_DEFINE_HANDLER_SYMBOL(gm_ring_fold, RingFoldImpl,
+    ffi::Ffi::Bind().Ctx<ffi::PlatformStream<cudaStream_t>>()
+        .Arg<ffi::Buffer<ffi::C64>>().Arg<ffi::Buffer<ffi::C64>>().Arg<ffi::Buffer<ffi::S32>>()
+        .Ret<ffi::Buffer<ffi::C64>>());
