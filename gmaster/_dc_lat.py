@@ -76,7 +76,8 @@ def _build():
         cc = str(getattr(devs[0], "compute_capability", "")).replace(".", "")
         os.makedirs(_CACHE, exist_ok=True)
         cu_src, cc_src = open(_CU).read(), open(_CC).read()
-        so = os.path.join(_CACHE, f"libgm_dc_{_digest(cu_src, cc, jax.__version__)}.so")
+        defs = [f"-D{d}" for d in os.environ.get("GMASTER_DC_DEFS", "").split()]
+        so = os.path.join(_CACHE, f"libgm_dc_{_digest(cu_src, cc, jax.__version__, ' '.join(defs))}.so")
         plan_so = os.path.join(_CACHE, f"libgm_dcplan_{_digest(cc_src)}.so")
         if not os.path.exists(so):
             nvcc = _nvcc()
@@ -84,7 +85,7 @@ def _build():
                 raise RuntimeError("nvcc not found (set GMASTER_NVCC)")
             tmp = so + f".{os.getpid()}.tmp"
             out = subprocess.run([nvcc, "-O3", "-std=c++17", "-shared", "-Xcompiler", "-fPIC",
-                                  f"-arch=sm_{cc}", "-diag-suppress", "940,2473",
+                                  f"-arch=sm_{cc}", "-diag-suppress", "940,2473", *defs,
                                   "-I", jax.ffi.include_dir(), "-o", tmp, _CU],
                                  capture_output=True, text=True, timeout=900)
             if out.returncode != 0:
@@ -99,7 +100,7 @@ def _build():
                 raise RuntimeError("g++ dc plan failed:\n" + out.stderr[-4000:])
             os.replace(tmp, plan_so)
         lib = ctypes.CDLL(so)
-        for name in ("gm_dc_synth", "gm_dc_ana"):
+        for name in ("gm_dc_synth", "gm_dc_synth2", "gm_dc_ana", "gm_dc_ana2"):
             jax.ffi.register_ffi_target(name, jax.ffi.pycapsule(getattr(lib, name)), platform="CUDA")
         plan = ctypes.CDLL(plan_so)
         plan.dc_plan.restype = ctypes.c_int64
@@ -170,13 +171,10 @@ class _Plan:
         self.args = tuple(jnp.asarray(h[k]) for k in _FIELDS)
         self.levels = np.stack([h["lev_kind"], h["lev_nnode"], h["lev_node0"], h["lev_maxk"],
                                 h["lev_sb0"]], axis=1).astype(np.int64).ravel()
-        nb = int(max(h["nbox"], h["cd_nbox"], 1))
-        nq = int(max(h["tau"].size, self.ntot, self.nprob * self.R, 1))
-        self.scratch = (jax.ShapeDtypeStruct((2 * nb,), jnp.float32),
-                        jax.ShapeDtypeStruct((_P * nb,), jnp.complex64),
-                        jax.ShapeDtypeStruct((_P * nb,), jnp.complex64),
-                        jax.ShapeDtypeStruct((nq,), jnp.complex64),
-                        jax.ShapeDtypeStruct((max(int(h["dsrc"].size), 1),), jnp.complex64))
+        # scratch element counts per right-hand side: FMM boxes, staged strengths, deflations, kept roots
+        self.sizes = (int(max(h["nbox"], h["cd_nbox"], 1)),
+                      int(max(h["tau"].size, self.ntot, self.nprob * self.R, 1)),
+                      max(int(h["dsrc"].size), 1), max(int(h["tau"].size), 1))
         # packing: problem t = 2 m + p holds ell = m + p + 2 k at offset off[t] + k
         n = np.array([len(range(m + p, L, 2)) for m in range(L) for p in (0, 1) if m + p < L])
         off = np.concatenate([[0], np.cumsum(n)])
@@ -202,28 +200,37 @@ class _Plan:
 
     def static(self):
         """Hashable description for the jitted wrappers (the arrays go in as arguments)."""
-        return (self.nprob, self.R, self.ntot, tuple(int(v) for v in self.levels),
-                tuple((tuple(sd.shape), str(sd.dtype)) for sd in self.scratch))
+        return (self.nprob, self.R, self.ntot, tuple(int(v) for v in self.levels), self.sizes)
 
 
-def _scratch(static):
-    return tuple(jax.ShapeDtypeStruct(shape, jnp.dtype(dt)) for shape, dt in static[4])
+def _scratch(static, nr):
+    nb, nq, nd, nk = static[4]
+    return (jax.ShapeDtypeStruct((2 * nb,), jnp.float32),
+            jax.ShapeDtypeStruct((_P * nb * nr,), jnp.complex64),
+            jax.ShapeDtypeStruct((_P * nb * nr,), jnp.complex64),
+            jax.ShapeDtypeStruct((nq * nr,), jnp.complex64),
+            jax.ShapeDtypeStruct((nd * nr,), jnp.complex64),
+            jax.ShapeDtypeStruct((2 * nk,), jnp.float32))
 
 
 def _synth(coef, args, static):
+    """``(ntot, nr)`` packed coefficients -> ``(nprob, R, nr)`` parity-resolved northern values."""
     nprob, R, ntot, levels = static[:4]
+    nr = coef.shape[1]
     return jax.ffi.ffi_call(
-        "gm_dc_synth",
-        (jax.ShapeDtypeStruct((nprob, R), jnp.complex64),
-         jax.ShapeDtypeStruct((ntot,), jnp.complex64)) + _scratch(static))(
+        "gm_dc_synth" if nr == 1 else "gm_dc_synth2",
+        (jax.ShapeDtypeStruct((nprob, R, nr), jnp.complex64),
+         jax.ShapeDtypeStruct((ntot, nr), jnp.complex64)) + _scratch(static, nr))(
         coef.astype(jnp.complex64), *args, levels=np.asarray(levels, np.int64))[0]
 
 
 def _analyse(ring, args, static):
+    """Adjoint of :func:`_synth`."""
     nprob, R, ntot, levels = static[:4]
+    nr = ring.shape[2]
     return jax.ffi.ffi_call(
-        "gm_dc_ana",
-        (jax.ShapeDtypeStruct((ntot,), jnp.complex64),) + _scratch(static))(
+        "gm_dc_ana" if nr == 1 else "gm_dc_ana2",
+        (jax.ShapeDtypeStruct((ntot, nr), jnp.complex64),) + _scratch(static, nr))(
         ring.astype(jnp.complex64), *args, levels=np.asarray(levels, np.int64))[0]
 
 
@@ -250,32 +257,53 @@ def _ring_phase(phase, L):
     return jax.lax.complex(jnp.cos(ang), jnp.sin(ang))
 
 
-@partial(jax.jit, static_argnames=("L", "nside", "static"))
-def _inverse_impl(positive, phase, args, ell, order, fac, *, L, nside, static):
-    coef = positive[ell, order].astype(jnp.complex64) * fac
-    return _hemispheres(_synth(coef, args, static), L, nside) * _ring_phase(phase, L)
-
-
-@partial(jax.jit, static_argnames=("L", "nside", "static"))
-def _forward_impl(positive, weights, phase, args, inv, fac, *, L, nside, static):
-    g = positive.astype(jnp.complex64) * (weights[:, None].astype(jnp.float32) * _ring_phase(phase, L))
+def _fold_hemispheres(g, L, nside):
+    """(4 nside - 1, L) weighted ring block -> (nprob, R) parity-resolved northern sums."""
     R = 2 * nside
     north = g[:R]                                                        # pole -> equator
     south = jnp.concatenate([g[R:][::-1], jnp.zeros((1, L), g.dtype)], axis=0)   # mirror of north
-    ring = jnp.stack([(north + south).T, (north - south).T], axis=1).reshape(2 * L, R)[: 2 * L - 1]
-    coef = jnp.concatenate([_analyse(ring, args, static) * fac, jnp.zeros(1, jnp.complex64)])
-    return coef[inv].reshape(L, L).astype(jnp.complex128)
+    return jnp.stack([(north + south).T, (north - south).T], axis=1).reshape(2 * L, R)[: 2 * L - 1]
+
+
+@partial(jax.jit, static_argnames=("L", "nside", "static"))
+def _inverse_impl(positives, phase, args, ell, order, fac, *, L, nside, static):
+    coef = jnp.stack([p[ell, order].astype(jnp.complex64) * fac for p in positives], axis=1)
+    ring = _synth(coef, args, static)
+    rp = _ring_phase(phase, L)
+    return tuple(_hemispheres(ring[:, :, k], L, nside) * rp for k in range(len(positives)))
+
+
+@partial(jax.jit, static_argnames=("L", "nside", "static"))
+def _forward_impl(positives, weights, phase, args, inv, fac, *, L, nside, static):
+    wp = weights[:, None].astype(jnp.float32) * _ring_phase(phase, L)
+    ring = jnp.stack([_fold_hemispheres(p.astype(jnp.complex64) * wp, L, nside) for p in positives],
+                     axis=2)
+    coef = _analyse(ring, args, static) * fac[:, None]
+    coef = jnp.concatenate([coef, jnp.zeros((1, coef.shape[1]), coef.dtype)], axis=0)
+    return tuple(coef[inv, k].reshape(L, L).astype(jnp.complex128) for k in range(len(positives)))
 
 
 def inverse_latitudinal_positive(positive, phase, *, L, nside):
     """``(L, L)`` ``[ell, m]`` coefficients -> ``(4 nside - 1, L)`` complex64 ring block, phase included."""
-    pl = plan_for(L, nside)
-    return _inverse_impl(positive, phase, pl.args, pl.ell, pl.order, pl.fac,
-                         L=int(L), nside=int(nside), static=pl.static())
+    return inverse_latitudinal_positive_pair(positive, None, phase, L=L, nside=nside)[0]
 
 
 def forward_latitudinal_positive(positive, weights, phase, *, L, nside):
     """``(4 nside - 1, L)`` ring block -> ``(L, L)`` ``[ell, m]`` coefficients."""
+    return forward_latitudinal_positive_pair(positive, None, weights, phase, L=L, nside=nside)[0]
+
+
+def inverse_latitudinal_positive_pair(positive_a, positive_b, phase, *, L, nside):
+    """Two syntheses over one traversal of the plan (``positive_b=None``: one)."""
     pl = plan_for(L, nside)
-    return _forward_impl(positive, weights, phase, pl.args, pl.inv, pl.fac,
+    maps = (positive_a,) if positive_b is None else (positive_a, positive_b)
+    return _inverse_impl(maps, phase, pl.args, pl.ell, pl.order, pl.fac,
+                         L=int(L), nside=int(nside), static=pl.static())
+
+
+def forward_latitudinal_positive_pair(positive_a, positive_b, weights, phase, *, L, nside):
+    """Two analyses over one traversal of the plan (``positive_b=None``: one)."""
+    pl = plan_for(L, nside)
+    maps = (positive_a,) if positive_b is None else (positive_a, positive_b)
+    return _forward_impl(maps, weights, phase, pl.args, pl.inv, pl.fac,
                          L=int(L), nside=int(nside), static=pl.static())

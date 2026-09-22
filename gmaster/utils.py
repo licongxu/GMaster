@@ -2153,7 +2153,12 @@ def _pair_latitudinal_analysis(ftm_a, ftm_b, ell, order, *, nside, L_work, march
     theta = _stable_thetas(L_work, nside)
     weights = quadrature_jax.quad_weights_transform(L_work, "healpix", nside)
     phase = -healpix_ffts.p2phi_rings_jax(jnp.arange(len(theta)), nside)
-    if march_pair:
+    if _spin_march._march_v2._dc(L_work) is not None:
+        # The divide-and-conquer engine pairs by sharing its plan traversal; it has no march-style
+        # memory gate, so both maps always go through one call.
+        positive_a, positive_b = _spin_march._march_v2.forward_latitudinal_positive_pair(
+            ftm_a, ftm_b, weights, phase, L=L_work, nside=nside)
+    elif march_pair:
         positive_a, positive_b = _spin_march.forward_latitudinal_positive_pair(
             ftm_a, ftm_b, weights, phase, L=L_work, nside=nside)
     elif _spin_march._march_v2.enabled(L_work) and not _prefer_theta_band(nside, L_work, 0):
