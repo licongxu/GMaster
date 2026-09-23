@@ -22,6 +22,9 @@ namespace ffi = xla::ffi;
 #ifndef CDF
 #define CDF 4          // CD leaves: this many of the plan's 16-point merged leaves per FMM leaf
 #endif
+#ifndef CD_MINB
+#define CD_MINB 3      // cd_fmm blocks per SM the register allocation must allow (94 regs -> 2; 3: 107.6 -> 105.0 ms per field at 2048, 4 spills: 133 ms)
+#endif
 #ifndef FL
 #define FL 32          // points of each set per FMM leaf in the merge kernels (8/16/32/64 swept at Nside 2048: 32 best)
 #endif
@@ -553,7 +556,7 @@ __global__ void __launch_bounds__(128) leaves(const int* __restrict__ off, const
 struct CDProb { int so, n, lo, nleaf, bo, nt, t0, pad; };   // active rings: [t0, t0 + nt) ascending
 
 template <int NR>
-__global__ void cd_fmm(
+__global__ void __launch_bounds__(256, CD_MINB) cd_fmm(
     const CDProb* __restrict__ probs, int nprob, int dir,
     const float* __restrict__ yh, const float* __restrict__ yl, const float* __restrict__ vlast,
     const float* __restrict__ ryh, const float* __restrict__ ryl, int R,

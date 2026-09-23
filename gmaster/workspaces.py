@@ -685,22 +685,37 @@ _WD_CACHE_KEEP_FRACTION = float(os.environ.get("GMASTER_WD_CACHE_FRACTION", "0.1
 _WD_POOL_HEADROOM = float(os.environ.get("GMASTER_WD_POOL_HEADROOM", "4.0"))
 
 
-def _pool_is_tight(total):
+def _pool_limit_and_free():
+    """`(limit, free)` bytes of the device pool.
+
+    A preallocated pool reports its limit; the non-preallocated `cuda_async` pool (the README's
+    invocation for large maps) reports 0, and a 0 here once sized the Wigner-table cache at its
+    2 GiB floor: the 3.6 GiB tables of Nside 2048 spin 2 were then rebuilt by every workspace --
+    ~40 ms of a 106 ms coupling stage.  Without a limit the driver's own numbers are used
+    (90 % of the device, and its free memory, which on a shared card is the conservative one).
+    """
     try:
         stats = jax.devices()[0].memory_stats() or {}
-        limit = stats.get("bytes_limit") or 0
-        in_use = stats.get("bytes_in_use") or 0
     except Exception:  # noqa: BLE001 - a backend without pool accounting
-        return False
-    return bool(limit) and (limit - in_use) < _WD_POOL_HEADROOM * total
+        return 0, None
+    limit = stats.get("bytes_limit") or 0
+    if limit:
+        return limit, limit - (stats.get("bytes_in_use") or 0)
+    from . import _march_v2
+
+    info = _march_v2.device_memory_info()
+    if info is None:
+        return 0, None
+    return int(0.9 * info[1]), info[0]
+
+
+def _pool_is_tight(total):
+    limit, free = _pool_limit_and_free()
+    return bool(limit) and free is not None and free < _WD_POOL_HEADROOM * total
 
 
 def _wd_cache_keep_bytes():
-    try:
-        stats = jax.devices()[0].memory_stats() or {}
-        limit = stats.get("bytes_limit") or 0
-    except Exception:  # noqa: BLE001 - a backend without pool accounting
-        limit = 0
+    limit, _ = _pool_limit_and_free()
     return max(2 * 1024 ** 3, int(limit * _WD_CACHE_KEEP_FRACTION))
 
 

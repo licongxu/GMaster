@@ -102,6 +102,33 @@ def _defs():
     return [f"-D{d}" for d in raw]
 
 
+@lru_cache(maxsize=1)
+def _cudart():
+    """The CUDA runtime library, or None."""
+    import glob
+
+    names = ["libcudart.so", "libcudart.so.13", "libcudart.so.12"]
+    for d in os.environ.get("LD_LIBRARY_PATH", "").split(":"):
+        names += sorted(glob.glob(os.path.join(d, "libcudart.so*")))
+    for name in names:
+        try:
+            return ctypes.CDLL(name)
+        except OSError:
+            continue
+    return None
+
+
+def device_memory_info():
+    """`(free, total)` bytes of the current CUDA device from the driver, or None."""
+    rt = _cudart()
+    if rt is None:
+        return None
+    free, total = ctypes.c_size_t(), ctypes.c_size_t()
+    if rt.cudaMemGetInfo(ctypes.byref(free), ctypes.byref(total)) != 0:
+        return None
+    return int(free.value), int(total.value)
+
+
 def _retain_pool_memory(ndev):
     """Keep freed device memory in the CUDA memory pool instead of returning it at every sync.
 
@@ -114,18 +141,8 @@ def _retain_pool_memory(ndev):
     """
     if os.environ.get("GMASTER_RETAIN_POOL", "1") == "0":
         return
-    import glob
-
-    names = ["libcudart.so", "libcudart.so.13", "libcudart.so.12"]
-    for d in os.environ.get("LD_LIBRARY_PATH", "").split(":"):
-        names += sorted(glob.glob(os.path.join(d, "libcudart.so*")))
-    for name in names:
-        try:
-            rt = ctypes.CDLL(name)
-            break
-        except OSError:
-            continue
-    else:
+    rt = _cudart()
+    if rt is None:
         return
     value = ctypes.c_uint64(2 ** 64 - 1)
     for dev in range(ndev):
