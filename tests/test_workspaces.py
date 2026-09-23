@@ -730,6 +730,7 @@ def test_pieced_coupling_matrix_matches_dense_and_decouples(monkeypatch):
     the shipped piece assembly, `couple_cell`, `decouple_cell` and
     `get_coupling_matrix` at a geometry the suite already compares to pymaster.
     """
+    monkeypatch.setattr(ws, "_BLOCK_MCM", False)
     rng = np.random.default_rng(14)
     nside, lmax = 4, 7
     npix = 12 * nside ** 2
@@ -787,3 +788,37 @@ def test_large_wigner_cache_is_dropped_above_keep_bytes(monkeypatch):
     ws._WD_TRIPLE_CACHE[("probe",)] = jax.numpy.zeros(8)
     ws._drop_large_wigner_cache()
     assert len(ws._WD_TRIPLE_CACHE) == 0
+
+
+@pytest.mark.parametrize("pure_b", [False, True])
+def test_block_coupling_matrix_matches_dense(monkeypatch, pure_b):
+    """The polarised matrix held as distinct blocks (`_BlockMCM`) is the dense matrix.
+
+    Its contraction, matvec and dense form replace the dense matrix's; everything downstream
+    (`get_coupling_matrix`, `decouple_cell`, `couple_cell`) must agree with the dense path.
+    """
+    rng = np.random.default_rng(15)
+    nside, lmax = 8, 23
+    npix = 12 * nside ** 2
+    mask = rng.uniform(0.3, 1, npix)
+    maps = rng.normal(size=(2, npix))
+    field = nmt.NmtField(mask, maps, lmax=lmax, lmax_mask=lmax, n_iter=0, purify_b=pure_b)
+    bins = nmt.NmtBin.from_lmax_linear(lmax, 4)
+    out = []
+    for block in (False, True):
+        monkeypatch.setattr(ws, "_BLOCK_MCM", block)
+        w = nmt.NmtWorkspace()
+        w.compute_coupling_matrix(field, field, bins)
+        assert isinstance(w.mcm, ws._BlockMCM) == block
+        out.append(w)
+    dense, blocked = out
+    np.testing.assert_allclose(np.asarray(blocked.get_coupling_matrix()),
+                               np.asarray(dense.get_coupling_matrix()), atol=1e-14)
+    cl = nmt.compute_coupled_cell(field, field)
+    np.testing.assert_allclose(np.asarray(blocked.decouple_cell(cl)),
+                               np.asarray(dense.decouple_cell(cl)), rtol=1e-11, atol=1e-16)
+    theory = rng.normal(size=(4, lmax + 1))
+    np.testing.assert_allclose(np.asarray(blocked.couple_cell(theory)),
+                               np.asarray(dense.couple_cell(theory)), atol=1e-13)
+    np.testing.assert_allclose(np.asarray(blocked.get_bandpower_windows()),
+                               np.asarray(dense.get_bandpower_windows()), rtol=1e-11, atol=1e-13)

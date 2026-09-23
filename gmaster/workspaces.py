@@ -145,6 +145,8 @@ _OFFSET_CHUNK = 16
 
 # Dense coupling matrices above this size are assembled in pieces (`_assemble_mcm`).
 _MCM_PIECED_BYTES = 4 * 1024 ** 3
+# Polarised matrices are held as their distinct blocks (`_BlockMCM`); 0 restores the dense form.
+_BLOCK_MCM = os.environ.get("GMASTER_BLOCK_MCM", "1") != "0"
 
 
 @partial(jax.jit, static_argnames=("dtype", "lmax", "ncls", "slots", "signs"))
@@ -173,6 +175,90 @@ def _mcm_row(pieces, *, signs):
     return jnp.stack([p * s for p, s in zip(pieces, signs)], axis=-1)
 
 
+@partial(jax.jit, static_argnames=("ncls", "slots", "signs", "index"))
+def _place_blocks(parts, *, ncls, slots, signs, index):
+    """`(rows, ncls, cols, ncls)` array with `parts[index[k]] * signs[k]` at slot `slots[k]`."""
+    rows, cols = parts[0].shape
+    out = jnp.zeros((rows, ncls, cols, ncls), dtype=parts[0].dtype)
+    for k, (c1, c2) in enumerate(slots):
+        out = out.at[:, c1, :, c2].add(parts[index[k]] * signs[k])
+    return out
+
+
+class _BlockMCM:
+    """A polarised mode-coupling matrix held as its distinct `(lmax+1, lmax+1)` blocks.
+
+    For spin-2 fields the `(ncls (lmax+1))^2` matrix repeats two blocks (`M+`, `M-`, NaMaster
+    eq. 19-20; more with purification) in `ncls^2` slots with signs +-1.  The consumers need
+    three things -- the binned contraction `W @ M`, a matvec and the dense matrix on request --
+    and each is cheaper from the blocks: `W @ M` is one `(nbpw, L) @ (L, L)` GEMM per distinct
+    block instead of the `(ncls nbpw, ncls L) @ (ncls L, ncls L)` one (2.0 TFLOP at Nside 2048
+    spin 2, and an 18 GiB operand at 4096), and the dense matrix is never built on the device.
+    """
+
+    def __init__(self, blocks, slots, signs, ncls):
+        uniq, index = [], []
+        for b in blocks:
+            k = next((i for i, u in enumerate(uniq) if u is b), None)
+            if k is None:
+                uniq.append(b)
+                k = len(uniq) - 1
+            index.append(k)
+        self.blocks, self.index = tuple(uniq), tuple(index)
+        self.slots, self.signs, self.ncls = tuple(slots), tuple(float(x) for x in signs), ncls
+        self.lmax1 = uniq[0].shape[0]
+        self.n = ncls * self.lmax1
+        self.shape = (self.n, self.n)
+
+    def _place(self, parts):
+        return _place_blocks(tuple(parts), ncls=self.ncls, slots=self.slots, signs=self.signs,
+                             index=self.index)
+
+    def dense_host(self):
+        """The `(n, n)` matrix as a host numpy array."""
+        out = np.zeros((self.lmax1, self.ncls, self.lmax1, self.ncls))
+        host = [np.asarray(b) for b in self.blocks]
+        for k, (c1, c2) in enumerate(self.slots):
+            out[:, c1, :, c2] += host[self.index[k]] * self.signs[k]
+        return out.reshape(self.shape)
+
+    def __array__(self, dtype=None, copy=None):
+        out = self.dense_host()
+        return out if dtype is None else out.astype(dtype)
+
+    def dense_device(self):
+        return self._place(self.blocks).reshape(self.shape)
+
+    def matvec(self, v):
+        """`M @ v` for a flat `(n,)` vector in the `l * ncls + c` ordering."""
+        v2 = v.reshape((self.lmax1, self.ncls))
+        out = [jnp.zeros(self.lmax1, dtype=jnp.result_type(v.dtype, self.blocks[0].dtype))
+               for _ in range(self.ncls)]
+        for k, (c1, c2) in enumerate(self.slots):
+            out[c1] = out[c1] + self.signs[k] * (self.blocks[self.index[k]] @ v2[:, c2])
+        return jnp.stack(out, axis=1).reshape(-1)
+
+    def banded(self, weights, theory, beam, *, f32):
+        """`(one_sided, binned)` for `output = kron(weights, eye)`, `theory = kron(theory, eye)`.
+
+        `one_sided = output @ M diag(beam)` and `binned = one_sided @ theory`, both per distinct
+        block: `(W M_u) diag(beam)` and then `@ T`, `(nbpw, L)` and `(nbpw, nbpw)` pieces placed
+        into the channel grid.  The dense `binned` product was 66 GFLOP of float64 at Nside 2048
+        spin 2 (`(1636, 24576) @ (24576, 1636)`); per block it is two 2-GFLOP ones.
+        """
+        if f32:
+            parts = [jnp.matmul(weights.astype(jnp.float32), b.astype(jnp.float32),
+                                precision=jax.lax.Precision.HIGHEST).astype(jnp.float64)
+                     for b in self.blocks]
+        else:
+            parts = [weights @ b for b in self.blocks]
+        parts = [p * beam[None, :] for p in parts]
+        nb = weights.shape[0]
+        one_sided = self._place(parts).reshape((nb * self.ncls, self.n))
+        binned = self._place([p @ theory for p in parts]).reshape((nb * self.ncls, nb * self.ncls))
+        return one_sided, binned
+
+
 def _assemble_mcm(dtype, blocks, *, lmax, ncls, slots, signs):
     """The dense mode-coupling matrix from its `(lmax+1, lmax+1)` blocks.
 
@@ -185,6 +271,8 @@ def _assemble_mcm(dtype, blocks, *, lmax, ncls, slots, signs):
     matrix -- and the pieces are joined along the row-channel axis, whose innermost axis
     already matches the output: a plain concatenate, not a transpose.  Values are unchanged.
     """
+    if ncls > 1 and _BLOCK_MCM:
+        return _BlockMCM(tuple(b.astype(dtype) for b in blocks), slots, signs, ncls)
     n = ncls * (lmax + 1)
     if n * n * jnp.dtype(dtype).itemsize <= _MCM_PIECED_BYTES:
         # `dtype` is passed by keyword: a static argument given *positionally* drops jax's C++
@@ -1216,7 +1304,7 @@ class _RowPieces(tuple):
 
 def _mcm_dense(mcm):
     """Host numpy copy of the matrix whichever form it is held in."""
-    return mcm.dense_host() if isinstance(mcm, _RowPieces) else np.asarray(mcm)
+    return mcm.dense_host() if isinstance(mcm, (_RowPieces, _BlockMCM)) else np.asarray(mcm)
 
 
 # Contract `output @ mcm` in row chunks of the matrix above this size (`_left_contract`).
@@ -1292,6 +1380,18 @@ def _banded_operators(mcm, beam1, beam2, output, theory, wawb, *, ncls, norm_typ
 
 class NmtWorkspace:
     """Curved-sky MASTER coupling matrix and bandpower operators."""
+
+    @property
+    def bpws(self):
+        """Bandpower windows `solve(mcm_binned, one_sided)`, formed on first use."""
+        if getattr(self, "_bpws", None) is None and getattr(self, "_one_sided", None) is not None:
+            self._bpws = jnp.linalg.solve(self.mcm_binned, self._one_sided)
+            self._one_sided = None
+        return getattr(self, "_bpws", None)
+
+    @bpws.setter
+    def bpws(self, value):
+        self._bpws, self._one_sided = value, None
 
     def __init__(
         self,
@@ -1603,6 +1703,18 @@ class NmtWorkspace:
 
     def _postprocess(self):
         output, theory = _expanded_binning_operators(self.bins, self.ncls)
+        if isinstance(self.mcm, _BlockMCM):
+            weights, theory_raw = _binning_operators(self.bins)
+            one_sided, binned = self.mcm.banded(weights, theory_raw, self.beam1 * self.beam2,
+                                                f32=_coupling_f32(self.lmax))
+            self.mcm_binned = (self.wawb * jnp.eye(one_sided.shape[0]) if self.norm_type
+                               else binned)
+            # The bandpower windows `solve(mcm_binned, one_sided)` are formed on first use
+            # (`bpws`): `decouple_cell` solves against the binned spectrum, as NaMaster does, and
+            # the eager solve was a float64 LU with `ncls (lmax+1)` right-hand sides -- 131 GFLOP,
+            # the largest cost of the coupling stage at Nside 2048 spin 2.
+            self._one_sided, self._bpws = one_sided, None
+            return
         self.mcm_binned, one_sided = _banded_operators(
             tuple(self.mcm) if isinstance(self.mcm, _RowPieces) else self.mcm,
             self.beam1,
@@ -1624,6 +1736,10 @@ class NmtWorkspace:
         """
         if isinstance(self.mcm, _RowPieces):
             return self.mcm.dense_host()
+        if isinstance(self.mcm, _BlockMCM):
+            if self.mcm.n ** 2 * 8 > _MCM_PIECED_BYTES:
+                return self.mcm.dense_host()
+            return self.mcm.dense_device()
         return self.mcm
 
     def update_coupling_matrix(self, new_matrix):
@@ -1670,7 +1786,7 @@ class NmtWorkspace:
             self.beam1 * self.beam2
         )[None, :]
         flat = theory.T.reshape(-1)
-        coupled = (self.mcm.matvec(flat) if isinstance(self.mcm, _RowPieces)
+        coupled = (self.mcm.matvec(flat) if isinstance(self.mcm, (_RowPieces, _BlockMCM))
                    else self.mcm @ flat)
         return coupled.reshape((self.lmax + 1, self.ncls)).T
 
