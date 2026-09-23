@@ -724,15 +724,22 @@ static constexpr int FMM_THREADS = 256;
 #define CF2(b) reinterpret_cast<const float2*>((b).typed_data())
 
 template <int NR>
-static ffi::Error apply(cudaStream_t s, int dir, int spin, const float2* in, float2* w, float2* ring_out,
+// stages: bit 0 runs the tree (leaves + merges), bit 1 the Christoffel-Darboux step.  CD-only calls
+// map node-space values to rings and back, tree-only analysis maps node space to coefficients; the
+// refinement loop runs in node space, where V^T V = I cancels the trees between iterations.
+static ffi::Error apply(cudaStream_t s, int dir, int spin, int stages, const float2* in, float2* w, float2* ring_out,
                         const float2* ring_in, int nprob, int R, ffi::Span<const int64_t> lev, PLAN_ARGS,
                         float* g, float2* mo, float2* lo, float2* q, float2* dst, float* rp) {
     const int nleaf = leaf_off.element_count();
     const int lgrid = (nleaf + 7) / 8;
     const CDProb* cdp = reinterpret_cast<const CDProb*>(cd_desc.typed_data());
+    const bool tree = stages & 1, cd = stages & 2;
+    const size_t wbytes = sizeof(float2) * NR * vlast.element_count();
     if (dir == 0) {
-        cudaMemcpyAsync(w, in, sizeof(float2) * NR * vlast.element_count(), cudaMemcpyDeviceToDevice, s);
-        leaves<NR><<<lgrid, 128, 0, s>>>(leaf_off.typed_data(), leaf_sz.typed_data(), leaf_mk.typed_data(), leaf_lam.typed_data(), w, nleaf, 0, spin);
+        cudaMemcpyAsync(w, in, wbytes, cudaMemcpyDeviceToDevice, s);
+        if (tree) leaves<NR><<<lgrid, 128, 0, s>>>(leaf_off.typed_data(), leaf_sz.typed_data(), leaf_mk.typed_data(), leaf_lam.typed_data(), w, nleaf, 0, spin);
+    } else if (!cd) {
+        cudaMemcpyAsync(w, ring_in, wbytes, cudaMemcpyDeviceToDevice, s);   // node-space input
     } else {
         cd_fmm<NR><<<nprob, 256, 0, s>>>(cdp, nprob, 1, cd_nh.typed_data(), cd_nl.typed_data(), vlast.typed_data(),
             ring_h.typed_data(), ring_l.typed_data(), R, cd_ln.typed_data(), cd_lr.typed_data(), scale.typed_data(), cd_der.typed_data(),
@@ -745,7 +752,7 @@ static ffi::Error apply(cudaStream_t s, int dir, int spin, const float2* in, flo
         }
     }
     // levels: (kind, nnode, node0, maxk, sb0, poff0, doff0) per tree level
-    const int nlev = lev.size() / 7;
+    const int nlev = tree ? (int)(lev.size() / 7) : 0;
     for (int qq = 0; qq < nlev; ++qq) {
         const int i = dir == 0 ? qq : nlev - 1 - qq;
         const int kind = lev[7 * i], nn = lev[7 * i + 1], node0 = lev[7 * i + 2], maxk = lev[7 * i + 3], sb0 = lev[7 * i + 4];
@@ -767,7 +774,7 @@ static ffi::Error apply(cudaStream_t s, int dir, int spin, const float2* in, flo
                     dsrc.typed_data(), ddst.typed_data(), w, sbase.typed_data() + sb0, g, mo, lo, q, dst, rp, poff0, doff0);
         }
     }
-    if (dir == 0) {
+    if (dir == 0 && cd) {
         cd_fmm<NR><<<nprob, 256, 0, s>>>(cdp, nprob, 0, cd_nh.typed_data(), cd_nl.typed_data(), vlast.typed_data(),
             ring_h.typed_data(), ring_l.typed_data(), R, cd_ln.typed_data(), cd_lr.typed_data(), scale.typed_data(), cd_der.typed_data(),
             w, ring_out, g, mo, lo);
@@ -777,7 +784,7 @@ static ffi::Error apply(cudaStream_t s, int dir, int spin, const float2* in, flo
                 cd_nh.typed_data(), cd_nl.typed_data(), vlast.typed_data(), ring_h.typed_data(), ring_l.typed_data(), R,
                 scale.typed_data(), cd_der.typed_data(), w, ring_out);
         }
-    } else {
+    } else if (dir == 1 && tree) {
         leaves<NR><<<lgrid, 128, 0, s>>>(leaf_off.typed_data(), leaf_sz.typed_data(), leaf_mk.typed_data(), leaf_lam.typed_data(), w, nleaf, 1, spin);
     }
     cudaError_t err = cudaGetLastError();
@@ -789,25 +796,26 @@ static ffi::Error apply(cudaStream_t s, int dir, int spin, const float2* in, flo
 template <int NR>
 ffi::Error SynthImpl(cudaStream_t s, ffi::Buffer<ffi::C64> coef, PLAN_ARGS,
                      ffi::ResultBuffer<ffi::C64> ring, ffi::ResultBuffer<ffi::C64> work, SCRATCH_ARGS,
-                     ffi::Span<const int64_t> lev, int64_t spin) {
+                     ffi::Span<const int64_t> lev, int64_t spin, int64_t stages) {
     const auto rd = ring->dimensions();
-    return apply<NR>(s, 0, (int)spin, CF2(coef), F2(work), F2(ring), nullptr, rd[0], rd[1], lev, PLAN_PASS,
+    return apply<NR>(s, 0, (int)spin, (int)stages, CF2(coef), F2(work), F2(ring), nullptr, rd[0], rd[1], lev, PLAN_PASS,
                      geo->typed_data(), F2(mom), F2(loc), F2(qs), F2(dstage), rpos->typed_data());
 }
 
 // analysis (adjoint): ring (nprob, R, NR) -> coef (ntot, NR)
 template <int NR>
 ffi::Error AnaImpl(cudaStream_t s, ffi::Buffer<ffi::C64> ring, PLAN_ARGS,
-                   ffi::ResultBuffer<ffi::C64> coef, SCRATCH_ARGS, ffi::Span<const int64_t> lev, int64_t spin) {
+                   ffi::ResultBuffer<ffi::C64> coef, SCRATCH_ARGS, ffi::Span<const int64_t> lev, int64_t spin,
+                   int64_t stages) {
     const auto rd = ring.dimensions();
-    return apply<NR>(s, 1, (int)spin, nullptr, F2(coef), nullptr, CF2(ring), rd[0], rd[1], lev, PLAN_PASS,
+    return apply<NR>(s, 1, (int)spin, (int)stages, nullptr, F2(coef), nullptr, CF2(ring), rd[0], rd[1], lev, PLAN_PASS,
                      geo->typed_data(), F2(mom), F2(loc), F2(qs), F2(dstage), rpos->typed_data());
 }
 
 #define SYNTH_BIND ffi::Ffi::Bind().Ctx<ffi::PlatformStream<cudaStream_t>>().Arg<ffi::Buffer<ffi::C64>>() PLAN_BIND \
-        .Ret<ffi::Buffer<ffi::C64>>().Ret<ffi::Buffer<ffi::C64>>() SCRATCH_BIND .Attr<ffi::Span<const int64_t>>("levels").Attr<int64_t>("spin")
+        .Ret<ffi::Buffer<ffi::C64>>().Ret<ffi::Buffer<ffi::C64>>() SCRATCH_BIND .Attr<ffi::Span<const int64_t>>("levels").Attr<int64_t>("spin").Attr<int64_t>("stages")
 #define ANA_BIND_DC ffi::Ffi::Bind().Ctx<ffi::PlatformStream<cudaStream_t>>().Arg<ffi::Buffer<ffi::C64>>() PLAN_BIND \
-        .Ret<ffi::Buffer<ffi::C64>>() SCRATCH_BIND .Attr<ffi::Span<const int64_t>>("levels").Attr<int64_t>("spin")
+        .Ret<ffi::Buffer<ffi::C64>>() SCRATCH_BIND .Attr<ffi::Span<const int64_t>>("levels").Attr<int64_t>("spin").Attr<int64_t>("stages")
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(gm_dc_synth, SynthImpl<1>, SYNTH_BIND);
 XLA_FFI_DEFINE_HANDLER_SYMBOL(gm_dc_synth2, SynthImpl<2>, SYNTH_BIND);

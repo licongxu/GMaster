@@ -259,7 +259,7 @@ def _scratch(static, nr):
             jax.ShapeDtypeStruct((2 * nk,), jnp.float32))
 
 
-def _synth(coef, args, static):
+def _synth(coef, args, static, stages=3):
     """``(ntot, nr)`` packed coefficients -> ``(nprob, R, nr)`` parity-resolved northern values."""
     nprob, R, ntot, levels = static[:4]
     nr = coef.shape[1]
@@ -267,17 +267,19 @@ def _synth(coef, args, static):
         "gm_dc_synth" if nr == 1 else "gm_dc_synth2",
         (jax.ShapeDtypeStruct((nprob, R, nr), jnp.complex64),
          jax.ShapeDtypeStruct((ntot, nr), jnp.complex64)) + _scratch(static, nr))(
-        coef.astype(jnp.complex64), *args, levels=np.asarray(levels, np.int64), spin=np.int64(static[5]))[0]
+        coef.astype(jnp.complex64), *args, levels=np.asarray(levels, np.int64), spin=np.int64(static[5]),
+        stages=np.int64(stages))[0]
 
 
-def _analyse(ring, args, static):
+def _analyse(ring, args, static, stages=3):
     """Adjoint of :func:`_synth`."""
     nprob, R, ntot, levels = static[:4]
     nr = ring.shape[2]
     return jax.ffi.ffi_call(
         "gm_dc_ana" if nr == 1 else "gm_dc_ana2",
         (jax.ShapeDtypeStruct((ntot, nr), jnp.complex64),) + _scratch(static, nr))(
-        ring.astype(jnp.complex64), *args, levels=np.asarray(levels, np.int64), spin=np.int64(static[5]))[0]
+        ring.astype(jnp.complex64), *args, levels=np.asarray(levels, np.int64), spin=np.int64(static[5]),
+        stages=np.int64(stages))[0]
 
 
 @lru_cache(maxsize=2)
@@ -450,3 +452,99 @@ def inverse_latitudinal_spin(flm, *, L, spin, nside):
     """``(L, 2L-1)`` flm -> ``(ntheta, 2L)`` ring spectrum (column 0 zero)."""
     pl = plan_for(L, nside, spin)
     return _inverse_spin_impl(flm, pl.args, pl.ell, pl.order, pl.fac, pl.msign, L=int(L), static=pl.static())
+
+
+
+# -------------------------------------------------------------------------- node-space refinement
+# Synthesis is S = C V^T diag(fac) and analysis A = diag(fac) V C^T, with C the Christoffel-Darboux
+# node-to-ring map and V the (orthogonal) eigenvector matrix applied by the tree; fac^2 = 1/(2 pi)
+# for the normalised transforms of either spin.  In w = V^T (alm / fac) the refinement
+#     alm <- alm - A (S alm - map)     becomes     w <- w - C^T (C w / (2 pi) - map),
+# so the trees cancel between iterations: each one costs two CD steps and the tree runs once, at
+# the end (alm = fac V w).
+
+_INV_2PI = 1.0 / (2.0 * math.pi)
+
+
+@partial(jax.jit, static_argnames=("L", "nside", "static"))
+def _cd_forward_impl(positives, weights, phase, args, *, L, nside, static):
+    wp = weights[:, None].astype(jnp.float32) * _ring_phase(phase, L)
+    ring = jnp.stack([_fold_hemispheres(p.astype(jnp.complex64) * wp, L, nside) for p in positives],
+                     axis=2)
+    return _analyse(ring, args, static, stages=2)
+
+
+@partial(jax.jit, static_argnames=("L", "nside", "static"))
+def _cd_inverse_impl(w, phase, args, *, L, nside, static):
+    ring = _synth(w.astype(jnp.complex64) * _INV_2PI, args, static, stages=2)
+    rp = _ring_phase(phase, L)
+    return tuple(_hemispheres(ring[:, :, k], L, nside) * rp for k in range(w.shape[1]))
+
+
+@partial(jax.jit, static_argnames=("static",))
+def _tree_finish_impl(w, args, fac, *, static):
+    nr = w.shape[1]
+    return _analyse(w.astype(jnp.complex64).reshape(-1, 1, nr), args, static, stages=1) * fac[:, None]
+
+
+def cd_forward_packed(ftms, weights, phase, *, L, nside):
+    """Ring blocks -> node-space w = C^T g, ``(ntot, nmaps)``."""
+    pl = plan_for(L, nside)
+    return _cd_forward_impl(tuple(ftms), weights, phase, pl.args, L=int(L), nside=int(nside), static=pl.static())
+
+
+def cd_inverse_packed(w, phase, *, L, nside):
+    """Node-space w -> ring blocks of C w / (2 pi) (the synthesis of alm = fac V w)."""
+    pl = plan_for(L, nside)
+    return _cd_inverse_impl(w, phase, pl.args, L=int(L), nside=int(nside), static=pl.static())
+
+
+def tree_finish_packed(w, *, L, nside):
+    """Node-space w -> packed alm = fac V w."""
+    pl = plan_for(L, nside)
+    return _tree_finish_impl(w, pl.args, pl.fac, static=pl.static())
+
+
+# Spin s in node space: the same channels as `_forward_spin_impl` / `_inverse_spin_impl` (direct
+# m >= 0, mirror = ring-reversed data with (-1)^(ell+s)), with the tree left out; msign^2 = 1 and
+# (fac N_ell)^2 = 1/(2 pi), so the node-space refinement is the spin-0 one.
+
+@partial(jax.jit, static_argnames=("L", "static"))
+def _cd_forward_spin_impl(ftm, args, *, L, static):
+    ftm = ftm.astype(jnp.complex64)
+    direct = ftm[:, L:2 * L].T
+    mirror = jnp.concatenate([jnp.zeros((1, ftm.shape[0]), ftm.dtype), ftm[::-1, 1:L][:, ::-1].T], axis=0)
+    return _analyse(jnp.stack([direct, mirror], axis=2), args, static, stages=2)
+
+
+@partial(jax.jit, static_argnames=("L", "static"))
+def _cd_inverse_spin_impl(w, args, *, L, static):
+    ring = _synth(w.astype(jnp.complex64) * _INV_2PI, args, static, stages=2)   # (L, ntheta, 2)
+    ntheta = ring.shape[1]
+    pos = ring[:, :, 0].T
+    neg = ring[1:, ::-1, 1].T
+    return jnp.concatenate([jnp.zeros((ntheta, 1), pos.dtype), neg[:, ::-1], pos], axis=1)
+
+
+@partial(jax.jit, static_argnames=("L", "static"))
+def _tree_finish_spin_impl(w, args, inv, fac, msign, *, L, static):
+    coef = _analyse(w.astype(jnp.complex64).reshape(-1, 1, 2), args, static, stages=1) * fac[:, None]
+    coef = jnp.concatenate([coef, jnp.zeros((1, 2), coef.dtype)], axis=0)
+    pos = coef[inv, 0].reshape(L, L).T
+    neg = jnp.concatenate([coef[:-1, 1] * msign, jnp.zeros(1, coef.dtype)])[inv].reshape(L, L).T
+    return jnp.concatenate([neg[:, 1:][:, ::-1], pos], axis=1).astype(jnp.complex128)
+
+
+def cd_forward_spin(ftm, *, L, spin, nside):
+    pl = plan_for(L, nside, spin)
+    return _cd_forward_spin_impl(ftm, pl.args, L=int(L), static=pl.static())
+
+
+def cd_inverse_spin(w, *, L, spin, nside):
+    pl = plan_for(L, nside, spin)
+    return _cd_inverse_spin_impl(w, pl.args, L=int(L), static=pl.static())
+
+
+def tree_finish_spin(w, *, L, spin, nside):
+    pl = plan_for(L, nside, spin)
+    return _tree_finish_spin_impl(w, pl.args, pl.inv_m, pl.fac, pl.msign, L=int(L), static=pl.static())

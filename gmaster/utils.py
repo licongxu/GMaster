@@ -1998,8 +1998,43 @@ def _map2alm_core_slab(maps, ell, order, *, spin, nside, L, L_work, n_iter,
     return alm
 
 
+@partial(jax.jit, static_argnames=("L", "nside"))
+def _spin_analysis_weigh(centered, *, L, nside):
+    """Raw centred ring spectrum -> the weighted, phase-shifted ``(ntheta, 2L)`` analysis input."""
+    ftm = jnp.concatenate((jnp.zeros((centered.shape[0], 1), centered.dtype), centered), axis=1)
+    ftm = ftm * quadrature_jax.quad_weights_transform(L, "healpix", nside)[:, None]
+    return ftm.at[:, 1:].multiply(healpix_ffts.ring_phase_shifts_hp_jax(L, nside, True, False))
+
+
+@partial(jax.jit, static_argnames=("L", "nside", "spin"))
+def _spin_synthesis_raw(ftm, *, L, nside, spin):
+    """Latitudinal ``(ntheta, 2L)`` synthesis output -> the raw centred spectrum the ring IFFT takes."""
+    return ftm[:, 1:] * healpix_ffts.ring_phase_shifts_hp_jax(L, nside, False, False) * (-1) ** abs(spin)
+
+
+def _map2alm_core_dc_spin(maps, ell, order, *, spin, nside, L_work, n_iter, dc):
+    """Spin-s refinement in the D&C engine's node space (see `_dc_lat`): no tree inside the loop."""
+    tables = _polarised_ring_tables(spin, L_work, nside, maps, synthesis=False)
+    fmap = _forward_ring_fft_full(maps[0] + 1j * maps[1], tables, L=L_work, nside=nside)
+    w = dc.cd_forward_spin(_spin_analysis_weigh(fmap, L=L_work, nside=nside), L=L_work, spin=spin, nside=nside)
+    for _ in range(n_iter):
+        raw = _spin_synthesis_raw(dc.cd_inverse_spin(w, L=L_work, spin=spin, nside=nside),
+                                  L=L_work, nside=nside, spin=spin)
+        resid = _spin_march._march_v2.ring_fold_residual_complex(raw, fmap, nside=nside)
+        w = w - dc.cd_forward_spin(_spin_analysis_weigh(resid, L=L_work, nside=nside),
+                                   L=L_work, spin=spin, nside=nside)
+    flm = dc.tree_finish_spin(w, L=L_work, spin=spin, nside=nside)
+    plus = _finish_forward_s2fft(flm, L=L_work, spin=spin, reality=False)
+    return _spin_pack_plus(plus, ell, order, L_work=L_work)
+
+
 def _map2alm_core(maps, ell, order, *, spin, nside, L, L_work, n_iter):
     """Run Jacobi refinement without retaining every iteration in one XLA graph."""
+    dc = _dc_spin(L_work, spin)
+    if dc is not None and n_iter and L == L_work and _NODE_SPACE and _RING_FOLD \
+            and _spin_march._march_v2.fold_available():
+        return _map2alm_core_dc_spin(maps, ell, order, spin=spin, nside=nside, L_work=L_work,
+                                     n_iter=n_iter, dc=dc)
     alm = _map2alm_once(
         maps, ell, order, spin=spin, nside=nside, L=L, L_work=L_work
     )
@@ -2241,6 +2276,8 @@ def _alm2map_core_pallas_pair_eager(alm_a, alm_b, *, nside, L, L_work):
 # spectra from its first analysis and never runs a ring FFT again.  `GMASTER_RING_FOLD=0` restores
 # the synthesise-to-pixels form.
 _RING_FOLD = os.environ.get("GMASTER_RING_FOLD", "1") != "0"
+# Refinement in the D&C engine's node space (V^T V = I: the trees cancel between iterations).
+_NODE_SPACE = os.environ.get("GMASTER_DC_NODE_SPACE", "1") != "0"
 
 
 def _ring_fold_ready(L_work):
@@ -2289,12 +2326,22 @@ def _map2alm_core_pallas_pair_eager(
                 for m in (maps_a, maps_b)]
         weights = quadrature_jax.quad_weights_transform(L_work, "healpix", nside)
         phi = healpix_ffts.p2phi_rings_jax(jnp.arange(4 * nside - 1), nside)
-        acc = dc.forward_packed(ftms, weights, -phi, L=L_work, nside=nside).astype(jnp.complex128)
-        for _ in range(n_iter):
-            rings = dc.inverse_packed(acc, phi, L=L_work, nside=nside)
-            resid = [_spin_march._march_v2.ring_fold_residual(r, f, nside=nside)
-                     for r, f in zip(rings, ftms)]
-            acc = acc - dc.forward_packed(resid, weights, -phi, L=L_work, nside=nside)
+        if _NODE_SPACE:
+            # Node-space refinement (`_dc_lat` notes): the trees cancel between iterations.
+            w = dc.cd_forward_packed(ftms, weights, -phi, L=L_work, nside=nside)
+            for _ in range(n_iter):
+                rings = dc.cd_inverse_packed(w, phi, L=L_work, nside=nside)
+                resid = [_spin_march._march_v2.ring_fold_residual(r, f, nside=nside)
+                         for r, f in zip(rings, ftms)]
+                w = w - dc.cd_forward_packed(resid, weights, -phi, L=L_work, nside=nside)
+            acc = dc.tree_finish_packed(w, L=L_work, nside=nside).astype(jnp.complex128)
+        else:
+            acc = dc.forward_packed(ftms, weights, -phi, L=L_work, nside=nside).astype(jnp.complex128)
+            for _ in range(n_iter):
+                rings = dc.inverse_packed(acc, phi, L=L_work, nside=nside)
+                resid = [_spin_march._march_v2.ring_fold_residual(r, f, nside=nside)
+                         for r, f in zip(rings, ftms)]
+                acc = acc - dc.forward_packed(resid, weights, -phi, L=L_work, nside=nside)
         return tuple(dc.packed_to_alm(acc[:, k], ell, order, L=L_work, nside=nside)[None, :]
                      for k in range(2))
     if n_iter and _ring_fold_ready(L_work):

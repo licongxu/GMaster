@@ -1412,3 +1412,27 @@ def test_dc_spin2_latitudinal_matches_march(nside):
     for march, dc in pairs:
         march, dc = np.asarray(march), np.asarray(dc)
         assert np.max(np.abs(dc - march)) < 5e-5 * np.max(np.abs(march))
+
+
+@pytest.mark.march_v2
+@pytest.mark.skipif(not _HAS_NVIDIA_GPU, reason="requires an NVIDIA GPU")
+@pytest.mark.parametrize("spin", [0, 2])
+def test_dc_node_space_refinement_matches_tree_space(monkeypatch, spin):
+    """Refinement in the D&C engine's node space (V^T V = I) is the tree-space refinement."""
+    from gmaster import _dc_lat, _march_v2
+    from gmaster import utils
+
+    if _dc_lat._build() is None or not _march_v2.fold_available():
+        pytest.skip("CUDA libraries unavailable")
+    monkeypatch.setattr(_dc_lat, "_MIN_L", 0)
+    nside = 64
+    npix = 12 * nside ** 2
+    rng = np.random.default_rng(spin)
+    mask = np.clip(rng.uniform(size=npix) + 0.3, 0, 1)
+    maps = [rng.normal(size=npix)] if spin == 0 else [rng.normal(size=npix), rng.normal(size=npix)]
+    out = []
+    for node_space in (False, True):
+        monkeypatch.setattr(utils, "_NODE_SPACE", node_space)
+        field = nmt.NmtField(mask, maps, n_iter=3, spin=spin)
+        out.append(np.asarray(field.alm))
+    assert np.max(np.abs(out[1] - out[0])) < 2e-5 * np.max(np.abs(out[0]))

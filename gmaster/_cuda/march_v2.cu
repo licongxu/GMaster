@@ -443,6 +443,29 @@ __global__ void ring_fold_residual(const float2* __restrict__ F, const float2* _
     }
 }
 
+// Complex (non-Hermitian) version for spin fields: centred spectra, column j <-> order j - (L-1),
+// m in [-(L-1), L-1].  R[r, k] = n_phi sum_{m = k mod n_phi} F[r, m] - Mf[r, k].
+__global__ void ring_fold_residual_c(const float2* __restrict__ F, const float2* __restrict__ Mf,
+                                     const int* __restrict__ nphi, float2* __restrict__ R, int L)
+{
+    const int r = blockIdx.x, n = nphi[r], W = 2 * L - 1, lo = -(L - 1);
+    const float2* f = F + (size_t)r * W;
+    const float2* mf = Mf + (size_t)r * W;
+    float2* out = R + (size_t)r * W;
+    const int nres = min(n, W);
+    for (int rho = threadIdx.x; rho < nres; rho += blockDim.x) {
+        // first order >= lo in residue class rho (mod n)
+        const int m0 = lo + (((rho - lo) % n) + n) % n;
+        double sx = 0.0, sy = 0.0;
+        for (int m = m0; m <= L - 1; m += n) { const float2 v = f[m - lo]; sx += v.x; sy += v.y; }
+        sx *= n; sy *= n;
+        for (int m = m0; m <= L - 1; m += n) {
+            const float2 q = mf[m - lo];
+            out[m - lo] = make_float2((float)(sx - (double)q.x), (float)(sy - (double)q.y));
+        }
+    }
+}
+
 // ================================================================================ FFI handlers
 template <int SPIN, int NCH, int NM>
 ffi::Error AnalysisImpl(cudaStream_t stream,
@@ -520,6 +543,24 @@ ffi::Error RingFoldImpl(cudaStream_t stream, ffi::Buffer<ffi::C64> F, ffi::Buffe
     if (err != cudaSuccess) return ffi::Error::Internal(cudaGetErrorString(err));
     return ffi::Error::Success();
 }
+
+ffi::Error RingFoldCImpl(cudaStream_t stream, ffi::Buffer<ffi::C64> F, ffi::Buffer<ffi::C64> Mf,
+                         ffi::Buffer<ffi::S32> nphi, ffi::ResultBuffer<ffi::C64> R)
+{
+    const auto fd = F.dimensions();              // (nring, 2L - 1)
+    const int nring = fd[0], L = (fd[1] + 1) / 2;
+    ring_fold_residual_c<<<nring, 256, 0, stream>>>(
+        reinterpret_cast<const float2*>(F.typed_data()), reinterpret_cast<const float2*>(Mf.typed_data()),
+        nphi.typed_data(), reinterpret_cast<float2*>(R->typed_data()), L);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) return ffi::Error::Internal(cudaGetErrorString(err));
+    return ffi::Error::Success();
+}
+
+XLA_FFI_DEFINE_HANDLER_SYMBOL(gm_ring_fold_c, RingFoldCImpl,
+    ffi::Ffi::Bind().Ctx<ffi::PlatformStream<cudaStream_t>>()
+        .Arg<ffi::Buffer<ffi::C64>>().Arg<ffi::Buffer<ffi::C64>>().Arg<ffi::Buffer<ffi::S32>>()
+        .Ret<ffi::Buffer<ffi::C64>>());
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(gm_ring_fold, RingFoldImpl,
     ffi::Ffi::Bind().Ctx<ffi::PlatformStream<cudaStream_t>>()

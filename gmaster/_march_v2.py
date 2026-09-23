@@ -136,7 +136,7 @@ def _build():
                 raise RuntimeError("nvcc failed:\n" + out.stderr[-4000:])
             os.replace(tmp, so)
         lib = ctypes.CDLL(so)
-        for name in _NAMES + ("gm_ring_fold",):
+        for name in _NAMES + ("gm_ring_fold", "gm_ring_fold_c"):
             jax.ffi.register_ffi_target(name, jax.ffi.pycapsule(getattr(lib, name)),
                                         platform="CUDA")
         _LIB = lib
@@ -550,6 +550,14 @@ def ring_fold_residual(ftm_synth, ftm_map, *, nside):
     Mf = jnp.asarray(ftm_map).astype(jnp.complex64)
     nphi = jnp.asarray(_ring_nphi(int(nside)))
     return jax.ffi.ffi_call("gm_ring_fold", jax.ShapeDtypeStruct(F.shape, jnp.complex64))(F, Mf, nphi)
+
+
+def ring_fold_residual_complex(ftm_synth, ftm_map, *, nside):
+    """Complex-field version of :func:`ring_fold_residual` on centred ``(nring, 2L-1)`` spectra."""
+    F = jnp.asarray(ftm_synth).astype(jnp.complex64)
+    Mf = jnp.asarray(ftm_map).astype(jnp.complex64)
+    nphi = jnp.asarray(_ring_nphi(int(nside)))
+    return jax.ffi.ffi_call("gm_ring_fold_c", jax.ShapeDtypeStruct(F.shape, jnp.complex64))(F, Mf, nphi)
 
 
 # ------------------------------------------------------------------------------- spin 0, folded
