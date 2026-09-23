@@ -413,6 +413,16 @@ march_synthesis(const float* __restrict__ xs_hi, const float* __restrict__ xs_lo
 //   Ft_r[m] = F[r, m] (m > 0), Re F[r, 0] (m = 0), conj F[r, -m] (m < 0),
 // with Mf the map's own ring spectrum (the analysis FFT the first pass already took).  One thread
 // per (ring, residue); the fold sums in float64 before the difference is rounded.
+// Compensated float32 accumulation (Knuth two-sum): the folds used to sum in float64, which on this
+// card's 1/64-rate fp64 pipe made them compute-bound at 19 % of DRAM bandwidth (2.4 ms per Nside 2048
+// call against a ~1 ms floor).  The inputs are complex64, so a float32 residual carries the data's own
+// absolute error; only the long polar-cap sums (up to L / n_phi terms) need the compensation.
+__device__ __forceinline__ void fold_acc(float& s, float& c, float x) {
+    const float t = s + x, bp = t - s;
+    c += (s - (t - bp)) + (x - bp);
+    s = t;
+}
+
 __global__ void ring_fold_residual(const float2* __restrict__ F, const float2* __restrict__ Mf,
                                    const int* __restrict__ nphi, float2* __restrict__ R, int L)
 {
@@ -423,22 +433,21 @@ __global__ void ring_fold_residual(const float2* __restrict__ F, const float2* _
     float2* out = R + (size_t)r * L;
     const int nres = min(n, L);
     for (int rho = threadIdx.x; rho < nres; rho += blockDim.x) {
-        double sx = 0.0, sy = 0.0;
+        float sx = 0.f, sy = 0.f, cx = 0.f, cy = 0.f;
         for (int m = rho; m < L; m += n) {
             const float2 v = f[m];
-            sx += v.x;
-            if (m) sy += v.y;
+            fold_acc(sx, cx, v.x);
+            if (m) fold_acc(sy, cy, v.y);
         }
         for (int m = n - rho; m < L; m += n) {        // negative orders -m = rho - t n
             const float2 v = f[m];
-            sx += v.x;
-            sy -= v.y;
+            fold_acc(sx, cx, v.x);
+            fold_acc(sy, cy, -v.y);
         }
-        sx *= n;
-        sy *= n;
+        const float fx = (float)n * (sx + cx), fy = (float)n * (sy + cy);
         for (int k = rho; k < L; k += n) {
             const float2 q = mf[k];
-            out[k] = make_float2((float)(sx - (double)q.x), (float)(sy - (double)q.y));
+            out[k] = make_float2(fx - q.x, fy - q.y);
         }
     }
 }
@@ -456,12 +465,12 @@ __global__ void ring_fold_residual_c(const float2* __restrict__ F, const float2*
     for (int rho = threadIdx.x; rho < nres; rho += blockDim.x) {
         // first order >= lo in residue class rho (mod n)
         const int m0 = lo + (((rho - lo) % n) + n) % n;
-        double sx = 0.0, sy = 0.0;
-        for (int m = m0; m <= L - 1; m += n) { const float2 v = f[m - lo]; sx += v.x; sy += v.y; }
-        sx *= n; sy *= n;
+        float sx = 0.f, sy = 0.f, cx = 0.f, cy = 0.f;
+        for (int m = m0; m <= L - 1; m += n) { const float2 v = f[m - lo]; fold_acc(sx, cx, v.x); fold_acc(sy, cy, v.y); }
+        const float fx = (float)n * (sx + cx), fy = (float)n * (sy + cy);
         for (int m = m0; m <= L - 1; m += n) {
             const float2 q = mf[m - lo];
-            out[m - lo] = make_float2((float)(sx - (double)q.x), (float)(sy - (double)q.y));
+            out[m - lo] = make_float2(fx - q.x, fy - q.y);
         }
     }
 }
