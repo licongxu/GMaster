@@ -2329,13 +2329,7 @@ def _map2alm_core_pallas_pair_eager(
         phi = healpix_ffts.p2phi_rings_jax(jnp.arange(4 * nside - 1), nside)
         if _NODE_SPACE:
             # Node-space refinement (`_dc_lat` notes): the trees cancel between iterations.
-            w = dc.cd_forward_packed(ftms, weights, -phi, L=L_work, nside=nside)
-            for _ in range(n_iter):
-                rings = dc.cd_inverse_packed(w, phi, L=L_work, nside=nside)
-                resid = [_spin_march._march_v2.ring_fold_residual(r, f, nside=nside)
-                         for r, f in zip(rings, ftms)]
-                w = w - dc.cd_forward_packed(resid, weights, -phi, L=L_work, nside=nside)
-            acc = dc.tree_finish_packed(w, L=L_work, nside=nside).astype(jnp.complex128)
+            return dc.refine_s0(ftms, weights, phi, ell, order, L=L_work, nside=nside, n_iter=n_iter)
         else:
             acc = dc.forward_packed(ftms, weights, -phi, L=L_work, nside=nside).astype(jnp.complex128)
             for _ in range(n_iter):
@@ -2536,13 +2530,7 @@ def _map2alm_core_pallas_eager(
         )
         weights = quadrature_jax.quad_weights_transform(L_work, "healpix", nside)
         phi = healpix_ffts.p2phi_rings_jax(jnp.arange(4 * nside - 1), nside)
-        w = dc.cd_forward_packed([ftm], weights, -phi, L=L_work, nside=nside)
-        for _ in range(n_iter):
-            (ring,) = dc.cd_inverse_packed(w, phi, L=L_work, nside=nside)
-            resid = _spin_march._march_v2.ring_fold_residual(ring, ftm, nside=nside)
-            w = w - dc.cd_forward_packed([resid], weights, -phi, L=L_work, nside=nside)
-        acc = dc.tree_finish_packed(w, L=L_work, nside=nside).astype(jnp.complex128)
-        return dc.packed_to_alm(acc[:, 0], ell, order, L=L_work, nside=nside)[None, :]
+        return dc.refine_s0([ftm], weights, phi, ell, order, L=L_work, nside=nside, n_iter=n_iter)[0]
     if spin == 0 and n_iter and _ring_fold_ready(L_work):
         ftm = _forward_ring_fft_positive(
             maps[0],

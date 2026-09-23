@@ -586,3 +586,30 @@ def cd_inverse_spin_raw(w, phase, *, L, spin, nside):
     """Node-space w -> raw centred ring spectrum for the ring IFFT (phase and (-1)^s applied)."""
     pl = plan_for(L, nside, spin)
     return _cd_inverse_spin_raw_impl(w, phase, pl.args, L=int(L), spin=int(spin), static=pl.static())
+
+
+# ------------------------------------------------------------------ one-program node-space refinement
+# The spin-0 refinement loop (`utils`) was ~20 eagerly dispatched programs per field -- ~15 ms of
+# host gaps at Nside 2048 against 93 ms of kernels.  Here it is one program, with the plan arrays as
+# arguments (never captured as constants): ring spectra in, `(ell, order)`-packed alms out.
+
+@partial(jax.jit, static_argnames=("L", "nside", "static", "n_iter"))
+def _refine_s0_impl(ftms, weights, phase, args, fac, inv, ell, order, *, L, nside, static, n_iter):
+    from ._march_v2 import ring_fold_residual
+
+    w = _cd_forward_impl(ftms, weights, -phase, args, L=L, nside=nside, static=static)
+    for _ in range(n_iter):
+        rings = _cd_inverse_impl(w, phase, args, L=L, nside=nside, static=static)
+        resid = tuple(ring_fold_residual(r, f, nside=nside) for r, f in zip(rings, ftms))
+        w = w - _cd_forward_impl(resid, weights, -phase, args, L=L, nside=nside, static=static)
+    acc = _tree_finish_impl(w, args, fac, static=static)
+    return tuple(_packed_to_alm_impl(acc[:, k], inv, ell, order, L=L)[None, :]
+                 for k in range(len(ftms)))
+
+
+def refine_s0(ftms, weights, phase, ell, order, *, L, nside, n_iter):
+    """Node-space MASTER refinement of one or two scalar maps from their ring spectra."""
+    pl = plan_for(L, nside)
+    return _refine_s0_impl(tuple(f.astype(jnp.complex64) for f in ftms), weights, phase, pl.args,
+                           pl.fac, pl.inv, ell, order, L=int(L), nside=int(nside),
+                           static=pl.static(), n_iter=int(n_iter))

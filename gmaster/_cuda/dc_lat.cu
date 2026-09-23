@@ -752,8 +752,11 @@ static ffi::Error apply(cudaStream_t s, int dir, int spin, int stages, const flo
     const CDProb* cdp = reinterpret_cast<const CDProb*>(cd_desc.typed_data());
     const bool tree = stages & 1, cd = stages & 2;
     const size_t wbytes = sizeof(float2) * NR * vlast.element_count();
+    // The tree works in place on w; a CD-only synthesis reads its input where it is (the node-space
+    // loop makes three per iteration pair).
+    float2* src = (dir == 0 && !tree) ? const_cast<float2*>(in) : w;
     if (dir == 0) {
-        cudaMemcpyAsync(w, in, wbytes, cudaMemcpyDeviceToDevice, s);
+        if (tree) cudaMemcpyAsync(w, in, wbytes, cudaMemcpyDeviceToDevice, s);
         if (tree) leaves<NR><<<lgrid, 128, 0, s>>>(leaf_off.typed_data(), leaf_sz.typed_data(), leaf_mk.typed_data(), leaf_lam.typed_data(), w, nleaf, 0, spin);
     } else if (!cd) {
         cudaMemcpyAsync(w, ring_in, wbytes, cudaMemcpyDeviceToDevice, s);   // node-space input
@@ -794,12 +797,12 @@ static ffi::Error apply(cudaStream_t s, int dir, int spin, int stages, const flo
     if (dir == 0 && cd) {
         cd_fmm<NR><<<nprob, 256, 0, s>>>(cdp, nprob, 0, cd_nh.typed_data(), cd_nl.typed_data(), vlast.typed_data(),
             ring_h.typed_data(), ring_l.typed_data(), R, cd_ln.typed_data(), cd_lr.typed_data(), scale.typed_data(), cd_der.typed_data(),
-            w, ring_out, g, mo, lo);
+            src, ring_out, g, mo, lo);
         {
             const int nrec = cdx_f.element_count();
             if (nrec) cd_fix<NR><<<(nrec + 127) / 128, 128, 0, s>>>(cdx_i.typed_data(), cdx_f.typed_data(), nrec, 0, cdp,
                 cd_nh.typed_data(), cd_nl.typed_data(), vlast.typed_data(), ring_h.typed_data(), ring_l.typed_data(), R,
-                scale.typed_data(), cd_der.typed_data(), w, ring_out);
+                scale.typed_data(), cd_der.typed_data(), src, ring_out);
         }
     } else if (dir == 1 && tree) {
         leaves<NR><<<lgrid, 128, 0, s>>>(leaf_off.typed_data(), leaf_sz.typed_data(), leaf_mk.typed_data(), leaf_lam.typed_data(), w, nleaf, 1, spin);
