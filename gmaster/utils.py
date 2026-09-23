@@ -2016,13 +2016,14 @@ def _map2alm_core_dc_spin(maps, ell, order, *, spin, nside, L_work, n_iter, dc):
     """Spin-s refinement in the D&C engine's node space (see `_dc_lat`): no tree inside the loop."""
     tables = _polarised_ring_tables(spin, L_work, nside, maps, synthesis=False)
     fmap = _forward_ring_fft_full(maps[0] + 1j * maps[1], tables, L=L_work, nside=nside)
-    w = dc.cd_forward_spin(_spin_analysis_weigh(fmap, L=L_work, nside=nside), L=L_work, spin=spin, nside=nside)
+    fmap = fmap.astype(jnp.complex64)
+    weights = quadrature_jax.quad_weights_transform(L_work, "healpix", nside)
+    phi = healpix_ffts.p2phi_rings_jax(jnp.arange(4 * nside - 1), nside)
+    w = dc.cd_forward_spin_raw(fmap, weights, phi, L=L_work, spin=spin, nside=nside)
     for _ in range(n_iter):
-        raw = _spin_synthesis_raw(dc.cd_inverse_spin(w, L=L_work, spin=spin, nside=nside),
-                                  L=L_work, nside=nside, spin=spin)
+        raw = dc.cd_inverse_spin_raw(w, phi, L=L_work, spin=spin, nside=nside)
         resid = _spin_march._march_v2.ring_fold_residual_complex(raw, fmap, nside=nside)
-        w = w - dc.cd_forward_spin(_spin_analysis_weigh(resid, L=L_work, nside=nside),
-                                   L=L_work, spin=spin, nside=nside)
+        w = w - dc.cd_forward_spin_raw(resid, weights, phi, L=L_work, spin=spin, nside=nside)
     flm = dc.tree_finish_spin(w, L=L_work, spin=spin, nside=nside)
     plus = _finish_forward_s2fft(flm, L=L_work, spin=spin, reality=False)
     return _spin_pack_plus(plus, ell, order, L_work=L_work)

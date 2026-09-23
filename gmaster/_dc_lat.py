@@ -548,3 +548,41 @@ def cd_inverse_spin(w, *, L, spin, nside):
 def tree_finish_spin(w, *, L, spin, nside):
     pl = plan_for(L, nside, spin)
     return _tree_finish_spin_impl(w, pl.args, pl.inv_m, pl.fac, pl.msign, L=int(L), static=pl.static())
+
+
+# Fused ring-side glue for the spin-s node-space loop: raw centred ring spectra `(nring, 2L-1)`
+# (column j <-> order j - (L-1)) straight to / from the (direct, mirror) channel stack, in
+# complex64 with the float64-reduced, float32 sincos ring phase.  Built from the generic wrappers
+# (weights, `ring_phase_shifts_hp_jax`, a zero column, the channel slicing) this was ~110 ms of
+# complex128 XLA passes per spin-2 field at Nside 2048 -- the fp64 sincos alone ~40 ms -- against
+# ~80 ms for the D&C kernels themselves.
+
+@partial(jax.jit, static_argnames=("L", "static"))
+def _cd_forward_spin_raw_impl(centered, weights, phase, args, *, L, static):
+    c = centered.astype(jnp.complex64) * weights[:, None].astype(jnp.float32)
+    rp = _ring_phase(phase, L)                                       # exp(i m phi_r), m = 0..L-1
+    direct = (c[:, L - 1:] * jnp.conj(rp)).T                        # order m >= 0: e^{-i m phi}
+    neg = c[::-1, :L][:, ::-1] * rp[::-1]                            # column m: order -m, rings reversed
+    mirror = neg.at[:, 0].set(0).T
+    return _analyse(jnp.stack([direct, mirror], axis=2), args, static, stages=2)
+
+
+@partial(jax.jit, static_argnames=("L", "spin", "static"))
+def _cd_inverse_spin_raw_impl(w, phase, args, *, L, spin, static):
+    ring = _synth(w.astype(jnp.complex64) * (_INV_2PI * (-1.0) ** spin), args, static, stages=2)
+    rp = _ring_phase(phase, L)
+    pos = ring[:, :, 0].T * rp                                       # (nring, L): order m, e^{+i m phi}
+    neg = ring[1:, ::-1, 1].T * jnp.conj(rp[:, 1:])                  # (nring, L-1): order -m
+    return jnp.concatenate([neg[:, ::-1], pos], axis=1)
+
+
+def cd_forward_spin_raw(centered, weights, phase, *, L, spin, nside):
+    """Raw centred analysis ring spectrum -> node-space w (weights and ring phase applied here)."""
+    pl = plan_for(L, nside, spin)
+    return _cd_forward_spin_raw_impl(centered, weights, phase, pl.args, L=int(L), static=pl.static())
+
+
+def cd_inverse_spin_raw(w, phase, *, L, spin, nside):
+    """Node-space w -> raw centred ring spectrum for the ring IFFT (phase and (-1)^s applied)."""
+    pl = plan_for(L, nside, spin)
+    return _cd_inverse_spin_raw_impl(w, phase, pl.args, L=int(L), spin=int(spin), static=pl.static())
