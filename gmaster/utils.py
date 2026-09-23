@@ -2240,6 +2240,26 @@ def _map2alm_core_pallas_pair_eager(
     a table cache; the two also select different kernels, so neither can become a
     runtime value.
     """
+    dc = _spin_march._march_v2._dc(L_work)
+    if n_iter and dc is not None and L == L_work and _ring_fold_ready(L_work):
+        # The divide-and-conquer engine serves both latitudinal stages: the refinement runs in its
+        # packed alm layout (fp64 accumulation) and converts to the output packing once.
+        ftms = [_forward_ring_fft_positive(
+                    m[0],
+                    _ring_analysis_tables(
+                        L_work, nside, getattr(m, "device", None) or getattr(m[0], "device", None)),
+                    L=L_work, nside=nside)
+                for m in (maps_a, maps_b)]
+        weights = quadrature_jax.quad_weights_transform(L_work, "healpix", nside)
+        phi = healpix_ffts.p2phi_rings_jax(jnp.arange(4 * nside - 1), nside)
+        acc = dc.forward_packed(ftms, weights, -phi, L=L_work, nside=nside).astype(jnp.complex128)
+        for _ in range(n_iter):
+            rings = dc.inverse_packed(acc, phi, L=L_work, nside=nside)
+            resid = [_spin_march._march_v2.ring_fold_residual(r, f, nside=nside)
+                     for r, f in zip(rings, ftms)]
+            acc = acc - dc.forward_packed(resid, weights, -phi, L=L_work, nside=nside)
+        return tuple(dc.packed_to_alm(acc[:, k], ell, order, L=L_work, nside=nside)[None, :]
+                     for k in range(2))
     if n_iter and _ring_fold_ready(L_work):
         alm_a, alm_b, ftm_a, ftm_b = _map2alm_pair_once_pallas(
             maps_a, maps_b, ell, order, nside=nside, L_work=L_work, march_pair=march_pair,

@@ -345,3 +345,50 @@ def forward_latitudinal_positive_pair(positive_a, positive_b, weights, phase, *,
     maps = (positive_a,) if positive_b is None else (positive_a, positive_b)
     return _forward_impl(maps, weights, phase, pl.args, pl.inv, pl.fac,
                          L=int(L), nside=int(nside), static=pl.static())
+
+
+# ------------------------------------------------------------------------ packed-state interface
+# The MASTER refinement loop can keep its alm state in this engine's packed layout (problem
+# t = 2m + p, ell = m + p + 2k) for all of its iterations and convert once at the end: going
+# through the (L, L) complex128 block on every pass was ~45 ms of XLA gathers, pads and casts per
+# field at Nside 2048.  Packed values are alm (Condon-Shortley), i.e. already scaled by `fac`.
+
+@partial(jax.jit, static_argnames=("L", "nside", "static"))
+def _forward_packed_impl(positives, weights, phase, args, fac, *, L, nside, static):
+    wp = weights[:, None].astype(jnp.float32) * _ring_phase(phase, L)
+    ring = jnp.stack([_fold_hemispheres(p.astype(jnp.complex64) * wp, L, nside) for p in positives],
+                     axis=2)
+    return _analyse(ring, args, static) * fac[:, None]
+
+
+@partial(jax.jit, static_argnames=("L", "nside", "static"))
+def _inverse_packed_impl(coef, phase, args, fac, *, L, nside, static):
+    ring = _synth(coef.astype(jnp.complex64) * fac[:, None], args, static)
+    rp = _ring_phase(phase, L)
+    return tuple(_hemispheres(ring[:, :, k], L, nside) * rp for k in range(coef.shape[1]))
+
+
+def forward_packed(ftms, weights, phase, *, L, nside):
+    """Ring blocks (one per map) -> ``(ntot, nmaps)`` complex64 packed alm."""
+    pl = plan_for(L, nside)
+    return _forward_packed_impl(tuple(ftms), weights, phase, pl.args, pl.fac,
+                                L=int(L), nside=int(nside), static=pl.static())
+
+
+def inverse_packed(coef, phase, *, L, nside):
+    """``(ntot, nmaps)`` packed alm -> tuple of complex64 ring blocks, phase included."""
+    pl = plan_for(L, nside)
+    return _inverse_packed_impl(coef, phase, pl.args, pl.fac,
+                                L=int(L), nside=int(nside), static=pl.static())
+
+
+@partial(jax.jit, static_argnames=("L",))
+def _packed_to_alm_impl(coef, inv, ell, order, *, L):
+    coef = jnp.concatenate([coef, jnp.zeros(1, coef.dtype)])
+    return coef[inv[ell * L + order]]
+
+
+def packed_to_alm(coef, ell, order, *, L, nside):
+    """One map's packed alm -> the pipeline's ``(ell, order)`` packing."""
+    pl = plan_for(L, nside)
+    return _packed_to_alm_impl(coef, pl.inv, ell, order, L=int(L))
