@@ -275,6 +275,10 @@ struct Packed {
     // Christoffel-Darboux
     std::vector<int32_t> cd_desc, cd_ln, cd_lr;
     std::vector<float> cd_nh, cd_nl, vlast, scale, ring_h, ring_l, cd_der;
+    // near node-ring pairs (|y_r - y_j| < CD_NEAR): (problem, node, ascending ring index) and the
+    // exact difference y_r - y_j (0 marks a coincidence, which takes the limit E phi_n'(y_j))
+    std::vector<int32_t> cdx_i;
+    std::vector<float> cdx_f;
     int64_t cd_nbox = 0, ntot = 0, nprob = 0, R = 0;
 };
 
@@ -494,6 +498,22 @@ int64_t dc_plan(int L, const double* xr, int R, int nthreads, int direct_max, in
             ln[q] = a; lr[q] = b;
         }
         const int32_t rec[8] = {(int32_t)off[t], pr.n, (int32_t)lo, nleaf, (int32_t)P.cd_nbox, nt, t0, 0};
+        {   // near pairs: the CD kernel's double-float difference is ~4e-17 absolute, so a pair closer
+            // than ~1e-10 loses digits (one node sat 8.9e-15 from a ring at Nside 4096 spin 2, m = 179)
+            constexpr double CD_NEAR = 1e-9;
+            int j = 0;
+            for (int b2 = 0; b2 < nt; ++b2) {
+                const double yrv = yr[t0 + b2];
+                while (j + 1 < pr.n && pr.y[j + 1] <= yrv) ++j;
+                for (int jj = std::max(j - 1, 0); jj <= std::min(j + 1, pr.n - 1); ++jj) {
+                    const double diff = yrv - pr.y[jj];
+                    if (std::fabs(diff) < CD_NEAR) {
+                        P.cdx_i.push_back((int32_t)t); P.cdx_i.push_back(jj); P.cdx_i.push_back(t0 + b2);
+                        P.cdx_f.push_back(std::fabs(diff) < 1e-15 ? 0.f : (float)diff);
+                    }
+                }
+            }
+        }
         P.cd_desc.insert(P.cd_desc.end(), rec, rec + 8);
         P.cd_ln.insert(P.cd_ln.end(), ln.begin(), ln.end());
         P.cd_lr.insert(P.cd_lr.end(), lr.begin(), lr.end());
@@ -510,7 +530,7 @@ int64_t dc_plan(int L, const double* xr, int R, int nthreads, int direct_max, in
 #define DC_FIELDS(X) \
     X(leaf_off) X(leaf_sz) X(leaf_mk) X(leaf_lam) X(lev_kind) X(lev_nnode) X(lev_node0) X(lev_maxk) X(lev_sb0) \
     X(nodes) X(sbase) X(dh) X(dl) X(gap) X(tau) X(z) X(c) X(gidx) X(slot) X(dsrc) X(ddst) \
-    X(cd_desc) X(cd_ln) X(cd_lr) X(cd_nh) X(cd_nl) X(vlast) X(scale) X(ring_h) X(ring_l) X(cd_der)
+    X(cd_desc) X(cd_ln) X(cd_lr) X(cd_nh) X(cd_nl) X(vlast) X(scale) X(ring_h) X(ring_l) X(cd_der) X(cdx_i) X(cdx_f)
 
 int64_t dc_size(const char* name) {
 #define X(f) if (!std::strcmp(name, #f)) return (int64_t)g_pack->f.size();

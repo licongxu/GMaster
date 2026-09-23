@@ -620,40 +620,61 @@ __global__ void cd_fmm(
         // Near field with compensated (two-sum) accumulation: at small m the Gauss nodes and the
         // dense polar rings interleave where phi_n' ~ n^2, so the analysis direction sums terms
         // ~1e7 that cancel to O(1) (m = 0 analysis was 1.3e-5 at Nside 2048 with a plain sum).
-        // Near field.  A ring can coincide with a node (the size-1 problem's node -2/(3 nside) is a
-        // HEALPix ring exactly), where the term s_r / (y_r - y_j) is 0/0 in double-float: it takes
-        // its limit E phi_n'(y_j) (`der`, from the plan), kept outside the ring scale.
+        // Near field, clamped reciprocal: node-ring pairs closer than 1e-9 (where the double-float
+        // difference loses digits, or the term is 0/0 at a coincidence) are replaced by exact terms
+        // afterwards (`cd_fix`, from the plan's list).
         const int s0 = S0[max(b - 1, 0)], s1 = S0[min(b + 1, nleaf - 1) + 1];
-        float2 spec[NR];
-        #pragma unroll
-        for (int r = 0; r < NR; ++r) spec[r] = make_float2(0.f, 0.f);
         for (int s = s0; s < s1; ++s) {
-            const float diff = (th[t] - sh[s]) + (tl[t] - sl[s]);
-            if (fabsf(diff) < 1e-14f) {
-                if (dir == 0) {
-                    const float dj = der[pr.so + s];
-                    #pragma unroll
-                    for (int r = 0; r < NR; ++r) fma2(spec[r], dj, qv(s, r));
-                } else {
-                    const int rr = R - 1 - (pr.t0 + s);
-                    const float dj = -der[pr.so + t];
-                    #pragma unroll
-                    for (int r = 0; r < NR; ++r) fma2(spec[r], dj, rg[rr * NR + r]);
-                }
-                continue;
-            }
-            const float inv = rcp(diff);
+            const float inv = rcp_c((th[t] - sh[s]) + (tl[t] - sl[s]));
             #pragma unroll
             for (int r = 0; r < NR; ++r) fma2(acc[r], inv, qv(s, r));
         }
         if (dir == 0) {
             const int rr = R - 1 - (pr.t0 + t); const float f = sc[rr];
             #pragma unroll
-            for (int r = 0; r < NR; ++r) rg[rr * NR + r] = make_float2(fmaf(f, acc[r].x, spec[r].x), fmaf(f, acc[r].y, spec[r].y));
+            for (int r = 0; r < NR; ++r) rg[rr * NR + r] = mul2(f, acc[r]);
         } else {
             const float f = -vlast[pr.so + t];
             #pragma unroll
-            for (int r = 0; r < NR; ++r) w[(pr.so + t) * NR + r] = mul2(f, make_float2(acc[r].x + spec[r].x, acc[r].y + spec[r].y));
+            for (int r = 0; r < NR; ++r) w[(pr.so + t) * NR + r] = mul2(f, acc[r]);
+        }
+    }
+}
+
+// Exact terms for the plan's near node-ring pairs (see cd_fmm's near field).  Record q: problem pb,
+// node j, ascending ring index ta, exact y_r - y_j (0: coincident -> limit E phi_n'(y_j) = der_j).
+template <int NR>
+__global__ void cd_fix(const int* __restrict__ cdx_i, const float* __restrict__ cdx_f, int nrec, int dir,
+                       const CDProb* __restrict__ probs, const float* __restrict__ nh, const float* __restrict__ nl,
+                       const float* __restrict__ vlast, const float* __restrict__ ryh, const float* __restrict__ ryl,
+                       int R, const float* __restrict__ scale, const float* __restrict__ der,
+                       float2* __restrict__ w, float2* __restrict__ ring)
+{
+    const int qi = blockIdx.x * blockDim.x + threadIdx.x;
+    if (qi >= nrec) return;
+    const int pb = cdx_i[3 * qi], j = cdx_i[3 * qi + 1], ta = cdx_i[3 * qi + 2];
+    const float ex = cdx_f[qi];
+    const int so = probs[pb].so, rr = R - 1 - ta;
+    const float sc = scale[(size_t)pb * R + rr];
+    const float dfd = (ryh[ta] - nh[so + j]) + (ryl[ta] - nl[so + j]);   // y_r - y_j as cd_fmm formed it
+    float2* rg = ring + (size_t)pb * R * NR;
+    if (dir == 0) {                     // ring rr holds sc * sum_j q_j * rcp_c(y_r - y_j)
+        const float bad = sc * rcp_c(dfd);
+        const float good = ex == 0.f ? der[so + j] : sc / ex;
+        const float vj = vlast[so + j];
+        for (int r = 0; r < NR; ++r) {
+            const float2 qj = mul2(vj, w[(so + j) * NR + r]);
+            atomicAdd(&rg[rr * NR + r].x, (good - bad) * qj.x);
+            atomicAdd(&rg[rr * NR + r].y, (good - bad) * qj.y);
+        }
+    } else {                            // node j holds -vlast_j * sum_r sc_r g_r * rcp_c(y_j - y_r)
+        const float bad = sc * rcp_c(-dfd);
+        const float good = ex == 0.f ? -der[so + j] : -sc / ex;
+        const float f = -vlast[so + j];
+        for (int r = 0; r < NR; ++r) {
+            const float2 g = rg[rr * NR + r];
+            atomicAdd(&w[(so + j) * NR + r].x, f * (good - bad) * g.x);
+            atomicAdd(&w[(so + j) * NR + r].y, f * (good - bad) * g.y);
         }
     }
 }
@@ -672,10 +693,11 @@ static constexpr int FMM_THREADS = 256;
     ffi::Buffer<ffi::S16> gidx, ffi::Buffer<ffi::S16> slot, ffi::Buffer<ffi::S16> dsrc, ffi::Buffer<ffi::S16> ddst, \
     ffi::Buffer<ffi::S32> cd_desc, ffi::Buffer<ffi::S32> cd_ln, ffi::Buffer<ffi::S32> cd_lr, \
     ffi::Buffer<ffi::F32> cd_nh, ffi::Buffer<ffi::F32> cd_nl, ffi::Buffer<ffi::F32> vlast, ffi::Buffer<ffi::F32> scale, \
-    ffi::Buffer<ffi::F32> ring_h, ffi::Buffer<ffi::F32> ring_l, ffi::Buffer<ffi::F32> cd_der
+    ffi::Buffer<ffi::F32> ring_h, ffi::Buffer<ffi::F32> ring_l, ffi::Buffer<ffi::F32> cd_der, \
+    ffi::Buffer<ffi::S32> cdx_i, ffi::Buffer<ffi::F32> cdx_f
 
 #define PLAN_PASS leaf_off, leaf_sz, leaf_mk, leaf_lam, nodes, sbase, dh, dl, gap, tau, z, c, gidx, slot, dsrc, ddst, \
-    cd_desc, cd_ln, cd_lr, cd_nh, cd_nl, vlast, scale, ring_h, ring_l, cd_der
+    cd_desc, cd_ln, cd_lr, cd_nh, cd_nl, vlast, scale, ring_h, ring_l, cd_der, cdx_i, cdx_f
 
 #define PLAN_BIND \
     .Arg<ffi::Buffer<ffi::S32>>().Arg<ffi::Buffer<ffi::S32>>().Arg<ffi::Buffer<ffi::S32>>().Arg<ffi::Buffer<ffi::F32>>() \
@@ -685,7 +707,8 @@ static constexpr int FMM_THREADS = 256;
     .Arg<ffi::Buffer<ffi::S16>>().Arg<ffi::Buffer<ffi::S16>>().Arg<ffi::Buffer<ffi::S16>>().Arg<ffi::Buffer<ffi::S16>>() \
     .Arg<ffi::Buffer<ffi::S32>>().Arg<ffi::Buffer<ffi::S32>>().Arg<ffi::Buffer<ffi::S32>>() \
     .Arg<ffi::Buffer<ffi::F32>>().Arg<ffi::Buffer<ffi::F32>>().Arg<ffi::Buffer<ffi::F32>>().Arg<ffi::Buffer<ffi::F32>>() \
-    .Arg<ffi::Buffer<ffi::F32>>().Arg<ffi::Buffer<ffi::F32>>().Arg<ffi::Buffer<ffi::F32>>()
+    .Arg<ffi::Buffer<ffi::F32>>().Arg<ffi::Buffer<ffi::F32>>().Arg<ffi::Buffer<ffi::F32>>() \
+    .Arg<ffi::Buffer<ffi::S32>>().Arg<ffi::Buffer<ffi::F32>>()
 
 // scratch (all sized for the largest single tree level, or for the CD step if larger):
 // geo (2 nbox), mom / loc (P nbox NR), qs (nkept NR), dstage (ndefl NR), rpos (2 nkept)
@@ -714,6 +737,12 @@ static ffi::Error apply(cudaStream_t s, int dir, int spin, const float2* in, flo
         cd_fmm<NR><<<nprob, 256, 0, s>>>(cdp, nprob, 1, cd_nh.typed_data(), cd_nl.typed_data(), vlast.typed_data(),
             ring_h.typed_data(), ring_l.typed_data(), R, cd_ln.typed_data(), cd_lr.typed_data(), scale.typed_data(), cd_der.typed_data(),
             w, const_cast<float2*>(ring_in), g, mo, lo);
+        {
+            const int nrec = cdx_f.element_count();
+            if (nrec) cd_fix<NR><<<(nrec + 127) / 128, 128, 0, s>>>(cdx_i.typed_data(), cdx_f.typed_data(), nrec, 1, cdp,
+                cd_nh.typed_data(), cd_nl.typed_data(), vlast.typed_data(), ring_h.typed_data(), ring_l.typed_data(), R,
+                scale.typed_data(), cd_der.typed_data(), w, const_cast<float2*>(ring_in));
+        }
     }
     // levels: (kind, nnode, node0, maxk, sb0, poff0, doff0) per tree level
     const int nlev = lev.size() / 7;
@@ -742,6 +771,12 @@ static ffi::Error apply(cudaStream_t s, int dir, int spin, const float2* in, flo
         cd_fmm<NR><<<nprob, 256, 0, s>>>(cdp, nprob, 0, cd_nh.typed_data(), cd_nl.typed_data(), vlast.typed_data(),
             ring_h.typed_data(), ring_l.typed_data(), R, cd_ln.typed_data(), cd_lr.typed_data(), scale.typed_data(), cd_der.typed_data(),
             w, ring_out, g, mo, lo);
+        {
+            const int nrec = cdx_f.element_count();
+            if (nrec) cd_fix<NR><<<(nrec + 127) / 128, 128, 0, s>>>(cdx_i.typed_data(), cdx_f.typed_data(), nrec, 0, cdp,
+                cd_nh.typed_data(), cd_nl.typed_data(), vlast.typed_data(), ring_h.typed_data(), ring_l.typed_data(), R,
+                scale.typed_data(), cd_der.typed_data(), w, ring_out);
+        }
     } else {
         leaves<NR><<<lgrid, 128, 0, s>>>(leaf_off.typed_data(), leaf_sz.typed_data(), leaf_mk.typed_data(), leaf_lam.typed_data(), w, nleaf, 1, spin);
     }

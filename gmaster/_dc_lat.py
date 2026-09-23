@@ -50,9 +50,9 @@ _P = 12                      # FMM expansion order (dc_lat.cu)
 _FL, _CDF = 32, 4            # merge FMM leaf size and CD leaf coarsening (dc_lat.cu defaults)
 _FIELDS = ("leaf_off", "leaf_sz", "leaf_mk", "leaf_lam", "nodes", "sbase", "dh", "dl", "gap", "tau", "z", "c",
            "gidx", "slot", "dsrc", "ddst", "cd_desc", "cd_ln", "cd_lr", "cd_nh", "cd_nl",
-           "vlast", "scale", "ring_h", "ring_l", "cd_der")
+           "vlast", "scale", "ring_h", "ring_l", "cd_der", "cdx_i", "cdx_f")
 _DTYPES = dict(leaf_off=np.int32, leaf_sz=np.int32, leaf_mk=np.int32, nodes=np.int32, sbase=np.int32, cd_desc=np.int32,
-               cd_ln=np.int32, cd_lr=np.int32, gidx=np.int16, slot=np.int16, dsrc=np.int16,
+               cd_ln=np.int32, cd_lr=np.int32, gidx=np.int16, slot=np.int16, dsrc=np.int16, cdx_i=np.int32,
                ddst=np.int16, lev_kind=np.int32, lev_nnode=np.int32, lev_node0=np.int32,
                lev_maxk=np.int32, lev_sb0=np.int32)
 _LIB = None

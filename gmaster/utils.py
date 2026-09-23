@@ -1702,8 +1702,36 @@ def _polarised_ring_tables(spin, L_work, nside, like, *, synthesis):
     return _spin_ring_analysis_tables(L_work, nside, device)
 
 
+def _dc_spin(L_work, spin):
+    """The divide-and-conquer engine for a polarised transform at this bandlimit, if it serves it.
+
+    Its spin-s calls are composed eagerly here (ring FFT, latitudinal step, finish -- each its own
+    program) so that the plan's arrays enter as jit arguments; traced inside the fused programs
+    below they would be captured as constants (~20 GiB of HLO at Nside 4096).
+    """
+    return _spin_march._march_v2._dc(L_work) if spin != 0 else None
+
+
+@partial(jax.jit, static_argnames=("L_work",))
+def _spin_pack_plus(plus, ell, order, *, L_work):
+    plus_m = plus[ell, L_work - 1 + order]
+    minus_m = (-1) ** order * jnp.conj(plus[ell, L_work - 1 - order])
+    return jnp.stack([-(plus_m + minus_m) / 2, 0.5j * (plus_m - minus_m)])
+
+
+@jax.jit
+def _complex_to_qu(maps):
+    return jnp.stack([jnp.real(maps), jnp.imag(maps)])
+
+
 def _alm2map_core(alm, ell, order, *, spin, nside, L, L_work):
     tables = _polarised_ring_tables(spin, L_work, nside, alm, synthesis=True)
+    dc = _dc_spin(L_work, spin)
+    if dc is not None:
+        flm = _prepare_inverse_s2fft(_unpack_spin(alm, L, L_work), L=L_work)
+        ftm = dc.inverse_latitudinal_spin(flm, L=L_work, spin=spin, nside=nside)
+        maps = _finish_inverse_s2fft(ftm, tables, L=L_work, spin=spin, nside=nside, reality=False)
+        return _complex_to_qu(maps)
     return _alm2map_core_impl(alm, tables, ell, order, spin=spin, nside=nside, L=L,
                               L_work=L_work)
 
@@ -1730,6 +1758,12 @@ def _alm2map_core_impl(alm, tables, ell, order, *, spin, nside, L, L_work):
 
 def _map2alm_once(maps, ell, order, *, spin, nside, L, L_work):
     tables = _polarised_ring_tables(spin, L_work, nside, maps, synthesis=False)
+    dc = _dc_spin(L_work, spin)
+    if dc is not None:
+        ftm = _forward_s2fft_ftm(maps[0] + 1j * maps[1], tables, L=L_work, nside=nside, reality=False)
+        flm = dc.forward_latitudinal_spin(ftm, L=L_work, spin=spin, nside=nside)
+        plus = _finish_forward_s2fft(flm, L=L_work, spin=spin, reality=False)
+        return _spin_pack_plus(plus, ell, order, L_work=L_work)
     return _map2alm_once_impl(maps, tables, ell, order, spin=spin, nside=nside, L=L,
                               L_work=L_work)
 
@@ -1764,6 +1798,9 @@ _ITERATION_SPLIT_BYTES = 4 * 1024 ** 3
 
 
 def _map2alm_iteration(alm, maps, ell, order, *, spin, nside, L, L_work):
+    if _dc_spin(L_work, spin) is not None:
+        residual = _alm2map_core(alm, ell, order, spin=spin, nside=nside, L=L, L_work=L_work) - maps
+        return alm - _map2alm_once(residual, ell, order, spin=spin, nside=nside, L=L, L_work=L_work)
     a_tables = _polarised_ring_tables(spin, L_work, nside, maps, synthesis=False)
     s_tables = _polarised_ring_tables(spin, L_work, nside, alm, synthesis=True)
     if (4 * nside - 1) * 2 * L_work * 16 > _ITERATION_SPLIT_BYTES:
@@ -2153,7 +2190,7 @@ def _pair_latitudinal_analysis(ftm_a, ftm_b, ell, order, *, nside, L_work, march
     theta = _stable_thetas(L_work, nside)
     weights = quadrature_jax.quad_weights_transform(L_work, "healpix", nside)
     phase = -healpix_ffts.p2phi_rings_jax(jnp.arange(len(theta)), nside)
-    if _spin_march._march_v2._dc(L_work) is not None:
+    if _spin_march._march_v2._dc(L_work, ftm_a) is not None:
         # The divide-and-conquer engine pairs by sharing its plan traversal; it has no march-style
         # memory gate, so both maps always go through one call.
         positive_a, positive_b = _spin_march._march_v2.forward_latitudinal_positive_pair(
