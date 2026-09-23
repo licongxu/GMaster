@@ -2523,6 +2523,25 @@ def _map2alm_core_pallas(
 def _map2alm_core_pallas_eager(
     maps, ell, order, *, nside, L, L_work, n_iter, spin=0
 ):
+    dc = _spin_march._march_v2._dc(L_work) if spin == 0 else None
+    if dc is not None and n_iter and L == L_work and _NODE_SPACE and _ring_fold_ready(L_work):
+        # One map in the D&C engine's node space (the paired route's loop with one right-hand side).
+        ftm = _forward_ring_fft_positive(
+            maps[0],
+            _ring_analysis_tables(
+                L_work, nside,
+                getattr(maps, "device", None) or getattr(maps[0], "device", None)),
+            L=L_work, nside=nside,
+        )
+        weights = quadrature_jax.quad_weights_transform(L_work, "healpix", nside)
+        phi = healpix_ffts.p2phi_rings_jax(jnp.arange(4 * nside - 1), nside)
+        w = dc.cd_forward_packed([ftm], weights, -phi, L=L_work, nside=nside)
+        for _ in range(n_iter):
+            (ring,) = dc.cd_inverse_packed(w, phi, L=L_work, nside=nside)
+            resid = _spin_march._march_v2.ring_fold_residual(ring, ftm, nside=nside)
+            w = w - dc.cd_forward_packed([resid], weights, -phi, L=L_work, nside=nside)
+        acc = dc.tree_finish_packed(w, L=L_work, nside=nside).astype(jnp.complex128)
+        return dc.packed_to_alm(acc[:, 0], ell, order, L=L_work, nside=nside)[None, :]
     if spin == 0 and n_iter and _ring_fold_ready(L_work):
         ftm = _forward_ring_fft_positive(
             maps[0],
