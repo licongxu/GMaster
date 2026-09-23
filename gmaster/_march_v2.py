@@ -102,6 +102,38 @@ def _defs():
     return [f"-D{d}" for d in raw]
 
 
+def _retain_pool_memory(ndev):
+    """Keep freed device memory in the CUDA memory pool instead of returning it at every sync.
+
+    JAX's `cuda_async` allocator draws from each device's current memory pool, whose release
+    threshold defaults to 0: with `XLA_PYTHON_CLIENT_PREALLOCATE=false` (the invocation the README
+    prescribes for large maps) every large temporary was unmapped at the next synchronisation and
+    mapped again on the next call -- 50 ms of the 107 ms Nside 2048 spin-2 coupling stage.  A
+    threshold of UINT64_MAX keeps what the process has touched (its high-water mark), as a caching
+    allocator does.  `GMASTER_RETAIN_POOL=0` leaves the pool alone (e.g. on a shared GPU).
+    """
+    if os.environ.get("GMASTER_RETAIN_POOL", "1") == "0":
+        return
+    import glob
+
+    names = ["libcudart.so", "libcudart.so.13", "libcudart.so.12"]
+    for d in os.environ.get("LD_LIBRARY_PATH", "").split(":"):
+        names += sorted(glob.glob(os.path.join(d, "libcudart.so*")))
+    for name in names:
+        try:
+            rt = ctypes.CDLL(name)
+            break
+        except OSError:
+            continue
+    else:
+        return
+    value = ctypes.c_uint64(2 ** 64 - 1)
+    for dev in range(ndev):
+        pool = ctypes.c_void_p()
+        if rt.cudaDeviceGetMemPool(ctypes.byref(pool), dev) == 0:
+            rt.cudaMemPoolSetAttribute(pool, 4, ctypes.byref(value))   # cudaMemPoolAttrReleaseThreshold
+
+
 def _build():
     """Compile the CUDA source into a per-source-hash shared library (cached under ~/.cache)."""
     global _LIB, _LIB_ERROR
@@ -111,6 +143,10 @@ def _build():
         devs = [d for d in jax.devices() if d.platform == "gpu"]
         if not devs:
             raise RuntimeError("no GPU device")
+        try:
+            _retain_pool_memory(len(devs))
+        except Exception:  # noqa: BLE001 - an allocator tweak must never cost the route
+            pass
         cc = str(getattr(devs[0], "compute_capability", "")).replace(".", "")
         if not cc:
             raise RuntimeError("unknown compute capability")
