@@ -26,7 +26,7 @@ namespace ffi = xla::ffi;
 #define FL 32          // points of each set per FMM leaf in the merge kernels (8/16/32/64 swept at Nside 2048: 32 best)
 #endif
 
-struct Node { int base, nk, nd, poff, doff, pad0, pad1, pad2; };
+struct Node { int base, nk, nd, poff, doff, goff, ng, pad; };   // goff/ng: this node's exact-gap records
 
 __device__ __forceinline__ int org_of(int j, float tau) { return tau > 0.f ? j : j + 1; }
 
@@ -63,6 +63,19 @@ __device__ __forceinline__ void two_sum_acc(float& s, float& c, float x) {
 }
 __device__ __forceinline__ float up(float r) { return fmaxf(r * 1.0000010f, 1e-30f); }
 
+// Adjacent gaps d_{i+1} - d_i: the double-float difference of the stored poles (good to ~3.6e-15
+// absolute), except where the plan recorded the gap exactly (below 1e-6).  The dense gap array this
+// replaces was 4 B per kept pole per level (2.3 GiB at Nside 4096).
+template <bool WARP>
+__device__ __forceinline__ void stage_gaps(const Node& nd, const float* dh, const float* dl,
+                                           const int* __restrict__ gpr_i, const float* __restrict__ gpr_f,
+                                           float* gp, int tid, int nth) {
+    const int nk = nd.nk;
+    for (int i = tid; i < nk; i += nth) gp[i] = i + 1 < nk ? (dh[i + 1] - dh[i]) + (dl[i + 1] - dl[i]) : 0.f;
+    if (WARP) __syncwarp(); else __syncthreads();
+    for (int r = tid; r < nd.ng; r += nth) gp[gpr_i[nd.goff + r]] = gpr_f[nd.goff + r];
+}
+
 __constant__ float BIN[P * P] = {1.0f,1.0f,1.0f,1.0f,1.0f,1.0f,1.0f,1.0f,1.0f,1.0f,1.0f,1.0f,1.0f,2.0f,3.0f,4.0f,5.0f,6.0f,7.0f,8.0f,9.0f,10.0f,11.0f,12.0f,1.0f,3.0f,6.0f,10.0f,15.0f,21.0f,28.0f,36.0f,45.0f,55.0f,66.0f,78.0f,1.0f,4.0f,10.0f,20.0f,35.0f,56.0f,84.0f,120.0f,165.0f,220.0f,286.0f,364.0f,1.0f,5.0f,15.0f,35.0f,70.0f,126.0f,210.0f,330.0f,495.0f,715.0f,1001.0f,1365.0f,1.0f,6.0f,21.0f,56.0f,126.0f,252.0f,462.0f,792.0f,1287.0f,2002.0f,3003.0f,4368.0f,1.0f,7.0f,28.0f,84.0f,210.0f,462.0f,924.0f,1716.0f,3003.0f,5005.0f,8008.0f,12376.0f,1.0f,8.0f,36.0f,120.0f,330.0f,792.0f,1716.0f,3432.0f,6435.0f,11440.0f,19448.0f,31824.0f,1.0f,9.0f,45.0f,165.0f,495.0f,1287.0f,3003.0f,6435.0f,12870.0f,24310.0f,43758.0f,75582.0f,1.0f,10.0f,55.0f,220.0f,715.0f,2002.0f,5005.0f,11440.0f,24310.0f,48620.0f,92378.0f,167960.0f,1.0f,11.0f,66.0f,286.0f,1001.0f,3003.0f,8008.0f,19448.0f,43758.0f,92378.0f,184756.0f,352716.0f,1.0f,12.0f,78.0f,364.0f,1365.0f,4368.0f,12376.0f,31824.0f,75582.0f,167960.0f,352716.0f,705432.0f};      // BIN[j*P + k] = C(j+k, j)
 __constant__ float CKJ[P * P] = {1.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,1.0f,1.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,1.0f,2.0f,1.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,1.0f,3.0f,3.0f,1.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,1.0f,4.0f,6.0f,4.0f,1.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,1.0f,5.0f,10.0f,10.0f,5.0f,1.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,1.0f,6.0f,15.0f,20.0f,15.0f,6.0f,1.0f,0.0f,0.0f,0.0f,0.0f,0.0f,1.0f,7.0f,21.0f,35.0f,35.0f,21.0f,7.0f,1.0f,0.0f,0.0f,0.0f,0.0f,1.0f,8.0f,28.0f,56.0f,70.0f,56.0f,28.0f,8.0f,1.0f,0.0f,0.0f,0.0f,1.0f,9.0f,36.0f,84.0f,126.0f,126.0f,84.0f,36.0f,9.0f,1.0f,0.0f,0.0f,1.0f,10.0f,45.0f,120.0f,210.0f,252.0f,210.0f,120.0f,45.0f,10.0f,1.0f,0.0f,1.0f,11.0f,55.0f,165.0f,330.0f,462.0f,462.0f,330.0f,165.0f,55.0f,11.0f,1.0f};      // CKJ[k*P + j] = C(k, j)
 
@@ -72,8 +85,8 @@ __constant__ float CKJ[P * P] = {1.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.
 template <int NR>
 __global__ void merge_direct(
     const Node* __restrict__ nodes, int nnode, int dir,
-    const float* __restrict__ gdh, const float* __restrict__ gdl, const float* __restrict__ ggap,
-    const float* __restrict__ gtau, const float* __restrict__ gz, const float* __restrict__ gc,
+    const float* __restrict__ gdh, const float* __restrict__ gdl, const int* __restrict__ gpr_i,
+    const float* __restrict__ gpr_f, const float* __restrict__ gtau, const float* __restrict__ gz, const float* __restrict__ gc,
     const short* __restrict__ ggidx, const short* __restrict__ gslot,
     const short* __restrict__ gdsrc, const short* __restrict__ gddst,
     float2* __restrict__ w)
@@ -87,12 +100,14 @@ __global__ void merge_direct(
     float2* q = reinterpret_cast<float2*>(sm + 4 * nk + 2);
     const float* pdh = gdh + nd.poff; const float* pdl = gdl + nd.poff; const float* pt = gtau + nd.poff;
     for (int i = threadIdx.x; i < nk; i += blockDim.x) {
-        dh[i] = pdh[i]; dl[i] = pdl[i]; tau[i] = pt[i]; gp[i] = ggap[nd.poff + i];
+        dh[i] = pdh[i]; dl[i] = pdl[i]; tau[i] = pt[i];
         const int src = dir == 0 ? ggidx[nd.poff + i] : gslot[nd.poff + i];
         const float f = dir == 0 ? gz[nd.poff + i] : gc[nd.poff + i];
         #pragma unroll
         for (int r = 0; r < NR; ++r) q[i * NR + r] = mul2(f, w[(nd.base + src) * NR + r]);
     }
+    __syncthreads();
+    stage_gaps<false>(nd, dh, dl, gpr_i, gpr_f, gp, threadIdx.x, blockDim.x);
     float2 dv[NR];
     const int t = threadIdx.x;
     if (t < nd.nd) {
@@ -311,8 +326,8 @@ __device__ __forceinline__ void l2p(float eta, const float2* loc_g, float2* acc)
 template <int NR, bool WARP>
 __global__ void merge_fmm(
     const Node* __restrict__ nodes, int nnode, int dir,
-    const float* __restrict__ gdh, const float* __restrict__ gdl, const float* __restrict__ ggap,
-    const float* __restrict__ gtau, const float* __restrict__ gz, const float* __restrict__ gc,
+    const float* __restrict__ gdh, const float* __restrict__ gdl, const int* __restrict__ gpr_i,
+    const float* __restrict__ gpr_f, const float* __restrict__ gtau, const float* __restrict__ gz, const float* __restrict__ gc,
     const short* __restrict__ ggidx, const short* __restrict__ gslot,
     const short* __restrict__ gdsrc, const short* __restrict__ gddst,
     float2* __restrict__ w,
@@ -325,12 +340,13 @@ __global__ void merge_fmm(
     const Node nd = nodes[nb];
     const int nk = nd.nk, tid = WARP ? (threadIdx.x & 31) : threadIdx.x, nth = WARP ? 32 : blockDim.x;
     const float* pdh = gdh + nd.poff; const float* pdl = gdl + nd.poff; const float* pt = gtau + nd.poff;
-    const float* pgp = ggap + nd.poff;
     // scratch is level-local: levels run one after another, so it holds one level at a time
     float2* q = qs + (size_t)(nd.poff - poff0) * NR;
     float2* dst = dstage + (size_t)(nd.doff - doff0) * NR;
-    float* rh = rpos + 2 * (size_t)(nd.poff - poff0);  // root positions (hi, lo) for this node
+    float* rh = rpos + 3 * (size_t)(nd.poff - poff0);  // root positions (hi, lo) and gaps for this node
     float* rl = rh + nk;
+    float* pgp = rh + 2 * nk;
+    stage_gaps<WARP>(nd, pdh, pdl, gpr_i, gpr_f, pgp, tid, nth);
     for (int i = tid; i < nk; i += nth) {
         const int src = dir == 0 ? ggidx[nd.poff + i] : gslot[nd.poff + i];
         const float f = dir == 0 ? gz[nd.poff + i] : gc[nd.poff + i];
@@ -688,7 +704,8 @@ static constexpr int FMM_THREADS = 256;
 
 #define PLAN_ARGS \
     ffi::Buffer<ffi::S32> leaf_off, ffi::Buffer<ffi::S32> leaf_sz, ffi::Buffer<ffi::S32> leaf_mk, ffi::Buffer<ffi::F32> leaf_lam, \
-    ffi::Buffer<ffi::S32> nodes, ffi::Buffer<ffi::S32> sbase, ffi::Buffer<ffi::F32> dh, ffi::Buffer<ffi::F32> dl, ffi::Buffer<ffi::F32> gap, \
+    ffi::Buffer<ffi::S32> nodes, ffi::Buffer<ffi::S32> sbase, ffi::Buffer<ffi::F32> dh, ffi::Buffer<ffi::F32> dl, \
+    ffi::Buffer<ffi::S32> gpr_i, ffi::Buffer<ffi::F32> gpr_f, \
     ffi::Buffer<ffi::F32> tau, ffi::Buffer<ffi::F32> z, ffi::Buffer<ffi::F32> c, \
     ffi::Buffer<ffi::S16> gidx, ffi::Buffer<ffi::S16> slot, ffi::Buffer<ffi::S16> dsrc, ffi::Buffer<ffi::S16> ddst, \
     ffi::Buffer<ffi::S32> cd_desc, ffi::Buffer<ffi::S32> cd_ln, ffi::Buffer<ffi::S32> cd_lr, \
@@ -696,13 +713,13 @@ static constexpr int FMM_THREADS = 256;
     ffi::Buffer<ffi::F32> ring_h, ffi::Buffer<ffi::F32> ring_l, ffi::Buffer<ffi::F32> cd_der, \
     ffi::Buffer<ffi::S32> cdx_i, ffi::Buffer<ffi::F32> cdx_f
 
-#define PLAN_PASS leaf_off, leaf_sz, leaf_mk, leaf_lam, nodes, sbase, dh, dl, gap, tau, z, c, gidx, slot, dsrc, ddst, \
+#define PLAN_PASS leaf_off, leaf_sz, leaf_mk, leaf_lam, nodes, sbase, dh, dl, gpr_i, gpr_f, tau, z, c, gidx, slot, dsrc, ddst, \
     cd_desc, cd_ln, cd_lr, cd_nh, cd_nl, vlast, scale, ring_h, ring_l, cd_der, cdx_i, cdx_f
 
 #define PLAN_BIND \
     .Arg<ffi::Buffer<ffi::S32>>().Arg<ffi::Buffer<ffi::S32>>().Arg<ffi::Buffer<ffi::S32>>().Arg<ffi::Buffer<ffi::F32>>() \
     .Arg<ffi::Buffer<ffi::S32>>().Arg<ffi::Buffer<ffi::S32>>().Arg<ffi::Buffer<ffi::F32>>().Arg<ffi::Buffer<ffi::F32>>() \
-    .Arg<ffi::Buffer<ffi::F32>>() \
+    .Arg<ffi::Buffer<ffi::S32>>().Arg<ffi::Buffer<ffi::F32>>() \
     .Arg<ffi::Buffer<ffi::F32>>().Arg<ffi::Buffer<ffi::F32>>().Arg<ffi::Buffer<ffi::F32>>() \
     .Arg<ffi::Buffer<ffi::S16>>().Arg<ffi::Buffer<ffi::S16>>().Arg<ffi::Buffer<ffi::S16>>().Arg<ffi::Buffer<ffi::S16>>() \
     .Arg<ffi::Buffer<ffi::S32>>().Arg<ffi::Buffer<ffi::S32>>().Arg<ffi::Buffer<ffi::S32>>() \
@@ -711,7 +728,7 @@ static constexpr int FMM_THREADS = 256;
     .Arg<ffi::Buffer<ffi::S32>>().Arg<ffi::Buffer<ffi::F32>>()
 
 // scratch (all sized for the largest single tree level, or for the CD step if larger):
-// geo (2 nbox), mom / loc (P nbox NR), qs (nkept NR), dstage (ndefl NR), rpos (2 nkept)
+// geo (2 nbox), mom / loc (P nbox NR), qs (nkept NR), dstage (ndefl NR), rpos (3 nkept)
 #define SCRATCH_ARGS \
     ffi::ResultBuffer<ffi::F32> geo, ffi::ResultBuffer<ffi::C64> mom, ffi::ResultBuffer<ffi::C64> loc, \
     ffi::ResultBuffer<ffi::C64> qs, ffi::ResultBuffer<ffi::C64> dstage, ffi::ResultBuffer<ffi::F32> rpos
@@ -761,16 +778,16 @@ static ffi::Error apply(cudaStream_t s, int dir, int spin, int stages, const flo
         if (kind == 0) {
             const int smem = 4 * (4 * maxk + 2) + 8 * NR * maxk;
             merge_direct<NR><<<nn, DIRECT_THREADS, smem, s>>>(nd, nn, dir, dh.typed_data(), dl.typed_data(),
-                gap.typed_data(), tau.typed_data(), z.typed_data(), c.typed_data(), gidx.typed_data(), slot.typed_data(),
+                gpr_i.typed_data(), gpr_f.typed_data(), tau.typed_data(), z.typed_data(), c.typed_data(), gidx.typed_data(), slot.typed_data(),
                 dsrc.typed_data(), ddst.typed_data(), w);
         } else {
             if (maxk <= WARP_MAX_K)
                 merge_fmm<NR, true><<<(nn + 7) / 8, 256, 0, s>>>(nd, nn, dir, dh.typed_data(), dl.typed_data(),
-                    gap.typed_data(), tau.typed_data(), z.typed_data(), c.typed_data(), gidx.typed_data(), slot.typed_data(),
+                    gpr_i.typed_data(), gpr_f.typed_data(), tau.typed_data(), z.typed_data(), c.typed_data(), gidx.typed_data(), slot.typed_data(),
                     dsrc.typed_data(), ddst.typed_data(), w, sbase.typed_data() + sb0, g, mo, lo, q, dst, rp, poff0, doff0);
             else
                 merge_fmm<NR, false><<<nn, FMM_THREADS, 0, s>>>(nd, nn, dir, dh.typed_data(), dl.typed_data(),
-                    gap.typed_data(), tau.typed_data(), z.typed_data(), c.typed_data(), gidx.typed_data(), slot.typed_data(),
+                    gpr_i.typed_data(), gpr_f.typed_data(), tau.typed_data(), z.typed_data(), c.typed_data(), gidx.typed_data(), slot.typed_data(),
                     dsrc.typed_data(), ddst.typed_data(), w, sbase.typed_data() + sb0, g, mo, lo, q, dst, rp, poff0, doff0);
         }
     }

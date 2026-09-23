@@ -17,6 +17,9 @@ namespace {
 
 constexpr int LEAF = 16;
 constexpr double DEFLATE = 1e-12;
+// Adjacent-pole gaps below this are stored exactly (as sparse records); the kernels recompute the
+// others as the double-float difference of the stored poles, good to ~3.6e-15 absolute.
+constexpr double GAP_TINY = 1e-6;
 
 inline double a_coef(int l, int m) {
     return l > m ? std::sqrt(double(l) * l - double(m) * m) / std::sqrt(4.0 * l * l - 1.0) : 0.0;
@@ -269,7 +272,9 @@ struct Packed {
     std::vector<int32_t> lev_kind, lev_nnode, lev_node0, lev_maxk, lev_sb0;
     std::vector<int32_t> nodes;                 // 8 per node: base nk nd poff doff 0 0 0
     std::vector<int32_t> sbase;                 // fmm nodes: first scratch box
-    std::vector<float> dh, dl, gap, tau, z, c;   // gap[i] = d[i+1] - d[i] (exact to fp32; 0 at the end)
+    std::vector<float> dh, dl, tau, z, c;
+    std::vector<int32_t> gpr_i;                 // tiny adjacent gaps: local index i (gap = d[i+1] - d[i])
+    std::vector<float> gpr_f;
     std::vector<int16_t> gidx, slot, dsrc, ddst;
     int64_t nbox = 0;
     // Christoffel-Darboux
@@ -452,11 +457,16 @@ int64_t dc_plan(int L, const double* xr, int R, int nthreads, int direct_max, in
                     const int nk = mg.d.size(), nd = mg.defl.size();
                     const bool direct = nk <= direct_max && nd <= direct_threads;
                     if (direct != (kind == 0)) continue;
-                    const int32_t rec[8] = {(int32_t)(off[t] + mg.off), nk, nd, (int32_t)poff, (int32_t)doff, 0, 0, 0};
+                    const int32_t goff = P.gpr_i.size();
+                    for (int i = 0; i + 1 < nk; ++i) {
+                        const double g = mg.d[i + 1] - mg.d[i];
+                        if (g < GAP_TINY) { P.gpr_i.push_back(i); P.gpr_f.push_back((float)g); }
+                    }
+                    const int32_t rec[8] = {(int32_t)(off[t] + mg.off), nk, nd, (int32_t)poff, (int32_t)doff,
+                                            goff, (int32_t)P.gpr_i.size() - goff, 0};
                     P.nodes.insert(P.nodes.end(), rec, rec + 8);
                     for (int i = 0; i < nk; ++i) {
                         float a, b; split(mg.d[i], a, b); P.dh.push_back(a); P.dl.push_back(b);
-                        P.gap.push_back(i + 1 < nk ? (float)(mg.d[i + 1] - mg.d[i]) : 0.f);
                     }
                     P.tau.insert(P.tau.end(), mg.tau.begin(), mg.tau.end());
                     P.z.insert(P.z.end(), mg.z.begin(), mg.z.end());
@@ -529,7 +539,7 @@ int64_t dc_plan(int L, const double* xr, int R, int nthreads, int direct_max, in
 // Sizes and copies of the packed arrays, by name.
 #define DC_FIELDS(X) \
     X(leaf_off) X(leaf_sz) X(leaf_mk) X(leaf_lam) X(lev_kind) X(lev_nnode) X(lev_node0) X(lev_maxk) X(lev_sb0) \
-    X(nodes) X(sbase) X(dh) X(dl) X(gap) X(tau) X(z) X(c) X(gidx) X(slot) X(dsrc) X(ddst) \
+    X(nodes) X(sbase) X(dh) X(dl) X(gpr_i) X(gpr_f) X(tau) X(z) X(c) X(gidx) X(slot) X(dsrc) X(ddst) \
     X(cd_desc) X(cd_ln) X(cd_lr) X(cd_nh) X(cd_nl) X(vlast) X(scale) X(ring_h) X(ring_l) X(cd_der) X(cdx_i) X(cdx_f)
 
 int64_t dc_size(const char* name) {
