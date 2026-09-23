@@ -43,7 +43,7 @@ _CACHE = os.environ.get("GMASTER_CUDA_CACHE", os.path.join(os.path.expanduser("~
 _MIN_L = int(os.environ.get("GMASTER_DC_MIN_L", "6144"))
 # The plan builder runs on the host; keep it small on shared machines.
 _THREADS = int(os.environ.get("GMASTER_DC_THREADS", "8"))
-_DIRECT_MAX = 256
+_DIRECT_MAX = int(os.environ.get("GMASTER_DC_DIRECT_MAX", "256"))
 _DIRECT_THREADS = 128        # merge_direct's block size: a direct node carries <= this many deflations
 _CD_SKIP = 1e-9              # CD rings where |E phi_n| < skip * max are in the forbidden region
 _P = 12                      # FMM expansion order (dc_lat.cu)

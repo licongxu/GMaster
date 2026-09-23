@@ -164,10 +164,14 @@ __global__ void merge_direct(
 // mom[(g * P + k) * NR + r].  The expansion passes run one right-hand side at a time: carrying
 // NR sets of P complex terms per thread spilled (159 registers and a stack frame at NR = 2, 2.7x
 // the NR = 1 time), while the geometry they would share is a few flops per box.
+template <bool WARP>
+__device__ __forceinline__ void team_sync() { if (WARP) __syncwarp(); else __syncthreads(); }
+
+template <bool WARP>
 __device__ void fmm_passes_one(int nlev, const int* lof, int bo, float* __restrict__ geo,
                                float2* __restrict__ mom, float2* __restrict__ loc, int NR, int r,
                                bool write_geo) {
-    const int tid = threadIdx.x, nth = blockDim.x;
+    const int tid = WARP ? (threadIdx.x & 31) : threadIdx.x, nth = WARP ? 32 : blockDim.x;
     // M2M: M_k = sum_j C(k,j) be^(k-j) (al^j Mc_j) over both children
     for (int l = 1; l < nlev; ++l) {
         const int nbx = lof[l + 1] - lof[l], cb0 = lof[l - 1], pb0 = lof[l], nc = lof[l] - lof[l - 1];
@@ -198,7 +202,7 @@ __device__ void fmm_passes_one(int nlev, const int* lof, int bo, float* __restri
             #pragma unroll
             for (int k = 0; k < P; ++k) mom[(g * P + k) * NR + r] = Mp[k];
         }
-        __syncthreads();
+        team_sync<WARP>();
     }
     // M2L: L_j += (bb^j / D) sum_k C(j+k, j) (a^k M_k) per interaction-list box
     for (int l = 0; l < nlev; ++l) {
@@ -232,7 +236,7 @@ __device__ void fmm_passes_one(int nlev, const int* lof, int bo, float* __restri
             #pragma unroll
             for (int j = 0; j < P; ++j) loc[(g * P + j) * NR + r] = La[j];
         }
-        __syncthreads();
+        team_sync<WARP>();
     }
     // L2L: L_i += al^i sum_{j>=i} C(j,i) be^(j-i) Lp_j
     for (int l = nlev - 2; l >= 0; --l) {
@@ -254,14 +258,14 @@ __device__ void fmm_passes_one(int nlev, const int* lof, int bo, float* __restri
                 ap *= al;
             }
         }
-        __syncthreads();
+        team_sync<WARP>();
     }
 }
 
-template <int NR>
+template <int NR, bool WARP = false>
 __device__ void fmm_passes(int nlev, const int* lof, int bo, float* __restrict__ geo,
                            float2* __restrict__ mom, float2* __restrict__ loc) {
-    for (int r = 0; r < NR; ++r) fmm_passes_one(nlev, lof, bo, geo, mom, loc, NR, r, r == 0);
+    for (int r = 0; r < NR; ++r) fmm_passes_one<WARP>(nlev, lof, bo, geo, mom, loc, NR, r, r == 0);
 }
 
 // P2M of one right-hand side
@@ -304,7 +308,7 @@ __device__ __forceinline__ void l2p(float eta, const float2* loc_g, float2* acc)
 // ------------------------------------------------------------------ FMM merge, one block per node
 // Leaves are FL poles + FL roots (interlaced).  Root positions are formed in double-float as
 // d_org + tau; poles are stored double-float.
-template <int NR>
+template <int NR, bool WARP>
 __global__ void merge_fmm(
     const Node* __restrict__ nodes, int nnode, int dir,
     const float* __restrict__ gdh, const float* __restrict__ gdl, const float* __restrict__ ggap,
@@ -315,10 +319,11 @@ __global__ void merge_fmm(
     const int* __restrict__ sbase, float* __restrict__ geo, float2* __restrict__ mom, float2* __restrict__ loc,
     float2* __restrict__ qs, float2* __restrict__ dstage, float* __restrict__ rpos, int poff0, int doff0)
 {
-    const int nb = blockIdx.x;
+    // WARP: one warp per node (mid-size nodes, where a whole block would idle between barriers)
+    const int nb = WARP ? blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5) : blockIdx.x;
     if (nb >= nnode) return;
     const Node nd = nodes[nb];
-    const int nk = nd.nk, tid = threadIdx.x, nth = blockDim.x;
+    const int nk = nd.nk, tid = WARP ? (threadIdx.x & 31) : threadIdx.x, nth = WARP ? 32 : blockDim.x;
     const float* pdh = gdh + nd.poff; const float* pdl = gdl + nd.poff; const float* pt = gtau + nd.poff;
     const float* pgp = ggap + nd.poff;
     // scratch is level-local: levels run one after another, so it holds one level at a time
@@ -348,7 +353,7 @@ __global__ void merge_fmm(
     // sources: poles (dir 0) or roots (dir 1); targets the other set
     const float* sh = dir == 0 ? pdh : rh; const float* sl = dir == 0 ? pdl : rl;
     const float* th = dir == 0 ? rh : pdh; const float* tl = dir == 0 ? rl : pdl;
-    __syncthreads();
+    team_sync<WARP>();
     for (int b = tid; b < nleaf; b += nth) {
         const int i0 = FL * b, i1 = min(FL * b + FL, nk);
         const float c = 0.5f * (fminf(sh[i0], th[i0]) + fmaxf(sh[i1 - 1], th[i1 - 1]));
@@ -359,8 +364,8 @@ __global__ void merge_fmm(
         geo[2 * g] = c; geo[2 * g + 1] = r;
         p2m<NR>(c, 1.0f / r, sh, sl, q, i0, i1, mom + (size_t)g * P * NR);
     }
-    __syncthreads();
-    fmm_passes<NR>(nlev, lof, bo, geo, mom, loc);
+    team_sync<WARP>();
+    fmm_passes<NR, WARP>(nlev, lof, bo, geo, mom, loc);
     for (int k = tid; k < nk; k += nth) {
         const int b = k / FL, g = bo + b;
         const float eta = ((th[k] - geo[2 * g]) + tl[k]) / geo[2 * g + 1];
@@ -627,6 +632,9 @@ __global__ void cd_fmm(
 // ================================================================================ FFI handlers
 static constexpr int DIRECT_THREADS = 128;
 static constexpr int FMM_THREADS = 256;
+#ifndef WARP_MAX_K
+#define WARP_MAX_K 1024   // FMM merges with at most this many kept poles run one warp per node
+#endif
 
 #define PLAN_ARGS \
     ffi::Buffer<ffi::S32> leaf_off, ffi::Buffer<ffi::S32> leaf_sz, ffi::Buffer<ffi::S32> leaf_mk, ffi::Buffer<ffi::F32> leaf_lam, \
@@ -691,9 +699,14 @@ static ffi::Error apply(cudaStream_t s, int dir, const float2* in, float2* w, fl
                 gap.typed_data(), tau.typed_data(), z.typed_data(), c.typed_data(), gidx.typed_data(), slot.typed_data(),
                 dsrc.typed_data(), ddst.typed_data(), w);
         } else {
-            merge_fmm<NR><<<nn, FMM_THREADS, 0, s>>>(nd, nn, dir, dh.typed_data(), dl.typed_data(),
-                gap.typed_data(), tau.typed_data(), z.typed_data(), c.typed_data(), gidx.typed_data(), slot.typed_data(),
-                dsrc.typed_data(), ddst.typed_data(), w, sbase.typed_data() + sb0, g, mo, lo, q, dst, rp, poff0, doff0);
+            if (maxk <= WARP_MAX_K)
+                merge_fmm<NR, true><<<(nn + 7) / 8, 256, 0, s>>>(nd, nn, dir, dh.typed_data(), dl.typed_data(),
+                    gap.typed_data(), tau.typed_data(), z.typed_data(), c.typed_data(), gidx.typed_data(), slot.typed_data(),
+                    dsrc.typed_data(), ddst.typed_data(), w, sbase.typed_data() + sb0, g, mo, lo, q, dst, rp, poff0, doff0);
+            else
+                merge_fmm<NR, false><<<nn, FMM_THREADS, 0, s>>>(nd, nn, dir, dh.typed_data(), dl.typed_data(),
+                    gap.typed_data(), tau.typed_data(), z.typed_data(), c.typed_data(), gidx.typed_data(), slot.typed_data(),
+                    dsrc.typed_data(), ddst.typed_data(), w, sbase.typed_data() + sb0, g, mo, lo, q, dst, rp, poff0, doff0);
         }
     }
     if (dir == 0) {
