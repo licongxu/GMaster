@@ -9097,3 +9097,32 @@ Two harness lessons: the first 96-thread board sat at a 65 ms floor from 16 thre
 was the single-threaded numpy post-scaling of a 3072x3072 complex array in the harness, not the
 kernel (moved into the C emit); and `_mm512_load_ps` on numpy buffers segfaults (use `loadu`).
 Not on `main`; plan/README.md ("Boris lock") parks this spike.
+
+## Addendum 37 (session 38, 22-23 September 2026, branch `exp/cpu-dform`): a sub-cubic latitudinal transform, the ring-Fourier fold, and the scalar coupling fix
+
+Full write-up with tables: `docs/dc_latitudinal.md`.  Probes / logs: `.qwen/tmp/s38/`.  GPU0 was
+used throughout (GPU1 held another user's 90 GB llama-server).
+
+1. **Scalar coupling** (c0c805b): half-node parity blocks, cached `P_l`, fp32 knob honoured.
+   Nside 2048 spin 0 end to end 1614 -> 472 ms (was the largest stage).
+2. **Ring-Fourier fold** (f95afc5): the refinement loop's `FFT(synth - map)` is the periodic fold of
+   the synthesis spectrum minus the map's own spectrum; no ring FFT after the first analysis.
+   -12.5 % end to end at 1024 and 2048.  `GMASTER_RING_FOLD=0` restores the old loop.
+3. **D&C latitudinal engine** (dcdc66e, 9da317e, ca27467, 0657136): Christoffel-Darboux + Cuppen/
+   Gu-Eisenstat tree + 1-D FMMs, `O(L^2 log L)`; field and mask share one traversal; leaves rebuilt
+   on the fly; level-local scratch; exact adjacent-pole gaps.  Routed from the march's four spin-0
+   entry points at `L >= GMASTER_DC_MIN_L` (default 6144; the boards used 3072, where pairs already
+   win).  `GMASTER_DC=0` disables it.  Plans are built on the host with `GMASTER_DC_THREADS` (8)
+   and cached in `~/.cache/gmaster/dcplan_*.npz` (28 s / 198 s / 1402 s at Nside 1024 / 2048 / 4096).
+4. **Board, spin 0**: 1024 64.1 ms (25.6x NaMaster), 2048 278.6 ms (36.0x), 4096 1450.9 ms (49.3x);
+   GPU peak within 7 % of the march route at 1024-2048 and at parity at 4096.
+5. **4096 accuracy**: every GMaster route, the exact fp64 one included, is 1.56e-4 from NaMaster at
+   Nside 4096 (a uniform ratio); the new engine is 1.2e-6 from GMaster's exact route (march 7.9e-6).
+   The NaMaster difference is open and predates this session.
+6. **Grok's Slevinsky route was reverted**: it sent every `L <= 192` transform through a host
+   `pure_callback` with pure-Python Givens loops, ~11,000x slower at Nside 64 (1.09 s vs 0.09 ms).
+   `gmaster/_slevinsky_lat.py` is left untracked and unused.
+7. **Not done**: spin 2 on the new engine (needs the `a != b` Jacobi form in `x`); FMM kernel
+   efficiency (the route runs at ~11 % of fp32 peak -- the remaining headroom); compressing the
+   int16 index maps (~0.5 GiB at 2048).  A 96-process host pool crashed the machine once this
+   session: keep host work at <= 8 threads.
