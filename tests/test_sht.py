@@ -1382,3 +1382,33 @@ def test_dc_latitudinal_matches_march(nside):
     for march, dc in pairs:
         march, dc = np.asarray(march), np.asarray(dc)
         assert np.max(np.abs(dc - march)) < 2e-5 * np.max(np.abs(march))
+
+
+@pytest.mark.march_v2
+@pytest.mark.skipif(not _HAS_NVIDIA_GPU, reason="requires an NVIDIA GPU")
+@pytest.mark.parametrize("nside", [64, 128])
+def test_dc_spin2_latitudinal_matches_march(nside):
+    """The divide-and-conquer engine's spin-2 route has the march's spin-2 contract."""
+    from gmaster import _dc_lat, _march_v2
+
+    L = 3 * nside
+    if _dc_lat._build() is None or not _march_v2.fold_available():
+        pytest.skip("CUDA libraries unavailable")
+    rng = np.random.default_rng(nside)
+    nt = 4 * nside - 1
+    ftm = rng.normal(size=(nt, 2 * L)) + 1j * rng.normal(size=(nt, 2 * L))
+    ftm[:, 0] = 0
+    flm = rng.normal(size=(L, 2 * L - 1)) + 1j * rng.normal(size=(L, 2 * L - 1))
+    ell = np.arange(L)[:, None]
+    flm[(ell < np.abs(np.arange(-(L - 1), L))[None, :]) | (ell < 2)] = 0
+    ftm, flm = jax.numpy.asarray(ftm), jax.numpy.asarray(flm)
+    geo, tabs = _march_v2.geo_arrays(L, nside, 2), _march_v2.tables_for(L, nside, 2)
+    pairs = (
+        (_march_v2._forward_impl(ftm, geo, tabs, L=L, nside=nside),
+         _dc_lat.forward_latitudinal_spin(ftm, L=L, spin=2, nside=nside)),
+        (_march_v2._inverse_impl(flm, geo, tabs, L=L, nside=nside),
+         _dc_lat.inverse_latitudinal_spin(flm, L=L, spin=2, nside=nside)),
+    )
+    for march, dc in pairs:
+        march, dc = np.asarray(march), np.asarray(dc)
+        assert np.max(np.abs(dc - march)) < 5e-5 * np.max(np.abs(march))

@@ -784,6 +784,9 @@ def _forward_impl(ftm, garr, tabs, *, L, nside):
 def forward_latitudinal(ftm, *, L, spin, nside):
     if int(spin) != 2:
         raise ValueError(f"v2 march implements spin=+2, got spin={spin}")
+    dc = _dc(L)
+    if dc is not None:
+        return dc.forward_latitudinal_spin(ftm, L=L, spin=2, nside=nside)
     return _forward_impl(ftm, geo_arrays(L, nside, 2), tables_for(L, nside, 2), L=L, nside=nside)
 
 
@@ -822,6 +825,9 @@ def _inverse_impl(flm, garr, tabs, *, L, nside):
 def inverse_latitudinal(flm, *, L, spin, nside):
     if int(spin) != 2:
         raise ValueError(f"v2 march implements spin=+2, got spin={spin}")
+    dc = _dc(L)
+    if dc is not None:
+        return dc.inverse_latitudinal_spin(flm, L=L, spin=2, nside=nside)
     return _inverse_impl(flm, geo_arrays(L, nside, 2), tables_for(L, nside, 2), L=L, nside=nside)
 
 

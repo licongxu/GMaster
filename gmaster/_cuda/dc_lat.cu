@@ -437,10 +437,15 @@ __device__ __forceinline__ float acoef(int l, int m) {
 
 // One leaf per half-warp (s <= 16), 8 per 128-thread block; the rebuilt block is staged in
 // shared memory so both directions read it row- or column-wise.
+__device__ __forceinline__ float aspin(int l, int m, int s) {     // Wigner-d recurrence, x-form
+    return l > max(m, s) ? sqrtf((float)(l - m) * (float)(l + m) * (float)(l - s) * (float)(l + s)) /
+                               ((float)l * sqrtf(4.f * (float)l * (float)l - 1.f)) : 0.f;
+}
+
 template <int NR>
 __global__ void __launch_bounds__(128) leaves(const int* __restrict__ off, const int* __restrict__ sz,
                        const int* __restrict__ mk, const float* __restrict__ lam, float2* __restrict__ w,
-                       int nleaf, int dir) {
+                       int nleaf, int dir, int spin) {
     __shared__ float Qs[8][16][17];
     const int hw = threadIdx.x >> 4, lane = threadIdx.x & 15;
     const int leaf = blockIdx.x * 8 + hw;
@@ -450,14 +455,25 @@ __global__ void __launch_bounds__(128) leaves(const int* __restrict__ off, const
     if (live) {
         const int m = mk[4 * leaf], p = mk[4 * leaf + 1], k0 = mk[4 * leaf + 2], n = mk[4 * leaf + 3];
         float D[16], E[16];
-        #pragma unroll
-        for (int k = 0; k < 16; ++k) {
-            const int l = m + p + 2 * (k0 + k);
-            const float a1 = acoef(l + 1, m), a0 = acoef(l, m);
-            D[k] = a1 * a1 + a0 * a0;
-            E[k] = a1 * acoef(l + 2, m);
+        if (spin == 0) {                                  // y-form, parity p
+            #pragma unroll
+            for (int k = 0; k < 16; ++k) {
+                const int l = m + p + 2 * (k0 + k);
+                const float a1 = acoef(l + 1, m), a0 = acoef(l, m);
+                D[k] = a1 * a1 + a0 * a0;
+                E[k] = a1 * acoef(l + 2, m);
+            }
+            if (k0 > 0) { const int l = m + p + 2 * (k0 - 1); D[0] -= acoef(l + 1, m) * acoef(l + 2, m); }
+        } else {                                          // x-form, l = max(m, s) + k
+            const int M = max(m, spin);
+            #pragma unroll
+            for (int k = 0; k < 16; ++k) {
+                const int l = M + k0 + k;
+                D[k] = -(float)m * (float)spin / ((float)l * (float)(l + 1));
+                E[k] = aspin(l + 1, m, spin);
+            }
+            if (k0 > 0) D[0] -= aspin(M + k0, m, spin);
         }
-        if (k0 > 0) { const int l = m + p + 2 * (k0 - 1); D[0] -= acoef(l + 1, m) * acoef(l + 2, m); }
         #pragma unroll
         for (int k = 0; k < 16; ++k) if (k == s - 1 && k0 + s < n) D[k] -= E[k];
         const float lj = lane < s ? lam[o + lane] : 0.f;
@@ -518,7 +534,7 @@ __global__ void __launch_bounds__(128) leaves(const int* __restrict__ off, const
 // ranges of the merged order: ln0 (node ranges) and lr0 (ring ranges), nleaf + 1 entries each.
 // dir 0: ring[p, R-1-t] = scale[p, R-1-t] * sum_j vlast_j w[so+j] / (y_t - y_j)
 // dir 1: w[so+j] = -vlast_j * sum_t scale ring / (y_j - y_t)                   (adjoint)
-struct CDProb { int so, n, lo, nleaf, bo, nt, pad0, pad1; };
+struct CDProb { int so, n, lo, nleaf, bo, nt, t0, pad; };   // active rings: [t0, t0 + nt) ascending
 
 template <int NR>
 __global__ void cd_fmm(
@@ -526,6 +542,7 @@ __global__ void cd_fmm(
     const float* __restrict__ yh, const float* __restrict__ yl, const float* __restrict__ vlast,
     const float* __restrict__ ryh, const float* __restrict__ ryl, int R,
     const int* __restrict__ ln0, const int* __restrict__ lr0, const float* __restrict__ scale,
+    const float* __restrict__ der,
     float2* __restrict__ w, float2* __restrict__ ring,
     float* __restrict__ geo, float2* __restrict__ mom, float2* __restrict__ loc)
 {
@@ -542,11 +559,11 @@ __global__ void cd_fmm(
     // scale * ring (dir 1), both indexed in the ascending order of this direction's sources
     auto qv = [&](int s, int r) -> float2 {
         if (dir == 0) return mul2(vlast[pr.so + s], w[(pr.so + s) * NR + r]);
-        const int rr = R - 1 - s;
+        const int rr = R - 1 - (pr.t0 + s);
         return mul2(sc[rr], rg[rr * NR + r]);
     };
     if (dir == 0)
-        for (int t = pr.nt + tid; t < R; t += nth)
+        for (int t = tid; t < R; t += nth) if (t < pr.t0 || t >= pr.t0 + pr.nt)
             #pragma unroll
             for (int r = 0; r < NR; ++r) rg[(R - 1 - t) * NR + r] = make_float2(0.f, 0.f);
     // coarse leaves: cut b is the plan's cut min(CDF b, nleaf); staged in shared memory
@@ -556,8 +573,9 @@ __global__ void cd_fmm(
     int nlev = 1, sz = nleaf, lof[24]; lof[0] = 0;
     while (true) { lof[nlev] = lof[nlev - 1] + sz; if (sz <= 3) break; sz = (sz + 1) / 2; ++nlev; }
     const int bo = pr.bo;
-    const float* sh = dir == 0 ? nh : ryh; const float* sl = dir == 0 ? nl : ryl;
-    const float* th = dir == 0 ? ryh : nh; const float* tl = dir == 0 ? ryl : nl;
+    const float* rh_ = ryh + pr.t0; const float* rl_ = ryl + pr.t0;     // active rings, ascending
+    const float* sh = dir == 0 ? nh : rh_; const float* sl = dir == 0 ? nl : rl_;
+    const float* th = dir == 0 ? rh_ : nh; const float* tl = dir == 0 ? rl_ : nl;
     const int* S0 = dir == 0 ? L0 : R0;
     const int* T0 = dir == 0 ? R0 : L0;
     __syncthreads();
@@ -565,11 +583,11 @@ __global__ void cd_fmm(
         const int n0 = L0[b], n1 = L0[b + 1], r0 = R0[b], r1 = R0[b + 1];
         float lo = 1e30f, hi = -1e30f;
         if (n1 > n0) { lo = fminf(lo, nh[n0]); hi = fmaxf(hi, nh[n1 - 1]); }
-        if (r1 > r0) { lo = fminf(lo, ryh[r0]); hi = fmaxf(hi, ryh[r1 - 1]); }
+        if (r1 > r0) { lo = fminf(lo, rh_[r0]); hi = fmaxf(hi, rh_[r1 - 1]); }
         const float c = 0.5f * (lo + hi);
         float rad = 0.f;
         for (int i = n0; i < n1; ++i) rad = fmaxf(rad, fabsf((nh[i] - c) + nl[i]));
-        for (int i = r0; i < r1; ++i) rad = fmaxf(rad, fabsf((ryh[i] - c) + ryl[i]));
+        for (int i = r0; i < r1; ++i) rad = fmaxf(rad, fabsf((rh_[i] - c) + rl_[i]));
         rad = up(rad);
         const int g = bo + b;
         geo[2 * g] = c; geo[2 * g + 1] = rad;
@@ -602,29 +620,40 @@ __global__ void cd_fmm(
         // Near field with compensated (two-sum) accumulation: at small m the Gauss nodes and the
         // dense polar rings interleave where phi_n' ~ n^2, so the analysis direction sums terms
         // ~1e7 that cancel to O(1) (m = 0 analysis was 1.3e-5 at Nside 2048 with a plain sum).
+        // Near field.  A ring can coincide with a node (the size-1 problem's node -2/(3 nside) is a
+        // HEALPix ring exactly), where the term s_r / (y_r - y_j) is 0/0 in double-float: it takes
+        // its limit E phi_n'(y_j) (`der`, from the plan), kept outside the ring scale.
         const int s0 = S0[max(b - 1, 0)], s1 = S0[min(b + 1, nleaf - 1) + 1];
-        float2 cmp[NR];
+        float2 spec[NR];
         #pragma unroll
-        for (int r = 0; r < NR; ++r) cmp[r] = make_float2(0.f, 0.f);
+        for (int r = 0; r < NR; ++r) spec[r] = make_float2(0.f, 0.f);
         for (int s = s0; s < s1; ++s) {
-            const float inv = rcp((th[t] - sh[s]) + (tl[t] - sl[s]));
-            #pragma unroll
-            for (int r = 0; r < NR; ++r) {
-                const float2 qq = qv(s, r);
-                two_sum_acc(acc[r].x, cmp[r].x, inv * qq.x);
-                two_sum_acc(acc[r].y, cmp[r].y, inv * qq.y);
+            const float diff = (th[t] - sh[s]) + (tl[t] - sl[s]);
+            if (fabsf(diff) < 1e-14f) {
+                if (dir == 0) {
+                    const float dj = der[pr.so + s];
+                    #pragma unroll
+                    for (int r = 0; r < NR; ++r) fma2(spec[r], dj, qv(s, r));
+                } else {
+                    const int rr = R - 1 - (pr.t0 + s);
+                    const float dj = -der[pr.so + t];
+                    #pragma unroll
+                    for (int r = 0; r < NR; ++r) fma2(spec[r], dj, rg[rr * NR + r]);
+                }
+                continue;
             }
-        }
-        #pragma unroll
-        for (int r = 0; r < NR; ++r) { acc[r].x += cmp[r].x; acc[r].y += cmp[r].y; }
-        if (dir == 0) {
-            const int rr = R - 1 - t; const float f = sc[rr];
+            const float inv = rcp(diff);
             #pragma unroll
-            for (int r = 0; r < NR; ++r) rg[rr * NR + r] = mul2(f, acc[r]);
+            for (int r = 0; r < NR; ++r) fma2(acc[r], inv, qv(s, r));
+        }
+        if (dir == 0) {
+            const int rr = R - 1 - (pr.t0 + t); const float f = sc[rr];
+            #pragma unroll
+            for (int r = 0; r < NR; ++r) rg[rr * NR + r] = make_float2(fmaf(f, acc[r].x, spec[r].x), fmaf(f, acc[r].y, spec[r].y));
         } else {
             const float f = -vlast[pr.so + t];
             #pragma unroll
-            for (int r = 0; r < NR; ++r) w[(pr.so + t) * NR + r] = mul2(f, acc[r]);
+            for (int r = 0; r < NR; ++r) w[(pr.so + t) * NR + r] = mul2(f, make_float2(acc[r].x + spec[r].x, acc[r].y + spec[r].y));
         }
     }
 }
@@ -643,10 +672,10 @@ static constexpr int FMM_THREADS = 256;
     ffi::Buffer<ffi::S16> gidx, ffi::Buffer<ffi::S16> slot, ffi::Buffer<ffi::S16> dsrc, ffi::Buffer<ffi::S16> ddst, \
     ffi::Buffer<ffi::S32> cd_desc, ffi::Buffer<ffi::S32> cd_ln, ffi::Buffer<ffi::S32> cd_lr, \
     ffi::Buffer<ffi::F32> cd_nh, ffi::Buffer<ffi::F32> cd_nl, ffi::Buffer<ffi::F32> vlast, ffi::Buffer<ffi::F32> scale, \
-    ffi::Buffer<ffi::F32> ring_h, ffi::Buffer<ffi::F32> ring_l
+    ffi::Buffer<ffi::F32> ring_h, ffi::Buffer<ffi::F32> ring_l, ffi::Buffer<ffi::F32> cd_der
 
 #define PLAN_PASS leaf_off, leaf_sz, leaf_mk, leaf_lam, nodes, sbase, dh, dl, gap, tau, z, c, gidx, slot, dsrc, ddst, \
-    cd_desc, cd_ln, cd_lr, cd_nh, cd_nl, vlast, scale, ring_h, ring_l
+    cd_desc, cd_ln, cd_lr, cd_nh, cd_nl, vlast, scale, ring_h, ring_l, cd_der
 
 #define PLAN_BIND \
     .Arg<ffi::Buffer<ffi::S32>>().Arg<ffi::Buffer<ffi::S32>>().Arg<ffi::Buffer<ffi::S32>>().Arg<ffi::Buffer<ffi::F32>>() \
@@ -656,7 +685,7 @@ static constexpr int FMM_THREADS = 256;
     .Arg<ffi::Buffer<ffi::S16>>().Arg<ffi::Buffer<ffi::S16>>().Arg<ffi::Buffer<ffi::S16>>().Arg<ffi::Buffer<ffi::S16>>() \
     .Arg<ffi::Buffer<ffi::S32>>().Arg<ffi::Buffer<ffi::S32>>().Arg<ffi::Buffer<ffi::S32>>() \
     .Arg<ffi::Buffer<ffi::F32>>().Arg<ffi::Buffer<ffi::F32>>().Arg<ffi::Buffer<ffi::F32>>().Arg<ffi::Buffer<ffi::F32>>() \
-    .Arg<ffi::Buffer<ffi::F32>>().Arg<ffi::Buffer<ffi::F32>>()
+    .Arg<ffi::Buffer<ffi::F32>>().Arg<ffi::Buffer<ffi::F32>>().Arg<ffi::Buffer<ffi::F32>>()
 
 // scratch (all sized for the largest single tree level, or for the CD step if larger):
 // geo (2 nbox), mom / loc (P nbox NR), qs (nkept NR), dstage (ndefl NR), rpos (2 nkept)
@@ -672,7 +701,7 @@ static constexpr int FMM_THREADS = 256;
 #define CF2(b) reinterpret_cast<const float2*>((b).typed_data())
 
 template <int NR>
-static ffi::Error apply(cudaStream_t s, int dir, const float2* in, float2* w, float2* ring_out,
+static ffi::Error apply(cudaStream_t s, int dir, int spin, const float2* in, float2* w, float2* ring_out,
                         const float2* ring_in, int nprob, int R, ffi::Span<const int64_t> lev, PLAN_ARGS,
                         float* g, float2* mo, float2* lo, float2* q, float2* dst, float* rp) {
     const int nleaf = leaf_off.element_count();
@@ -680,10 +709,10 @@ static ffi::Error apply(cudaStream_t s, int dir, const float2* in, float2* w, fl
     const CDProb* cdp = reinterpret_cast<const CDProb*>(cd_desc.typed_data());
     if (dir == 0) {
         cudaMemcpyAsync(w, in, sizeof(float2) * NR * vlast.element_count(), cudaMemcpyDeviceToDevice, s);
-        leaves<NR><<<lgrid, 128, 0, s>>>(leaf_off.typed_data(), leaf_sz.typed_data(), leaf_mk.typed_data(), leaf_lam.typed_data(), w, nleaf, 0);
+        leaves<NR><<<lgrid, 128, 0, s>>>(leaf_off.typed_data(), leaf_sz.typed_data(), leaf_mk.typed_data(), leaf_lam.typed_data(), w, nleaf, 0, spin);
     } else {
         cd_fmm<NR><<<nprob, 256, 0, s>>>(cdp, nprob, 1, cd_nh.typed_data(), cd_nl.typed_data(), vlast.typed_data(),
-            ring_h.typed_data(), ring_l.typed_data(), R, cd_ln.typed_data(), cd_lr.typed_data(), scale.typed_data(),
+            ring_h.typed_data(), ring_l.typed_data(), R, cd_ln.typed_data(), cd_lr.typed_data(), scale.typed_data(), cd_der.typed_data(),
             w, const_cast<float2*>(ring_in), g, mo, lo);
     }
     // levels: (kind, nnode, node0, maxk, sb0, poff0, doff0) per tree level
@@ -711,10 +740,10 @@ static ffi::Error apply(cudaStream_t s, int dir, const float2* in, float2* w, fl
     }
     if (dir == 0) {
         cd_fmm<NR><<<nprob, 256, 0, s>>>(cdp, nprob, 0, cd_nh.typed_data(), cd_nl.typed_data(), vlast.typed_data(),
-            ring_h.typed_data(), ring_l.typed_data(), R, cd_ln.typed_data(), cd_lr.typed_data(), scale.typed_data(),
+            ring_h.typed_data(), ring_l.typed_data(), R, cd_ln.typed_data(), cd_lr.typed_data(), scale.typed_data(), cd_der.typed_data(),
             w, ring_out, g, mo, lo);
     } else {
-        leaves<NR><<<lgrid, 128, 0, s>>>(leaf_off.typed_data(), leaf_sz.typed_data(), leaf_mk.typed_data(), leaf_lam.typed_data(), w, nleaf, 1);
+        leaves<NR><<<lgrid, 128, 0, s>>>(leaf_off.typed_data(), leaf_sz.typed_data(), leaf_mk.typed_data(), leaf_lam.typed_data(), w, nleaf, 1, spin);
     }
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) return ffi::Error::Internal(cudaGetErrorString(err));
@@ -725,25 +754,25 @@ static ffi::Error apply(cudaStream_t s, int dir, const float2* in, float2* w, fl
 template <int NR>
 ffi::Error SynthImpl(cudaStream_t s, ffi::Buffer<ffi::C64> coef, PLAN_ARGS,
                      ffi::ResultBuffer<ffi::C64> ring, ffi::ResultBuffer<ffi::C64> work, SCRATCH_ARGS,
-                     ffi::Span<const int64_t> lev) {
+                     ffi::Span<const int64_t> lev, int64_t spin) {
     const auto rd = ring->dimensions();
-    return apply<NR>(s, 0, CF2(coef), F2(work), F2(ring), nullptr, rd[0], rd[1], lev, PLAN_PASS,
+    return apply<NR>(s, 0, (int)spin, CF2(coef), F2(work), F2(ring), nullptr, rd[0], rd[1], lev, PLAN_PASS,
                      geo->typed_data(), F2(mom), F2(loc), F2(qs), F2(dstage), rpos->typed_data());
 }
 
 // analysis (adjoint): ring (nprob, R, NR) -> coef (ntot, NR)
 template <int NR>
 ffi::Error AnaImpl(cudaStream_t s, ffi::Buffer<ffi::C64> ring, PLAN_ARGS,
-                   ffi::ResultBuffer<ffi::C64> coef, SCRATCH_ARGS, ffi::Span<const int64_t> lev) {
+                   ffi::ResultBuffer<ffi::C64> coef, SCRATCH_ARGS, ffi::Span<const int64_t> lev, int64_t spin) {
     const auto rd = ring.dimensions();
-    return apply<NR>(s, 1, nullptr, F2(coef), nullptr, CF2(ring), rd[0], rd[1], lev, PLAN_PASS,
+    return apply<NR>(s, 1, (int)spin, nullptr, F2(coef), nullptr, CF2(ring), rd[0], rd[1], lev, PLAN_PASS,
                      geo->typed_data(), F2(mom), F2(loc), F2(qs), F2(dstage), rpos->typed_data());
 }
 
 #define SYNTH_BIND ffi::Ffi::Bind().Ctx<ffi::PlatformStream<cudaStream_t>>().Arg<ffi::Buffer<ffi::C64>>() PLAN_BIND \
-        .Ret<ffi::Buffer<ffi::C64>>().Ret<ffi::Buffer<ffi::C64>>() SCRATCH_BIND .Attr<ffi::Span<const int64_t>>("levels")
+        .Ret<ffi::Buffer<ffi::C64>>().Ret<ffi::Buffer<ffi::C64>>() SCRATCH_BIND .Attr<ffi::Span<const int64_t>>("levels").Attr<int64_t>("spin")
 #define ANA_BIND_DC ffi::Ffi::Bind().Ctx<ffi::PlatformStream<cudaStream_t>>().Arg<ffi::Buffer<ffi::C64>>() PLAN_BIND \
-        .Ret<ffi::Buffer<ffi::C64>>() SCRATCH_BIND .Attr<ffi::Span<const int64_t>>("levels")
+        .Ret<ffi::Buffer<ffi::C64>>() SCRATCH_BIND .Attr<ffi::Span<const int64_t>>("levels").Attr<int64_t>("spin")
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(gm_dc_synth, SynthImpl<1>, SYNTH_BIND);
 XLA_FFI_DEFINE_HANDLER_SYMBOL(gm_dc_synth2, SynthImpl<2>, SYNTH_BIND);

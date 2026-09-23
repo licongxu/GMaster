@@ -257,7 +257,7 @@ struct Problem {
     std::vector<Leaf> leaves;
     std::vector<Merge> merges;
     std::vector<double> y;
-    std::vector<float> vlast, scale;
+    std::vector<float> vlast, scale, der;   // der_j = E phi_n'(y_j): the CD term's limit at a node
     double E;
 };
 
@@ -274,7 +274,7 @@ struct Packed {
     int64_t nbox = 0;
     // Christoffel-Darboux
     std::vector<int32_t> cd_desc, cd_ln, cd_lr;
-    std::vector<float> cd_nh, cd_nl, vlast, scale, ring_h, ring_l;
+    std::vector<float> cd_nh, cd_nl, vlast, scale, ring_h, ring_l, cd_der;
     int64_t cd_nbox = 0, ntot = 0, nprob = 0, R = 0;
 };
 
@@ -293,24 +293,42 @@ extern "C" {
 // Build and pack every (m, p) problem for bandlimit L on the northern rings xr[0..R) (cos theta,
 // pole to equator).  direct_max: kept-size cut between the direct and FMM merge kernels.
 // skip: CD rings whose |E phi_n| is below skip * max are left out (forbidden region).
+// spin 0: xr are the northern rings (pole to equator); problems (m, p) in y = x^2, two parities.
+// spin s > 0: xr are all rings (pole to pole); one problem per m in x over the normalised Wigner
+// functions u_l = sqrt((2l+1)/2) d^l_{m,-s}, l = max(m, s) ..., whose Jacobi matrix has
+// diagonal -m s / (l (l+1)) and off-diagonal a_{l+1}, a_l = sqrt((l^2-m^2)(l^2-s^2)) / (l sqrt(4l^2-1)).
+static inline double a_spin(int l, int m, int s) {
+    return l > std::max(m, s) ? std::sqrt((double(l) * l - double(m) * m) * (double(l) * l - double(s) * s))
+                                    / (l * std::sqrt(4.0 * l * l - 1.0)) : 0.0;
+}
+
 int64_t dc_plan(int L, const double* xr, int R, int nthreads, int direct_max, int direct_threads,
-                double skip) {
+                double skip, int spin) {
     std::vector<std::pair<int, int>> pairs;
-    for (int m = 0; m < L; ++m) for (int p = 0; p < 2; ++p) if (m + p < L) pairs.push_back({m, p});
+    if (spin == 0) { for (int m = 0; m < L; ++m) for (int p = 0; p < 2; ++p) if (m + p < L) pairs.push_back({m, p}); }
+    else { for (int m = 0; m < L; ++m) if (std::max(m, spin) < L) pairs.push_back({m, 0}); }
     std::vector<Problem> probs(pairs.size());
     #pragma omp parallel for schedule(dynamic, 1) num_threads(nthreads)
     for (size_t t = 0; t < pairs.size(); ++t) {
         const int m = pairs[t].first, p = pairs[t].second;
         Problem& pr = probs[t];
         pr.m = m; pr.p = p;
-        int n = 0; for (int l = m + p; l < L; l += 2) ++n;
+        const int M = std::max(m, spin);
+        int n = 0;
+        if (spin == 0) { for (int l = m + p; l < L; l += 2) ++n; } else n = L - M;
         pr.n = n;
         std::vector<double> D(n), E(n);
         for (int k = 0; k < n; ++k) {
-            const int l = m + p + 2 * k;
-            const double a1 = a_coef(l + 1, m), a0 = a_coef(l, m);
-            D[k] = a1 * a1 + a0 * a0;
-            E[k] = a_coef(l + 1, m) * a_coef(l + 2, m);
+            if (spin == 0) {
+                const int l = m + p + 2 * k;
+                const double a1 = a_coef(l + 1, m), a0 = a_coef(l, m);
+                D[k] = a1 * a1 + a0 * a0;
+                E[k] = a_coef(l + 1, m) * a_coef(l + 2, m);
+            } else {
+                const int l = M + k;
+                D[k] = -double(m) * spin / (double(l) * (l + 1));
+                E[k] = a_spin(l + 1, m, spin);
+            }
         }
         Node root = build(D, E, 0, n, 0, pr.leaves, pr.merges);
         pr.y = root.lam;
@@ -330,26 +348,73 @@ int64_t dc_plan(int L, const double* xr, int R, int nthreads, int direct_max, in
         pr.vlast.resize(n);
         for (int j = 0; j < n; ++j) pr.vlast[j] = (float)root.last[j];
         pr.E = E[n - 1];
-        const int lnext = m + p + 2 * n;
-        pr.scale.resize(R);
-        double lg2 = 0.5 * std::log2((2.0 * m + 1) / 2.0);
-        for (int k = 1; k <= m; ++k) lg2 += 0.5 * std::log2((2.0 * k - 1) / (2.0 * k));
-        std::vector<double> cur(R), prev(R, 0.0), ex(R), xs(xr, xr + R);
-        for (int r = 0; r < R; ++r) {
-            const double s = std::sqrt(std::max(1.0 - xs[r] * xs[r], 0.0));
-            const double e2 = lg2 + (s > 0 ? m * std::log2(s) : -1e9);
-            ex[r] = std::floor(e2); cur[r] = std::exp2(e2 - ex[r]);
-        }
-        for (int l = m + 1; l <= lnext; ++l) {
-            const double a = std::sqrt((4.0 * l * l - 1) / (double(l) * l - double(m) * m));
-            const double b = l - 1 > m ? std::sqrt(((l - 1.0) * (l - 1.0) - double(m) * m) / (4.0 * (l - 1.0) * (l - 1.0) - 1)) : 0.0;
-            for (int r = 0; r < R; ++r) {
-                const double nx = a * (xs[r] * cur[r] - b * prev[r]);
-                prev[r] = cur[r]; cur[r] = nx;
+        // E phi_n'(y_j) = phi_0(y_j) / (V[0,j] V[n-1,j]) (Christoffel-Darboux at a node; invariant
+        // under the column's sign), in log form since phi_0 and V[0,j] underflow together at large m
+        pr.der.resize(n);
+        for (int j = 0; j < n; ++j) {
+            const double yj = pr.y[j];
+            double lg0;                                         // log2 |phi_0(y_j)|
+            double sg0 = 1.0;
+            if (spin == 0) {
+                const double xx = std::sqrt(std::max(yj, 0.0)), sn = std::sqrt(std::max(1.0 - yj, 0.0));
+                lg0 = 0.5 * std::log2((2.0 * m + 1) / 2.0);
+                for (int k = 1; k <= m; ++k) lg0 += 0.5 * std::log2((2.0 * k - 1) / (2.0 * k));
+                lg0 += sn > 0 ? m * std::log2(sn) : -1e9;
+                if (p == 1) lg0 += std::log2(std::sqrt(2.0 * m + 3.0) * std::max(xx, 1e-300));
+            } else {
+                const int aa = m + spin, bb = std::abs(m - spin), MM = std::max(m, spin);
+                lg0 = 0.5 * std::log2((2.0 * MM + 1) / 2.0)
+                    + 0.5 * (std::lgamma(aa + bb + 1.0) - std::lgamma(aa + 1.0) - std::lgamma(bb + 1.0)) / std::log(2.0)
+                    + 0.5 * aa * std::log2(std::max(0.5 * (1.0 - yj), 1e-300))
+                    + 0.5 * bb * std::log2(std::max(0.5 * (1.0 + yj), 1e-300));
             }
-            if ((l & 15) == 0)
-                for (int r = 0; r < R; ++r)
-                    if (std::fabs(cur[r]) > 0x1p200) { prev[r] *= 0x1p-200; cur[r] *= 0x1p-200; ex[r] += 200; }
+            const double f = root.first[j], l = root.last[j];
+            if (f == 0.0 || l == 0.0) { pr.der[j] = 0.f; continue; }
+            const double lg = lg0 - std::log2(std::fabs(f)) - std::log2(std::fabs(l));
+            pr.der[j] = (float)(sg0 * ((f * l) < 0 ? -1.0 : 1.0) * std::exp2(std::max(std::min(lg, 120.0), -140.0)));
+        }
+        pr.scale.resize(R);
+        std::vector<double> cur(R), prev(R, 0.0), ex(R), xs(xr, xr + R);
+        if (spin == 0) {
+            const int lnext = m + p + 2 * n;
+            double lg2 = 0.5 * std::log2((2.0 * m + 1) / 2.0);
+            for (int k = 1; k <= m; ++k) lg2 += 0.5 * std::log2((2.0 * k - 1) / (2.0 * k));
+            for (int r = 0; r < R; ++r) {
+                const double s = std::sqrt(std::max(1.0 - xs[r] * xs[r], 0.0));
+                const double e2 = lg2 + (s > 0 ? m * std::log2(s) : -1e9);
+                ex[r] = std::floor(e2); cur[r] = std::exp2(e2 - ex[r]);
+            }
+            for (int l = m + 1; l <= lnext; ++l) {
+                const double a = std::sqrt((4.0 * l * l - 1) / (double(l) * l - double(m) * m));
+                const double b = l - 1 > m ? std::sqrt(((l - 1.0) * (l - 1.0) - double(m) * m) / (4.0 * (l - 1.0) * (l - 1.0) - 1)) : 0.0;
+                for (int r = 0; r < R; ++r) {
+                    const double nx = a * (xs[r] * cur[r] - b * prev[r]);
+                    prev[r] = cur[r]; cur[r] = nx;
+                }
+                if ((l & 15) == 0)
+                    for (int r = 0; r < R; ++r)
+                        if (std::fabs(cur[r]) > 0x1p200) { prev[r] *= 0x1p-200; cur[r] *= 0x1p-200; ex[r] += 200; }
+            }
+        } else {
+            // u_M = sqrt((2M+1)/2) sqrt((a+b)! / (a! b!)) sin(theta/2)^a cos(theta/2)^b, a = m+s, b = |m-s|
+            const int aa = m + spin, bb = std::abs(m - spin);
+            const double lg2 = 0.5 * std::log2((2.0 * M + 1) / 2.0)
+                + 0.5 * (std::lgamma(aa + bb + 1.0) - std::lgamma(aa + 1.0) - std::lgamma(bb + 1.0)) / std::log(2.0);
+            for (int r = 0; r < R; ++r) {
+                const double sh = std::max(0.5 * (1.0 - xs[r]), 1e-300), ch = std::max(0.5 * (1.0 + xs[r]), 1e-300);
+                const double e2 = lg2 + 0.5 * aa * std::log2(sh) + 0.5 * bb * std::log2(ch);
+                ex[r] = std::floor(e2); cur[r] = std::exp2(e2 - ex[r]);
+            }
+            for (int l = M; l < L; ++l) {          // u_{l+1} = ((x - b_l) u_l - a_l u_{l-1}) / a_{l+1}
+                const double bl = -double(m) * spin / (double(l) * (l + 1)), al = a_spin(l, m, spin), an = a_spin(l + 1, m, spin);
+                for (int r = 0; r < R; ++r) {
+                    const double nx = ((xs[r] - bl) * cur[r] - al * prev[r]) / an;
+                    prev[r] = cur[r]; cur[r] = nx;
+                }
+                if ((l & 15) == 0)
+                    for (int r = 0; r < R; ++r)
+                        if (std::fabs(cur[r]) > 0x1p200) { prev[r] *= 0x1p-200; cur[r] *= 0x1p-200; ex[r] += 200; }
+            }
         }
         for (int r = 0; r < R; ++r)
             pr.scale[r] = (float)(pr.E * cur[r] * std::exp2(std::max(std::min(ex[r], 1000.0), -1100.0)));
@@ -405,32 +470,37 @@ int64_t dc_plan(int L, const double* xr, int R, int nthreads, int direct_max, in
             }
         }
     }
-    // Christoffel-Darboux: rings ascending in y = x^2 (equator first)
+    // Christoffel-Darboux: rings ascending in the problem variable (y = x^2 from the equator for
+    // spin 0; x from the south pole otherwise -- both are the given ring order reversed)
     std::vector<double> yr(R);
-    for (int r = 0; r < R; ++r) yr[r] = xr[R - 1 - r] * xr[R - 1 - r];
+    for (int r = 0; r < R; ++r) yr[r] = spin == 0 ? xr[R - 1 - r] * xr[R - 1 - r] : xr[R - 1 - r];
     for (int r = 0; r < R; ++r) { float a, b; split(yr[r], a, b); P.ring_h.push_back(a); P.ring_l.push_back(b); }
     int64_t lo = 0;
     for (size_t t = 0; t < probs.size(); ++t) {
         const Problem& pr = probs[t];
         float smax = 0; for (float v : pr.scale) smax = std::max(smax, std::fabs(v));
-        int nt = 0;
-        for (int r = 0; r < R; ++r) if (std::fabs(pr.scale[R - 1 - r]) > skip * smax) nt = r + 1;
+        // active rings: the interval [t0, t0 + nt) of the ascending order outside the forbidden region(s)
+        int t0 = R, t1 = 0;
+        for (int r = 0; r < R; ++r) if (std::fabs(pr.scale[R - 1 - r]) > skip * smax) { t0 = std::min(t0, r); t1 = r + 1; }
+        if (t1 <= t0) { t0 = 0; t1 = 0; }
+        const int nt = t1 - t0;
         const int tot = pr.n + nt, nleaf = std::max(1, (tot + 15) / 16);
-        // merged order of nodes (ascending) and the first nt ring y (ascending)
+        // merged order of nodes (ascending) and the active ring coordinates (ascending)
         int a = 0, b = 0;
         std::vector<int32_t> ln(nleaf + 1), lr(nleaf + 1);
         for (int q = 0; q <= nleaf; ++q) {
             const int cut = std::min(q * 16, tot);
-            while (a + b < cut) { if (b >= nt || (a < pr.n && pr.y[a] <= yr[b])) ++a; else ++b; }
+            while (a + b < cut) { if (b >= nt || (a < pr.n && pr.y[a] <= yr[t0 + b])) ++a; else ++b; }
             ln[q] = a; lr[q] = b;
         }
-        const int32_t rec[8] = {(int32_t)off[t], pr.n, (int32_t)lo, nleaf, (int32_t)P.cd_nbox, nt, 0, 0};
+        const int32_t rec[8] = {(int32_t)off[t], pr.n, (int32_t)lo, nleaf, (int32_t)P.cd_nbox, nt, t0, 0};
         P.cd_desc.insert(P.cd_desc.end(), rec, rec + 8);
         P.cd_ln.insert(P.cd_ln.end(), ln.begin(), ln.end());
         P.cd_lr.insert(P.cd_lr.end(), lr.begin(), lr.end());
         lo += nleaf; P.cd_nbox += nbox_of(tot, 16);
         for (int j = 0; j < pr.n; ++j) { float h, l; split(pr.y[j], h, l); P.cd_nh.push_back(h); P.cd_nl.push_back(l); }
         P.vlast.insert(P.vlast.end(), pr.vlast.begin(), pr.vlast.end());
+        P.cd_der.insert(P.cd_der.end(), pr.der.begin(), pr.der.end());
         P.scale.insert(P.scale.end(), pr.scale.begin(), pr.scale.end());
     }
     return P.ntot;
@@ -440,7 +510,7 @@ int64_t dc_plan(int L, const double* xr, int R, int nthreads, int direct_max, in
 #define DC_FIELDS(X) \
     X(leaf_off) X(leaf_sz) X(leaf_mk) X(leaf_lam) X(lev_kind) X(lev_nnode) X(lev_node0) X(lev_maxk) X(lev_sb0) \
     X(nodes) X(sbase) X(dh) X(dl) X(gap) X(tau) X(z) X(c) X(gidx) X(slot) X(dsrc) X(ddst) \
-    X(cd_desc) X(cd_ln) X(cd_lr) X(cd_nh) X(cd_nl) X(vlast) X(scale) X(ring_h) X(ring_l)
+    X(cd_desc) X(cd_ln) X(cd_lr) X(cd_nh) X(cd_nl) X(vlast) X(scale) X(ring_h) X(ring_l) X(cd_der)
 
 int64_t dc_size(const char* name) {
 #define X(f) if (!std::strcmp(name, #f)) return (int64_t)g_pack->f.size();

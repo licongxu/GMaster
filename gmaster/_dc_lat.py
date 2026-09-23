@@ -50,7 +50,7 @@ _P = 12                      # FMM expansion order (dc_lat.cu)
 _FL, _CDF = 32, 4            # merge FMM leaf size and CD leaf coarsening (dc_lat.cu defaults)
 _FIELDS = ("leaf_off", "leaf_sz", "leaf_mk", "leaf_lam", "nodes", "sbase", "dh", "dl", "gap", "tau", "z", "c",
            "gidx", "slot", "dsrc", "ddst", "cd_desc", "cd_ln", "cd_lr", "cd_nh", "cd_nl",
-           "vlast", "scale", "ring_h", "ring_l")
+           "vlast", "scale", "ring_h", "ring_l", "cd_der")
 _DTYPES = dict(leaf_off=np.int32, leaf_sz=np.int32, leaf_mk=np.int32, nodes=np.int32, sbase=np.int32, cd_desc=np.int32,
                cd_ln=np.int32, cd_lr=np.int32, gidx=np.int16, slot=np.int16, dsrc=np.int16,
                ddst=np.int16, lev_kind=np.int32, lev_nnode=np.int32, lev_node0=np.int32,
@@ -106,7 +106,7 @@ def _build():
         plan = ctypes.CDLL(plan_so)
         plan.dc_plan.restype = ctypes.c_int64
         plan.dc_plan.argtypes = [ctypes.c_int, ctypes.POINTER(ctypes.c_double), ctypes.c_int,
-                                 ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_double]
+                                 ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_double, ctypes.c_int]
         plan.dc_size.restype = ctypes.c_int64
         plan.dc_size.argtypes = [ctypes.c_char_p]
         plan.dc_copy.argtypes = [ctypes.c_char_p, ctypes.c_void_p]
@@ -127,25 +127,26 @@ def enabled(L=None) -> bool:
     return _build() is not None
 
 
-def _ring_x(L, nside):
+def _ring_x(L, nside, spin=0):
     from .utils import _stable_thetas
 
     theta = np.asarray(_stable_thetas(L, nside), dtype=np.float64)
-    return np.cos(theta[: 2 * nside])          # northern rings, pole to equator (equator last)
+    # spin 0: northern rings, pole to equator; spin > 0: every ring, pole to pole
+    return np.cos(theta[: 2 * nside] if spin == 0 else theta)
 
 
-def _host_plan(L, nside):
+def _host_plan(L, nside, spin=0):
     """The packed plan as numpy arrays, from the disk cache or built on the host."""
     lib, plan, tag = _build()
-    x = _ring_x(L, nside)
-    key = _digest(tag, hashlib.sha1(x.tobytes()).hexdigest(), str((_DIRECT_MAX, _DIRECT_THREADS, _CD_SKIP)))
-    path = os.path.join(_CACHE, f"dcplan_L{L}_n{nside}_{key}.npz")
+    x = _ring_x(L, nside, spin)
+    key = _digest(tag, hashlib.sha1(x.tobytes()).hexdigest(), str((_DIRECT_MAX, _DIRECT_THREADS, _CD_SKIP, spin)))
+    path = os.path.join(_CACHE, f"dcplan_L{L}_n{nside}_s{spin}_{key}.npz")
     if os.path.exists(path):
         with np.load(path) as f:
             return {k: f[k] for k in f.files}
     xs = np.ascontiguousarray(x)
     plan.dc_plan(int(L), xs.ctypes.data_as(ctypes.POINTER(ctypes.c_double)), xs.size,
-                 _THREADS, _DIRECT_MAX, _DIRECT_THREADS, _CD_SKIP)
+                 _THREADS, _DIRECT_MAX, _DIRECT_THREADS, _CD_SKIP, int(spin))
     out = {}
     for name in _FIELDS + ("lev_kind", "lev_nnode", "lev_node0", "lev_maxk", "lev_sb0"):
         n = plan.dc_size(name.encode())
@@ -163,33 +164,40 @@ def _host_plan(L, nside):
 
 
 class _Plan:
-    def __init__(self, L, nside):
-        h = _host_plan(L, nside)
-        self.L, self.nside = L, nside
-        self.R = 2 * nside
-        self.nprob = 2 * L - 1
+    def __init__(self, L, nside, spin=0):
+        h = _host_plan(L, nside, spin)
+        self.L, self.nside, self.spin = L, nside, spin
+        self.R = 2 * nside if spin == 0 else 4 * nside - 1
+        self.nprob = 2 * L - 1 if spin == 0 else L
         self.ntot = int(h["vlast"].size)
         self._layout(h)
         self.args = tuple(jnp.asarray(h[k]) for k in _FIELDS)
-        # packing: problem t = 2 m + p holds ell = m + p + 2 k at offset off[t] + k
-        n = np.array([len(range(m + p, L, 2)) for m in range(L) for p in (0, 1) if m + p < L])
-        off = np.concatenate([[0], np.cumsum(n)])
-        ell = np.empty(self.ntot, np.int32)
-        order = np.empty(self.ntot, np.int32)
-        t = 0
-        for m in range(L):
-            for p in (0, 1):
-                if m + p < L:
-                    ell[off[t]:off[t + 1]] = np.arange(m + p, L, 2)
-                    order[off[t]:off[t + 1]] = m
-                    t += 1
+        # packing: spin 0, problem t = 2 m + p holds ell = m + p + 2 k; spin s, problem t = m holds
+        # ell = max(m, s) + k; both at offset off[t] + k
+        if spin == 0:
+            rows = [(m, np.arange(m + p, L, 2)) for m in range(L) for p in (0, 1) if m + p < L]
+        else:
+            rows = [(m, np.arange(max(m, spin), L)) for m in range(L)]
+        ell = np.concatenate([r[1] for r in rows]).astype(np.int32)
+        order = np.concatenate([np.full(r[1].size, r[0]) for r in rows]).astype(np.int32)
         self.ell, self.order = jnp.asarray(ell), jnp.asarray(order)
         # analysis writes back by *gather*: position ell * L + m -> packed index (ntot = zero slot)
         inv = np.full(L * L, self.ntot, np.int32)
         inv[ell.astype(np.int64) * L + order] = np.arange(self.ntot, dtype=np.int32)
         self.inv = jnp.asarray(inv)
-        # alm_CS = (-1)^m psi / sqrt(2 pi) on both sides of the transform
-        self.fac = jnp.asarray(((-1.0) ** order / math.sqrt(2.0 * math.pi)).astype(np.float32))
+        inv_m = np.full(L * L, self.ntot, np.int32)                      # position m * L + ell
+        inv_m[order.astype(np.int64) * L + ell] = np.arange(self.ntot, dtype=np.int32)
+        self.inv_m = jnp.asarray(inv_m)
+        # spin 0: alm_CS = (-1)^m psi / sqrt(2 pi) on both sides of the transform.  Spin s: the march's
+        # contract is the bare d^l_{m,-s} (normalisation applied by its callers), and the plan's
+        # functions are u_l = sqrt((2l+1)/2) d^l_{m,-s}, so the factor is (-1)^(m+s) sqrt(2/(2l+1)).
+        if spin == 0:
+            fac = (-1.0) ** order / math.sqrt(2.0 * math.pi)
+        else:
+            fac = (-1.0) ** (order + spin) * np.sqrt(2.0 / (2.0 * ell + 1.0))
+        self.fac = jnp.asarray(fac.astype(np.float32))
+        # mirror channel sign (-1)^(ell + s) for the negative orders
+        self.msign = jnp.asarray(((-1.0) ** (ell + spin)).astype(np.float32))
 
     def _layout(self, h):
         """Level-local scratch layout, recomputed from the plan's node table.
@@ -228,7 +236,7 @@ class _Plan:
 
     def static(self):
         """Hashable description for the jitted wrappers (the arrays go in as arguments)."""
-        return (self.nprob, self.R, self.ntot, tuple(int(v) for v in self.levels), self.sizes)
+        return (self.nprob, self.R, self.ntot, tuple(int(v) for v in self.levels), self.sizes, self.spin)
 
 
 def _nbox(nleaf):
@@ -259,7 +267,7 @@ def _synth(coef, args, static):
         "gm_dc_synth" if nr == 1 else "gm_dc_synth2",
         (jax.ShapeDtypeStruct((nprob, R, nr), jnp.complex64),
          jax.ShapeDtypeStruct((ntot, nr), jnp.complex64)) + _scratch(static, nr))(
-        coef.astype(jnp.complex64), *args, levels=np.asarray(levels, np.int64))[0]
+        coef.astype(jnp.complex64), *args, levels=np.asarray(levels, np.int64), spin=np.int64(static[5]))[0]
 
 
 def _analyse(ring, args, static):
@@ -269,12 +277,15 @@ def _analyse(ring, args, static):
     return jax.ffi.ffi_call(
         "gm_dc_ana" if nr == 1 else "gm_dc_ana2",
         (jax.ShapeDtypeStruct((ntot, nr), jnp.complex64),) + _scratch(static, nr))(
-        ring.astype(jnp.complex64), *args, levels=np.asarray(levels, np.int64))[0]
+        ring.astype(jnp.complex64), *args, levels=np.asarray(levels, np.int64), spin=np.int64(static[5]))[0]
 
 
 @lru_cache(maxsize=2)
-def plan_for(L, nside):
-    return _Plan(int(L), int(nside))
+def plan_for(L, nside, spin=0):
+    # Concrete even when first asked for inside a trace (the spin-2 seam sits in a jitted program):
+    # the plan is geometry, and its arrays must be device buffers, not tracers.
+    with jax.ensure_compile_time_eval():
+        return _Plan(int(L), int(nside), int(spin))
 
 
 def _hemispheres(ring, L, nside):
@@ -392,3 +403,50 @@ def packed_to_alm(coef, ell, order, *, L, nside):
     """One map's packed alm -> the pipeline's ``(ell, order)`` packing."""
     pl = plan_for(L, nside)
     return _packed_to_alm_impl(coef, pl.inv, ell, order, L=int(L))
+
+
+# ------------------------------------------------------------------------------------- spin s
+# The march's spin-2 contract (`_march_v2.forward_latitudinal` / `inverse_latitudinal`): ring spectra
+# `(ntheta, 2L)` with column `L + m` holding order `m`, and `flm[ell, L - 1 + m]`.  Orders m >= 0 use
+# plan row m directly; order -m uses the same row on the ring-reversed data with the sign
+# (-1)^(ell + s), since d^l_{-m,-s}(theta) = (-1)^(l+s) d^l_{m,-s}(pi - theta).  Both channels go
+# through one traversal (NR = 2).
+
+@partial(jax.jit, static_argnames=("L", "static"))
+def _forward_spin_impl(ftm, args, inv, fac, msign, *, L, static):
+    ftm = ftm.astype(jnp.complex64)
+    direct = ftm[:, L:2 * L].T                                         # (L, ntheta), row m
+    mirror = jnp.concatenate([jnp.zeros((1, ftm.shape[0]), ftm.dtype),
+                              ftm[::-1, 1:L][:, ::-1].T], axis=0)      # row m: order -m, rings reversed
+    coef = _analyse(jnp.stack([direct, mirror], axis=2), args, static) * fac[:, None]
+    coef = jnp.concatenate([coef, jnp.zeros((1, 2), coef.dtype)], axis=0)
+    zero = jnp.asarray(0.0, jnp.float32)
+    pos = coef[inv, 0].reshape(L, L)                                    # [m, ell] -> transposed below
+    neg = (coef[:-1, 1] * msign)
+    neg = jnp.concatenate([neg, jnp.zeros(1, neg.dtype)])[inv].reshape(L, L)
+    pos, neg = pos.T, neg.T                                             # [ell, m]
+    return jnp.concatenate([neg[:, 1:][:, ::-1], pos], axis=1).astype(jnp.complex128)
+
+
+@partial(jax.jit, static_argnames=("L", "static"))
+def _inverse_spin_impl(flm, args, ell, order, fac, msign, *, L, static):
+    flm = flm.astype(jnp.complex64)
+    cpos = flm[ell, L - 1 + order] * fac
+    cneg = jnp.where(order > 0, flm[ell, L - 1 - order], 0) * fac * msign
+    ring = _synth(jnp.stack([cpos, cneg], axis=1), args, static)       # (L, ntheta, 2)
+    ntheta = ring.shape[1]
+    pos = ring[:, :, 0].T                                               # (ntheta, L), column m
+    neg = ring[1:, ::-1, 1].T                                           # column m-1: order -m
+    return jnp.concatenate([jnp.zeros((ntheta, 1), pos.dtype), neg[:, ::-1], pos], axis=1)
+
+
+def forward_latitudinal_spin(ftm, *, L, spin, nside):
+    """``(ntheta, 2L)`` ring spectrum -> ``(L, 2L-1)`` flm (the march's spin-s analysis contract)."""
+    pl = plan_for(L, nside, spin)
+    return _forward_spin_impl(ftm, pl.args, pl.inv_m, pl.fac, pl.msign, L=int(L), static=pl.static())
+
+
+def inverse_latitudinal_spin(flm, *, L, spin, nside):
+    """``(L, 2L-1)`` flm -> ``(ntheta, 2L)`` ring spectrum (column 0 zero)."""
+    pl = plan_for(L, nside, spin)
+    return _inverse_spin_impl(flm, pl.args, pl.ell, pl.order, pl.fac, pl.msign, L=int(L), static=pl.static())
