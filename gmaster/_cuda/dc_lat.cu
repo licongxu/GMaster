@@ -91,7 +91,7 @@ template <int NR>
 __global__ void merge_direct(
     const Node* __restrict__ nodes, int nnode, int dir,
     const float* __restrict__ gdh, const float* __restrict__ gdl, const int* __restrict__ gpr_i,
-    const float* __restrict__ gpr_f, const float* __restrict__ gtau, const float* __restrict__ gz, const float* __restrict__ gc,
+    const float* __restrict__ gpr_f, const float* __restrict__ gtau, const float* __restrict__ gz,
     const short* __restrict__ ggidx, const short* __restrict__ gslot,
     const short* __restrict__ gdsrc, const short* __restrict__ gddst,
     float2* __restrict__ w)
@@ -107,7 +107,7 @@ __global__ void merge_direct(
     for (int i = threadIdx.x; i < nk; i += blockDim.x) {
         dh[i] = pdh[i]; dl[i] = pdl[i]; tau[i] = pt[i];
         const int src = dir == 0 ? ggidx[nd.poff + i] : gslot[nd.poff + i];
-        const float f = dir == 0 ? gz[nd.poff + i] : gc[nd.poff + i];
+        const float f = dir == 0 ? gz[nd.poff + i] : 1.f;   // column norms live in z / vlast
         #pragma unroll
         for (int r = 0; r < NR; ++r) q[i * NR + r] = mul2(f, w[(nd.base + src) * NR + r]);
     }
@@ -143,7 +143,7 @@ __global__ void merge_direct(
                 #pragma unroll
                 for (int r = 0; r < NR; ++r) fma2(acc[r], corr, q[i * NR + r]);
             }
-            const float cc = -gc[nd.poff + k];
+            const float cc = -1.f;
             const int dst = nd.base + gslot[nd.poff + k];
             #pragma unroll
             for (int r = 0; r < NR; ++r) w[dst * NR + r] = mul2(cc, acc[r]);
@@ -332,7 +332,7 @@ template <int NR, bool WARP>
 __global__ void merge_fmm(
     const Node* __restrict__ nodes, int nnode, int dir,
     const float* __restrict__ gdh, const float* __restrict__ gdl, const int* __restrict__ gpr_i,
-    const float* __restrict__ gpr_f, const float* __restrict__ gtau, const float* __restrict__ gz, const float* __restrict__ gc,
+    const float* __restrict__ gpr_f, const float* __restrict__ gtau, const float* __restrict__ gz,
     const short* __restrict__ ggidx, const short* __restrict__ gslot,
     const short* __restrict__ gdsrc, const short* __restrict__ gddst,
     float2* __restrict__ w,
@@ -354,7 +354,7 @@ __global__ void merge_fmm(
     stage_gaps<WARP>(nd, pdh, pdl, gpr_i, gpr_f, pgp, tid, nth);
     for (int i = tid; i < nk; i += nth) {
         const int src = dir == 0 ? ggidx[nd.poff + i] : gslot[nd.poff + i];
-        const float f = dir == 0 ? gz[nd.poff + i] : gc[nd.poff + i];
+        const float f = dir == 0 ? gz[nd.poff + i] : 1.f;   // column norms live in z / vlast
         #pragma unroll
         for (int r = 0; r < NR; ++r) q[i * NR + r] = mul2(f, w[(nd.base + src) * NR + r]);
         const int o = org_of(i, pt[i]);
@@ -411,7 +411,7 @@ __global__ void merge_fmm(
                 #pragma unroll
                 for (int r = 0; r < NR; ++r) fma2(acc[r], corr, q[i * NR + r]);
             }
-            const float cc = -gc[nd.poff + k];
+            const float cc = -1.f;
             const int d = nd.base + gslot[nd.poff + k];
             #pragma unroll
             for (int r = 0; r < NR; ++r) w[d * NR + r] = mul2(cc, acc[r]);
@@ -442,6 +442,17 @@ __global__ void merge_fmm(
         #pragma unroll
         for (int r = 0; r < NR; ++r) w[(nd.base + d) * NR + r] = dst[i * NR + r];
     }
+}
+
+// The top node's pending column norms (every lower level's are folded into its parent's z), applied
+// to the whole coefficient vector: after the tree in synthesis, before it in analysis.
+template <int NR>
+__global__ void scale_root(const float* __restrict__ cr, float2* __restrict__ w, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const float f = cr[i];
+    #pragma unroll
+    for (int r = 0; r < NR; ++r) w[i * NR + r] = mul2(f, w[i * NR + r]);
 }
 
 // ------------------------------------------------------------------ leaves (warp per <= 16 x 16 block)
@@ -711,14 +722,14 @@ static constexpr int FMM_THREADS = 256;
     ffi::Buffer<ffi::S32> leaf_off, ffi::Buffer<ffi::S32> leaf_sz, ffi::Buffer<ffi::S32> leaf_mk, ffi::Buffer<ffi::F32> leaf_lam, \
     ffi::Buffer<ffi::S32> nodes, ffi::Buffer<ffi::S32> sbase, ffi::Buffer<ffi::F32> dh, ffi::Buffer<ffi::F32> dl, \
     ffi::Buffer<ffi::S32> gpr_i, ffi::Buffer<ffi::F32> gpr_f, \
-    ffi::Buffer<ffi::F32> tau, ffi::Buffer<ffi::F32> z, ffi::Buffer<ffi::F32> c, \
+    ffi::Buffer<ffi::F32> tau, ffi::Buffer<ffi::F32> z, ffi::Buffer<ffi::F32> croot, \
     ffi::Buffer<ffi::S16> gidx, ffi::Buffer<ffi::S16> slot, ffi::Buffer<ffi::S16> dsrc, ffi::Buffer<ffi::S16> ddst, \
     ffi::Buffer<ffi::S32> cd_desc, ffi::Buffer<ffi::S32> cd_ln, ffi::Buffer<ffi::S32> cd_lr, \
     ffi::Buffer<ffi::F32> cd_nh, ffi::Buffer<ffi::F32> cd_nl, ffi::Buffer<ffi::F32> vlast, ffi::Buffer<ffi::F32> scale, \
     ffi::Buffer<ffi::F32> ring_h, ffi::Buffer<ffi::F32> ring_l, ffi::Buffer<ffi::F32> cd_der, \
     ffi::Buffer<ffi::S32> cdx_i, ffi::Buffer<ffi::F32> cdx_f
 
-#define PLAN_PASS leaf_off, leaf_sz, leaf_mk, leaf_lam, nodes, sbase, dh, dl, gpr_i, gpr_f, tau, z, c, gidx, slot, dsrc, ddst, \
+#define PLAN_PASS leaf_off, leaf_sz, leaf_mk, leaf_lam, nodes, sbase, dh, dl, gpr_i, gpr_f, tau, z, croot, gidx, slot, dsrc, ddst, \
     cd_desc, cd_ln, cd_lr, cd_nh, cd_nl, vlast, scale, ring_h, ring_l, cd_der, cdx_i, cdx_f
 
 #define PLAN_BIND \
@@ -777,6 +788,8 @@ static ffi::Error apply(cudaStream_t s, int dir, int spin, int stages, const flo
         }
     }
     // levels: (kind, nnode, node0, maxk, sb0, poff0, doff0) per tree level
+    const int ncoef = vlast.element_count();
+    if (tree && dir == 1) scale_root<NR><<<(ncoef + 255) / 256, 256, 0, s>>>(croot.typed_data(), w, ncoef);
     const int nlev = tree ? (int)(lev.size() / 7) : 0;
     for (int qq = 0; qq < nlev; ++qq) {
         const int i = dir == 0 ? qq : nlev - 1 - qq;
@@ -786,19 +799,20 @@ static ffi::Error apply(cudaStream_t s, int dir, int spin, int stages, const flo
         if (kind == 0) {
             const int smem = 4 * (4 * maxk + 2) + 8 * NR * maxk;
             merge_direct<NR><<<nn, DIRECT_THREADS, smem, s>>>(nd, nn, dir, dh.typed_data(), dl.typed_data(),
-                gpr_i.typed_data(), gpr_f.typed_data(), tau.typed_data(), z.typed_data(), c.typed_data(), gidx.typed_data(), slot.typed_data(),
+                gpr_i.typed_data(), gpr_f.typed_data(), tau.typed_data(), z.typed_data(), gidx.typed_data(), slot.typed_data(),
                 dsrc.typed_data(), ddst.typed_data(), w);
         } else {
             if (maxk <= WARP_MAX_K)
                 merge_fmm<NR, true><<<(nn + 7) / 8, 256, 0, s>>>(nd, nn, dir, dh.typed_data(), dl.typed_data(),
-                    gpr_i.typed_data(), gpr_f.typed_data(), tau.typed_data(), z.typed_data(), c.typed_data(), gidx.typed_data(), slot.typed_data(),
+                    gpr_i.typed_data(), gpr_f.typed_data(), tau.typed_data(), z.typed_data(), gidx.typed_data(), slot.typed_data(),
                     dsrc.typed_data(), ddst.typed_data(), w, sbase.typed_data() + sb0, g, mo, lo, q, dst, rp, poff0, doff0);
             else
                 merge_fmm<NR, false><<<nn, FMM_THREADS, 0, s>>>(nd, nn, dir, dh.typed_data(), dl.typed_data(),
-                    gpr_i.typed_data(), gpr_f.typed_data(), tau.typed_data(), z.typed_data(), c.typed_data(), gidx.typed_data(), slot.typed_data(),
+                    gpr_i.typed_data(), gpr_f.typed_data(), tau.typed_data(), z.typed_data(), gidx.typed_data(), slot.typed_data(),
                     dsrc.typed_data(), ddst.typed_data(), w, sbase.typed_data() + sb0, g, mo, lo, q, dst, rp, poff0, doff0);
         }
     }
+    if (tree && dir == 0) scale_root<NR><<<(ncoef + 255) / 256, 256, 0, s>>>(croot.typed_data(), w, ncoef);
     if (dir == 0 && cd) {
         cd_fmm<NR><<<nprob, 256, 0, s>>>(cdp, nprob, 0, cd_nh.typed_data(), cd_nl.typed_data(), vlast.typed_data(),
             ring_h.typed_data(), ring_l.typed_data(), R, cd_ln.typed_data(), cd_lr.typed_data(), scale.typed_data(), cd_der.typed_data(),

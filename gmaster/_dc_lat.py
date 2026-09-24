@@ -48,7 +48,7 @@ _DIRECT_THREADS = 128        # merge_direct's block size: a direct node carries 
 _CD_SKIP = 1e-9              # CD rings where |E phi_n| < skip * max are in the forbidden region
 _P = int(dict(d.split("=") for d in os.environ.get("GMASTER_DC_DEFS", "").split() if "=" in d).get("P", 12))   # FMM order (dc_lat.cu)
 _FL, _CDF = 32, 4            # merge FMM leaf size and CD leaf coarsening (dc_lat.cu defaults)
-_FIELDS = ("leaf_off", "leaf_sz", "leaf_mk", "leaf_lam", "nodes", "sbase", "dh", "dl", "gpr_i", "gpr_f", "tau", "z", "c",
+_FIELDS = ("leaf_off", "leaf_sz", "leaf_mk", "leaf_lam", "nodes", "sbase", "dh", "dl", "gpr_i", "gpr_f", "tau", "z", "croot",
            "gidx", "slot", "dsrc", "ddst", "cd_desc", "cd_ln", "cd_lr", "cd_nh", "cd_nl",
            "vlast", "scale", "ring_h", "ring_l", "cd_der", "cdx_i", "cdx_f")
 _DTYPES = dict(leaf_off=np.int32, leaf_sz=np.int32, leaf_mk=np.int32, nodes=np.int32, sbase=np.int32, cd_desc=np.int32,

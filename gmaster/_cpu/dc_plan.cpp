@@ -84,7 +84,7 @@ void tql2(int n, std::vector<double>& d, std::vector<double> e, std::vector<doub
 struct Merge {
     int height, off, n;
     std::vector<double> d;            // kept poles, ascending
-    std::vector<float> tau, z, c;
+    std::vector<float> tau, z;          // z: Gu-Eisenstat z times the children's column norms
     std::vector<int16_t> kept, slot_kept, defl, slot_defl;
 };
 struct Leaf { int off, s; float lam[16]; };
@@ -92,6 +92,11 @@ struct Leaf { int off, s; float lam[16]; };
 struct Node {
     int n, height;
     std::vector<double> lam, first, last;
+    // Column-norm factors not yet applied to this node's output slots.  A merge's column norms c_j
+    // scale its roots on output (synthesis) and input (analysis); the next level up scales the same
+    // values by its z_i.  So each c_j is folded into the parent's z_i for that edge (or carried
+    // through the parent's deflations, or into vlast at the top), and no c is stored.
+    std::vector<double> pending;
 };
 
 // roots of 1 + rho sum z_i^2 / (d_i - lam), d ascending, rho > 0.  Root j is in
@@ -171,6 +176,7 @@ Node build(const std::vector<double>& D, const std::vector<double>& E, int lo, i
         node.height = 0; node.lam = d;
         node.first.resize(node.n); node.last.resize(node.n);
         for (int j = 0; j < node.n; ++j) { node.first[j] = Z[j]; node.last[j] = Z[(node.n - 1) * node.n + j]; }
+        node.pending.assign(node.n, 1.0);
         return node;
     }
     const int k = lo + node.n / 2;
@@ -231,9 +237,17 @@ Node build(const std::vector<double>& D, const std::vector<double>& E, int lo, i
     applyUt(lr, node.last);
     Merge mg;
     mg.height = node.height; mg.off = lo; mg.n = n;
-    mg.d = dk; mg.tau.resize(nk); mg.z.resize(nk); mg.c.resize(nk);
+    mg.d = dk; mg.tau.resize(nk); mg.z.resize(nk);
     mg.kept.resize(nk); mg.defl.resize(nd);
-    for (int i = 0; i < nk; ++i) { mg.tau[i] = (float)tau[i]; mg.z[i] = (float)zh[i]; mg.c[i] = (float)cn[i]; mg.kept[i] = (int16_t)keptv[i]; }
+    // fold the children's pending column norms into this node's z (kept poles) or pass them through
+    // its deflations; this node's own c becomes pending on its root slots
+    std::vector<double> pend_in(n);
+    for (int i = 0; i < L.n; ++i) pend_in[i] = L.pending[i];
+    for (int i = 0; i < R.n; ++i) pend_in[L.n + i] = R.pending[i];
+    node.pending.assign(n, 1.0);
+    for (int j = 0; j < nk; ++j) node.pending[slot_k[j]] = cn[j];
+    for (int b = 0; b < nd; ++b) node.pending[slot_d[b]] = pend_in[deflv[b]];
+    for (int i = 0; i < nk; ++i) { mg.tau[i] = (float)tau[i]; mg.z[i] = (float)(zh[i] * pend_in[keptv[i]]); mg.kept[i] = (int16_t)keptv[i]; }
     for (int b = 0; b < nd; ++b) mg.defl[b] = (int16_t)deflv[b];
     mg.slot_kept = slot_k; mg.slot_defl = slot_d;
     merges.push_back(std::move(mg));
@@ -261,6 +275,7 @@ struct Problem {
     std::vector<Merge> merges;
     std::vector<double> y;
     std::vector<float> vlast, scale, der;   // der_j = E phi_n'(y_j): the CD term's limit at a node
+    std::vector<float> croot;                // the top node's pending column norms, per output slot
     double E;
 };
 
@@ -272,7 +287,7 @@ struct Packed {
     std::vector<int32_t> lev_kind, lev_nnode, lev_node0, lev_maxk, lev_sb0;
     std::vector<int32_t> nodes;                 // 8 per node: base nk nd poff doff 0 0 0
     std::vector<int32_t> sbase;                 // fmm nodes: first scratch box
-    std::vector<float> dh, dl, tau, z, c;
+    std::vector<float> dh, dl, tau, z, croot;   // croot: per coefficient, the top node's pending column norms
     std::vector<int32_t> gpr_i;                 // tiny adjacent gaps: local index i (gap = d[i+1] - d[i])
     std::vector<float> gpr_f;
     std::vector<int16_t> gidx, slot, dsrc, ddst;
@@ -356,6 +371,8 @@ int64_t dc_plan(int L, const double* xr, int R, int nthreads, int direct_max, in
         }
         pr.vlast.resize(n);
         for (int j = 0; j < n; ++j) pr.vlast[j] = (float)root.last[j];
+        pr.croot.resize(n);
+        for (int j = 0; j < n; ++j) pr.croot[j] = (float)root.pending[j];
         pr.E = E[n - 1];
         // E phi_n'(y_j) = phi_0(y_j) / (V[0,j] V[n-1,j]) (Christoffel-Darboux at a node; invariant
         // under the column's sign), in log form since phi_0 and V[0,j] underflow together at large m
@@ -470,7 +487,6 @@ int64_t dc_plan(int L, const double* xr, int R, int nthreads, int direct_max, in
                     }
                     P.tau.insert(P.tau.end(), mg.tau.begin(), mg.tau.end());
                     P.z.insert(P.z.end(), mg.z.begin(), mg.z.end());
-                    P.c.insert(P.c.end(), mg.c.begin(), mg.c.end());
                     P.gidx.insert(P.gidx.end(), mg.kept.begin(), mg.kept.end());
                     P.slot.insert(P.slot.end(), mg.slot_kept.begin(), mg.slot_kept.end());
                     P.dsrc.insert(P.dsrc.end(), mg.defl.begin(), mg.defl.end());
@@ -530,6 +546,7 @@ int64_t dc_plan(int L, const double* xr, int R, int nthreads, int direct_max, in
         lo += nleaf; P.cd_nbox += nbox_of(tot, 16);
         for (int j = 0; j < pr.n; ++j) { float h, l; split(pr.y[j], h, l); P.cd_nh.push_back(h); P.cd_nl.push_back(l); }
         P.vlast.insert(P.vlast.end(), pr.vlast.begin(), pr.vlast.end());
+        P.croot.insert(P.croot.end(), pr.croot.begin(), pr.croot.end());
         P.cd_der.insert(P.cd_der.end(), pr.der.begin(), pr.der.end());
         P.scale.insert(P.scale.end(), pr.scale.begin(), pr.scale.end());
     }
@@ -539,7 +556,7 @@ int64_t dc_plan(int L, const double* xr, int R, int nthreads, int direct_max, in
 // Sizes and copies of the packed arrays, by name.
 #define DC_FIELDS(X) \
     X(leaf_off) X(leaf_sz) X(leaf_mk) X(leaf_lam) X(lev_kind) X(lev_nnode) X(lev_node0) X(lev_maxk) X(lev_sb0) \
-    X(nodes) X(sbase) X(dh) X(dl) X(gpr_i) X(gpr_f) X(tau) X(z) X(c) X(gidx) X(slot) X(dsrc) X(ddst) \
+    X(nodes) X(sbase) X(dh) X(dl) X(gpr_i) X(gpr_f) X(tau) X(z) X(croot) X(gidx) X(slot) X(dsrc) X(ddst) \
     X(cd_desc) X(cd_ln) X(cd_lr) X(cd_nh) X(cd_nl) X(vlast) X(scale) X(ring_h) X(ring_l) X(cd_der) X(cdx_i) X(cdx_f)
 
 int64_t dc_size(const char* name) {
