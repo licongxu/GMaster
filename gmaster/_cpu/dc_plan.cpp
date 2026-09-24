@@ -82,7 +82,7 @@ void tql2(int n, std::vector<double>& d, std::vector<double> e, std::vector<doub
 }
 
 struct Merge {
-    int height, off, n;
+    int height, off, n, nleft;
     std::vector<double> d;            // kept poles, ascending
     std::vector<float> tau, z;          // z: Gu-Eisenstat z times the children's column norms
     std::vector<int16_t> kept, slot_kept, defl, slot_defl;
@@ -249,7 +249,7 @@ Node build(const std::vector<double>& D, const std::vector<double>& E, int lo, i
     for (int b = 0; b < nd; ++b) node.pending[slot_d[b]] = pend_in[deflv[b]];
     for (int i = 0; i < nk; ++i) { mg.tau[i] = (float)tau[i]; mg.z[i] = (float)(zh[i] * pend_in[keptv[i]]); mg.kept[i] = (int16_t)keptv[i]; }
     for (int b = 0; b < nd; ++b) mg.defl[b] = (int16_t)deflv[b];
-    mg.slot_kept = slot_k; mg.slot_defl = slot_d;
+    mg.slot_kept = slot_k; mg.slot_defl = slot_d; mg.nleft = L.n;
     merges.push_back(std::move(mg));
     return node;
 }
@@ -290,7 +290,12 @@ struct Packed {
     std::vector<float> dh, dl, tau, z, croot;   // croot: per coefficient, the top node's pending column norms
     std::vector<int32_t> gpr_i;                 // tiny adjacent gaps: local index i (gap = d[i+1] - d[i])
     std::vector<float> gpr_f;
-    std::vector<int16_t> gidx, dsrc, ddst;   // the kept roots' slots follow from ddst (slot_of)
+    // Index maps.  Kept poles need no per-entry map: a side bit (left / right child) and the ranks
+    // it gives recover each pole's child position (gidx_of), and the deflation list its slot
+    // (slot_of).  kbits / kpre: side bits over the global kept index and their per-word prefix.
+    // Deflation pairs (dsrc, ddst) are sorted by child position; ddsort is ddst sorted.
+    std::vector<int16_t> dsrc, ddst, ddsort;
+    std::vector<int32_t> kbits, kpre;
     int64_t nbox = 0;
     // Christoffel-Darboux
     std::vector<int32_t> cd_desc, cd_ln, cd_lr;
@@ -480,16 +485,25 @@ int64_t dc_plan(int L, const double* xr, int R, int nthreads, int direct_max, in
                         if (g < GAP_TINY) { P.gpr_i.push_back(i); P.gpr_f.push_back((float)g); }
                     }
                     const int32_t rec[8] = {(int32_t)(off[t] + mg.off), nk, nd, (int32_t)poff, (int32_t)doff,
-                                            goff, (int32_t)P.gpr_i.size() - goff, 0};
+                                            goff, (int32_t)P.gpr_i.size() - goff, mg.nleft};
+                    for (int i = 0; i < nk; ++i) {             // side bit of global kept index poff + i
+                        const int64_t g = poff + i;
+                        if ((size_t)(g >> 5) >= P.kbits.size()) P.kbits.push_back(0);
+                        if (mg.kept[i] >= mg.nleft) P.kbits[g >> 5] |= int32_t(1u << (g & 31));
+                    }
+                    {
+                        std::vector<int> ord(nd);
+                        for (int b = 0; b < nd; ++b) ord[b] = b;
+                        std::sort(ord.begin(), ord.end(), [&](int a, int b2) { return mg.defl[a] < mg.defl[b2]; });
+                        for (int b = 0; b < nd; ++b) { P.dsrc.push_back(mg.defl[ord[b]]); P.ddst.push_back(mg.slot_defl[ord[b]]); }
+                        P.ddsort.insert(P.ddsort.end(), mg.slot_defl.begin(), mg.slot_defl.end());
+                    }
                     P.nodes.insert(P.nodes.end(), rec, rec + 8);
                     for (int i = 0; i < nk; ++i) {
                         float a, b; split(mg.d[i], a, b); P.dh.push_back(a); P.dl.push_back(b);
                     }
                     P.tau.insert(P.tau.end(), mg.tau.begin(), mg.tau.end());
                     P.z.insert(P.z.end(), mg.z.begin(), mg.z.end());
-                    P.gidx.insert(P.gidx.end(), mg.kept.begin(), mg.kept.end());
-                    P.dsrc.insert(P.dsrc.end(), mg.defl.begin(), mg.defl.end());
-                    P.ddst.insert(P.ddst.end(), mg.slot_defl.begin(), mg.slot_defl.end());
                     if (kind == 1) { P.sbase.push_back((int32_t)P.nbox); P.nbox += nbox_of(nk, 8); }
                     poff += nk; doff += nd; ++nn; maxk = std::max(maxk, nk);
                 }
@@ -499,6 +513,8 @@ int64_t dc_plan(int L, const double* xr, int R, int nthreads, int direct_max, in
             }
         }
     }
+    P.kpre.resize(P.kbits.size());
+    for (int64_t w = 0, acc = 0; w < (int64_t)P.kbits.size(); ++w) { P.kpre[w] = (int32_t)acc; acc += __builtin_popcount((uint32_t)P.kbits[w]); }
     // Christoffel-Darboux: rings ascending in the problem variable (y = x^2 from the equator for
     // spin 0; x from the south pole otherwise -- both are the given ring order reversed)
     std::vector<double> yr(R);
@@ -555,7 +571,7 @@ int64_t dc_plan(int L, const double* xr, int R, int nthreads, int direct_max, in
 // Sizes and copies of the packed arrays, by name.
 #define DC_FIELDS(X) \
     X(leaf_off) X(leaf_sz) X(leaf_mk) X(leaf_lam) X(lev_kind) X(lev_nnode) X(lev_node0) X(lev_maxk) X(lev_sb0) \
-    X(nodes) X(sbase) X(dh) X(dl) X(gpr_i) X(gpr_f) X(tau) X(z) X(croot) X(gidx) X(dsrc) X(ddst) \
+    X(nodes) X(sbase) X(dh) X(dl) X(gpr_i) X(gpr_f) X(tau) X(z) X(croot) X(kbits) X(kpre) X(dsrc) X(ddst) X(ddsort) \
     X(cd_desc) X(cd_ln) X(cd_lr) X(cd_nh) X(cd_nl) X(vlast) X(scale) X(ring_h) X(ring_l) X(cd_der) X(cdx_i) X(cdx_f)
 
 int64_t dc_size(const char* name) {

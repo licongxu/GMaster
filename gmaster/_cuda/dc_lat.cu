@@ -31,7 +31,7 @@ namespace ffi = xla::ffi;
 #define FL 32          // points of each set per FMM leaf in the merge kernels (8/16/32/64 swept at Nside 2048: 32 best)
 #endif
 
-struct Node { int base, nk, nd, poff, doff, goff, ng, pad; };   // goff/ng: this node's exact-gap records
+struct Node { int base, nk, nd, poff, doff, goff, ng, nleft; };   // goff/ng: exact-gap records; nleft: left child size
 
 __device__ __forceinline__ int org_of(int j, float tau) { return tau > 0.f ? j : j + 1; }
 
@@ -94,6 +94,31 @@ __device__ __forceinline__ int slot_of(const short* __restrict__ ddst, int nd, i
     return k + lo;
 }
 
+// Child position of kept pole i.  The kept poles in value order interleave the two children's
+// surviving eigenvalues, each child's in increasing position, so a side bit per pole (kbits, over
+// the global kept index, with per-word prefix counts kpre) gives its rank r on its side, and the
+// position is the r-th entry of the complement of that side's deflated positions (dsrc, sorted by
+// position: the left child's first).  Replaces a 2 B per kept pole per level map.
+__device__ __forceinline__ int rank1(const int* __restrict__ kbits, const int* __restrict__ kpre, int g) {
+    const unsigned w = (unsigned)kbits[g >> 5];
+    return kpre[g >> 5] + __popc(w & ((1u << (g & 31)) - 1u));
+}
+__device__ __forceinline__ int complement_at(const short* __restrict__ S, int n, int off, int r) {
+    int lo = 0, hi = n;                       // r-th element (0-based) of the complement of S - off
+    while (lo < hi) { const int mid = (lo + hi) >> 1; if (S[mid] - off - mid <= r) lo = mid + 1; else hi = mid; }
+    return r + lo;
+}
+__device__ __forceinline__ int gidx_of(const Node& nd, const int* __restrict__ kbits, const int* __restrict__ kpre,
+                                       const short* __restrict__ dsrc, int i) {
+    const int g = nd.poff + i;
+    const int rR = rank1(kbits, kpre, g) - rank1(kbits, kpre, nd.poff);
+    int ndl = 0, hi = nd.nd;                  // deflated positions < nleft come first
+    while (ndl < hi) { const int mid = (ndl + hi) >> 1; if (dsrc[mid] < nd.nleft) ndl = mid + 1; else hi = mid; }
+    if (((unsigned)kbits[g >> 5] >> (g & 31)) & 1u)
+        return nd.nleft + complement_at(dsrc + ndl, nd.nd - ndl, nd.nleft, rR);
+    return complement_at(dsrc, ndl, 0, i - rR);
+}
+
 // ------------------------------------------------------------------ direct merge, one block per node
 // dir 0: w[base+slot_k] = -c_k sum_i (z_i w[base+gidx_i]) / (lam_k - d_i)
 // dir 1: w[base+gidx_k] =  z_k sum_j (c_j w[base+slot_j]) / (d_k - lam_j)
@@ -102,7 +127,7 @@ __global__ void merge_direct(
     const Node* __restrict__ nodes, int nnode, int dir,
     const float* __restrict__ gdh, const float* __restrict__ gdl, const int* __restrict__ gpr_i,
     const float* __restrict__ gpr_f, const float* __restrict__ gtau, const float* __restrict__ gz,
-    const short* __restrict__ ggidx,
+    const int* __restrict__ kbits, const int* __restrict__ kpre, const short* __restrict__ gddsort,
     const short* __restrict__ gdsrc, const short* __restrict__ gddst,
     float2* __restrict__ w)
 {
@@ -116,7 +141,7 @@ __global__ void merge_direct(
     const float* pdh = gdh + nd.poff; const float* pdl = gdl + nd.poff; const float* pt = gtau + nd.poff;
     for (int i = threadIdx.x; i < nk; i += blockDim.x) {
         dh[i] = pdh[i]; dl[i] = pdl[i]; tau[i] = pt[i];
-        const int src = dir == 0 ? ggidx[nd.poff + i] : slot_of(gddst + nd.doff, nd.nd, i);
+        const int src = dir == 0 ? gidx_of(nd, kbits, kpre, gdsrc + nd.doff, i) : slot_of(gddsort + nd.doff, nd.nd, i);
         const float f = dir == 0 ? gz[nd.poff + i] : 1.f;   // column norms live in z / vlast
         #pragma unroll
         for (int r = 0; r < NR; ++r) q[i * NR + r] = mul2(f, w[(nd.base + src) * NR + r]);
@@ -154,7 +179,7 @@ __global__ void merge_direct(
                 for (int r = 0; r < NR; ++r) fma2(acc[r], corr, q[i * NR + r]);
             }
             const float cc = -1.f;
-            const int dst = nd.base + slot_of(gddst + nd.doff, nd.nd, k);
+            const int dst = nd.base + slot_of(gddsort + nd.doff, nd.nd, k);
             #pragma unroll
             for (int r = 0; r < NR; ++r) w[dst * NR + r] = mul2(cc, acc[r]);
         } else {                       // target pole k, sources roots j
@@ -176,7 +201,7 @@ __global__ void merge_direct(
                 for (int r = 0; r < NR; ++r) fma2(acc[r], corr, q[j * NR + r]);
             }
             const float zz = gz[nd.poff + k];
-            const int dst = nd.base + ggidx[nd.poff + k];
+            const int dst = nd.base + gidx_of(nd, kbits, kpre, gdsrc + nd.doff, k);
             #pragma unroll
             for (int r = 0; r < NR; ++r) w[dst * NR + r] = mul2(zz, acc[r]);
         }
@@ -343,7 +368,7 @@ __global__ void merge_fmm(
     const Node* __restrict__ nodes, int nnode, int dir,
     const float* __restrict__ gdh, const float* __restrict__ gdl, const int* __restrict__ gpr_i,
     const float* __restrict__ gpr_f, const float* __restrict__ gtau, const float* __restrict__ gz,
-    const short* __restrict__ ggidx,
+    const int* __restrict__ kbits, const int* __restrict__ kpre, const short* __restrict__ gddsort,
     const short* __restrict__ gdsrc, const short* __restrict__ gddst,
     float2* __restrict__ w,
     const int* __restrict__ sbase, float* __restrict__ geo, float2* __restrict__ mom, float2* __restrict__ loc,
@@ -363,7 +388,7 @@ __global__ void merge_fmm(
     float* pgp = rh + 2 * nk;
     stage_gaps<WARP>(nd, pdh, pdl, gpr_i, gpr_f, pgp, tid, nth);
     for (int i = tid; i < nk; i += nth) {
-        const int src = dir == 0 ? ggidx[nd.poff + i] : slot_of(gddst + nd.doff, nd.nd, i);
+        const int src = dir == 0 ? gidx_of(nd, kbits, kpre, gdsrc + nd.doff, i) : slot_of(gddsort + nd.doff, nd.nd, i);
         const float f = dir == 0 ? gz[nd.poff + i] : 1.f;   // column norms live in z / vlast
         #pragma unroll
         for (int r = 0; r < NR; ++r) q[i * NR + r] = mul2(f, w[(nd.base + src) * NR + r]);
@@ -422,7 +447,7 @@ __global__ void merge_fmm(
                 for (int r = 0; r < NR; ++r) fma2(acc[r], corr, q[i * NR + r]);
             }
             const float cc = -1.f;
-            const int d = nd.base + slot_of(gddst + nd.doff, nd.nd, k);
+            const int d = nd.base + slot_of(gddsort + nd.doff, nd.nd, k);
             #pragma unroll
             for (int r = 0; r < NR; ++r) w[d * NR + r] = mul2(cc, acc[r]);
         } else {
@@ -442,7 +467,7 @@ __global__ void merge_fmm(
                 for (int r = 0; r < NR; ++r) fma2(acc[r], corr, q[s * NR + r]);
             }
             const float zz = gz[nd.poff + k];
-            const int d = nd.base + ggidx[nd.poff + k];
+            const int d = nd.base + gidx_of(nd, kbits, kpre, gdsrc + nd.doff, k);
             #pragma unroll
             for (int r = 0; r < NR; ++r) w[d * NR + r] = mul2(zz, acc[r]);
         }
@@ -733,13 +758,14 @@ static constexpr int FMM_THREADS = 256;
     ffi::Buffer<ffi::S32> nodes, ffi::Buffer<ffi::S32> sbase, ffi::Buffer<ffi::F32> dh, ffi::Buffer<ffi::F32> dl, \
     ffi::Buffer<ffi::S32> gpr_i, ffi::Buffer<ffi::F32> gpr_f, \
     ffi::Buffer<ffi::F32> tau, ffi::Buffer<ffi::F32> z, ffi::Buffer<ffi::F32> croot, \
-    ffi::Buffer<ffi::S16> gidx, ffi::Buffer<ffi::S16> dsrc, ffi::Buffer<ffi::S16> ddst, \
+    ffi::Buffer<ffi::S32> kbits, ffi::Buffer<ffi::S32> kpre, ffi::Buffer<ffi::S16> dsrc, ffi::Buffer<ffi::S16> ddst, \
+    ffi::Buffer<ffi::S16> ddsort, \
     ffi::Buffer<ffi::S32> cd_desc, ffi::Buffer<ffi::S32> cd_ln, ffi::Buffer<ffi::S32> cd_lr, \
     ffi::Buffer<ffi::F32> cd_nh, ffi::Buffer<ffi::F32> cd_nl, ffi::Buffer<ffi::F32> vlast, ffi::Buffer<ffi::F32> scale, \
     ffi::Buffer<ffi::F32> ring_h, ffi::Buffer<ffi::F32> ring_l, ffi::Buffer<ffi::F32> cd_der, \
     ffi::Buffer<ffi::S32> cdx_i, ffi::Buffer<ffi::F32> cdx_f
 
-#define PLAN_PASS leaf_off, leaf_sz, leaf_mk, leaf_lam, nodes, sbase, dh, dl, gpr_i, gpr_f, tau, z, croot, gidx, dsrc, ddst, \
+#define PLAN_PASS leaf_off, leaf_sz, leaf_mk, leaf_lam, nodes, sbase, dh, dl, gpr_i, gpr_f, tau, z, croot, kbits, kpre, dsrc, ddst, ddsort, \
     cd_desc, cd_ln, cd_lr, cd_nh, cd_nl, vlast, scale, ring_h, ring_l, cd_der, cdx_i, cdx_f
 
 #define PLAN_BIND \
@@ -747,7 +773,8 @@ static constexpr int FMM_THREADS = 256;
     .Arg<ffi::Buffer<ffi::S32>>().Arg<ffi::Buffer<ffi::S32>>().Arg<ffi::Buffer<ffi::F32>>().Arg<ffi::Buffer<ffi::F32>>() \
     .Arg<ffi::Buffer<ffi::S32>>().Arg<ffi::Buffer<ffi::F32>>() \
     .Arg<ffi::Buffer<ffi::F32>>().Arg<ffi::Buffer<ffi::F32>>().Arg<ffi::Buffer<ffi::F32>>() \
-    .Arg<ffi::Buffer<ffi::S16>>().Arg<ffi::Buffer<ffi::S16>>().Arg<ffi::Buffer<ffi::S16>>() \
+    .Arg<ffi::Buffer<ffi::S32>>().Arg<ffi::Buffer<ffi::S32>>().Arg<ffi::Buffer<ffi::S16>>().Arg<ffi::Buffer<ffi::S16>>() \
+    .Arg<ffi::Buffer<ffi::S16>>() \
     .Arg<ffi::Buffer<ffi::S32>>().Arg<ffi::Buffer<ffi::S32>>().Arg<ffi::Buffer<ffi::S32>>() \
     .Arg<ffi::Buffer<ffi::F32>>().Arg<ffi::Buffer<ffi::F32>>().Arg<ffi::Buffer<ffi::F32>>().Arg<ffi::Buffer<ffi::F32>>() \
     .Arg<ffi::Buffer<ffi::F32>>().Arg<ffi::Buffer<ffi::F32>>().Arg<ffi::Buffer<ffi::F32>>() \
@@ -809,16 +836,16 @@ static ffi::Error apply(cudaStream_t s, int dir, int spin, int stages, const flo
         if (kind == 0) {
             const int smem = 4 * (4 * maxk + 2) + 8 * NR * maxk;
             merge_direct<NR><<<nn, DIRECT_THREADS, smem, s>>>(nd, nn, dir, dh.typed_data(), dl.typed_data(),
-                gpr_i.typed_data(), gpr_f.typed_data(), tau.typed_data(), z.typed_data(), gidx.typed_data(),
+                gpr_i.typed_data(), gpr_f.typed_data(), tau.typed_data(), z.typed_data(), kbits.typed_data(), kpre.typed_data(), ddsort.typed_data(),
                 dsrc.typed_data(), ddst.typed_data(), w);
         } else {
             if (maxk <= WARP_MAX_K)
                 merge_fmm<NR, true><<<(nn + 7) / 8, 256, 0, s>>>(nd, nn, dir, dh.typed_data(), dl.typed_data(),
-                    gpr_i.typed_data(), gpr_f.typed_data(), tau.typed_data(), z.typed_data(), gidx.typed_data(),
+                    gpr_i.typed_data(), gpr_f.typed_data(), tau.typed_data(), z.typed_data(), kbits.typed_data(), kpre.typed_data(), ddsort.typed_data(),
                     dsrc.typed_data(), ddst.typed_data(), w, sbase.typed_data() + sb0, g, mo, lo, q, dst, rp, poff0, doff0);
             else
                 merge_fmm<NR, false><<<nn, FMM_THREADS, 0, s>>>(nd, nn, dir, dh.typed_data(), dl.typed_data(),
-                    gpr_i.typed_data(), gpr_f.typed_data(), tau.typed_data(), z.typed_data(), gidx.typed_data(),
+                    gpr_i.typed_data(), gpr_f.typed_data(), tau.typed_data(), z.typed_data(), kbits.typed_data(), kpre.typed_data(), ddsort.typed_data(),
                     dsrc.typed_data(), ddst.typed_data(), w, sbase.typed_data() + sb0, g, mo, lo, q, dst, rp, poff0, doff0);
         }
     }
