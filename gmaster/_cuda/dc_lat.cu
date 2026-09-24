@@ -84,6 +84,16 @@ __device__ __forceinline__ void stage_gaps(const Node& nd, const float* dh, cons
 __constant__ float BIN[12 * 12] = {1.0f,1.0f,1.0f,1.0f,1.0f,1.0f,1.0f,1.0f,1.0f,1.0f,1.0f,1.0f,1.0f,2.0f,3.0f,4.0f,5.0f,6.0f,7.0f,8.0f,9.0f,10.0f,11.0f,12.0f,1.0f,3.0f,6.0f,10.0f,15.0f,21.0f,28.0f,36.0f,45.0f,55.0f,66.0f,78.0f,1.0f,4.0f,10.0f,20.0f,35.0f,56.0f,84.0f,120.0f,165.0f,220.0f,286.0f,364.0f,1.0f,5.0f,15.0f,35.0f,70.0f,126.0f,210.0f,330.0f,495.0f,715.0f,1001.0f,1365.0f,1.0f,6.0f,21.0f,56.0f,126.0f,252.0f,462.0f,792.0f,1287.0f,2002.0f,3003.0f,4368.0f,1.0f,7.0f,28.0f,84.0f,210.0f,462.0f,924.0f,1716.0f,3003.0f,5005.0f,8008.0f,12376.0f,1.0f,8.0f,36.0f,120.0f,330.0f,792.0f,1716.0f,3432.0f,6435.0f,11440.0f,19448.0f,31824.0f,1.0f,9.0f,45.0f,165.0f,495.0f,1287.0f,3003.0f,6435.0f,12870.0f,24310.0f,43758.0f,75582.0f,1.0f,10.0f,55.0f,220.0f,715.0f,2002.0f,5005.0f,11440.0f,24310.0f,48620.0f,92378.0f,167960.0f,1.0f,11.0f,66.0f,286.0f,1001.0f,3003.0f,8008.0f,19448.0f,43758.0f,92378.0f,184756.0f,352716.0f,1.0f,12.0f,78.0f,364.0f,1365.0f,4368.0f,12376.0f,31824.0f,75582.0f,167960.0f,352716.0f,705432.0f};      // BIN[j*P + k] = C(j+k, j)
 __constant__ float CKJ[12 * 12] = {1.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,1.0f,1.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,1.0f,2.0f,1.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,1.0f,3.0f,3.0f,1.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,1.0f,4.0f,6.0f,4.0f,1.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,1.0f,5.0f,10.0f,10.0f,5.0f,1.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,1.0f,6.0f,15.0f,20.0f,15.0f,6.0f,1.0f,0.0f,0.0f,0.0f,0.0f,0.0f,1.0f,7.0f,21.0f,35.0f,35.0f,21.0f,7.0f,1.0f,0.0f,0.0f,0.0f,0.0f,1.0f,8.0f,28.0f,56.0f,70.0f,56.0f,28.0f,8.0f,1.0f,0.0f,0.0f,0.0f,1.0f,9.0f,36.0f,84.0f,126.0f,126.0f,84.0f,36.0f,9.0f,1.0f,0.0f,0.0f,1.0f,10.0f,45.0f,120.0f,210.0f,252.0f,210.0f,120.0f,45.0f,10.0f,1.0f,0.0f,1.0f,11.0f,55.0f,165.0f,330.0f,462.0f,462.0f,330.0f,165.0f,55.0f,11.0f,1.0f};      // CKJ[k*P + j] = C(k, j)
 
+// Output slot of kept root k.  A node's slots hold its kept roots and its deflated poles merged in
+// ascending order and both lists are sorted, so the kept roots fill the complement of the deflated
+// slots ddst[]: slot(k) = k + #{b : ddst[b] - b <= k}.  (The per-entry slot map this replaces was
+// 2 B per kept pole per level.)
+__device__ __forceinline__ int slot_of(const short* __restrict__ ddst, int nd, int k) {
+    int lo = 0, hi = nd;                      // first b with ddst[b] - b > k
+    while (lo < hi) { const int mid = (lo + hi) >> 1; if (ddst[mid] - mid <= k) lo = mid + 1; else hi = mid; }
+    return k + lo;
+}
+
 // ------------------------------------------------------------------ direct merge, one block per node
 // dir 0: w[base+slot_k] = -c_k sum_i (z_i w[base+gidx_i]) / (lam_k - d_i)
 // dir 1: w[base+gidx_k] =  z_k sum_j (c_j w[base+slot_j]) / (d_k - lam_j)
@@ -92,7 +102,7 @@ __global__ void merge_direct(
     const Node* __restrict__ nodes, int nnode, int dir,
     const float* __restrict__ gdh, const float* __restrict__ gdl, const int* __restrict__ gpr_i,
     const float* __restrict__ gpr_f, const float* __restrict__ gtau, const float* __restrict__ gz,
-    const short* __restrict__ ggidx, const short* __restrict__ gslot,
+    const short* __restrict__ ggidx,
     const short* __restrict__ gdsrc, const short* __restrict__ gddst,
     float2* __restrict__ w)
 {
@@ -106,7 +116,7 @@ __global__ void merge_direct(
     const float* pdh = gdh + nd.poff; const float* pdl = gdl + nd.poff; const float* pt = gtau + nd.poff;
     for (int i = threadIdx.x; i < nk; i += blockDim.x) {
         dh[i] = pdh[i]; dl[i] = pdl[i]; tau[i] = pt[i];
-        const int src = dir == 0 ? ggidx[nd.poff + i] : gslot[nd.poff + i];
+        const int src = dir == 0 ? ggidx[nd.poff + i] : slot_of(gddst + nd.doff, nd.nd, i);
         const float f = dir == 0 ? gz[nd.poff + i] : 1.f;   // column norms live in z / vlast
         #pragma unroll
         for (int r = 0; r < NR; ++r) q[i * NR + r] = mul2(f, w[(nd.base + src) * NR + r]);
@@ -144,7 +154,7 @@ __global__ void merge_direct(
                 for (int r = 0; r < NR; ++r) fma2(acc[r], corr, q[i * NR + r]);
             }
             const float cc = -1.f;
-            const int dst = nd.base + gslot[nd.poff + k];
+            const int dst = nd.base + slot_of(gddst + nd.doff, nd.nd, k);
             #pragma unroll
             for (int r = 0; r < NR; ++r) w[dst * NR + r] = mul2(cc, acc[r]);
         } else {                       // target pole k, sources roots j
@@ -333,7 +343,7 @@ __global__ void merge_fmm(
     const Node* __restrict__ nodes, int nnode, int dir,
     const float* __restrict__ gdh, const float* __restrict__ gdl, const int* __restrict__ gpr_i,
     const float* __restrict__ gpr_f, const float* __restrict__ gtau, const float* __restrict__ gz,
-    const short* __restrict__ ggidx, const short* __restrict__ gslot,
+    const short* __restrict__ ggidx,
     const short* __restrict__ gdsrc, const short* __restrict__ gddst,
     float2* __restrict__ w,
     const int* __restrict__ sbase, float* __restrict__ geo, float2* __restrict__ mom, float2* __restrict__ loc,
@@ -353,7 +363,7 @@ __global__ void merge_fmm(
     float* pgp = rh + 2 * nk;
     stage_gaps<WARP>(nd, pdh, pdl, gpr_i, gpr_f, pgp, tid, nth);
     for (int i = tid; i < nk; i += nth) {
-        const int src = dir == 0 ? ggidx[nd.poff + i] : gslot[nd.poff + i];
+        const int src = dir == 0 ? ggidx[nd.poff + i] : slot_of(gddst + nd.doff, nd.nd, i);
         const float f = dir == 0 ? gz[nd.poff + i] : 1.f;   // column norms live in z / vlast
         #pragma unroll
         for (int r = 0; r < NR; ++r) q[i * NR + r] = mul2(f, w[(nd.base + src) * NR + r]);
@@ -412,7 +422,7 @@ __global__ void merge_fmm(
                 for (int r = 0; r < NR; ++r) fma2(acc[r], corr, q[i * NR + r]);
             }
             const float cc = -1.f;
-            const int d = nd.base + gslot[nd.poff + k];
+            const int d = nd.base + slot_of(gddst + nd.doff, nd.nd, k);
             #pragma unroll
             for (int r = 0; r < NR; ++r) w[d * NR + r] = mul2(cc, acc[r]);
         } else {
@@ -723,13 +733,13 @@ static constexpr int FMM_THREADS = 256;
     ffi::Buffer<ffi::S32> nodes, ffi::Buffer<ffi::S32> sbase, ffi::Buffer<ffi::F32> dh, ffi::Buffer<ffi::F32> dl, \
     ffi::Buffer<ffi::S32> gpr_i, ffi::Buffer<ffi::F32> gpr_f, \
     ffi::Buffer<ffi::F32> tau, ffi::Buffer<ffi::F32> z, ffi::Buffer<ffi::F32> croot, \
-    ffi::Buffer<ffi::S16> gidx, ffi::Buffer<ffi::S16> slot, ffi::Buffer<ffi::S16> dsrc, ffi::Buffer<ffi::S16> ddst, \
+    ffi::Buffer<ffi::S16> gidx, ffi::Buffer<ffi::S16> dsrc, ffi::Buffer<ffi::S16> ddst, \
     ffi::Buffer<ffi::S32> cd_desc, ffi::Buffer<ffi::S32> cd_ln, ffi::Buffer<ffi::S32> cd_lr, \
     ffi::Buffer<ffi::F32> cd_nh, ffi::Buffer<ffi::F32> cd_nl, ffi::Buffer<ffi::F32> vlast, ffi::Buffer<ffi::F32> scale, \
     ffi::Buffer<ffi::F32> ring_h, ffi::Buffer<ffi::F32> ring_l, ffi::Buffer<ffi::F32> cd_der, \
     ffi::Buffer<ffi::S32> cdx_i, ffi::Buffer<ffi::F32> cdx_f
 
-#define PLAN_PASS leaf_off, leaf_sz, leaf_mk, leaf_lam, nodes, sbase, dh, dl, gpr_i, gpr_f, tau, z, croot, gidx, slot, dsrc, ddst, \
+#define PLAN_PASS leaf_off, leaf_sz, leaf_mk, leaf_lam, nodes, sbase, dh, dl, gpr_i, gpr_f, tau, z, croot, gidx, dsrc, ddst, \
     cd_desc, cd_ln, cd_lr, cd_nh, cd_nl, vlast, scale, ring_h, ring_l, cd_der, cdx_i, cdx_f
 
 #define PLAN_BIND \
@@ -737,7 +747,7 @@ static constexpr int FMM_THREADS = 256;
     .Arg<ffi::Buffer<ffi::S32>>().Arg<ffi::Buffer<ffi::S32>>().Arg<ffi::Buffer<ffi::F32>>().Arg<ffi::Buffer<ffi::F32>>() \
     .Arg<ffi::Buffer<ffi::S32>>().Arg<ffi::Buffer<ffi::F32>>() \
     .Arg<ffi::Buffer<ffi::F32>>().Arg<ffi::Buffer<ffi::F32>>().Arg<ffi::Buffer<ffi::F32>>() \
-    .Arg<ffi::Buffer<ffi::S16>>().Arg<ffi::Buffer<ffi::S16>>().Arg<ffi::Buffer<ffi::S16>>().Arg<ffi::Buffer<ffi::S16>>() \
+    .Arg<ffi::Buffer<ffi::S16>>().Arg<ffi::Buffer<ffi::S16>>().Arg<ffi::Buffer<ffi::S16>>() \
     .Arg<ffi::Buffer<ffi::S32>>().Arg<ffi::Buffer<ffi::S32>>().Arg<ffi::Buffer<ffi::S32>>() \
     .Arg<ffi::Buffer<ffi::F32>>().Arg<ffi::Buffer<ffi::F32>>().Arg<ffi::Buffer<ffi::F32>>().Arg<ffi::Buffer<ffi::F32>>() \
     .Arg<ffi::Buffer<ffi::F32>>().Arg<ffi::Buffer<ffi::F32>>().Arg<ffi::Buffer<ffi::F32>>() \
@@ -799,16 +809,16 @@ static ffi::Error apply(cudaStream_t s, int dir, int spin, int stages, const flo
         if (kind == 0) {
             const int smem = 4 * (4 * maxk + 2) + 8 * NR * maxk;
             merge_direct<NR><<<nn, DIRECT_THREADS, smem, s>>>(nd, nn, dir, dh.typed_data(), dl.typed_data(),
-                gpr_i.typed_data(), gpr_f.typed_data(), tau.typed_data(), z.typed_data(), gidx.typed_data(), slot.typed_data(),
+                gpr_i.typed_data(), gpr_f.typed_data(), tau.typed_data(), z.typed_data(), gidx.typed_data(),
                 dsrc.typed_data(), ddst.typed_data(), w);
         } else {
             if (maxk <= WARP_MAX_K)
                 merge_fmm<NR, true><<<(nn + 7) / 8, 256, 0, s>>>(nd, nn, dir, dh.typed_data(), dl.typed_data(),
-                    gpr_i.typed_data(), gpr_f.typed_data(), tau.typed_data(), z.typed_data(), gidx.typed_data(), slot.typed_data(),
+                    gpr_i.typed_data(), gpr_f.typed_data(), tau.typed_data(), z.typed_data(), gidx.typed_data(),
                     dsrc.typed_data(), ddst.typed_data(), w, sbase.typed_data() + sb0, g, mo, lo, q, dst, rp, poff0, doff0);
             else
                 merge_fmm<NR, false><<<nn, FMM_THREADS, 0, s>>>(nd, nn, dir, dh.typed_data(), dl.typed_data(),
-                    gpr_i.typed_data(), gpr_f.typed_data(), tau.typed_data(), z.typed_data(), gidx.typed_data(), slot.typed_data(),
+                    gpr_i.typed_data(), gpr_f.typed_data(), tau.typed_data(), z.typed_data(), gidx.typed_data(),
                     dsrc.typed_data(), ddst.typed_data(), w, sbase.typed_data() + sb0, g, mo, lo, q, dst, rp, poff0, doff0);
         }
     }

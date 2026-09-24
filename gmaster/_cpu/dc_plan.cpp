@@ -290,7 +290,7 @@ struct Packed {
     std::vector<float> dh, dl, tau, z, croot;   // croot: per coefficient, the top node's pending column norms
     std::vector<int32_t> gpr_i;                 // tiny adjacent gaps: local index i (gap = d[i+1] - d[i])
     std::vector<float> gpr_f;
-    std::vector<int16_t> gidx, slot, dsrc, ddst;
+    std::vector<int16_t> gidx, dsrc, ddst;   // the kept roots' slots follow from ddst (slot_of)
     int64_t nbox = 0;
     // Christoffel-Darboux
     std::vector<int32_t> cd_desc, cd_ln, cd_lr;
@@ -488,7 +488,6 @@ int64_t dc_plan(int L, const double* xr, int R, int nthreads, int direct_max, in
                     P.tau.insert(P.tau.end(), mg.tau.begin(), mg.tau.end());
                     P.z.insert(P.z.end(), mg.z.begin(), mg.z.end());
                     P.gidx.insert(P.gidx.end(), mg.kept.begin(), mg.kept.end());
-                    P.slot.insert(P.slot.end(), mg.slot_kept.begin(), mg.slot_kept.end());
                     P.dsrc.insert(P.dsrc.end(), mg.defl.begin(), mg.defl.end());
                     P.ddst.insert(P.ddst.end(), mg.slot_defl.begin(), mg.slot_defl.end());
                     if (kind == 1) { P.sbase.push_back((int32_t)P.nbox); P.nbox += nbox_of(nk, 8); }
@@ -556,7 +555,7 @@ int64_t dc_plan(int L, const double* xr, int R, int nthreads, int direct_max, in
 // Sizes and copies of the packed arrays, by name.
 #define DC_FIELDS(X) \
     X(leaf_off) X(leaf_sz) X(leaf_mk) X(leaf_lam) X(lev_kind) X(lev_nnode) X(lev_node0) X(lev_maxk) X(lev_sb0) \
-    X(nodes) X(sbase) X(dh) X(dl) X(gpr_i) X(gpr_f) X(tau) X(z) X(croot) X(gidx) X(slot) X(dsrc) X(ddst) \
+    X(nodes) X(sbase) X(dh) X(dl) X(gpr_i) X(gpr_f) X(tau) X(z) X(croot) X(gidx) X(dsrc) X(ddst) \
     X(cd_desc) X(cd_ln) X(cd_lr) X(cd_nh) X(cd_nl) X(vlast) X(scale) X(ring_h) X(ring_l) X(cd_der) X(cdx_i) X(cdx_f)
 
 int64_t dc_size(const char* name) {
