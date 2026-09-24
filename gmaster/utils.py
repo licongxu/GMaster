@@ -1135,22 +1135,31 @@ def _chirp(index, two_nphi, sign, L):
     """exp(sign i pi q^2 / nphi) in the ring stage's dtype.
 
     The angle is reduced exactly in integers as in `_chirp_angle`; for a complex64 ring stage the
-    reduction runs in int32 as ((q mod m)^2) mod m (m = 2 nphi <= 32768, so the square fits), the
-    angle is scaled in float64 and evaluated with float32 sincos, all in one fused program.  Built
+    reduction runs as ((q mod m)^2) mod m (m = 2 nphi) in uint32 while m <= 65536 -- the square of a
+    residue then fits -- and in int64 above (Nside > 8192); the angle is scaled in float64 and
+    evaluated with float32 sincos, all in one fused program.  (An int32 square overflowed at Nside
+    8192, where polar rings reach m = 65528: O(1) errors in every polar-cap ring transform.)  Built
     in complex128 (int64 squares, float64 sincos at 1/64 rate, complex128 kernel FFTs) these tables
     took 287 ms at Nside 4096 spin 2 -- too slow to rebuild per field, so 6.5 GiB stayed resident.
     """
     if jnp.dtype(ring_dtype(L)) == jnp.complex64:
-        return _chirp_c64(jnp.asarray(index), jnp.asarray(two_nphi), sign=float(sign))
+        two_nphi = jnp.asarray(two_nphi)
+        wide = int(np.max(np.asarray(two_nphi))) > 65536
+        return _chirp_c64(jnp.asarray(index), two_nphi, sign=float(sign), wide=wide)
     reduced = (index.astype(jnp.int64) ** 2) % two_nphi
     return jnp.exp(sign * 1j * reduced * (jnp.pi / two_nphi) * 2.0)
 
 
-@partial(jax.jit, static_argnames=("sign",))
-def _chirp_c64(index, two_nphi, *, sign):
-    m = two_nphi.astype(jnp.int32)
-    r = jnp.mod(index.astype(jnp.int32), m)
-    reduced = jnp.mod(r * r, m)
+@partial(jax.jit, static_argnames=("sign", "wide"))
+def _chirp_c64(index, two_nphi, *, sign, wide=False):
+    if wide:                                   # m > 65536: the residue's square needs 64 bits
+        m = two_nphi.astype(jnp.int64)
+        r = jnp.mod(index.astype(jnp.int64), m)
+        reduced = jnp.mod(r * r, m)
+    else:                                      # r < m <= 65536: r * r < 2^32 in uint32, exactly
+        m = two_nphi.astype(jnp.uint32)
+        r = jnp.mod(index.astype(jnp.int64), two_nphi.astype(jnp.int64)).astype(jnp.uint32)
+        reduced = jnp.mod(r * r, m)
     ang = (reduced.astype(jnp.float64) * (2.0 * jnp.pi / m.astype(jnp.float64))).astype(jnp.float32)
     return jax.lax.complex(jnp.cos(ang), sign * jnp.sin(ang))
 

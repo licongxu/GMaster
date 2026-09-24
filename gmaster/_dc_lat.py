@@ -41,6 +41,10 @@ _CACHE = os.environ.get("GMASTER_CUDA_CACHE", os.path.join(os.path.expanduser("~
 # Below this bandlimit the march is at least as fast: at L 3072 this route is 0.98x (synthesis) / 0.91x
 # (analysis) of it, at 6144 1.77x / 1.66x (`.qwen/tmp/s38/dc_vs_march.py`, GPU0).
 _MIN_L = int(os.environ.get("GMASTER_DC_MIN_L", "6144"))
+# Above this the plan (O(L^2 log L): ~12-13 GiB per spin at L 12288, ~4.5x that at L 24576) and its
+# host build (~L^3: ~3.5 h per spin at Nside 8192 on 8 threads) are not worth building by default;
+# the march serves larger maps.
+_MAX_L = int(os.environ.get("GMASTER_DC_MAX_L", "12288"))
 # The plan builder runs on the host; keep it small on shared machines.
 _THREADS = int(os.environ.get("GMASTER_DC_THREADS", "8"))
 _DIRECT_MAX = int(os.environ.get("GMASTER_DC_DIRECT_MAX", "256"))
@@ -122,7 +126,7 @@ def enabled(L=None) -> bool:
     """True when this route serves spin-0 latitudinal transforms at bandlimit ``L``."""
     if os.environ.get("GMASTER_DC", "1") == "0":
         return False
-    if L is not None and int(L) < _MIN_L:
+    if L is not None and not (_MIN_L <= int(L) <= _MAX_L):
         return False
     return _build() is not None
 

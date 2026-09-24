@@ -124,3 +124,22 @@ def test_cuda_gpu_gate_accepts_colab_tesla_t4():
     assert "NVIDIA" not in "Tesla T4".upper()
     assert not is_cuda_device_kind("TPU v5")
     assert not is_cuda_device_kind("AMD Instinct MI250")
+
+
+@pytest.mark.parametrize("two_nphi", [8, 32760, 65528, 65536, 131064])
+def test_complex64_chirp_matches_exact_integer_reduction(two_nphi):
+    """`_chirp_c64` reduces q^2 mod 2 nphi exactly at every HEALPix ring size up to Nside 16384.
+
+    An int32 square overflowed at Nside 8192 (polar rings reach 2 nphi = 65528), which put O(1)
+    errors into every polar-cap ring transform there.
+    """
+    import jax.numpy as jnp
+    from gmaster import utils
+
+    index = jnp.arange(-3 * two_nphi, 3 * two_nphi, 7, dtype=jnp.int64)
+    m = jnp.asarray([[two_nphi]], dtype=jnp.int64)
+    got = np.asarray(utils._chirp_c64(index, m, sign=1.0, wide=two_nphi > 65536))
+    q = np.asarray(index, dtype=object)
+    reduced = np.array([(int(v) * int(v)) % two_nphi for v in q], dtype=np.float64)
+    exact = np.exp(1j * reduced * (2 * np.pi / two_nphi))[None, :]
+    assert np.max(np.abs(got - exact)) < 1e-6
