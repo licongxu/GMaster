@@ -1048,14 +1048,25 @@ def _ring_czt_constants_numpy(L, nside):
 
 
 def _ring_czt_constants(L, nside):
-    nphi, start, gather, valid, width = _ring_czt_constants_numpy(L, nside)
-    return (
-        jnp.asarray(nphi),
-        jnp.asarray(start),
-        jnp.asarray(gather),
-        jnp.asarray(valid),
-        width,
-    )
+    """`(nphi, start, None, None, width)`: the per-ring vectors only.
+
+    The `(4 nside - 1, 4 nside)` gather / valid grids are not uploaded: at Nside 4096 the int64
+    gather alone is 2.1 GB, and it was copied to the device by every table build and embedded as a
+    constant in every jitted forward ring transform.  `_cap_pixels` forms the cap rows' pixel
+    indices from `start + j, j < nphi` instead.
+    """
+    nphi, start, _, _, width = _ring_czt_constants_numpy(L, nside)
+    return jnp.asarray(nphi), jnp.asarray(start), None, None, width
+
+
+def _cap_pixels(pixels, caps, L, nside):
+    """The polar-cap rows of the ring grid, zero past each ring's `nphi` pixels."""
+    nphi, start, _, _, width = _ring_czt_constants_numpy(L, nside)
+    off = jnp.arange(width, dtype=jnp.int32)[None, :]
+    nrow = jnp.asarray(nphi[caps].astype(np.int32))[:, None]
+    valid = off < nrow
+    index = jnp.where(valid, jnp.asarray(start[caps])[:, None] + off, 0)
+    return jnp.where(valid, pixels[index], 0.0)
 
 
 @lru_cache(maxsize=32)
@@ -1084,6 +1095,64 @@ def _ring_inverse_layout(L, nside):
     # would keep tracers from whichever trace first asked.
     source, used = _ring_inverse_layout_numpy(L, nside)
     return jnp.asarray(source), jnp.asarray(used)
+
+
+# Ring chirp-Z tables are rebuilt when large instead of kept: in the node-space refinement the ring
+# FFT runs once per map, and at Nside 4096 the kept tables were 6.5 GiB (spin) + 3.75 GiB (scalar).
+_RING_TABLE_CACHE_BYTES = int(float(os.environ.get("GMASTER_RING_TABLE_CACHE_BYTES", str(2 ** 30))))
+
+
+class _CacheInfo:
+    """The `currsize` field of `functools.lru_cache`'s `cache_info()`."""
+
+    def __init__(self, currsize):
+        self.currsize = currsize
+
+
+def _size_cached(fn):
+    """`lru_cache(maxsize=2)` for results under `_RING_TABLE_CACHE_BYTES`; larger ones are rebuilt."""
+    cache = {}
+
+    def wrapper(*args):
+        hit = cache.get(args)
+        if hit is not None:
+            return hit
+        out = fn(*args)
+        if sum(int(t.size) * t.dtype.itemsize for t in jax.tree.leaves(out)) <= _RING_TABLE_CACHE_BYTES:
+            if len(cache) >= 2:
+                cache.pop(next(iter(cache)))
+            cache[args] = out
+        return out
+
+    wrapper.cache_clear = cache.clear
+    wrapper.cache_info = lambda: _CacheInfo(len(cache))
+    wrapper.__wrapped__ = fn
+    wrapper.__doc__ = fn.__doc__
+    return wrapper
+
+
+def _chirp(index, two_nphi, sign, L):
+    """exp(sign i pi q^2 / nphi) in the ring stage's dtype.
+
+    The angle is reduced exactly in integers as in `_chirp_angle`; for a complex64 ring stage the
+    reduction runs in int32 as ((q mod m)^2) mod m (m = 2 nphi <= 32768, so the square fits), the
+    angle is scaled in float64 and evaluated with float32 sincos, all in one fused program.  Built
+    in complex128 (int64 squares, float64 sincos at 1/64 rate, complex128 kernel FFTs) these tables
+    took 287 ms at Nside 4096 spin 2 -- too slow to rebuild per field, so 6.5 GiB stayed resident.
+    """
+    if jnp.dtype(ring_dtype(L)) == jnp.complex64:
+        return _chirp_c64(jnp.asarray(index), jnp.asarray(two_nphi), sign=float(sign))
+    reduced = (index.astype(jnp.int64) ** 2) % two_nphi
+    return jnp.exp(sign * 1j * reduced * (jnp.pi / two_nphi) * 2.0)
+
+
+@partial(jax.jit, static_argnames=("sign",))
+def _chirp_c64(index, two_nphi, *, sign):
+    m = two_nphi.astype(jnp.int32)
+    r = jnp.mod(index.astype(jnp.int32), m)
+    reduced = jnp.mod(r * r, m)
+    ang = (reduced.astype(jnp.float64) * (2.0 * jnp.pi / m.astype(jnp.float64))).astype(jnp.float32)
+    return jax.lax.complex(jnp.cos(ang), sign * jnp.sin(ang))
 
 
 def _chirp_angle(index, two_nphi, inverse):
@@ -1120,7 +1189,7 @@ def _ring_split_numpy(L, nside):
     return belt_lo, belt_hi, belt_start, caps
 
 
-@lru_cache(maxsize=2)
+@_size_cached
 def _ring_analysis_tables(L, nside, device=None):
     """The constant factors of the analysis ring chirp-Z, built once per geometry.
 
@@ -1152,9 +1221,9 @@ def _ring_analysis_tables(L, nside, device=None):
         m_index = jnp.arange(L, dtype=jnp.int64)
         shift = jnp.arange(transform_size, dtype=jnp.int64) - (width - 1)
         tables = (
-            jnp.exp(-1j * _chirp_angle(n_index, two_nphi, False)),
-            jnp.fft.fft(jnp.exp(1j * _chirp_angle(shift, two_nphi, False)), axis=-1),
-            jnp.exp(-1j * _chirp_angle(m_index, two_nphi, False)),
+            _chirp(n_index, two_nphi, -1.0, L),
+            jnp.fft.fft(_chirp(shift, two_nphi, 1.0, L), axis=-1),
+            _chirp(m_index, two_nphi, -1.0, L),
         )
         cplx = ring_dtype(L)
         tables = tuple(t.astype(cplx) for t in tables)
@@ -1187,10 +1256,7 @@ def _forward_ring_fft_positive(map_flat, tables, *, L, nside):
 
     cap_out = None
     if caps.size:
-        _, _, gather, valid, _ = _ring_czt_constants(L, nside)
-        rows = jnp.asarray(caps)
-        cap_pixels = jnp.where(jnp.asarray(valid)[rows],
-                               pixels[jnp.asarray(gather)[rows]], 0.0)
+        cap_pixels = _cap_pixels(pixels, caps, L, nside)
         transform_size = _next_fast_len_pow2(L + width)
         embedded = jnp.pad(cap_pixels * chirp_in, ((0, 0), (0, transform_size - width)))
         convolution = jnp.fft.ifft(
@@ -1256,7 +1322,7 @@ def _inverse_ring_fft(ftm_positive, *, L, nside):
     return jnp.where(used, slots[source], 0.0)
 
 
-@lru_cache(maxsize=2)
+@_size_cached
 def _ring_synthesis_tables(L, nside, device=None):
     """Constant factors of the synthesis ring chirp-Z; see `_ring_analysis_tables`.
 
@@ -1271,9 +1337,9 @@ def _ring_synthesis_tables(L, nside, device=None):
         p_index = jnp.arange(width, dtype=jnp.int64)
         shift = jnp.arange(transform_size, dtype=jnp.int64) - (L - 1)
         tables = (
-            jnp.exp(1j * _chirp_angle(m_index, two_nphi, False)),
-            jnp.fft.fft(jnp.exp(-1j * _chirp_angle(shift, two_nphi, False)), axis=-1),
-            jnp.exp(1j * _chirp_angle(p_index, two_nphi, False)),
+            _chirp(m_index, two_nphi, 1.0, L),
+            jnp.fft.fft(_chirp(shift, two_nphi, -1.0, L), axis=-1),
+            _chirp(p_index, two_nphi, 1.0, L),
         )
         cplx = ring_dtype(L)
         tables = tuple(t.astype(cplx) for t in tables)
@@ -1334,7 +1400,7 @@ def _inverse_ring_fft_herm(ftm_positive, tables, *, L, nside):
     return jnp.where(used, slots[source], 0.0)
 
 
-@lru_cache(maxsize=2)
+@_size_cached
 def _spin_ring_analysis_tables(L, nside, device=None):
     """Constant factors of the polarised analysis ring chirp-Z.
 
@@ -1352,9 +1418,9 @@ def _spin_ring_analysis_tables(L, nside, device=None):
         m_index = jnp.arange(-(L - 1), L, dtype=jnp.int64)
         shift = jnp.arange(transform_size, dtype=jnp.int64) - (width - 1) - (L - 1)
         tables = (
-            jnp.exp(-1j * _chirp_angle(n_index, two_nphi, False)),
-            jnp.fft.fft(jnp.exp(1j * _chirp_angle(shift, two_nphi, False)), axis=-1),
-            jnp.exp(-1j * _chirp_angle(m_index, two_nphi, False)),
+            _chirp(n_index, two_nphi, -1.0, L),
+            jnp.fft.fft(_chirp(shift, two_nphi, 1.0, L), axis=-1),
+            _chirp(m_index, two_nphi, -1.0, L),
         )
         cplx = ring_dtype(L)
         tables = tuple(t.astype(cplx) for t in tables)
@@ -1410,10 +1476,7 @@ def _forward_ring_fft_full(signal, tables, *, L, nside):
 
     cap_out = None
     if caps.size:
-        _, _, gather, valid, _ = _ring_czt_constants(L, nside)
-        rows = jnp.asarray(caps)
-        cap_pixels = jnp.where(jnp.asarray(valid)[rows],
-                               pixels[jnp.asarray(gather)[rows]], 0.0)
+        cap_pixels = _cap_pixels(pixels, caps, L, nside)
         transform_size = _next_fast_len_pow2(width + 2 * L)
 
         def czt(px, c_in, k_spec, c_out):
@@ -1442,7 +1505,7 @@ def _forward_ring_fft_full(signal, tables, *, L, nside):
     return jnp.concatenate((cap_out[:belt_lo], belt_out, cap_out[belt_lo:]), axis=0)
 
 
-@lru_cache(maxsize=2)
+@_size_cached
 def _spin_ring_synthesis_tables(L, nside, device=None):
     """Constant factors of the polarised synthesis ring chirp-Z; polar rows only."""
     with jax.ensure_compile_time_eval(), jax.default_device(device):
@@ -1454,9 +1517,9 @@ def _spin_ring_synthesis_tables(L, nside, device=None):
         p_index = jnp.arange(width, dtype=jnp.int64)
         shift = jnp.arange(transform_size, dtype=jnp.int64) - (2 * L - 2)
         tables = (
-            jnp.exp(1j * _chirp_angle(c_index, two_nphi, False)),
-            jnp.fft.fft(jnp.exp(-1j * _chirp_angle(shift, two_nphi, False)), axis=-1),
-            jnp.exp(1j * _chirp_angle(p_index, two_nphi, False)),
+            _chirp(c_index, two_nphi, 1.0, L),
+            jnp.fft.fft(_chirp(shift, two_nphi, -1.0, L), axis=-1),
+            _chirp(p_index, two_nphi, 1.0, L),
         )
         cplx = ring_dtype(L)
         tables = tuple(t.astype(cplx) for t in tables)
