@@ -432,13 +432,30 @@ __global__ void ring_fold_residual(const float2* __restrict__ F, const float2* _
     const float2* mf = Mf + (size_t)r * L;
     float2* out = R + (size_t)r * L;
     const int nres = min(n, L);
+    if (n >= L) {
+        // Belt rings (n_phi >= L): each output k has at most two inputs, order k and order
+        // -(n - k); straight-line and unrolled so the loads overlap (the loop form below ran
+        // latency-bound at a third of DRAM bandwidth, ncu).
+        #pragma unroll 4
+        for (int k = threadIdx.x; k < L; k += blockDim.x) {
+            const float2 v = f[k];
+            const int mneg = n - k;
+            const float2 w = mneg < L ? f[mneg] : make_float2(0.f, 0.f);
+            const float2 q = mf[k];
+            const float sy = (k ? v.y : 0.f) - w.y;
+            out[k] = make_float2((float)n * (v.x + w.x) - q.x, (float)n * sy - q.y);
+        }
+        return;
+    }
     for (int rho = threadIdx.x; rho < nres; rho += blockDim.x) {
         float sx = 0.f, sy = 0.f, cx = 0.f, cy = 0.f;
+        #pragma unroll 8
         for (int m = rho; m < L; m += n) {
             const float2 v = f[m];
             fold_acc(sx, cx, v.x);
             if (m) fold_acc(sy, cy, v.y);
         }
+        #pragma unroll 8
         for (int m = n - rho; m < L; m += n) {        // negative orders -m = rho - t n
             const float2 v = f[m];
             fold_acc(sx, cx, v.x);

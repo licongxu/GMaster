@@ -46,7 +46,7 @@ _THREADS = int(os.environ.get("GMASTER_DC_THREADS", "8"))
 _DIRECT_MAX = int(os.environ.get("GMASTER_DC_DIRECT_MAX", "256"))
 _DIRECT_THREADS = 128        # merge_direct's block size: a direct node carries <= this many deflations
 _CD_SKIP = 1e-9              # CD rings where |E phi_n| < skip * max are in the forbidden region
-_P = 12                      # FMM expansion order (dc_lat.cu)
+_P = int(dict(d.split("=") for d in os.environ.get("GMASTER_DC_DEFS", "").split() if "=" in d).get("P", 12))   # FMM order (dc_lat.cu)
 _FL, _CDF = 32, 4            # merge FMM leaf size and CD leaf coarsening (dc_lat.cu defaults)
 _FIELDS = ("leaf_off", "leaf_sz", "leaf_mk", "leaf_lam", "nodes", "sbase", "dh", "dl", "gpr_i", "gpr_f", "tau", "z", "c",
            "gidx", "slot", "dsrc", "ddst", "cd_desc", "cd_ln", "cd_lr", "cd_nh", "cd_nl",

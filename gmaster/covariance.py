@@ -109,10 +109,10 @@ def _covariance_kernels(
             else _coupling_matrix_tt(padded, lmax=lmax)
         ) / columns
     elif (spin1 == 0) != (spin2 == 0):
-        mixed, _, _ = _coupling_matrices_spin2(padded, lmax=lmax)
+        mixed, _, _ = _coupling_matrices_spin2(padded, lmax=lmax, need_ee=False)
         kernels["0s"] = mixed / columns
     else:
-        _, even, odd = _coupling_matrices_spin2(padded, lmax=lmax)
+        _, even, odd = _coupling_matrices_spin2(padded, lmax=lmax, need_te=False)
         kernels["pp"] = even / columns
         kernels["mm"] = odd / columns
     if l_toeplitz > 0:

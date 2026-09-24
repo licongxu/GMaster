@@ -788,25 +788,22 @@ def _general_coupling_matrix(
     )
 
 
-def _coupling_matrices_spin2(window_cls, *, lmax):
-    mixed = _general_coupling_matrix(
-        window_cls,
-        s1=0,
-        s2=2,
-        n1=0,
-        n2=2,
-        lmax=lmax,
-        lmax_mask=2 * lmax,
-    ).sum(axis=0)
-    even, odd = _general_coupling_matrix(
-        window_cls,
-        s1=2,
-        s2=2,
-        n1=2,
-        n2=2,
-        lmax=lmax,
-        lmax_mask=2 * lmax,
-    )
+def _coupling_matrices_spin2(window_cls, *, lmax, need_te=True, need_ee=True):
+    """`(te, even, odd)` for spin-0/2 fields; blocks the channel layout does not use are None.
+
+    Each is a full Gauss-Legendre quadrature (two O(lmax^2 N_q) GEMMs): a spin-2 x spin-2 workspace
+    never places `te` and a spin-0 x spin-2 one never places `even` / `odd`, and building them
+    anyway was a third of the spin-2 coupling stage (Nside 4096: ~600 ms).
+    """
+    mixed = even = odd = None
+    if need_te:
+        mixed = _general_coupling_matrix(
+            window_cls, s1=0, s2=2, n1=0, n2=2, lmax=lmax, lmax_mask=2 * lmax,
+        ).sum(axis=0)
+    if need_ee:
+        even, odd = _general_coupling_matrix(
+            window_cls, s1=2, s2=2, n1=2, n2=2, lmax=lmax, lmax_mask=2 * lmax,
+        )
     return mixed, even, odd
 
 
@@ -1094,7 +1091,7 @@ def get_master_coefficients(
                 mixed, _, _ = (
                     spin2_pure[:3]
                     if spin2_pure is not None
-                    else _coupling_matrices_spin2(padded, lmax=lmax)
+                    else _coupling_matrices_spin2(padded, lmax=lmax, need_ee=False)
                 )
                 result["0s"] = mixed / columns
             else:
@@ -1111,7 +1108,7 @@ def get_master_coefficients(
                 _, even, odd = (
                     spin2_pure[:3]
                     if spin2_pure is not None
-                    else _coupling_matrices_spin2(padded, lmax=lmax)
+                    else _coupling_matrices_spin2(padded, lmax=lmax, need_te=False)
                 )
                 result["pp"], result["mm"] = even / columns, odd / columns
             else:
@@ -1552,7 +1549,9 @@ class NmtWorkspace:
                 te, even, odd = (
                     spin2_pure[:3]
                     if spin2_pure is not None
-                    else _coupling_matrices_spin2(window_cls, lmax=self.lmax)
+                    else _coupling_matrices_spin2(
+                        window_cls, lmax=self.lmax,
+                        need_te=self.ncls in (2, 7), need_ee=self.ncls in (4, 7))
                 )
             else:
                 if self.spin1 == 0 or self.spin2 == 0:
