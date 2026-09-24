@@ -1,0 +1,528 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[margin=2.4cm]{geometry}
+\usepackage{fontspec}
+\usepackage{amsmath,amssymb,amsthm,mathtools}
+\usepackage{booktabs}
+\usepackage{microtype}
+\usepackage[hidelinks]{hyperref}
+
+\setmainfont{Latin Modern Roman}
+\setmonofont{Latin Modern Mono}[Scale=MatchLowercase]
+
+\newtheorem{proposition}{Proposition}[section]
+\numberwithin{equation}{section}
+\emergencystretch=2.5em
+
+\title{\textbf{Study note: from a ring transform to the sub-cubic sum}}
+\author{}
+\date{GMaster, 24 September 2026}
+
+\begin{document}
+\maketitle
+\vspace{-1.4em}
+
+\begin{center}
+{\small Every identity below is the one implemented in \texttt{gmaster/\_dc\_lat.py}.\\
+Nothing is assumed from the v2 march except the transform it is replacing.}
+\end{center}
+
+\tableofcontents
+
+\section{The transform, before any algorithm}
+\label{sec:sht}
+
+A scalar map on the sphere has spherical-harmonic coefficients
+\begin{equation}
+  a_{\ell m}
+  = \int_{S^2} f(\theta,\varphi)\, Y_{\ell m}(\theta,\varphi)^\ast \,\mathrm{d}\Omega,
+  \label{eq:alm}
+\end{equation}
+and the inverse is $f=\sum_{\ell m} a_{\ell m} Y_{\ell m}$.
+The spherical harmonics separate,
+\[
+  Y_{\ell m}(\theta,\varphi)
+  = \lambda_{\ell m}(\cos\theta)\, \frac{e^{im\varphi}}{\sqrt{2\pi}},
+\]
+with $\lambda_{\ell m}$ the orthonormal associated Legendre function on $[-1,1]$
+(the Condon--Shortley phase is the one shared with ducc0; it rides along and never
+changes the argument below). The area element is $\mathrm{d}\Omega=\sin\theta\,\mathrm{d}\theta\,\mathrm{d}\varphi$.
+
+HEALPix, at resolution $N_{\mathrm{side}}$, places its pixels on rings of constant $\theta$.
+On ring $r$ the azimuthal samples are equally spaced, so the $\varphi$ integral on that
+ring is a discrete Fourier transform. After that Fourier transform, what remains of
+\eqref{eq:alm} at one fixed order $m$ is a sum over rings only:
+\begin{equation}
+  a_{\ell m}
+  = \sum_{r} \lambda_{\ell m}(x_r)\, F_m(\theta_r)\, w_r,
+  \qquad x_r=\cos\theta_r.
+  \label{eq:lat}
+\end{equation}
+$F_m(\theta_r)$ is the Fourier coefficient of the ring, and $w_r$ is the quadrature
+weight of that ring (pixel area, and the usual HEALPix ring weight).
+Synthesis is the transpose: given $a_{\ell m}$, form
+\begin{equation}
+  F_m(\theta_r) = \sum_{\ell\ge |m|} \lambda_{\ell m}(x_r)\, a_{\ell m}
+  \label{eq:syn}
+\end{equation}
+and Fourier-synthesise each ring.
+
+Equations \eqref{eq:lat} and \eqref{eq:syn} are the whole latitudinal problem.
+The azimuthal FFT is not discussed again. The bandlimit is $L=\ell_{\max}+1$,
+with $\ell_{\max}=3N_{\mathrm{side}}-1$ in every timing below, so there are
+$O(L)$ orders and $O(L)$ degrees in each.
+
+\section{What the march does, and what it costs}
+\label{sec:march}
+
+The associated Legendre functions in $\ell$, at fixed $m$ and $x$, obey a three-term
+recurrence. The v2 march evaluates that recurrence once per ring: for every pair
+$(\ell,m)$ it produces $\lambda_{\ell m}(x_r)$, then dots with the ring coefficient.
+The number of pairs is $\sum_m (L-|m|)\sim L^2/2$, and each is repeated on
+$N_{\mathrm{ring}}\sim 4N_{\mathrm{side}}\sim L$ rings, so the work is
+\[
+  O(L^2 N_{\mathrm{ring}})=O(L^3).
+\]
+That count is the definition of the march. The rest of this note never forms
+$\lambda_{\ell m}(x_r)$.
+
+\section{One order is a polynomial in \texorpdfstring{$\cos^2\theta$}{cos squared theta}}
+\label{sec:fold}
+
+Fix $m\ge 0$. The functions $\lambda_{\ell m}(x)$ are polynomials in $x$ of degree $\ell$,
+times a fixed power of $\sqrt{1-x^2}$ that depends only on $m$. They have a parity:
+\[
+  \lambda_{\ell m}(-x) = (-1)^{\ell+m}\,\lambda_{\ell m}(x).
+\]
+Split the sum \eqref{eq:syn} into even and odd steps in $\ell$ relative to $m$.
+Write $p\in\{0,1\}$ for that parity, and keep only the degrees
+\[
+  \ell = m+p+2k, \qquad k=0,1,2,\dots
+\]
+On those degrees $\lambda_{\ell m}(x)$ is an even or odd function of $x$ times a fixed
+factor that does not depend on $k$. Set
+\[
+  y = x^2 = \cos^2\theta \in [0,1].
+\]
+Then the $k$-dependence sits in a polynomial in $y$. Define the orthonormal versions of
+those polynomials by folding the Legendre row,
+\begin{equation}
+  \phi_k(y) = \psi_{m+p+2k}(\sqrt{y}),
+  \label{eq:phi}
+\end{equation}
+where $\psi_\ell$ is $\lambda_{\ell m}$ with the $m$-dependent factor divided out and the
+result renormalised so that $\{\phi_k\}$ is orthonormal on $[0,1]$ with its weight.
+Orthonormality is the only property used from here:
+\begin{equation}
+  \int_0^1 \phi_j(y)\,\phi_k(y)\,\mathrm{d}\mu(y) = \delta_{jk}.
+  \label{eq:on}
+\end{equation}
+The northern and southern hemispheres are the same polynomials in $y$, with a sign
+$(-1)^{\ell}$ between them. One $(m,p)$ problem therefore covers both hemispheres.
+There are four such problems for each pair $\pm m$ (two signs of $m$, two parities);
+negative $m$ is the complex conjugate of positive $m$ for a real map, so it is not a
+new polynomial.
+
+A synthesis at this $(m,p)$ is now exactly
+\begin{equation}
+  f(y_r) = \sum_{k=0}^{n-1} c_k\,\phi_k(y_r),
+  \label{eq:f}
+\end{equation}
+with $c_k$ a rescaling of $a_{m+p+2k,\, m}$ and $n$ the number of degrees of this
+parity, $n\sim (L-m)/2$. Equation \eqref{eq:f} is the object to evaluate.
+The march would build each $\phi_k(y_r)$ by recurrence. The next sections replace that.
+
+\section{Multiplication by \texorpdfstring{$y$}{y} is a tridiagonal matrix}
+\label{sec:jacobi}
+
+Any three consecutive orthonormal polynomials obey a three-term recurrence. The reason
+is degree, not a special property of Legendre. The product $y\,\phi_k$ is a polynomial
+of degree $k+1$ in the same family, so
+\[
+  y\,\phi_k = \sum_{j=0}^{k+1} J_{jk}\,\phi_j.
+\]
+Orthonormality gives $J_{jk}=\int \phi_j\, y\,\phi_k\,\mathrm{d}\mu$.
+The integrand is symmetric in $(j,k)$, so $J$ is symmetric.
+If $|j-k|>1$ then $y\phi_k$ has degree at most $k+1<j$, and $\phi_j$ is orthogonal to
+every polynomial of lower degree, so $J_{jk}=0$.
+Only the three diagonals survive:
+\begin{equation}
+  y\,\phi_k = E_k\,\phi_{k+1} + D_k\,\phi_k + E_{k-1}\,\phi_{k-1}.
+  \label{eq:rec}
+\end{equation}
+$E_k>0$ by the standard sign convention on leading coefficients, and $D_k$ is real.
+In matrix form, on the coefficient vector of $(\phi_0,\dots,\phi_{n-1})$,
+multiplication by $y$ is the $n\times n$ real symmetric tridiagonal Jacobi matrix $T$
+with diagonal $D_k$ and off-diagonal $E_k$.
+
+\section{The nodes are the eigenvalues}
+\label{sec:spectral}
+
+Let $T=VYV^\top$ be the spectral decomposition: $V$ orthogonal, $Y=\mathrm{diag}(y_0,\dots,y_{n-1})$.
+The eigenvalues $y_j$ are simple and lie in $(0,1)$. They are the zeros of $\phi_n$.
+That is Golub--Welsch: $\phi_n(y_j)=0$, and the $j$-th column of $V$, normalised to unit
+Euclidean length, is the vector of polynomial values at that zero, scaled by the
+Gauss quadrature weight $w_j$ of the node,
+\begin{equation}
+  V_{kj} = \sqrt{w_j}\,\phi_k(y_j),
+  \qquad
+  w_j=\Biggl(\sum_{k=0}^{n-1}\phi_k(y_j)^2\Biggr)^{-1}.
+  \label{eq:gw}
+\end{equation}
+(The weight in \eqref{eq:gw} is the Christoffel number. It is not the HEALPix ring
+weight $w_r$ of \eqref{eq:lat}.) Equation \eqref{eq:gw} is the bridge from the matrix
+$V$, which we will apply without forming $\phi_k$, back to the polynomial values.
+
+\section{Christoffel--Darboux, derived}
+\label{sec:cd}
+
+\begin{proposition}
+\label{prop:cd}
+For the orthonormal recurrence \eqref{eq:rec},
+\begin{equation}
+  (z-y)\sum_{k=0}^{n-1}\phi_k(z)\,\phi_k(y)
+  = E_{n-1}\bigl(\phi_n(z)\,\phi_{n-1}(y)-\phi_{n-1}(z)\,\phi_n(y)\bigr).
+  \label{eq:cdid}
+\end{equation}
+\end{proposition}
+
+\begin{proof}
+Apply \eqref{eq:rec} at $z$ and at $y$:
+\begin{align*}
+  z\,\phi_k(z) &= E_k\phi_{k+1}(z)+D_k\phi_k(z)+E_{k-1}\phi_{k-1}(z),\\
+  y\,\phi_k(y) &= E_k\phi_{k+1}(y)+D_k\phi_k(y)+E_{k-1}\phi_{k-1}(y).
+\end{align*}
+Multiply the first by $\phi_k(y)$ and the second by $\phi_k(z)$, and subtract.
+The $D_k$ terms cancel, and what remains is a difference of neighbours:
+\begin{align*}
+  (z-y)\,\phi_k(z)\phi_k(y)
+  &= E_k\bigl(\phi_{k+1}(z)\phi_k(y)-\phi_k(z)\phi_{k+1}(y)\bigr)\\
+  &\quad - E_{k-1}\bigl(\phi_k(z)\phi_{k-1}(y)-\phi_{k-1}(z)\phi_k(y)\bigr).
+\end{align*}
+Sum from $k=0$ to $k=n-1$. The sum on the right telescopes. The $k=0$ end vanishes
+because there is no $\phi_{-1}$. The only surviving boundary term is the one at
+$k=n-1$, with coefficient $E_{n-1}$, which is \eqref{eq:cdid}.
+\end{proof}
+
+Now specialise to a node. By \S\ref{sec:spectral}, $\phi_n(y_j)=0$, so \eqref{eq:cdid} at
+$y=y_j$ collapses to
+\begin{equation}
+  \sum_{k=0}^{n-1}\phi_k(z)\,\phi_k(y_j)
+  = E_{n-1}\,\frac{\phi_n(z)\,\phi_{n-1}(y_j)}{z-y_j}.
+  \label{eq:cdnode}
+\end{equation}
+Take the polynomial expansion \eqref{eq:f} and insert the spectral expansion of the
+coefficients. Since $V$ is orthogonal, $c=Vw$ means $w=V^\top c$ and
+$c_k=\sum_j V_{kj} w_j$. Therefore
+\begin{equation}
+  f(z)
+  = \sum_{k=0}^{n-1} c_k\,\phi_k(z)
+  = \sum_{j=0}^{n-1} w_j \sum_{k=0}^{n-1} V_{kj}\,\phi_k(z).
+  \label{eq:f2}
+\end{equation}
+Substitute $V_{kj}=\sqrt{w_j}\,\phi_k(y_j)$ from \eqref{eq:gw} into the inner sum:
+\[
+  \sum_{k=0}^{n-1} V_{kj}\,\phi_k(z)
+  = \sqrt{w_j}\sum_{k=0}^{n-1}\phi_k(y_j)\,\phi_k(z)
+  = \sqrt{w_j}\, E_{n-1}\,\frac{\phi_n(z)\,\phi_{n-1}(y_j)}{z-y_j},
+\]
+where the second equality is \eqref{eq:cdnode}.
+The same identity \eqref{eq:gw} at degree $n-1$ says
+$V_{n-1,j}=\sqrt{w_j}\,\phi_{n-1}(y_j)$, so
+$\sqrt{w_j}\,\phi_{n-1}(y_j)=V_{n-1,j}$. The inner sum is therefore
+\[
+  \sum_{k} V_{kj}\,\phi_k(z)
+  = E_{n-1}\,\phi_n(z)\,\frac{V_{n-1,j}}{z-y_j}.
+\]
+Put that into \eqref{eq:f2} and restore $w_j$ as the $j$-th entry of $V^\top c$:
+\begin{equation}
+  \boxed{
+  f(z)
+  = E_{n-1}\,\phi_n(z)
+    \sum_{j=0}^{n-1}
+    \frac{V_{n-1,j}\,(V^\top c)_j}{z-y_j}.
+  }
+  \label{eq:final}
+\end{equation}
+This holds at every $z$ that is not a node $y_j$. A HEALPix ring $y_r=\cos^2\theta_r$
+is such a point, except for the size-$1$ problem, where a node can sit on a ring;
+that case is \S\ref{sec:coinc}.
+
+Read \eqref{eq:final} from left to right as an algorithm:
+\begin{enumerate}
+  \item $w=V^\top c$. This is a linear map on the $n$ coefficients of one order. It does
+        not look at the rings.
+  \item For each ring $z=y_r$, the sum $\sum_j w_j V_{n-1,j}/(y_r-y_j)$. This is a
+        Cauchy sum from the $n$ nodes to that ring. The numbers $V_{n-1,j}$ are the
+        last row of $V$, a property of $T$ alone.
+  \item Multiply by the scalar $E_{n-1}\phi_n(y_r)$, a property of the ring and of
+        $(m,p)$, independent of the map.
+\end{enumerate}
+No value of $\phi_k(y_r)$ for $k<n$ was computed. Analysis is the Euclidean adjoint.
+The scalar in step 3 is real, the Cauchy kernel $1/(y_r-y_j)$ is symmetric in the
+two sets of points, and $V$ is orthogonal, so the adjoint is: multiply the ring
+residual by $E_{n-1}\phi_n(y_r)$, apply the transposed Cauchy sum, then apply $V$.
+Same plan, reversed order, transposed kernels.
+
+\section{Applying \texorpdfstring{$V^\top$}{V transpose} without storing \texorpdfstring{$V$}{V}}
+\label{sec:cuppen}
+
+Forming $V$ would be $O(n^3)$ for one order and $O(L^4)$ for the sphere, which is worse
+than the march. $V$ is the eigenvector matrix of a tridiagonal matrix, and a tridiagonal
+eigenproblem splits.
+
+Tear $T$ into two principal blocks $T_1$, $T_2$ of half the size, and one coupling
+$\rho=E_{n/2}$ across the cut. After moving that coupling onto a rank-one spike,
+\begin{equation}
+  T = \begin{pmatrix} T_1 & 0 \\ 0 & T_2 \end{pmatrix} + \rho\, uu^\top
+  \label{eq:cuppen}
+\end{equation}
+for a vector $u$ that is nonzero in only two entries (the two corners that were joined).
+This is Cuppen's splitting. Suppose the two blocks are already diagonalised,
+$\mathrm{diag}(T_1,T_2)=Q\,\mathrm{diag}(d)\,Q^\top$. Then $T$ is a diagonal matrix plus a
+rank-one update, in the $Q$ basis. Its eigenvalues $\lambda$ are the roots of the secular
+equation
+\begin{equation}
+  1 + \rho\sum_i \frac{u_i^2}{d_i-\lambda} = 0,
+  \label{eq:secular}
+\end{equation}
+one root in each gap between the $d_i$ (and one outside each end).
+The corresponding unit eigenvector has components proportional to $u_i/(d_i-\lambda)$.
+So the eigenvector matrix of the merge, in the basis of the children's eigenvectors, has entries
+\begin{equation}
+  U_{ij} = \frac{z_i\, c_j}{d_i-\lambda_j}.
+  \label{eq:cauchy}
+\end{equation}
+Gu and Eisenstat's form replaces the raw $u_i$ by a computed $z_i$ so that \eqref{eq:cauchy}
+is the exact eigenvector matrix of a tridiagonal matrix within a few units in the last
+place of $T$. That is what makes the merge stable; a raw $u_i/(d_i-\lambda)$ is not, once
+two poles nearly coincide.
+
+Applying $U$ or $U^\top$ to a vector is the Cauchy sum \eqref{eq:cauchy}. It is the same
+shape as the ring sum in \eqref{eq:final}. The divide-and-conquer tree is: diagonalise
+the $16\times 16$ leaves directly, then at each level apply one Cauchy merge per block.
+A leaf eigenvector block is not stored. Its 16 eigenvalues determine it, and a half-warp
+rebuilds the $16\times 16$ block from those eigenvalues by a twisted factorisation of the
+torn tridiagonal. The tridiagonal entries are closed form in $(m,\ell)$ from
+\eqref{eq:rec}. Stored cost of a leaf is 16 eigenvalues, not $16^2$ eigenvectors:
+$4$ bytes per coefficient instead of $64$.
+
+There are $O(\log n)$ levels. A direct Cauchy sum at a level of size $n$ is $O(n^2)$ per
+block and $O(n)$ blocks, hence $O(n^2)$ per level, and $O(n^2\log n)$ per order. That
+would still be $O(L^3\log L)$ over all orders, no better than the march. The next section
+is what removes the extra $n$.
+
+\section{The Cauchy sums are one-dimensional fast multipole sums}
+\label{sec:fmm}
+
+Both \eqref{eq:final} and \eqref{eq:cauchy} are sums
+\[
+  g(x) = \sum_j \frac{q_j}{x-y_j}
+\]
+with charges $q_j$ on a set of real points $y_j$ and targets $x$ on the real line.
+If a target interval and a source interval are separated by at least their own length,
+then for every source $y$ in the source interval and every target $x$ in the target interval
+the kernel has a uniformly convergent expansion in $(x-c)^{-1}$ about the source centre $c$,
+\[
+  \frac{1}{x-y}
+  = \sum_{p=0}^{P-1} \frac{(y-c)^p}{(x-c)^{p+1}} + \text{remainder}.
+\]
+The sum over a well-separated source interval collapses to $P$ moments
+$\sum_j q_j (y_j-c)^p$, independent of the target, and each target evaluates a $P$-term
+polynomial in $1/(x-c)$. Near interactions, where the intervals touch, stay direct.
+With $P$ fixed, a binary tree of this splitting evaluates the sum in $O(N)$ or
+$O(N\log N)$ work for $N$ sources and $N$ targets. The implementation uses $P=12$ and
+leaves of $32$ poles, and it uses the direct sum when a merge has fewer than $256$ poles.
+That is a parameter choice, not a new identity: any fixed $P$ leaves the complexity
+$O(n\log n)$ per order.
+
+An order of length $n$ therefore costs $O(n\log n)$ to apply $V^\top$, and $O(n)$ or
+$O(n\log n)$ for the final node-to-ring Cauchy sum. Summing over parities and over
+$m=0,\dots,L-1$, with $n\sim (L-m)/2$, gives
+\[
+  \sum_{m=0}^{L-1} O\bigl((L-m)\log(L-m)\bigr) = O(L^2\log L)
+\]
+for one scalar transform. The march was $O(L^3)$.
+
+\section{When a denominator vanishes}
+\label{sec:coinc}
+
+Two corrections are required because \eqref{eq:final} and \eqref{eq:cauchy} divide by a
+difference of real numbers.
+
+Adjacent eigenvalues of the two children in \eqref{eq:cuppen} can lie closer together than
+a float64 unit in the last place of their values. Their stored difference is then noise.
+The plan stores each adjacent gap exactly (as a float32 correction on top of the
+double-float poles). The hot loop uses a clamped reciprocal, and each target replaces at
+most three nearest terms by those exact values afterwards. The replacement is branch-free.
+Deflating the pair by a Givens rotation is the wrong fix here: the secular root that sits
+between the two poles is closer than the perturbation the rotation introduces, and the
+resulting error is of order $10^{-3}$.
+
+Separately, a node $y_j$ can land on a ring $y_r$. The size-$1$ problem does this exactly.
+At $N_{\mathrm{side}}=4096$, spin $2$, $m=179$, the closest approach on the board is
+$8.9\times 10^{-15}$. The plan lists every node-ring pair closer than $10^{-9}$, with the
+float64 value of $y_r-y_j$. If the two coincide, the summand has a limit, from
+differentiating \eqref{eq:cdnode} or equivalently from the normalisation \eqref{eq:gw},
+\[
+  E_{n-1}\,\phi_n'(y_j)
+  = \frac{\phi_0(y_j)}{V_{0j}\, V_{n-1,j}}.
+\]
+A small kernel writes those terms in place of the reciprocal.
+
+\section{Spin 2 is the same tridiagonal problem}
+\label{sec:spin2}
+
+For a spin-$s$ field the latitudinal functions are Wigner $d$-functions. With
+$a=m+s$, $b=|m-s|$, $x=\cos\theta$ and $n=\ell-\max(m,s)$,
+\begin{equation}
+  d^\ell_{m,-s}(\theta)
+  = \Bigl(\sin\frac{\theta}{2}\Bigr)^{a}
+    \Bigl(\cos\frac{\theta}{2}\Bigr)^{b}
+    P_n^{(a,b)}(x).
+  \label{eq:djac}
+\end{equation}
+(The phase and the power of two that convert this to the Condon--Shortley normalisation
+are independent of the summation index inside one order; they scale $c_k$ and do not
+change $T$.) $P_n^{(a,b)}$ is a Jacobi polynomial. Jacobi polynomials satisfy a
+three-term recurrence in $n$ because they are orthogonal polynomials, by the same degree
+argument as \S\ref{sec:jacobi}. Written on the orthonormal functions
+$u_\ell=\sqrt{(2\ell+1)/2}\, d^\ell_{m,-s}$, that recurrence is
+\begin{equation}
+  x\, u_\ell = a_{\ell+1} u_{\ell+1} + b_\ell u_\ell + a_\ell u_{\ell-1},
+  \label{eq:wrec}
+\end{equation}
+with the explicit coefficients
+\begin{align}
+  b_\ell &= -\frac{ms}{\ell(\ell+1)},
+  \label{eq:bl}\\
+  a_\ell &= \frac{\sqrt{(\ell^2-m^2)(\ell^2-s^2)}}{\ell\,\sqrt{4\ell^2-1}}.
+  \label{eq:al}
+\end{align}
+Equation \eqref{eq:bl} is the only structural difference from spin $0$. For $s=0$ one has
+$b_\ell=0$, the matrix is off-diagonal, even and odd $\ell$ decouple, and \S\ref{sec:fold}
+folds them into $y=x^2$. For $s\neq 0$ the diagonal is nonzero, so there is one tridiagonal
+per $m$, of length $L-\max(m,s)$, with no parity split, and the nodes are Gauss--Jacobi
+nodes in $x=\cos\theta$ rather than in $y=\cos^2\theta$. The ring sum runs over all rings,
+not over a hemisphere.
+
+From \eqref{eq:wrec} onward nothing changes. $T$ is still real symmetric tridiagonal,
+\eqref{eq:cdid}--\eqref{eq:final} never used $D_k=0$, and Cuppen's splitting
+\eqref{eq:cuppen} never used it either. Negative orders do not need a second plan:
+\begin{equation}
+  d^\ell_{-m,-s}(\theta) = (-1)^{\ell+s}\, d^\ell_{m,-s}(\pi-\theta).
+  \label{eq:mirror}
+\end{equation}
+The right-hand side is the same vector of polynomial values on the rings read in reverse
+order, times a sign that depends on $\ell$ but not on $\theta$. It is a second right-hand
+side of the same traversal.
+
+The coefficients \eqref{eq:bl} and \eqref{eq:al} were checked against a direct sympy
+expansion of the Jacobi recurrence to $10^{-16}$. The check is a comparison of closed
+forms, not a fit.
+
+\section{The iteration never returns to \texorpdfstring{$a_{\ell m}$}{alm}}
+\label{sec:node}
+
+Write \eqref{eq:final} as a matrix. Let $C$ be the linear map that sends the node-space
+vector $w$ to the rings by the Cauchy sum and the scalar $E_{n-1}\phi_n$, and let $f$ be
+the per-degree normalisation that converts $a_{\ell m}$ into the orthonormal coefficients
+$c$. Synthesis and analysis of one spin are
+\begin{equation}
+  S = C\, V^\top \,\mathrm{diag}(f),
+  \qquad
+  A = \mathrm{diag}(f)\, V\, C^\top.
+  \label{eq:SA}
+\end{equation}
+For the normalised transforms of either spin, $f^2=1/(2\pi)$. (For spin $s$ the bare
+normalisation and the factor $\sqrt{(2\ell+1)/2}$ in $u_\ell$ multiply to this same
+constant; the mirror sign in \eqref{eq:mirror} squares to $1$.)
+
+MASTER refinement at $n_{\mathrm{iter}}$ iterations is the map
+\begin{equation}
+  a \leftarrow a - A(Sa - \mathrm{map}),
+  \label{eq:iter}
+\end{equation}
+applied $n_{\mathrm{iter}}$ times, starting from $a=0$ or from a previous estimate.
+Substitute \eqref{eq:SA}. Set $w=V^\top(a/f)$, i.e.\ $a=f\,Vw$, which is step 1 of
+\S\ref{sec:cd} done once. Then
+\[
+  Sa = C\, V^\top \mathrm{diag}(f)\, (f\, V w) = C\, V^\top (f^2)\, V w.
+\]
+$V$ is orthogonal and $f^2=1/(2\pi)$ is a scalar, so $V^\top (f^2) V=(1/(2\pi))I$ and
+\[
+  Sa = \frac{1}{2\pi}\, C w.
+\]
+The correction $A(Sa-\mathrm{map})$ pushed back to $w$-space is
+\[
+  V^\top \mathrm{diag}(f)^{-1} A(Sa-\mathrm{map})
+  = V^\top C^\top (Sa-\mathrm{map})
+  = C^\top\Bigl(\frac{Cw}{2\pi}-\mathrm{map}\Bigr),
+\]
+where the first equality uses $A=\mathrm{diag}(f)\, V C^\top$ and $\mathrm{diag}(f)^{-1}\mathrm{diag}(f)=I$.
+Therefore \eqref{eq:iter} in the $w$ coordinate is
+\begin{equation}
+  \boxed{ w \leftarrow w - C^\top\Bigl(\frac{Cw}{2\pi} - \mathrm{map}\Bigr) }
+  \label{eq:witer}
+\end{equation}
+and $a=f\,Vw$ is formed only after the last iteration.
+One iteration is two applications of $C$ and a ring-space residual. The tree that applies
+$V$ and $V^\top$, which is about $70\%$ of the cost of a transform, runs once per refinement
+loop instead of once per $S$ and once per $A$. With $n_{\mathrm{iter}}=3$ that is once
+instead of $2\cdot 3+1=7$ times.
+
+The residual $Cw/(2\pi)-\mathrm{map}$ is a ring map. Its azimuthal structure is already a
+Fourier series (the output of $C$ is $F_m(\theta_r)$). Folding that series,
+$\mathrm{FFT}(\mathrm{IFFT}(F))$, is the periodic sum that the ring transform needs, and it
+does not require a second FFT inside the iteration. The loop stays in node space and in
+ring-Fourier space.
+
+\section{Cost, memory, and where the engine stops}
+\label{sec:cost}
+
+Work per scalar transform: $O(L^2\log L)$, from the last display in \S\ref{sec:fmm}.
+Measured on one RTX PRO 6000, doubling $L$ from $N_{\mathrm{side}}=2048$ to $4096$
+multiplies a D\&C pass by about $4.2$ and a march pass by $6$ to $16$. The log-log slope
+in $N_{\mathrm{side}}$ over that interval is $2.05$ / $2.06$ (spin $0$, synthesis /
+analysis) and $2.09$ / $2.07$ (spin $2$). An $O(N^2\log N)$ model predicts $2.13$ on that
+interval; $O(N^3)$ predicts $3$.
+
+The plan (eigenvalues, Gu--Eisenstat $z$, adjacent gaps, the last row of each $V$, the
+scalars $E\phi_n$) is geometry only. It is $O(L^2\log L)$ numbers. The march's recurrence
+tables are $O(L^2)$. At $N_{\mathrm{side}}=4096$ the accounted device peak is $37.5$ GiB
+for spin $0$ and $59.9$ GiB for spin $2$, against $25.0$ and $43.9$ GiB for the march.
+Above $L=12288$, which is $N_{\mathrm{side}}=8192$ at $\ell_{\max}=3N_{\mathrm{side}}-1$,
+the router does not build the plan: the host build would take hours and about $55$ GiB per
+spin. At that size the latitudinal step falls back to the march, and the memory wall that
+remains is the azimuthal chirp-Z, which is outside this note.
+
+On the same card, spin $0$, warm medians, synthesis / analysis at $n_{\mathrm{iter}}=0$ /
+analysis at $n_{\mathrm{iter}}=3$, in milliseconds:
+
+\begin{center}
+\small
+\begin{tabular}{@{}rccc@{}}
+\toprule
+$N_{\mathrm{side}}$ & D\&C & v2 march & $n_{\mathrm{iter}}=3$ ratio \\
+\midrule
+1024 & 5.9 / 6.7 / 15 & 6.9 / 7.3 / 43 & $2.8\times$ \\
+2048 & 24 / 29 / 57 & 37 / 42 / 251 & $4.4\times$ \\
+4096 & 123 / 145 / 250 & 511 / 453 / 3110 & $12\times$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The error against ducc0 on the same HEALPix operator stays between $2\times 10^{-6}$ and
+$3\times 10^{-5}$ at every size on that board. The march, whose error is the float32
+recurrence, grows to about $10^{-4}$ at $N_{\mathrm{side}}=4096$.
+
+\section{What was not used}
+\label{sec:not}
+
+The derivation used orthonormality, the three-term recurrence, the spectral theorem for a
+real symmetric tridiagonal matrix, and one telescoping sum. It did not use a fast cosine
+transform, a precomputed Legendre table, or the compensated float32 arithmetic of the march.
+The march remains the algorithm below $L=3072$, where the tree's launch cost is larger
+than the $O(L^3)$ recurrence, and above $L=12288$, where the plan does not fit the build.
+
+\end{document}
