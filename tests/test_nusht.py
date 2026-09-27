@@ -16,11 +16,26 @@ jax.config.update("jax_enable_x64", True)
 import ducc0
 
 from gmaster import nusht
-from gmaster._cuda_gpu import on_cuda_gpu
+from gmaster._sht.cuda_gpu import on_cuda_gpu
 
 
 _HAS_NVIDIA_GPU = on_cuda_gpu()
-pytestmark = pytest.mark.skipif(not _HAS_NVIDIA_GPU, reason="needs an NVIDIA GPU")
+# The general SHT is built on the v2 march, which `conftest.py` switches off unless asked for.
+pytestmark = [pytest.mark.skipif(not _HAS_NVIDIA_GPU, reason="needs an NVIDIA GPU"),
+              pytest.mark.march_v2]
+
+
+
+def _has_cufinufft():
+    try:
+        nusht._cufinufft()
+    except ImportError:
+        return False
+    return True
+
+
+# The general transforms put the NUFFT on the torus through cufinufft (an optional dependency).
+needs_cufinufft = pytest.mark.skipif(not _has_cufinufft(), reason="needs cufinufft")
 
 L = 64
 LMAX = L - 1
@@ -124,6 +139,7 @@ def test_march_is_transpose(spin):
         assert abs(lhs - rhs) / abs(lhs) < TOL
 
 
+@needs_cufinufft
 @pytest.mark.parametrize("spin", [0, 2])
 def test_synthesis_general_matches_ducc(spin):
     rng = np.random.default_rng(7)
@@ -137,6 +153,7 @@ def test_synthesis_general_matches_ducc(spin):
     assert np.linalg.norm(got - want) / np.linalg.norm(want) < TOL
 
 
+@needs_cufinufft
 @pytest.mark.parametrize("spin", [0, 2])
 def test_adjoint_synthesis_general_matches_ducc(spin):
     rng = np.random.default_rng(9)
@@ -152,6 +169,7 @@ def test_adjoint_synthesis_general_matches_ducc(spin):
     assert np.linalg.norm(got - want) / np.linalg.norm(want) < TOL
 
 
+@needs_cufinufft
 @pytest.mark.parametrize("upsampfac", [1.25, 2.0])
 def test_upsampfac_does_not_change_the_answer(upsampfac):
     rng = np.random.default_rng(11)
@@ -164,6 +182,7 @@ def test_upsampfac_does_not_change_the_answer(upsampfac):
     assert np.linalg.norm(got - want) / np.linalg.norm(want) < TOL
 
 
+@needs_cufinufft
 def test_custom_mstart_packing():
     """A non-default (but still valid) mstart must give the same field."""
     rng = np.random.default_rng(13)

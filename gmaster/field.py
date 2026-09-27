@@ -4,7 +4,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from . import utils
+from . import _config
+from ._sht import healpix as _healpix
 from .utils import (
     NmtAlmInfo,
     NmtMapInfo,
@@ -192,10 +193,10 @@ class NmtField:
 
         # A large field's transforms need tens of GiB of temporaries (a polarised Nside 4096
         # pass peaks at 40 GiB); evict the stale caches a previous workspace left on the
-        # device before starting (`utils.make_room`, session 36).
+        # device before starting (`_config.make_room`).
         nside = getattr(self.minfo, "nside", None)
         if nside:
-            utils.make_room(6 * (4 * nside - 1) * 2 * (self.ainfo.lmax + 1) * 16)
+            _config.make_room(6 * (4 * nside - 1) * 2 * (self.ainfo.lmax + 1) * 16)
         # At Nside 8192 the mask's spin-0 transform (~47 GiB working set) does not fit beside a
         # polarised field's alms and maps; the workspace asked for it after the field and the
         # coupling stage ran out of memory.  Taken first, only the maps are resident; it is waited
@@ -285,7 +286,7 @@ class NmtField:
             # Spin maps stay on the first GPU. The scalar mask runs on the
             # other card, which the spin march has already released.
             mask = self.mask[None, :]
-            gpus = utils._gpu_devices()
+            gpus = _healpix._gpu_devices()
             if len(gpus) > 1:
                 mask = jax.device_put(mask, gpus[1])
             alms = map2alm(

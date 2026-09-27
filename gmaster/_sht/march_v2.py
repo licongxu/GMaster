@@ -2,8 +2,8 @@
 
 Same contracts as the Pallas march in :mod:`gmaster._spin_march_pallas` (spin-0 folded analysis /
 synthesis of the positive-m block, spin-2 analysis / synthesis of the full ``(L, 2L-1)`` block),
-served by CUDA kernels in ``gmaster/_cuda/march_v2.cu`` (``nvcc`` on first GPU use) and the
-OpenMP CPU port in ``gmaster/_cpu/march_v2_cpu.cc`` (``g++`` when JAX is on CPU).
+served by CUDA kernels in ``gmaster/_native/cuda/march_v2.cu`` (``nvcc`` on first GPU use) and the
+OpenMP CPU port in ``gmaster/_native/cpu/march_v2_cpu.cc`` (``g++`` when JAX is on CPU).
 
 The mathematics (docs/march_v2_maths.md): for the Jacobi row ``v_n = (c1 x + c0) v_{n-1} - cb v_{n-2}``
 the kernel marches the pair ``(v, D = v_n - v_{n-1})`` as
@@ -55,7 +55,7 @@ _PARTS_BUDGET = int(float(os.environ.get("GMASTER_V2_PARTS_GB", "2")) * 1024 ** 
 # budget and are rebuilt per call above it (50-60 ms for a whole Nside 4096 geometry, against a
 # 260-900 ms pass).  The budget holds Nside <= 2048 and refuses Nside 4096 (7.5-8.3 GiB per
 # geometry, and the polarised pipeline needs its pool): pinning those cost the Nside 4096 spin-2
-# pipeline its command buffer.  `utils.make_room` evicts whatever is held.
+# pipeline its command buffer.  `_config.make_room` evicts whatever is held.
 _TABLE_CACHE_GB = os.environ.get("GMASTER_V2_TABLE_CACHE_GB")
 
 
@@ -72,8 +72,9 @@ _TABLE_CACHE = {}
 _GEO_CACHE = {}
 _TABLE_CACHE_SIZE = [0]
 
-_CU = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_cuda", "march_v2.cu")
-_CPU_CC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_cpu", "march_v2_cpu.cc")
+_NATIVE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "_native")
+_CU = os.path.join(_NATIVE, "cuda", "march_v2.cu")
+_CPU_CC = os.path.join(_NATIVE, "cpu", "march_v2_cpu.cc")
 _NAMES = ("gm_march_ana_s0", "gm_march_ana_s0_pair", "gm_march_ana_s2",
           "gm_march_syn_s0", "gm_march_syn_s0_pair", "gm_march_syn_s2")
 _LIB = None
@@ -283,7 +284,7 @@ def _geometry_numpy(L, nside, spin):
     that every tile (of either kernel) lies in one hemisphere."""
     from s2fft.sampling import s2_samples
 
-    # the grid `utils._stable_thetas` gives, built on the host so that the geometry is concrete
+    # the grid `healpix._stable_thetas` gives, built on the host so that the geometry is concrete
     theta = (np.asarray(s2_samples.thetas(L, "healpix", nside), np.float64)
              + 8 * np.finfo(np.float64).eps)
     ntheta = theta.shape[0]
@@ -542,10 +543,10 @@ def drop_table_cache():
 
 
 def _register_room_hook():
-    from gmaster import utils
+    from gmaster import _config
 
-    if drop_table_cache not in utils._ROOM_HOOKS_LAST:
-        utils._ROOM_HOOKS_LAST.append(drop_table_cache)
+    if drop_table_cache not in _config._ROOM_HOOKS_LAST:
+        _config._ROOM_HOOKS_LAST.append(drop_table_cache)
 
 
 def _ffi_analysis(spin, geo, m0, mbp, L, man, ex0, tab, rhs, nmaps=1):
@@ -691,7 +692,7 @@ def _dc(L, *arrays):
     Never inside a trace: its plan arrays would be captured as program constants there (the
     callers that serve it compose their programs eagerly), so a traced call keeps the march.
     """
-    from . import _dc_lat
+    from . import dc as _dc_lat
 
     if any(isinstance(a, jax.core.Tracer) for a in arrays):
         return None

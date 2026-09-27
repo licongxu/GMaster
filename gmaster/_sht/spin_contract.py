@@ -199,7 +199,7 @@ def forward(slab, ftm, *, L):
     :func:`gmaster._spin_slice.forward_latitudinal` to the summation-order floor
     (6.1e-16 relative at Nside 128 float64, ``.qwen/tmp/spin_contract_gate.log``).
     """
-    from gmaster import _spin_slice as ss
+    from gmaster._sht import spin_slice as ss
 
     ftm = jnp.asarray(ftm)
     off = L - 1
@@ -226,7 +226,7 @@ def forward(slab, ftm, *, L):
 
 def inverse(slab, flm, *, L):
     """Synthesis contraction over the ell-contiguous block set."""
-    from gmaster import _spin_slice as ss
+    from gmaster._sht import spin_slice as ss
 
     alm = jnp.asarray(flm)
     off = L - 1

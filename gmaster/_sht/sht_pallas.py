@@ -1043,7 +1043,7 @@ def _scalar_forward_adjoint(
     complex64 `positive_ftm`, and an uncast float64 cotangent reaching that
     stage trips JAX's bilinear transpose rule
     (`lax.mul requires arguments to have the same dtypes, got complex64,
-    complex128` at `utils._forward_ring_fft_positive`).  Casting back to the
+    complex128` at `rings._forward_ring_fft_positive`).  Casting back to the
     operand's type is what an explicit boundary cast would have inserted.
     """
     return _scalar_forward_latitudinal_impl(

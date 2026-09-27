@@ -7,8 +7,11 @@ import pytest
 jax.config.update("jax_enable_x64", True)
 
 import gmaster as nmt
-from gmaster import _spin_slice, _theta_matrix, utils, workspaces
-from gmaster._cuda_gpu import on_cuda_gpu
+from gmaster import utils, workspaces
+from gmaster._sht import spin_slice as _spin_slice
+from gmaster._sht import theta_matrix as _theta_matrix
+from gmaster._sht.cuda_gpu import on_cuda_gpu
+from gmaster._sht import rings
 
 _HAS_NVIDIA_GPU = on_cuda_gpu()
 
@@ -67,16 +70,17 @@ def test_ring_precision_follows_the_tables_only_while_it_follows():
 
 def test_ring_switch_rebuilds_the_ring_tables():
     nside, L = 32, 96
-    fp64 = utils._ring_analysis_tables(L, nside)
+    fp64 = rings._ring_analysis_tables(L, nside)
     assert fp64[0].dtype == jnp.complex128
 
     utils.set_ring_precision("fp32")
-    fp32 = utils._ring_analysis_tables(L, nside)
+    fp32 = rings._ring_analysis_tables(L, nside)
     assert fp32[0].dtype == jnp.complex64
-    # The chirp is a phase ramp: the two precisions are the same numbers, rounded.
+    # The chirp is a phase ramp.  The complex64 one is evaluated in float32 (exactly reduced
+    # angle, float32 sincos), so it agrees with the rounded float64 ramp to a few float32 ulps.
     np.testing.assert_allclose(
         np.asarray(fp32[0]), np.asarray(fp64[0]).astype(np.complex64),
-        rtol=0.0, atol=0.0)
+        rtol=0.0, atol=4 * np.finfo(np.float32).eps)
 
 
 def test_band_storage_follows_the_selection():

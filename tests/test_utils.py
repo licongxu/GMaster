@@ -7,7 +7,8 @@ jax.config.update("jax_enable_x64", True)
 
 import gmaster as nmt
 from gmaster import utils
-from gmaster._cuda_gpu import is_cuda_device_kind
+from gmaster._sht.cuda_gpu import is_cuda_device_kind
+from gmaster._sht import rings
 
 
 def test_mask_apodization_matches_namaster():
@@ -116,7 +117,7 @@ def test_default_parameters_control_new_fields():
 
 
 def test_latitudinal_method_chooses_march_or_dc():
-    from gmaster import _dc_lat
+    from gmaster._sht import dc as _dc_lat
 
     original = nmt.latitudinal_method()
     try:
@@ -152,11 +153,10 @@ def test_complex64_chirp_matches_exact_integer_reduction(two_nphi):
     errors into every polar-cap ring transform there.
     """
     import jax.numpy as jnp
-    from gmaster import utils
 
     index = jnp.arange(-3 * two_nphi, 3 * two_nphi, 7, dtype=jnp.int64)
     m = jnp.asarray([[two_nphi]], dtype=jnp.int64)
-    got = np.asarray(utils._chirp_c64(index, m, sign=1.0, wide=two_nphi > 65536))
+    got = np.asarray(rings._chirp_c64(index, m, sign=1.0, wide=two_nphi > 65536))
     q = np.asarray(index, dtype=object)
     reduced = np.array([(int(v) * int(v)) % two_nphi for v in q], dtype=np.float64)
     exact = np.exp(1j * reduced * (2 * np.pi / two_nphi))[None, :]

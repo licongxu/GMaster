@@ -45,7 +45,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import triton as plt
 import numpy as np
 
-from gmaster._sht_pallas import _initial_factor
+from gmaster._sht.sht_pallas import _initial_factor
 
 # Theta lanes per program.  The store-only probe on this layout peaked here and regressed at
 # 512 (`.qwen/tmp/pallas_band_emitter.log`: 127.8 / 123.3 / 89.5 G values/s for 128 / 256 / 512).

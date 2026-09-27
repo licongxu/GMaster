@@ -149,7 +149,7 @@ def test_scalar_coupling_matches_per_offset_recurrence(lmax):
 
 
 def _triangle_cuda_indexing(window_cls, lmax, *, use_f32):
-    """Host replica of ``gmaster/_cuda/coupling_tt.cu`` (upper triangle, f32 products)."""
+    """Host replica of ``gmaster/_native/cuda/coupling_tt.cu`` (upper triangle, f32 products)."""
     n_ell = lmax + 1
     table_dtype = np.float64
     element_dtype = np.float32 if use_f32 else np.float64
@@ -201,7 +201,7 @@ def test_coupling_tt_cuda_source_compiles_with_nvcc():
     )
     if not nvcc:
         pytest.skip("nvcc not available")
-    src = Path(__file__).resolve().parents[1] / "gmaster" / "_cuda" / "coupling_tt.cu"
+    src = Path(__file__).resolve().parents[1] / "gmaster" / "_native" / "cuda" / "coupling_tt.cu"
     inc = jax.ffi.include_dir()
     out = Path(os.environ.get("TEST_TMPDIR", "/tmp")) / f"gm_coupling_tt_{os.getpid()}.o"
     cmd = [

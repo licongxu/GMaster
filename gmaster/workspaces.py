@@ -10,7 +10,7 @@ from jax.scipy.special import gammaln
 from scipy.special import roots_legendre
 
 from .bins import NmtBin, NmtBinFlat
-from . import utils
+from . import _config
 from . import _coupling_tt_cuda
 from .utils import alm2map, map2alm
 
@@ -35,7 +35,7 @@ def _coupling_f32(lmax):
     """Whether this coupling build uses float32 operands."""
     if _COUPLING_PRECISION != "auto":
         return _COUPLING_PRECISION == "fp32"
-    from . import _march_v2
+    from ._sht import march_v2 as _march_v2
 
     return _march_v2.enabled(int(lmax) + 1)
 
@@ -392,7 +392,7 @@ def _coupling_matrix_tt_recurrence(window_cls, *, lmax):
     The body keeps a uniform ``(chunk, n, n)`` shape and a ``fori_loop``, so one
     compile serves every chunk.  Invalid lanes (offset past ``lmax``, or
     ``offset > min(l1, l2)``) are masked; kept entries match the shrinking form.
-    On a GPU the float32 arm is the CUDA kernel in ``_cuda/coupling_tt.cu``:
+    On a GPU the float32 arm is the CUDA kernel in ``_native/cuda/coupling_tt.cu``:
     one launch, no ``(chunk, n, n)`` temps (those were ~576 MiB at lmax 3071
     and minutes on a Colab T4).  The scan remains the CPU / no-nvcc fallback.
 
@@ -608,7 +608,7 @@ def _wigner_d_table(beta, *, m, n, lmax):
 
     # The scan's stacked values are a second full table.  Ask for that room here, not
     # at the start of the workspace: by this point the field transform is resident.
-    utils.make_room(int(len(beta)) * int(lmax + 1) * 8 * 4)
+    _config.make_room(int(len(beta)) * int(lmax + 1) * 8 * 4)
     # The recurrence is stacked instead of written column by column: a traced
     # column index makes XLA copy the whole (nodes, ell) table on every degree.
     # It is also launch-bound -- at lmax 768 with 1535 nodes each step is only
@@ -670,7 +670,7 @@ def _general_coupling_matrix_quadrature(
 
 
 _WD_TRIPLE_CACHE = {}
-utils._ROOM_HOOKS.append(_WD_TRIPLE_CACHE.clear)   # 9 GiB of device tables at Nside 4096
+_config._ROOM_HOOKS.append(_WD_TRIPLE_CACHE.clear)   # 9 GiB of device tables at Nside 4096
 # The Wigner-d quadrature tables are kept between workspace builds while they are small against
 # the device pool.  A fixed 2 GiB threshold dropped them at every geometry that matters: at
 # Nside 2048 spin 2 the three `(12287, 12287)` float64 tables are 3.6 GiB, so every
@@ -704,7 +704,7 @@ def _pool_limit_and_free():
     limit = stats.get("bytes_limit") or 0
     if limit:
         return limit, limit - (stats.get("bytes_in_use") or 0)
-    from . import _march_v2
+    from ._sht import march_v2 as _march_v2
 
     info = _march_v2.device_memory_info()
     if info is None:
@@ -1332,7 +1332,7 @@ def _binning_operators(bins):
 _expanded_binning_cache: dict = {}
 # Dense `kron(op, eye(ncls))` pairs: 5.1 GiB at Nside 8192 spin 2, kept from one workspace into the
 # next field's transform, which then did not fit.  Dropped when a transform asks for room.
-utils._ROOM_HOOKS.append(_expanded_binning_cache.clear)
+_config._ROOM_HOOKS.append(_expanded_binning_cache.clear)
 
 
 def _expanded_binning_operators(bins, ncls):
@@ -1562,11 +1562,11 @@ class NmtWorkspace:
         # consumed.  Wait here so that ~26 GiB is back in the pool before the
         # quadrature asks for its own table.  Nside 8192 spin 0 otherwise sits at
         # 85.5 GiB and fails a further 34.3 GiB allocation.
-        jax.block_until_ready(fl1.get_alms())
-        jax.block_until_ready(fl1.get_mask_alms())
-        if fl2 is not fl1:
-            jax.block_until_ready(fl2.get_alms())
-            jax.block_until_ready(fl2.get_mask_alms())
+        # Mask-only fields (catalogs, covariance inputs) have no alms to wait for.
+        for fl in (fl1,) if fl2 is fl1 else (fl1, fl2):
+            if getattr(fl, "alm", None) is not None:
+                jax.block_until_ready(fl.alm)
+            jax.block_until_ready(fl.get_mask_alms())
         alm1 = fl1.get_mask_alms()[None, :]
         alm2 = alm1 if fl2 is fl1 else fl2.get_mask_alms()[None, :]
         # The stage needs room for the matrix twice over (its blocks and the assembled form) plus
@@ -1580,7 +1580,7 @@ class NmtWorkspace:
         # evict the march's window tables during a scalar Nside 4096 pipeline, and rebuilding
         # them is 1.2 s a time.
         ring_width = 2 * (self.lmax_mask + 1) if self.spin1 or self.spin2 else self.lmax_mask + 1
-        utils.make_room(2 * (self.ncls * (self.lmax + 1)) ** 2 * 8
+        _config.make_room(2 * (self.ncls * (self.lmax + 1)) ** 2 * 8
                         + 6 * (4 * nside - 1) * ring_width * 16)
         self.pcl_mask = _compute_coupled_cell(
             alm1,

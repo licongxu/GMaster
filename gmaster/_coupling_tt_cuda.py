@@ -18,7 +18,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-_CU = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_cuda", "coupling_tt.cu")
+_CU = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_native", "cuda", "coupling_tt.cu")
 _NAME = "gm_coupling_tt"
 _LIB = None
 _LIB_ERROR = None

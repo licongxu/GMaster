@@ -25,7 +25,7 @@ from jax.experimental.pallas import triton as plt
 import jax.numpy as jnp
 import numpy as np
 
-from . import _sht_pallas
+from . import sht_pallas as _sht_pallas
 
 
 # --- f32 primitives -------------------------------------------------------

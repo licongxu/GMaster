@@ -6,7 +6,7 @@ jax.config.update("jax_enable_x64", True)
 
 import gmaster as nmt
 import gmaster.field as field_module
-from gmaster._cuda_gpu import on_cuda_gpu
+from gmaster._sht.cuda_gpu import on_cuda_gpu
 
 
 _HAS_NVIDIA_GPU = on_cuda_gpu()

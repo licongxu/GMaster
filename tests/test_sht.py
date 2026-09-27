@@ -10,8 +10,11 @@ from s2fft.utils import healpix_ffts, quadrature_jax
 jax.config.update("jax_enable_x64", True)
 
 import gmaster as nmt
-from gmaster import _theta_matrix, utils
-from gmaster._cuda_gpu import on_cuda_gpu
+from gmaster import utils
+from gmaster._sht import theta_matrix as _theta_matrix
+from gmaster._sht.cuda_gpu import on_cuda_gpu
+from gmaster import _config
+from gmaster._sht import healpix, rings
 
 
 _HAS_NVIDIA_GPU = on_cuda_gpu()
@@ -128,7 +131,7 @@ def test_gathered_alm_unpack_matches_healpy_layout(L, L_work):
     expected[ainfo._ell, L_work - 1 - ainfo._m] = np.where(
         ainfo._m > 0, (-1) ** ainfo._m * np.conj(alm), alm
     )
-    np.testing.assert_array_equal(utils._unpack_real(alm, L, L_work), expected)
+    np.testing.assert_array_equal(healpix._unpack_real(alm, L, L_work), expected)
     b_alm = rng.normal(size=ainfo.nelem) + 1j * rng.normal(size=ainfo.nelem)
     b_expected = np.zeros_like(expected)
     b_expected[ainfo._ell, L_work - 1 + ainfo._m] = b_alm
@@ -136,7 +139,7 @@ def test_gathered_alm_unpack_matches_healpy_layout(L, L_work):
         ainfo._m > 0, (-1) ** ainfo._m * np.conj(b_alm), b_alm
     )
     np.testing.assert_array_equal(
-        utils._unpack_spin(np.stack((alm, b_alm)), L, L_work),
+        healpix._unpack_spin(np.stack((alm, b_alm)), L, L_work),
         -(expected + 1j * b_expected),
     )
 
@@ -247,7 +250,7 @@ def test_fused_scalar_transform_gradients_match_generic_jax():
     alms = jnp.asarray(_random_alms(np.random.default_rng(42), 1, ainfo, 0))
 
     def fused_analysis_loss(values):
-        transformed = utils._map2alm_core_pallas(
+        transformed = healpix._map2alm_core_pallas(
             values,
             ainfo._ell,
             ainfo._m,
@@ -259,7 +262,7 @@ def test_fused_scalar_transform_gradients_match_generic_jax():
         return jnp.real(jnp.vdot(transformed, transformed))
 
     def fused_synthesis_loss(values):
-        transformed = utils._alm2map_core_pallas(
+        transformed = healpix._alm2map_core_pallas(
             values, nside=nside, L=L, L_work=L
         )
         return jnp.sum(transformed**2)
@@ -393,8 +396,8 @@ def test_matrix_theta_stage_matches_fused_kernel(monkeypatch):
         np.testing.assert_allclose(matrix_map, fused_map, atol=1e-14)
 
         L = lmax + 1
-        theta = utils._stable_thetas(L, nside)
-        ftm = utils._forward_healpix_fft(jnp.asarray(reference_map), L=L,
+        theta = healpix._stable_thetas(L, nside)
+        ftm = healpix._forward_healpix_fft(jnp.asarray(reference_map), L=L,
                                          nside=nside, reality=True)
         positive = _theta_matrix.forward_latitudinal(
             ftm, L=L, nside=nside, theta=theta,
@@ -424,9 +427,9 @@ def test_ring_synthesis_from_positive_half_matches_centred_window(nside, L):
         jax.random.normal(jax.random.PRNGKey(11), (4 * nside - 1, L))
         + 1j * jax.random.normal(jax.random.PRNGKey(12), (4 * nside - 1, L))
     )
-    reference = utils._inverse_ring_fft(positive, L=L, nside=nside)
-    got = utils._inverse_ring_fft_herm(
-        positive, utils._ring_synthesis_tables(L, nside), L=L, nside=nside
+    reference = rings._inverse_ring_fft(positive, L=L, nside=nside)
+    got = rings._inverse_ring_fft_herm(
+        positive, rings._ring_synthesis_tables(L, nside), L=L, nside=nside
     )
     np.testing.assert_allclose(got, reference, rtol=1e-13, atol=1e-13)
 
@@ -444,13 +447,13 @@ def test_ring_analysis_matches_direct_dft_ring_by_ring(nside, L):
     single-width chirp-Z. `L = 40` at Nside 32 is wider than the polar rings' own `nphi`,
     so their chirp-Z has to alias.
     """
-    nphi, start, _, _, _ = utils._ring_czt_constants_numpy(L, nside)
+    nphi, start, _, _, _ = rings._ring_czt_constants_numpy(L, nside)
     map_flat = jnp.asarray(
         np.random.default_rng(4).normal(size=12 * nside ** 2)
     )
     got = np.asarray(
-        utils._forward_ring_fft_positive(
-            map_flat, utils._ring_analysis_tables(L, nside), L=L, nside=nside
+        rings._forward_ring_fft_positive(
+            map_flat, rings._ring_analysis_tables(L, nside), L=L, nside=nside
         )
     )
     ntheta = 4 * nside - 1
@@ -482,7 +485,7 @@ def test_spin_ring_window_matches_direct_dft_both_ways(nside, L):
     and back. `L = 2*nside` is the boundary where the two slot ranges just touch,
     `L = 3*nside`/`3*nside-1` overlap them, and `L = 4*nside+7` declines the belt entirely.
     """
-    nphi, start, _, _, _ = utils._ring_czt_constants_numpy(L, nside)
+    nphi, start, _, _, _ = rings._ring_czt_constants_numpy(L, nside)
     npix = 12 * nside ** 2
     ntheta = 4 * nside - 1
     rng = np.random.default_rng(7)
@@ -490,11 +493,11 @@ def test_spin_ring_window_matches_direct_dft_both_ways(nside, L):
     centered = (jax.random.normal(jax.random.PRNGKey(3), (ntheta, 2 * L - 1))
                 + 1j * jax.random.normal(jax.random.PRNGKey(4), (ntheta, 2 * L - 1)))
 
-    forward = np.asarray(utils._forward_ring_fft_full(
-        jnp.asarray(signal), utils._spin_ring_analysis_tables(L, nside),
+    forward = np.asarray(rings._forward_ring_fft_full(
+        jnp.asarray(signal), rings._spin_ring_analysis_tables(L, nside),
         L=L, nside=nside))
-    backward = np.asarray(utils._inverse_ring_fft_complex(
-        centered, utils._spin_ring_synthesis_tables(L, nside), L=L, nside=nside))
+    backward = np.asarray(rings._inverse_ring_fft_complex(
+        centered, rings._spin_ring_synthesis_tables(L, nside), L=L, nside=nside))
 
     m_index = np.arange(-(L - 1), L)
     for ring in {0, nside // 2, nside - 2, nside - 1, nside,
@@ -533,7 +536,7 @@ def test_spin2_march_synthesis_matches_the_route_it_replaces(nside):
     64, and 1.01e-05 for both at 128 (`.qwen/tmp/synth_march_rel.log`) — dropping the accumulation
     limb is not what limits this step.
     """
-    from gmaster import _spin_march_pallas as march
+    from gmaster._sht import spin_march as march
 
     lmax = 3 * nside - 1
     L = lmax + 1
@@ -542,7 +545,7 @@ def test_spin2_march_synthesis_matches_the_route_it_replaces(nside):
     flm[:2] = 0.0                       # rows are ell: no sub-spin power
     jflm = jnp.asarray(flm)
 
-    exact = utils._inverse_latitudinal(jflm, utils._stable_thetas(L, nside), L=L, spin=2,
+    exact = healpix._inverse_latitudinal(jflm, healpix._stable_thetas(L, nside), L=L, spin=2,
                                        nside=nside, reality=False)
     got = march.inverse_latitudinal(jflm, L=L, spin=2, nside=nside)
     assert got.shape == exact.shape
@@ -593,13 +596,13 @@ def test_spin2_march_analysis_writes_every_lane_it_returns(nside):
     The `ftm` comes from the pipeline's own ring step rather than a random array because its column
     layout is `L + m` over `2L` columns, which is what makes the window slices line up.
     """
-    from gmaster import _spin_march_pallas as march
+    from gmaster._sht import spin_march as march
 
     lmax = 3 * nside - 1
     L = lmax + 1
     rng = np.random.default_rng(5)
     maps = jnp.asarray(rng.normal(size=12 * nside ** 2) + 1j * rng.normal(size=12 * nside ** 2))
-    ftm = utils._forward_s2fft_ftm(maps, utils._spin_ring_analysis_tables(L, nside),
+    ftm = healpix._forward_s2fft_ftm(maps, rings._spin_ring_analysis_tables(L, nside),
                                    L=L, nside=nside, reality=False)
 
     dirt = [jnp.full(n, np.nan)
@@ -614,7 +617,7 @@ def test_spin2_march_analysis_writes_every_lane_it_returns(nside):
 
     # Explicit copy: `np.asarray` hands back a read-once view of the JAX buffer, and the zeroing
     # below would raise `ValueError: assignment destination is read-only`.
-    ref = np.array(utils._forward_latitudinal(ftm, L=L, spin=2, nside=nside,
+    ref = np.array(healpix._forward_latitudinal(ftm, L=L, spin=2, nside=nside,
                                               reality=False, L_lower=0), copy=True)
     # Rows `ell < spin` are where an uninitialized lane would land, so they stay in the comparison.
     # They are also the one place the two routes differ by convention: the march's recurrence starts
@@ -644,24 +647,24 @@ def test_fused_slab_route_is_bit_identical_to_the_split_route(nside):
     npix = 12 * nside ** 2
     rng = np.random.default_rng(7)
     maps = jnp.asarray(rng.normal(size=(2, npix)) * 1e-3)
-    ell, order = utils._ell_order_arrays(lmax)
+    ell, order = healpix._ell_order_arrays(lmax)
 
-    a_slab, s_slab = utils._spin_slabs(L, 2, nside=nside)
+    a_slab, s_slab = healpix._spin_slabs(L, 2, nside=nside)
     assert a_slab is not None and s_slab is not None
-    assert utils._slab_bytes(a_slab) <= utils._SLAB_FUSE_MAX_BYTES
+    assert healpix._slab_bytes(a_slab) <= healpix._SLAB_FUSE_MAX_BYTES
 
-    tables = utils._spin_ring_analysis_tables(L, nside, maps.device)
-    got = utils._map2alm_once_slab_fused(maps, tables, ell, order, spin=2, nside=nside,
+    tables = rings._spin_ring_analysis_tables(L, nside, maps.device)
+    got = healpix._map2alm_once_slab_fused(maps, tables, ell, order, spin=2, nside=nside,
                                          L=L, L_work=L, slab=a_slab)
-    ref = utils._map2alm_once_slab_body(maps, tables, ell, order, spin=2, nside=nside,
+    ref = healpix._map2alm_once_slab_body(maps, tables, ell, order, spin=2, nside=nside,
                                         L=L, L_work=L, slab=a_slab)
     np.testing.assert_array_equal(np.asarray(got), np.asarray(ref))
 
     alm = jnp.asarray(_random_alms(rng, 2, utils.NmtAlmInfo(lmax), 2))
-    s_tables = utils._spin_ring_synthesis_tables(L, nside, alm.device)
-    got = utils._alm2map_core_slab_fused(alm, s_slab, s_tables, spin=2, nside=nside,
+    s_tables = rings._spin_ring_synthesis_tables(L, nside, alm.device)
+    got = healpix._alm2map_core_slab_fused(alm, s_slab, s_tables, spin=2, nside=nside,
                                          L=L, L_work=L)
-    ref = utils._alm2map_core_slab_body(alm, s_slab, s_tables, spin=2, nside=nside,
+    ref = healpix._alm2map_core_slab_body(alm, s_slab, s_tables, spin=2, nside=nside,
                                         L=L, L_work=L)
     np.testing.assert_array_equal(np.asarray(got), np.asarray(ref))
 
@@ -682,18 +685,18 @@ def test_traced_refinement_route_is_bit_identical_to_op_by_op(nside):
     lmax = 3 * nside - 1
     L = lmax + 1
     npix = 12 * nside ** 2
-    assert L <= utils._PALLAS_TRACED_MAX_L
+    assert L <= healpix._PALLAS_TRACED_MAX_L
     rng = np.random.default_rng(11)
     maps = jnp.asarray(rng.normal(size=(1, npix)))
-    ell, order = utils._ell_order_arrays(lmax)
+    ell, order = healpix._ell_order_arrays(lmax)
 
     # The gate's own condition: the band must be concrete device buffers before a
     # program is allowed to read it.
-    assert utils._trace_route_ready(nside, L)
+    assert healpix._trace_route_ready(nside, L)
 
-    ref = np.asarray(utils._map2alm_core_pallas_eager(
+    ref = np.asarray(healpix._map2alm_core_pallas_eager(
         maps, ell, order, nside=nside, L=L, L_work=L, n_iter=3, spin=0))
-    got = np.asarray(utils._map2alm_core_pallas_traced(
+    got = np.asarray(healpix._map2alm_core_pallas_traced(
         maps, ell, order, nside=nside, L=L, L_work=L, n_iter=3, spin=0))
     np.testing.assert_array_equal(got, ref)
 
@@ -717,11 +720,11 @@ def test_band_build_declines_inside_a_trace_instead_of_raising(monkeypatch):
     L = lmax + 1
     npix = 12 * nside ** 2
     rng = np.random.default_rng(13)
-    ell, order = utils._ell_order_arrays(lmax)
+    ell, order = healpix._ell_order_arrays(lmax)
     _theta_matrix.release()
 
     def scalar(maps_in):
-        return jnp.sum(jnp.abs(utils._map2alm_core_pallas(
+        return jnp.sum(jnp.abs(healpix._map2alm_core_pallas(
             maps_in[None, :], ell, order, nside=nside, L=L, L_work=L, n_iter=0,
             spin=0)))
 
@@ -746,7 +749,7 @@ def test_no_tracer_can_enter_the_table_caches():
     L = 3 * nside
     _theta_matrix.release()
 
-    out = jax.jit(lambda x: (utils._trace_route_ready(nside, L), x * 2.0)[1])(
+    out = jax.jit(lambda x: (healpix._trace_route_ready(nside, L), x * 2.0)[1])(
         jnp.ones(4))
     np.testing.assert_allclose(np.asarray(out), 2.0)
 
@@ -782,7 +785,7 @@ def test_shared_band_pair_is_bit_identical_to_two_transforms(monkeypatch, nside)
     lmax = 3 * nside - 1
     L = lmax + 1
     npix = 12 * nside ** 2
-    assert utils._shared_band_route(nside, L)[0]
+    assert healpix._shared_band_route(nside, L)[0]
     minfo = nmt.NmtMapInfo(None, (npix,))
     ainfo = nmt.NmtAlmInfo(lmax)
     rng = np.random.default_rng(23)
@@ -817,10 +820,10 @@ def test_shared_band_pair_declines_when_no_route_serves(monkeypatch):
     ainfo = nmt.NmtAlmInfo(L - 1)
     maps = jnp.asarray(np.zeros((1, npix)))
     assert utils.map2alm_pair(maps, maps, minfo, ainfo, n_iter=1) is not None
-    monkeypatch.setattr(utils, "_MATRIX_BAND_BUDGET", 0)
+    monkeypatch.setattr(healpix, "_MATRIX_BAND_BUDGET", 0)
     monkeypatch.setenv("GMASTER_SPIN0_MARCH", "0")
-    assert utils._shared_band_route(nside, L) == (False, False)
-    assert utils._march_pair_route(nside, L) is False
+    assert healpix._shared_band_route(nside, L) == (False, False)
+    assert healpix._march_pair_route(nside, L) is False
     assert utils.map2alm_pair(maps, maps, minfo, ainfo, n_iter=1) is None
 
 
@@ -843,8 +846,8 @@ def test_marched_pair_shares_one_recurrence(monkeypatch, nside):
     lmax = 3 * nside - 1
     L = lmax + 1
     npix = 12 * nside ** 2
-    assert utils._shared_band_route(nside, L) == (False, False)
-    assert utils._march_pair_route(nside, L) is True
+    assert healpix._shared_band_route(nside, L) == (False, False)
+    assert healpix._march_pair_route(nside, L) is True
     minfo = nmt.NmtMapInfo(None, (npix,))
     ainfo = nmt.NmtAlmInfo(lmax)
     rng = np.random.default_rng(29)
@@ -865,10 +868,10 @@ def test_paired_fold_footprint_grows_with_the_geometry():
     The estimate is a sum of `L * ntheta`-scale terms, and a formula slip that made it fall
     with Nside would refuse the small geometries that the pairing actually wins on.
     """
-    sizes = [utils._spin_march.fold_pair_bytes(n, 3 * n)
+    sizes = [healpix._spin_march.fold_pair_bytes(n, 3 * n)
              for n in (256, 512, 1024, 2048, 3072, 4096)]
     assert all(a < b for a, b in zip(sizes, sizes[1:]))
-    from gmaster import _march_v2
+    from gmaster._sht import march_v2 as _march_v2
 
     v2_sizes = [_march_v2.pair_bytes(3 * n, n)
                 for n in (256, 512, 1024, 2048, 4096)]
@@ -897,8 +900,8 @@ def test_paired_fold_gate_sides_at_the_measured_sizes(monkeypatch, nside, fits):
     verdicts are the same in an fp32-ring session (where they are conservative).
     """
     monkeypatch.setenv("GMASTER_SPIN0_MARCH", "1")
-    assert utils._spin_march.fold_pair_fits(nside, 3 * nside) is fits
-    assert utils._march_pair_route(nside, 3 * nside) is fits
+    assert healpix._spin_march.fold_pair_fits(nside, 3 * nside) is fits
+    assert healpix._march_pair_route(nside, 3 * nside) is fits
 
 
 @pytest.mark.skipif(not _HAS_NVIDIA_GPU, reason="requires an NVIDIA GPU")
@@ -918,13 +921,13 @@ def test_latitudinal_adjoint_hands_back_the_operand_dtype():
         utils.set_ring_precision("fp32")
         nside = 16
         L = 3 * nside
-        theta, weights, phase = utils._pallas_parameters(L, nside)
+        theta, weights, phase = healpix._pallas_parameters(L, nside)
         ftm = jnp.ones((4 * nside - 1, L), dtype=jnp.complex64)
 
         def stage(x):
-            return utils.scalar_forward_latitudinal(
+            return healpix.scalar_forward_latitudinal(
                 x, theta, weights, phase, L=L,
-                block_size=utils._pallas_block_size(nside))
+                block_size=healpix._pallas_block_size(nside))
 
         out, vjp = jax.vjp(stage, ftm)
         assert out.dtype == jnp.complex128
@@ -940,13 +943,13 @@ def test_paired_fold_declines_when_the_gate_refuses(monkeypatch):
     # The v2 CUDA march serves this geometry by default; this test is about the exact band /
     # Pallas route it replaced, so pin that route.
     monkeypatch.setenv("GMASTER_MARCH_V2", "0")
-    monkeypatch.setattr(utils._spin_march, "_PAIR_POOL_FACTOR", 10 ** 9)
+    monkeypatch.setattr(healpix._spin_march, "_PAIR_POOL_FACTOR", 10 ** 9)
     monkeypatch.setenv("GMASTER_SPIN0_MARCH", "1")
     nside = 64
     L = 3 * nside
     npix = 12 * nside ** 2
-    assert utils._spin_march.fold_requested(nside, L) is True
-    assert utils._march_pair_route(nside, L) is False
+    assert healpix._spin_march.fold_requested(nside, L) is True
+    assert healpix._march_pair_route(nside, L) is False
     minfo = nmt.NmtMapInfo(None, (npix,))
     ainfo = nmt.NmtAlmInfo(L - 1)
     maps = jnp.asarray(np.zeros((1, npix)))
@@ -970,7 +973,7 @@ def test_synthesis_tile_is_per_spin_and_still_powers_of_two(nside):
     512 (453.7 ms at 2048 against 508.1 at 256 and 524.6 at 1024).  See the `_ST0` note in
     `gmaster/_spin_march_pallas.py`.
     """
-    from gmaster import _spin_march_pallas as smp
+    from gmaster._sht import spin_march as smp
 
     ntheta = 4 * nside - 1
     north = (ntheta + 1) // 2
@@ -1001,8 +1004,8 @@ def test_synth_order_window_fills_the_launch_ceiling(nside):
     64-window value, not a 256-window one).  So the synthesis width must be independent of the
     analysis windows, and this asserts that at every size.
     """
-    from gmaster import _spin_march_pallas as smp
-    from gmaster import _spin_slice as ss
+    from gmaster._sht import spin_march as smp
+    from gmaster._sht import spin_slice as ss
 
     L = 3 * nside - 1
     north = (4 * nside - 1 + 1) // 2
@@ -1047,7 +1050,7 @@ def test_pool_headroom_survives_a_backend_without_allocator_stats(monkeypatch):
     `None` on the CPU backend instead of raising, so the very next line (`stats.get("pool_bytes")`)
     raised `AttributeError: 'NoneType' object has no attribute 'get'` out of `slabs_for`.
     """
-    from gmaster import _spin_slice as ss
+    from gmaster._sht import spin_slice as ss
 
     class _Silent:
         def memory_stats(self):
@@ -1078,7 +1081,7 @@ def test_polar_refinement_trace_gate_sides_at_the_measured_sizes(nside, traced):
     """
     L_work = 3 * nside
     maps = jnp.zeros((2, 12 * nside ** 2), dtype=jnp.float64)
-    assert utils._spin_slab_trace_ready(maps, L_work) is traced
+    assert healpix._spin_slab_trace_ready(maps, L_work) is traced
 
 
 @pytest.mark.skipif(not _HAS_NVIDIA_GPU, reason="requires an NVIDIA GPU")
@@ -1094,7 +1097,7 @@ def test_polar_refinement_stays_eager_under_a_trace():
     seen = []
 
     def probe(maps_in):
-        seen.append(utils._spin_slab_trace_ready(maps_in, 192))
+        seen.append(healpix._spin_slab_trace_ready(maps_in, 192))
         return 0.0
 
     jax.eval_shape(probe, jnp.zeros((2, 12 * 64 ** 2), dtype=jnp.float64))
@@ -1115,17 +1118,17 @@ def test_traced_refinement_loop_matches_the_eager_loop(nside):
     npix = 12 * nside ** 2
     rng = np.random.default_rng(11)
     maps = jnp.asarray(rng.normal(size=(2, npix)) * 1e-3)
-    ell, order = utils._ell_order_arrays(lmax)
-    a_slab, s_slab = utils._spin_slabs(L, 2, nside=nside)
+    ell, order = healpix._ell_order_arrays(lmax)
+    a_slab, s_slab = healpix._spin_slabs(L, 2, nside=nside)
     assert a_slab is not None and s_slab is not None
 
-    traced = utils._map2alm_core_slab(maps, ell, order, spin=2, nside=nside, L=L,
+    traced = healpix._map2alm_core_slab(maps, ell, order, spin=2, nside=nside, L=L,
                                       L_work=L, n_iter=2, analysis_slab=a_slab,
                                       synthesis_slab=s_slab)
-    eager = utils._map2alm_once_slab(maps, ell, order, spin=2, nside=nside, L=L,
+    eager = healpix._map2alm_once_slab(maps, ell, order, spin=2, nside=nside, L=L,
                                      L_work=L, slab=a_slab)
     for _ in range(2):
-        eager = utils._map2alm_iteration_slab(
+        eager = healpix._map2alm_iteration_slab(
             eager, maps, ell, order, spin=2, nside=nside, L=L, L_work=L,
             analysis_slab=a_slab, synthesis_slab=s_slab)
     np.testing.assert_array_equal(np.asarray(traced), np.asarray(eager))
@@ -1134,7 +1137,7 @@ def test_traced_refinement_loop_matches_the_eager_loop(nside):
 def test_chunked_rows_concatenates_static_slices():
     """Polar-cap chirp-Z batches are a concatenate of static row slices, not a rewrite."""
     rows = jnp.arange(10, dtype=jnp.float64)[:, None] * jnp.array([1.0, 2.0, 3.0])
-    got = utils._chunked_rows(10, 3, lambda lo, hi: rows[lo:hi])
+    got = rings._chunked_rows(10, 3, lambda lo, hi: rows[lo:hi])
     np.testing.assert_array_equal(np.asarray(got), np.asarray(rows))
 
 
@@ -1155,21 +1158,21 @@ def test_polar_cap_chunking_matches_the_unchunked_ring_stage():
         rng.normal(size=(ntheta, 2 * L - 1))
         + 1j * rng.normal(size=(ntheta, 2 * L - 1))
     )
-    a_tables = utils._spin_ring_analysis_tables(L, nside)
-    s_tables = utils._spin_ring_synthesis_tables(L, nside)
-    fwd0 = np.asarray(utils._forward_ring_fft_full(signal, a_tables, L=L, nside=nside))
-    inv0 = np.asarray(utils._inverse_ring_fft_complex(centered, s_tables, L=L, nside=nside))
-    orig = utils._CAP_CHUNK_ROWS
+    a_tables = rings._spin_ring_analysis_tables(L, nside)
+    s_tables = rings._spin_ring_synthesis_tables(L, nside)
+    fwd0 = np.asarray(rings._forward_ring_fft_full(signal, a_tables, L=L, nside=nside))
+    inv0 = np.asarray(rings._inverse_ring_fft_complex(centered, s_tables, L=L, nside=nside))
+    orig = rings._CAP_CHUNK_ROWS
     try:
-        utils._CAP_CHUNK_ROWS = 4
-        utils._forward_ring_fft_full.clear_cache()
-        utils._inverse_ring_fft_complex.clear_cache()
-        fwd1 = np.asarray(utils._forward_ring_fft_full(signal, a_tables, L=L, nside=nside))
-        inv1 = np.asarray(utils._inverse_ring_fft_complex(centered, s_tables, L=L, nside=nside))
+        rings._CAP_CHUNK_ROWS = 4
+        rings._forward_ring_fft_full.clear_cache()
+        rings._inverse_ring_fft_complex.clear_cache()
+        fwd1 = np.asarray(rings._forward_ring_fft_full(signal, a_tables, L=L, nside=nside))
+        inv1 = np.asarray(rings._inverse_ring_fft_complex(centered, s_tables, L=L, nside=nside))
     finally:
-        utils._CAP_CHUNK_ROWS = orig
-        utils._forward_ring_fft_full.clear_cache()
-        utils._inverse_ring_fft_complex.clear_cache()
+        rings._CAP_CHUNK_ROWS = orig
+        rings._forward_ring_fft_full.clear_cache()
+        rings._inverse_ring_fft_complex.clear_cache()
     np.testing.assert_array_equal(fwd1, fwd0)
     np.testing.assert_array_equal(inv1, inv0)
 
@@ -1177,9 +1180,9 @@ def test_polar_cap_chunking_matches_the_unchunked_ring_stage():
 def test_iteration_split_engages_at_nside_4096_and_not_at_nside_8():
     """XLA's one-temp fused iteration is 26 GiB at Nside 4096; the gate is that footprint."""
     nside, L_work = 4096, 3 * 4096
-    assert (4 * nside - 1) * 2 * L_work * 16 > utils._ITERATION_SPLIT_BYTES
+    assert (4 * nside - 1) * 2 * L_work * 16 > healpix._ITERATION_SPLIT_BYTES
     nside_s, L_s = 8, 24
-    assert (4 * nside_s - 1) * 2 * L_s * 16 <= utils._ITERATION_SPLIT_BYTES
+    assert (4 * nside_s - 1) * 2 * L_s * 16 <= healpix._ITERATION_SPLIT_BYTES
 
 
 def test_split_refinement_iteration_matches_fused_program(monkeypatch):
@@ -1197,7 +1200,7 @@ def test_split_refinement_iteration_matches_fused_program(monkeypatch):
     rng = np.random.default_rng(3)
     maps = jnp.asarray(rng.normal(size=(2, npix)))
     fused = np.asarray(nmt.map2alm(maps, 2, minfo, ainfo, n_iter=1))
-    monkeypatch.setattr(utils, "_ITERATION_SPLIT_BYTES", 0)
+    monkeypatch.setattr(healpix, "_ITERATION_SPLIT_BYTES", 0)
     split = np.asarray(nmt.map2alm(maps, 2, minfo, ainfo, n_iter=1))
     np.testing.assert_allclose(split, fused, atol=3e-13)
     ref_minfo = reference.NmtMapInfo(None, (npix,))
@@ -1213,9 +1216,9 @@ def test_make_room_drops_ring_tables_only_when_the_pool_is_short(monkeypatch):
     and a dummy device object is what segfaulted later tests in this process.
     """
     nside, L = 8, 16
-    utils.drop_ring_tables()
-    utils._spin_ring_analysis_tables(L, nside)
-    assert utils._spin_ring_analysis_tables.cache_info().currsize > 0
+    rings.drop_ring_tables()
+    rings._spin_ring_analysis_tables(L, nside)
+    assert rings._spin_ring_analysis_tables.cache_info().currsize > 0
     inner = jax.devices()[0]
 
     class _Wrap:
@@ -1229,12 +1232,12 @@ def test_make_room_drops_ring_tables_only_when_the_pool_is_short(monkeypatch):
             return getattr(inner, name)
 
     monkeypatch.setattr(jax, "devices", lambda: [_Wrap({"bytes_limit": 10 ** 12, "bytes_in_use": 10})])
-    utils.make_room(10 ** 6)
-    assert utils._spin_ring_analysis_tables.cache_info().currsize > 0
+    _config.make_room(10 ** 6)
+    assert rings._spin_ring_analysis_tables.cache_info().currsize > 0
 
     monkeypatch.setattr(jax, "devices", lambda: [_Wrap({"bytes_limit": 100, "bytes_in_use": 90})])
-    utils.make_room(50)
-    assert utils._spin_ring_analysis_tables.cache_info().currsize == 0
+    _config.make_room(50)
+    assert rings._spin_ring_analysis_tables.cache_info().currsize == 0
 
 
 def test_legendre_pool_bytes_is_unbounded_when_the_backend_is_silent(monkeypatch):
@@ -1244,7 +1247,7 @@ def test_legendre_pool_bytes_is_unbounded_when_the_backend_is_silent(monkeypatch
     to raise `AttributeError: 'NoneType' object has no attribute 'get'` out of
     `_synth_band`, which is the first thing `test_contracts_reduce_*` calls.
     """
-    from gmaster import _theta_matrix
+    from gmaster._sht import theta_matrix as _theta_matrix
 
     class _Silent:
         def memory_stats(self):
@@ -1272,7 +1275,7 @@ def test_v2_march_pair_matches_two_transforms(nside):
     the reduction tree over a tile differs and the result moves by the float32 rounding of the
     emit (measured 2.6e-07 relative at Nside 1024).  Its bar is that distance, not equality.
     """
-    from gmaster import _march_v2
+    from gmaster._sht import march_v2 as _march_v2
 
     if not _march_v2.enabled(3 * nside):
         pytest.skip("v2 march unavailable")
@@ -1331,8 +1334,7 @@ def test_ring_fold_residual_is_fft_of_ifft(nside):
     A ring with fewer pixels than 2L aliases, so the check runs through the polar caps as well as
     the belt; the fold sums in float64 and the bar is the complex64 rounding of the ring stage.
     """
-    from gmaster import _march_v2
-    from gmaster import utils
+    from gmaster._sht import march_v2 as _march_v2
 
     L = 3 * nside
     if not _march_v2.fold_available():
@@ -1341,9 +1343,9 @@ def test_ring_fold_residual_is_fft_of_ifft(nside):
     shape = (4 * nside - 1, L)
     F = jax.numpy.asarray(rng.normal(size=shape) + 1j * rng.normal(size=shape))
     Mf = jax.numpy.asarray((rng.normal(size=shape) + 1j * rng.normal(size=shape)).astype(np.complex64))
-    maps = jax.numpy.real(utils._finish_inverse_pallas(F, L=L, nside=nside))
-    explicit = np.asarray(utils._forward_ring_fft_positive(
-        maps, utils._ring_analysis_tables(L, nside), L=L, nside=nside)) - np.asarray(Mf)
+    maps = jax.numpy.real(healpix._finish_inverse_pallas(F, L=L, nside=nside))
+    explicit = np.asarray(rings._forward_ring_fft_positive(
+        maps, rings._ring_analysis_tables(L, nside), L=L, nside=nside)) - np.asarray(Mf)
     folded = np.asarray(_march_v2.ring_fold_residual(F, Mf, nside=nside))
     assert np.max(np.abs(folded - explicit)) < 2e-6 * np.max(np.abs(explicit))
 
@@ -1357,8 +1359,9 @@ def test_dc_latitudinal_matches_march(nside):
     The router only hands it L >= 6144, so it is exercised here directly on small geometries:
     both engines are float32-class, and their distance is that of the two against fp64.
     """
-    from gmaster import _dc_lat, _march_v2
-    from gmaster.utils import _stable_thetas
+    from gmaster._sht import dc as _dc_lat
+    from gmaster._sht import march_v2 as _march_v2
+    from gmaster._sht.healpix import _stable_thetas
     from s2fft.utils import healpix_ffts, quadrature_jax
 
     L = 3 * nside
@@ -1389,7 +1392,8 @@ def test_dc_latitudinal_matches_march(nside):
 @pytest.mark.parametrize("nside", [64, 128])
 def test_dc_spin2_latitudinal_matches_march(nside):
     """The divide-and-conquer engine's spin-2 route has the march's spin-2 contract."""
-    from gmaster import _dc_lat, _march_v2
+    from gmaster._sht import dc as _dc_lat
+    from gmaster._sht import march_v2 as _march_v2
 
     L = 3 * nside
     if _dc_lat._build() is None or not _march_v2.fold_available():
@@ -1419,8 +1423,8 @@ def test_dc_spin2_latitudinal_matches_march(nside):
 @pytest.mark.parametrize("spin", [0, 2])
 def test_dc_node_space_refinement_matches_tree_space(monkeypatch, spin):
     """Refinement in the D&C engine's node space (V^T V = I) is the tree-space refinement."""
-    from gmaster import _dc_lat, _march_v2
-    from gmaster import utils
+    from gmaster._sht import dc as _dc_lat
+    from gmaster._sht import march_v2 as _march_v2
 
     if _dc_lat._build() is None or not _march_v2.fold_available():
         pytest.skip("CUDA libraries unavailable")
@@ -1432,7 +1436,7 @@ def test_dc_node_space_refinement_matches_tree_space(monkeypatch, spin):
     maps = [rng.normal(size=npix)] if spin == 0 else [rng.normal(size=npix), rng.normal(size=npix)]
     out = []
     for node_space in (False, True):
-        monkeypatch.setattr(utils, "_NODE_SPACE", node_space)
+        monkeypatch.setattr(healpix, "_NODE_SPACE", node_space)
         field = nmt.NmtField(mask, maps, n_iter=3, spin=spin)
         out.append(np.asarray(field.alm))
     assert np.max(np.abs(out[1] - out[0])) < 2e-5 * np.max(np.abs(out[0]))

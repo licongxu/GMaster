@@ -109,6 +109,7 @@ __all__ = [
     "set_ring_precision",
     "set_table_precision",
     "set_tol_pinv_default",
+    "ring_dtype",
     "table_dtype",
     "synfast_spherical",
     "synfast_flat",

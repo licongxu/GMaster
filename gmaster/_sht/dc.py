@@ -17,7 +17,7 @@ final sum over ``j`` is another 1-D FMM from the Gauss nodes to the rings.  Ever
 march's ``O(L^2 N_ring) = O(L^3)``.  Analysis is the exact adjoint (same plan, transposed kernels).
 
 The plan depends on the geometry only (``L`` and the ring colatitudes) and is built once on the
-host (``_cpu/dc_plan.cpp``), cached on disk, and kept on the device.  Contract of the two public
+host (``_native/cpu/dc_plan.cpp``), cached on disk, and kept on the device.  Contract of the two public
 calls is the folded march's (``_march_v2.forward/inverse_latitudinal_positive``), so the router
 can swap engines per geometry.
 """
@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import ctypes
 import hashlib
+import logging
 import math
 import os
 import subprocess
@@ -35,8 +36,9 @@ import jax.numpy as jnp
 import numpy as np
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
-_CU = os.path.join(_HERE, "_cuda", "dc_lat.cu")
-_CC = os.path.join(_HERE, "_cpu", "dc_plan.cpp")
+_NATIVE = os.path.join(os.path.dirname(_HERE), "_native")
+_CU = os.path.join(_NATIVE, "cuda", "dc_lat.cu")
+_CC = os.path.join(_NATIVE, "cpu", "dc_plan.cpp")
 _CACHE = os.environ.get("GMASTER_CUDA_CACHE", os.path.join(os.path.expanduser("~"), ".cache", "gmaster"))
 # Below this bandlimit the march is at least as fast: at L 3072 this route is 0.98x (synthesis) / 0.91x
 # (analysis) of it, at 6144 1.77x / 1.66x (`.qwen/tmp/s38/dc_vs_march.py`, GPU0).
@@ -73,7 +75,7 @@ def _build():
     if _LIB is not None or _LIB_ERROR is not None:
         return _LIB
     try:
-        from ._march_v2 import _nvcc
+        from .march_v2 import _nvcc
 
         devs = [d for d in jax.devices() if d.platform == "gpu"]
         if not devs:
@@ -129,7 +131,7 @@ def enabled(L=None) -> bool:
     ``_MAX_L``, including below the auto window. ``"auto"`` keeps ``[_MIN_L, _MAX_L]`` and
     honours ``GMASTER_DC=0``.
     """
-    from .utils import nmt_params
+    from .._config import nmt_params
 
     choice = nmt_params.latitudinal_method
     if choice == "march":
@@ -145,7 +147,7 @@ def enabled(L=None) -> bool:
 
 
 def _ring_x(L, nside, spin=0):
-    from .utils import _stable_thetas
+    from .healpix import _stable_thetas
 
     theta = np.asarray(_stable_thetas(L, nside), dtype=np.float64)
     # spin 0: northern rings, pole to equator; spin > 0: every ring, pole to pole
@@ -161,6 +163,10 @@ def _host_plan(L, nside, spin=0):
     if os.path.exists(path):
         with np.load(path) as f:
             return {k: f[k] for k in f.files}
+    logging.getLogger("gmaster").warning(
+        "Building the divide-and-conquer plan for L=%d, spin %d on %d host threads (one-time; "
+        "minutes at Nside >= 2048, cached in %s). set_latitudinal_method('march') skips it.",
+        L, spin, _THREADS, _CACHE)
     xs = np.ascontiguousarray(x)
     plan.dc_plan(int(L), xs.ctypes.data_as(ctypes.POINTER(ctypes.c_double)), xs.size,
                  _THREADS, _DIRECT_MAX, _DIRECT_THREADS, _CD_SKIP, int(spin))
@@ -606,13 +612,13 @@ def cd_inverse_spin_raw(w, phase, *, L, spin, nside):
 
 
 # ------------------------------------------------------------------ one-program node-space refinement
-# The spin-0 refinement loop (`utils`) was ~20 eagerly dispatched programs per field -- ~15 ms of
+# The spin-0 refinement loop (`healpix`) was ~20 eagerly dispatched programs per field -- ~15 ms of
 # host gaps at Nside 2048 against 93 ms of kernels.  Here it is one program, with the plan arrays as
 # arguments (never captured as constants): ring spectra in, `(ell, order)`-packed alms out.
 
 @partial(jax.jit, static_argnames=("L", "nside", "static", "n_iter"))
 def _refine_s0_impl(ftms, weights, phase, args, fac, inv, ell, order, *, L, nside, static, n_iter):
-    from ._march_v2 import ring_fold_residual
+    from .march_v2 import ring_fold_residual
 
     w = _cd_forward_impl(ftms, weights, -phase, args, L=L, nside=nside, static=static)
     for _ in range(n_iter):

@@ -32,7 +32,7 @@ float64 and are summed across tiles, the same discipline as `_spin_slice._reduce
 
 Everything the kernel reads is computed inside the trace from `cos(theta)` and static (L, nside):
 no table is materialised on the host, on the device between calls, or in the module.  Selected by
-`GMASTER_SPIN2_MARCH=1` at the seam in :func:`gmaster.utils._forward_latitudinal`; off by default,
+`GMASTER_SPIN2_MARCH=1` at the seam in :func:`gmaster._sht.healpix._forward_latitudinal`; off by default,
 and any spin other than +2 (or a non-NVIDIA device) keeps the shipped route.
 """
 from __future__ import annotations
@@ -49,8 +49,8 @@ from jax.experimental.pallas import triton as plt
 from jax.scipy.special import gammaln
 from s2fft.sampling import s2_samples
 
-from gmaster import _march_v2
-from gmaster._cuda_gpu import on_cuda_gpu
+from gmaster._sht import march_v2 as _march_v2
+from gmaster._sht.cuda_gpu import on_cuda_gpu
 
 SPIN = 2
 NC = 4                       # direct re/im, mirror re/im -- the same split as `_rhs_forward`
@@ -84,10 +84,10 @@ def slice_declined(L, nside) -> bool:
     (`.qwen/tmp/score_s2_routes_1024.log`: 13 255 ms against ducc0's 112.9 ms, 0.01x).  fp32 tables
     are the cheapest the layout can ever be, so testing them is what "cannot exist" means.
     """
-    from gmaster import _spin_slice as ss
-    from gmaster import utils
+    from gmaster._config import table_dtype
+    from gmaster._sht import spin_slice as ss
 
-    return ss.triangle_bytes(nside, L, utils.table_dtype()) > ss._SLAB_BUDGET
+    return ss.triangle_bytes(nside, L, table_dtype()) > ss._SLAB_BUDGET
 
 
 def march_requested(spin, *, L=None, nside=None) -> bool:
@@ -530,7 +530,7 @@ def _march_windows(L, ntile, spin):
     `rel = 3.69e-06` -- digit-for-digit the narrow value -- in every pipeline process tried, against
     2/2 `nan` at the same cell before the fix (`.qwen/tmp/pipe_trim_wide.log`, HANDOFF session 29).
     """
-    from gmaster import _spin_slice as ss
+    from gmaster._sht import spin_slice as ss
 
     mb = ss._MARCH_M_BLOCK
     if mb * ntile > _MARCH_GRID_CAP:
@@ -558,7 +558,7 @@ def _synth_windows(L, ntile, spin):
     route keeps `_march_windows`: growing its window past the ceiling does not widen anything, it
     trips the fallback to `_M_BLOCK` and costs 1.37x at 2048.
     """
-    from gmaster import _spin_slice as ss
+    from gmaster._sht import spin_slice as ss
 
     if int(spin) != 0 or int(ntile) < 4:
         return _march_windows(L, ntile, spin)
@@ -571,11 +571,11 @@ def _synth_windows(L, ntile, spin):
 
 @partial(jax.jit, static_argnames=("L", "spin", "nside"))
 def _forward_impl(ftm, *, L, spin, nside):
-    from gmaster import _spin_slice as ss
+    from gmaster._sht import spin_slice as ss
 
     ftm = jnp.asarray(ftm)
     theta = (jnp.asarray(s2_samples.thetas(L, "healpix", nside), dtype=jnp.float64)
-             + 8 * jnp.finfo(jnp.float64).eps)      # the same grid `utils._stable_thetas` gives
+             + 8 * jnp.finfo(jnp.float64).eps)      # the same grid `healpix._stable_thetas` gives
     ntheta = theta.shape[0]
     ntile = -(-ntheta // _TILE)
     npad = ntile * _TILE
@@ -653,7 +653,7 @@ def fold_requested(nside, L) -> bool:
     band, measured against ducc0 in the scoring runs below, against 3.4e-07 for the kernel it
     replaces.
     """
-    from gmaster import utils
+    from gmaster._sht import healpix
 
     on_gpu = _on_nvidia()
     flag = os.environ.get("GMASTER_SPIN0_MARCH")
@@ -661,7 +661,7 @@ def fold_requested(nside, L) -> bool:
         return flag == "1" and (on_gpu or _march_v2.enabled(L))
     if _march_v2.enabled(L):
         return True
-    return on_gpu and not utils._prefer_theta_band(nside, L, 0)
+    return on_gpu and not healpix._prefer_theta_band(nside, L, 0)
 
 
 # Demand the paired fold may put on the allocator, judged against the device pool.  The two
@@ -729,7 +729,7 @@ def fold_synth_requested(nside, L) -> bool:
     `4096 0 alm2map 2022.3 10050.4 0.20x`).  Its own flag so the two directions can be A/B'd apart;
     unset falls back to `GMASTER_SPIN0_MARCH` so one switch still flips the whole spin-0 route.
     """
-    from gmaster import utils
+    from gmaster._sht import healpix
 
     on_gpu = _on_nvidia()
     flag = os.environ.get("GMASTER_SPIN0_MARCH_SYNTH")
@@ -739,7 +739,7 @@ def fold_synth_requested(nside, L) -> bool:
         return flag == "1" and (on_gpu or _march_v2.enabled(L))
     if _march_v2.enabled(L):
         return True
-    return on_gpu and not utils._prefer_theta_band(nside, L, 0)
+    return on_gpu and not healpix._prefer_theta_band(nside, L, 0)
 
 
 def _fold_analyze(positives, weights, phase, *, L, nside):
@@ -751,13 +751,12 @@ def _fold_analyze(positives, weights, phase, *, L, nside):
     `4k:4k+4` and add a contraction to a row that is being computed anyway, instead of a second
     march over the same lane count.
     """
-    from gmaster import utils
-    from gmaster import _spin_slice as ss
+    from gmaster._sht import healpix
 
     positives = [jnp.asarray(p) for p in positives]
     weights = jnp.asarray(weights)
     phase = jnp.asarray(phase)
-    theta = jnp.asarray(utils._stable_thetas(L, nside), dtype=jnp.float64)
+    theta = jnp.asarray(healpix._stable_thetas(L, nside), dtype=jnp.float64)
     ntheta = theta.shape[0]
     north = (ntheta + 1) // 2
     ntile = -(-north // _TILE)
@@ -1193,7 +1192,7 @@ def _synth_coeff(flm, m0, mb, L, *, mirror):
     float32 coefficient alone is re-spent at every degree of the same lane and its error grows
     like L * 2**-24 (measured 5.9e-06 at Nside 32).
     """
-    from gmaster import _spin_slice as ss
+    from gmaster._sht import spin_slice as ss
 
     ms = m0 + jnp.arange(mb)
     cols = L - 1 + ms if not mirror else L - 1 - ms
@@ -1248,7 +1247,6 @@ def _synth_coeff0(alm, m0, mb, L, *, mirror):
 
 @partial(jax.jit, static_argnames=("L", "spin", "nside"))
 def _inverse_impl(flm, *, L, spin, nside):
-    from gmaster import _spin_slice as ss
 
     flm = jnp.asarray(flm)
     theta = (jnp.asarray(s2_samples.thetas(L, "healpix", nside), dtype=jnp.float64)
@@ -1311,11 +1309,10 @@ def _inverse_fold_impl(positive, phase, *, L, nside):
     `_theta_matrix._inverse` uses, including dropping the equator lane, which is its own partner and
     contributes only through the direct accumulator.
     """
-    from gmaster import _spin_slice as ss
-    from gmaster import utils
+    from gmaster._sht import healpix
 
     positive = jnp.asarray(positive)
-    theta = jnp.asarray(utils._stable_thetas(L, nside), dtype=jnp.float64)
+    theta = jnp.asarray(healpix._stable_thetas(L, nside), dtype=jnp.float64)
     ntheta = theta.shape[0]
     north = (ntheta + 1) // 2
     st0 = _synth_tile(0, north)
@@ -1350,7 +1347,7 @@ def _inverse_fold_impl(positive, phase, *, L, nside):
 def inverse_latitudinal_positive(positive, phase, *, L, nside):
     """Folded spin-0 synthesis: `(L, L)` positive-m block in, `(4*nside-1, L)` complex out.
 
-    Same contract as `_theta_matrix.inverse_latitudinal` / `utils.scalar_inverse_latitudinal`
+    Same contract as `_theta_matrix.inverse_latitudinal` / `sht_pallas.scalar_inverse_latitudinal`
     (ring phi phase applied, `sqrt((2l+1)/4pi)` baked in), without the Legendre band.
     """
     if _march_v2.enabled(L):
@@ -1362,7 +1359,7 @@ def inverse_latitudinal(flm, *, L, spin, nside):
     """Synthesis latitudinal step with no Wigner-d table.
 
     ``(L, 2L-1)`` complex in (``flm[ell, L-1+m]``) to ``(4*nside-1, 2L)`` complex, the contract
-    `utils._inverse_latitudinal` has today; the kernel is the same certified ``d^l_(m,-2)`` the
+    `healpix._inverse_latitudinal` has today; the kernel is the same certified ``d^l_(m,-2)`` the
     analysis march uses, measured against the shipped route at rel 1e-14 with unit scalar
     (``.qwen/tmp/spin2_synth_row2_64.log``).
     """

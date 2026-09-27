@@ -11,7 +11,7 @@ import pytest
 
 @pytest.mark.march_v2
 def test_cpu_march_library_builds():
-    from gmaster import _march_v2
+    from gmaster._sht import march_v2 as _march_v2
 
     lib = _march_v2._build_cpu()
     assert lib is not None, _march_v2._CPU_LIB_ERROR
@@ -35,7 +35,7 @@ import jax.numpy as jnp
 import numpy as np
 import pymaster as ref
 import gmaster as nmt
-from gmaster import _march_v2
+from gmaster._sht import march_v2 as _march_v2
 assert jax.default_backend() == "cpu", jax.devices()
 assert _march_v2.enabled(96), _march_v2.unavailable_reason()
 nside, spin = 32, 0

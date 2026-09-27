@@ -34,8 +34,8 @@ import jax
 import jax.numpy as jnp
 from jax import lax
 
-from gmaster._cuda_gpu import on_cuda_gpu
-from gmaster._sht_pallas import (
+from gmaster._sht.cuda_gpu import on_cuda_gpu
+from gmaster._sht.sht_pallas import (
     _diagonal_normalization,
     _initial_factor,
     _normalized_coefficients_numpy,
@@ -167,7 +167,7 @@ def _band(geometry):
     `ensure_compile_time_eval`, so this returns None and the caller falls back
     to the fused kernel: gradients keep flowing, they just take the kernel.
     """
-    from gmaster import utils
+    from gmaster._sht import healpix
 
     cached = _BAND_CACHE.get(geometry)
     if cached is not None:
@@ -178,7 +178,7 @@ def _band(geometry):
     store = jnp.dtype(store)
     if geometry not in _BAND_CACHE and len(_BAND_CACHE) >= _BAND_MAX_GEOMETRIES:
         _BAND_CACHE.clear()
-    theta = utils._stable_thetas(L, nside)
+    theta = healpix._stable_thetas(L, nside)
     diag = jnp.asarray(_diagonal_normalization(L))
     c1_np, c2_np = _normalized_coefficients_numpy(L, 0, L)
 
@@ -195,7 +195,7 @@ def _band(geometry):
         # into the parity halves.  Chosen because the scan route pays an XLA
         # compile per block, which is 99% of a build (340 s for 36.73 GiB at
         # Nside 1024, against 5.14 s for the same band here).
-        from gmaster import _band_pallas
+        from gmaster._sht import band_pallas as _band_pallas
 
         builder = partial(_band_pallas.build_pair, theta, L, diag, c1_np, c2_np)
     else:
@@ -315,9 +315,9 @@ def band_geometry(nside, L):
     cached fp64 band must not be handed to a caller that asked for fp32 or vice
     versa, so the dtype is part of the key rather than an implicit input.
     """
-    from gmaster import utils
+    from gmaster._config import table_dtype
 
-    return (nside, L, BLOCK, utils.table_dtype())
+    return (nside, L, BLOCK, table_dtype())
 
 
 def _contract_theta(slab, chan):

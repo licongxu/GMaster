@@ -37,7 +37,7 @@ import jax
 import jax.numpy as jnp
 from jax import lax
 
-from . import _march_v2 as v2
+from ._sht import march_v2 as v2
 
 __all__ = [
     "synthesis_general",
@@ -47,10 +47,8 @@ __all__ = [
 ]
 
 # --------------------------------------------------------------------------- cufinufft loading
-_REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-_NU_PATH = os.environ.get(
-    "GMASTER_CUFINUFFT_PATH", os.path.join(_REPO, ".qwen", "tmp", "nu_pkgs")
-)
+# Optional extra directory to import `cufinufft` from (e.g. a target of `pip install --target`).
+_NU_PATH = os.environ.get("GMASTER_CUFINUFFT_PATH")
 
 
 @lru_cache(maxsize=1)
@@ -221,7 +219,7 @@ def drop_tables():
 def _scale(L, spin):
     """``sqrt((2l+1)/4pi) (-1)^m``: the closed form the march kernel expects (see
     ``_march_v2._fold_synthesise`` / ``_inverse_impl``), times the ``(-1)^s`` of the s2fft
-    spin-harmonic convention (``utils._finish_inverse_s2fft``)."""
+    spin-harmonic convention (``healpix._finish_inverse_s2fft``)."""
     norm = jnp.sqrt((2.0 * jnp.arange(L, dtype=jnp.float64) + 1.0) / (4.0 * jnp.pi))
     rowsign = 1.0 - 2.0 * (jnp.arange(L) % 2).astype(jnp.float64)
     return ((-1.0) ** abs(spin)) * norm[:, None] * rowsign[None, :]

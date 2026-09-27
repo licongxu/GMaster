@@ -11,7 +11,7 @@ On HEALPix the latitudinal step is a *single* contraction against the
     flm[ell, L-1+m] = sum_theta slice[theta, ell, m] * ftm[theta, L+m]
 
 (the ``+1`` on the ftm column is s2fft's HEALPix Fourier padding). Verified exact
-against ``utils._forward_latitudinal`` to <1e-15 for spin +/-2 and +/-1 -- the path
+against ``healpix._forward_latitudinal`` to <1e-15 for spin +/-2 and +/-1 -- the path
 that already agrees with NaMaster -- and its transpose reproduces the synthesis
 step to the same accuracy.
 
@@ -65,7 +65,7 @@ from jax import lax
 
 from s2fft.recursions.price_mcewen import generate_precomputes_jax
 
-from gmaster._cuda_gpu import on_cuda_gpu
+from gmaster._sht.cuda_gpu import on_cuda_gpu
 
 THETA_CONTIG = "theta_contig"  # (m, ell, theta) -- analysis reduces over theta
 ELL_CONTIG = "ell_contig"  # (m, theta, ell) -- synthesis reduces over ell
@@ -465,7 +465,7 @@ def _build_or_none(theta, L, spin, want_theta, want_ell, store=jnp.float64):
                 raise
         _CACHE.clear()
         gc.collect()
-        from . import _theta_matrix
+        from . import theta_matrix as _theta_matrix
         _theta_matrix.release()
     return None
 
@@ -507,9 +507,9 @@ def slabs_for(theta, *, L, spin, nside):
     256).  ``(None, None)`` means the caller keeps the generic scatter
     loop: too large, or a trace context with nothing concrete to cache.
     """
-    from . import utils
+    from .._config import table_dtype
 
-    store = utils.table_dtype()
+    store = table_dtype()
     tri = triangle_bytes(nside, L, store)
     if tri > _SLAB_BUDGET:
         return None, None
@@ -531,7 +531,7 @@ def slabs_for(theta, *, L, spin, nside):
         # costs more than that rebuild by a wide margin, so take its room rather
         # than decline.  If that still is not enough, decline: the generic path is
         # slow but never out of memory.
-        from . import _theta_matrix
+        from . import theta_matrix as _theta_matrix
         _theta_matrix.release()
         if need > _pool_headroom():
             return None, None
@@ -597,7 +597,7 @@ def forward_latitudinal(ftm, slab, *, L):
     :func:`_kernel_contract` for the measured reason).
     """
     if _kernel_contract(slab):
-        from gmaster._spin_contract_pallas import forward
+        from gmaster._sht.spin_contract import forward
 
         return forward(slab, ftm, L=L)
     return _forward_latitudinal_xla(ftm, slab, L=L)
@@ -668,7 +668,7 @@ def inverse_latitudinal(flm, slab, *, L):
     with XLA.
     """
     if _kernel_contract(slab, synthesis=True):
-        from gmaster._spin_contract_pallas import inverse
+        from gmaster._sht.spin_contract import inverse
 
         return inverse(slab, flm, L=L)
     return _inverse_latitudinal_xla(flm, slab, L=L)
