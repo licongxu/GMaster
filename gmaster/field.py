@@ -196,6 +196,13 @@ class NmtField:
         nside = getattr(self.minfo, "nside", None)
         if nside:
             utils.make_room(6 * (4 * nside - 1) * 2 * (self.ainfo.lmax + 1) * 16)
+        # At Nside 8192 the mask's spin-0 transform (~47 GiB working set) does not fit beside a
+        # polarised field's alms and maps; the workspace asked for it after the field and the
+        # coupling stage ran out of memory.  Taken first, only the maps are resident; it is waited
+        # for, or the asynchronous dispatch overlaps its buffers with the spin-2 transform's.
+        if (nside and nside >= 8192 and self.spin and not self.lite
+                and self.mask is not None):
+            jax.block_until_ready(self.get_mask_alms())
         if pure_any:
             task = (self.pure_e, self.pure_b)
             self.alm, maps = self._purify(
@@ -215,7 +222,8 @@ class NmtField:
             if (self.spin == 0 and not self.lite and self.mask is not None
                     and not self.anisotropic_mask
                     and self.ainfo == self.ainfo_mask
-                    and self.n_iter == self.n_iter_mask):
+                    and self.n_iter == self.n_iter_mask
+                    and not (nside and nside >= 8192)):
                 fused = map2alm_pair(
                     maps, self.mask[None, :], self.minfo, self.ainfo,
                     n_iter=self.n_iter,
@@ -274,8 +282,14 @@ class NmtField:
 
     def get_mask_alms(self):
         if self.alm_mask is None:
+            # Spin maps stay on the first GPU. The scalar mask runs on the
+            # other card, which the spin march has already released.
+            mask = self.mask[None, :]
+            gpus = utils._gpu_devices()
+            if len(gpus) > 1:
+                mask = jax.device_put(mask, gpus[1])
             alms = map2alm(
-                self.mask[None, :],
+                mask,
                 0,
                 self.minfo,
                 self.ainfo_mask,

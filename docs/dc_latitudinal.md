@@ -70,6 +70,24 @@ complex, non-Hermitian version for spin fields) the loop never leaves (node, rin
 * The D&C engine is never traced inside another jitted program (its plan would become constants);
   its callers compose their programs eagerly.
 
+## 1e. Plan memory: 28 -> 18 bytes per kept pole per level (24 September)
+
+The plan is O(L^2 log L); what it stores per kept pole per merge level went from seven fields to four
+floats plus two bits, with no loss of accuracy and no slowdown:
+
+| removed | how it is recovered | saving |
+|---|---|---|
+| dense adjacent gaps `gap` (4 B) | recomputed from the stored poles; gaps below 1e-6 kept as sparse exact records (1-3 % of entries) | -12 %, and faster |
+| column norms `c` (4 B) | folded into the parent's `z` along each edge (carried through deflations); the top node's kept per coefficient | -12 % |
+| output slots `slot` (2 B) | slot(k) = k + #{b : ddst[b] - b <= k} over the node's sorted deflation list | -8 % |
+| child positions `gidx` (2 B) | a side bit per pole + per-word prefix counts give its rank; the position is the rank-th entry of the complement of that side's deflations | -7 % |
+
+Nside 2048: 4.21 -> 2.82 GiB (spin 0), 4.70 -> 3.09 GiB (spin 2).  Tried and not kept: propagating the
+poles up the tree instead of storing `dh` / `dl` (branch `exp/evprop`: analysis needs them top-down, so
+they must be recomputed from snapshots -- net -8 % for -4 % speed); a ring-space Christoffel-Darboux
+kernel K = C C^T as a rank-2 Cauchy sum (exact to 1e-6, but two channels per right-hand side make one
+application slower than the two CD FMMs it replaces).
+
 ## 2. Engineering that made it fit (memory and accuracy)
 
 * **Plan** (geometry only; host-built once in C++/OpenMP with 8 threads, cached on disk):

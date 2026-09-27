@@ -24,12 +24,13 @@ import time
 import numpy as np
 
 
-def med(f, reps, sync):
+def timed(f, reps, sync):
+    """One untimed call, then `reps` warm times in milliseconds."""
     f(); sync()
     ts = []
     for _ in range(reps):
-        t = time.perf_counter(); f(); sync(); ts.append(time.perf_counter() - t)
-    return 1e3 * float(np.median(ts))
+        t = time.perf_counter(); f(); sync(); ts.append((time.perf_counter() - t) * 1e3)
+    return ts
 
 
 def rel(a, b):
@@ -75,12 +76,19 @@ def run_gm(nside, spin, reps):
     sync = lambda: jax.block_until_ready(jax.numpy.zeros(1))
     out = {}
     syn = nmt.alm2map(alm_d, spin, minfo, ainfo); jax.block_until_ready(syn)
-    out["syn_ms"] = med(lambda: jax.block_until_ready(nmt.alm2map(alm_d, spin, minfo, ainfo)), reps, sync)
+    syn_s = timed(lambda: jax.block_until_ready(nmt.alm2map(alm_d, spin, minfo, ainfo)), reps, sync)
+    out["syn_ms"] = float(np.median(syn_s))
+    out["syn_times_ms"] = syn_s
     out["syn_err"] = rel(syn, r_syn)
+    # Outside the timed calls, nothing from synthesis stays on the card: at Nside 8192 spin 2 the
+    # alms and the map it kept (21 GiB) sent the n_iter 3 analysis out of memory.
+    del syn, alm_d
     for k in (0, 3):
-        a = nmt.map2alm(maps_d, spin, minfo, ainfo, n_iter=k); jax.block_until_ready(a)
-        out[f"ana{k}_ms"] = med(lambda: jax.block_until_ready(
+        a = np.asarray(nmt.map2alm(maps_d, spin, minfo, ainfo, n_iter=k))
+        ana_s = timed(lambda: jax.block_until_ready(
             nmt.map2alm(maps_d, spin, minfo, ainfo, n_iter=k)), reps, sync)
+        out[f"ana{k}_ms"] = float(np.median(ana_s))
+        out[f"ana{k}_times_ms"] = ana_s
         out[f"ana{k}_err"] = rel(a, r_ana[k])
     st = d.memory_stats() or {}
     out["peak_gib"] = st.get("peak_bytes_in_use", 0) / 2**30
@@ -128,14 +136,17 @@ def run_shtns(nside, spin, reps):
             syn(); sync()
             got = cp.asnumpy(x_d).astype(np.float64).reshape(nphi, nlat).T
             keep = x_d.copy()
-            out[f"{prec}_syn_ms"] = med(syn, reps, sync)
+            syn_s = timed(syn, reps, sync)
+            out[f"{prec}_syn_ms"] = float(np.median(syn_s))
+            out[f"{prec}_syn_times_ms"] = syn_s
             x_d[...] = keep
             ana(); sync()
             out[f"{prec}_rt_err"] = rel(cp.asnumpy(b_d), alm)
             ts = []
             for _ in range(reps):
-                x_d[...] = keep; sync(); t = time.perf_counter(); ana(); sync(); ts.append(time.perf_counter() - t)
-            out[f"{prec}_ana_ms"] = 1e3 * float(np.median(ts))
+                x_d[...] = keep; sync(); t = time.perf_counter(); ana(); sync(); ts.append((time.perf_counter() - t) * 1e3)
+            out[f"{prec}_ana_ms"] = float(np.median(ts))
+            out[f"{prec}_ana_times_ms"] = ts
             out[f"{prec}_syn_err"] = rel(got, r)
             out[f"{prec}_dev_gib"] = dev_used() - used0
             del sh, a_d, x_d, b_d, keep
@@ -151,15 +162,20 @@ def run_shtns(nside, spin, reps):
             a[sh.l < 1] = 0
         s_d, t_d = cp.asarray(s), cp.asarray(t_)
         vt, vp = cp.empty(nphi * nlat), cp.empty(nphi * nlat)
-        s2, t2 = cp.empty_like(s_d), cp.empty_like(t_d)
+        s2, t2 = s_d, t_d   # analysis runs after every synthesis timing; its error is against host s, t_
         syn = lambda: sh.cu_SHsphtor_to_spat(s_d.data.ptr, t_d.data.ptr, vt.data.ptr, vp.data.ptr)
         ana = lambda: sh.cu_spat_to_SHsphtor(vt.data.ptr, vp.data.ptr, s2.data.ptr, t2.data.ptr)
-        syn(); sync(); kt, kp = vt.copy(), vp.copy()
-        out["vec1_syn_ms"] = med(syn, reps, sync)
+        # The restore copies live on the host: at Nside 8192 two more 9 GiB fields on the card
+        # ran cupy out of memory before the first timing.
+        syn(); sync(); kt, kp = cp.asnumpy(vt), cp.asnumpy(vp)
+        syn_s = timed(syn, reps, sync)
+        out["vec1_syn_ms"] = float(np.median(syn_s))
+        out["vec1_syn_times_ms"] = syn_s
         ts = []
         for _ in range(reps):
-            vt[...] = kt; vp[...] = kp; sync(); t0 = time.perf_counter(); ana(); sync(); ts.append(time.perf_counter() - t0)
-        out["vec1_ana_ms"] = 1e3 * float(np.median(ts))
+            vt.set(kt); vp.set(kp); sync(); t0 = time.perf_counter(); ana(); sync(); ts.append((time.perf_counter() - t0) * 1e3)
+        out["vec1_ana_ms"] = float(np.median(ts))
+        out["vec1_ana_times_ms"] = ts
         out["vec1_rt_err"] = max(rel(cp.asnumpy(s2), s), rel(cp.asnumpy(t2), t_))
         out["vec1_dev_gib"] = dev_used() - used0
     return out

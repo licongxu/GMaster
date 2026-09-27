@@ -1,0 +1,2 @@
+PARTITION=root
+HOST_DENIED cpu 64

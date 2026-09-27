@@ -115,6 +115,24 @@ def test_default_parameters_control_new_fields():
         nmt.set_sht_calculator(original["sht_calculator"])
 
 
+def test_latitudinal_method_chooses_march_or_dc():
+    from gmaster import _dc_lat
+
+    original = nmt.latitudinal_method()
+    try:
+        nmt.set_latitudinal_method("march")
+        assert nmt.latitudinal_method() == "march"
+        assert _dc_lat.enabled(6144) is False
+        nmt.set_latitudinal_method("dc")
+        assert _dc_lat.enabled(20000) is False
+        nmt.set_latitudinal_method("auto")
+        assert _dc_lat.enabled(10) is False
+        with pytest.raises(KeyError, match="latitudinal"):
+            nmt.set_latitudinal_method("healpy")
+    finally:
+        nmt.set_latitudinal_method(original)
+
+
 def test_cuda_gpu_gate_accepts_colab_tesla_t4():
     """Colab T4 is ``Tesla T4``; requiring ``NVIDIA`` silently skipped the march."""
     assert is_cuda_device_kind("Tesla T4")

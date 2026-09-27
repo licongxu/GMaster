@@ -1,0 +1,37 @@
+PARTITION=root
+HOST_DENIED cpu 32
+E0925 09:49:06.944045     102 gpu_cudamallocasync_allocator.cc:359] gpu_async_0 cuMemAllocAsync failed to allocate 36862845640 bytes: RESOURCE_EXHAUSTED: : CUDA_ERROR_OUT_OF_MEMORY: out of memory
+ Reported by CUDA: Free memory/Total memory: 34078720/101971460096
+E0925 09:49:06.944104     102 gpu_cudamallocasync_allocator.cc:364] Stats: Limit:                              0B
+InUse:                        85.50GiB
+MaxInUse:                     85.50GiB
+NumAllocs:                        7243
+MaxAllocSize:                 30.53GiB
+Reserved:                           0B
+PeakReserved:                       0B
+LargestFreeBlock:                   0B
+
+E0925 09:49:06.944119     102 gpu_cudamallocasync_allocator.cc:68] Histogram of current allocation: (allocation_size_in_bytes, nb_allocation_of_that_sizes), ...;
+E0925 09:49:06.944120     102 gpu_cudamallocasync_allocator.cc:71] 4, 3
+E0925 09:49:06.944122     102 gpu_cudamallocasync_allocator.cc:71] 8, 3
+E0925 09:49:06.944123     102 gpu_cudamallocasync_allocator.cc:71] 16, 1
+E0925 09:49:06.944124     102 gpu_cudamallocasync_allocator.cc:71] 256, 1
+E0925 09:49:06.944124     102 gpu_cudamallocasync_allocator.cc:71] 16384, 1
+E0925 09:49:06.944125     102 gpu_cudamallocasync_allocator.cc:71] 65528, 3
+E0925 09:49:06.944125     102 gpu_cudamallocasync_allocator.cc:71] 65536, 3
+E0925 09:49:06.944126     102 gpu_cudamallocasync_allocator.cc:71] 98280, 2
+E0925 09:49:06.944126     102 gpu_cudamallocasync_allocator.cc:71] 131056, 3
+E0925 09:49:06.944127     102 gpu_cudamallocasync_allocator.cc:71] 131072, 3
+E0925 09:49:06.944127     102 gpu_cudamallocasync_allocator.cc:71] 196560, 2
+E0925 09:49:06.944129     102 gpu_cudamallocasync_allocator.cc:71] 196608, 1
+E0925 09:49:06.944130     102 gpu_cudamallocasync_allocator.cc:71] 262136, 3
+E0925 09:49:06.944131     102 gpu_cudamallocasync_allocator.cc:71] 2416017408, 2
+E0925 09:49:06.944131     102 gpu_cudamallocasync_allocator.cc:71] 4832034816, 2
+E0925 09:49:06.944132     102 gpu_cudamallocasync_allocator.cc:71] 6442254336, 2
+E0925 09:49:06.944133     102 gpu_cudamallocasync_allocator.cc:71] 6442450944, 3
+E0925 09:49:06.944133     102 gpu_cudamallocasync_allocator.cc:71] 9663676416, 2
+E0925 09:49:06.944134     102 gpu_cudamallocasync_allocator.cc:71] 12884508672, 2
+E0925 09:49:06.944136     102 gpu_cudamallocasync_allocator.cc:104] CU_MEMPOOL_ATTR_RESERVED_MEM_CURRENT: 101233721344
+E0925 09:49:06.944137     102 gpu_cudamallocasync_allocator.cc:106] CU_MEMPOOL_ATTR_USED_MEM_CURRENT: 91807105092
+E0925 09:49:06.944138     102 gpu_cudamallocasync_allocator.cc:107] CU_MEMPOOL_ATTR_RESERVED_MEM_HIGH: 101233721344
+E0925 09:49:06.944139     102 gpu_cudamallocasync_allocator.cc:108] CU_MEMPOOL_ATTR_USED_MEM_HIGH: 91807105092

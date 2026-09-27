@@ -123,11 +123,24 @@ def _build():
 
 
 def enabled(L=None) -> bool:
-    """True when this route serves spin-0 latitudinal transforms at bandlimit ``L``."""
-    if os.environ.get("GMASTER_DC", "1") == "0":
+    """True when this route serves latitudinal transforms at bandlimit ``L``.
+
+    ``set_latitudinal_method("march")`` refuses it. ``"dc"`` serves every bandlimit up to
+    ``_MAX_L``, including below the auto window. ``"auto"`` keeps ``[_MIN_L, _MAX_L]`` and
+    honours ``GMASTER_DC=0``.
+    """
+    from .utils import nmt_params
+
+    choice = nmt_params.latitudinal_method
+    if choice == "march":
         return False
-    if L is not None and not (_MIN_L <= int(L) <= _MAX_L):
+    if choice != "dc" and os.environ.get("GMASTER_DC", "1") == "0":
         return False
+    if L is not None:
+        L = int(L)
+        lo = 0 if choice == "dc" else _MIN_L
+        if not (lo <= L <= _MAX_L):
+            return False
     return _build() is not None
 
 

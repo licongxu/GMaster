@@ -1,0 +1,622 @@
+PARTITION=root
+HOST_DENIED cpu 64
+BEGIN gm 8192 0
+RESULT {"engine": "gm", "route": "march", "nside": 8192, "spin": 0, "syn_ms": 3284.6250220027287, "syn_times_ms": [3277.557337016333, 3284.6250220027287, 3285.535828996217, 3287.8434699960053, 3282.3929259902798], "syn_err": 0.00017378284587401085, "ana0_ms": 3013.5746330197435, "ana0_times_ms": [3018.415850994643, 3012.787328014383, 3010.9205690096132, 3013.5746330197435, 3017.4697900074534], "ana0_err": 0.00023200362508724945, "ana3_ms": 21098.64398901118, "ana3_times_ms": [21063.640023989137, 21098.46273000585, 21098.64398901118, 21125.926334003452, 21133.7500459922], "ana3_err": 0.0002229532836004265, "peak_gib": 81.51770825311542, "dev_gib": 89.548828125}
+BEGIN gm 8192 2
+W0925 10:17:02.003427    1860 hlo_rematerialization.cc:3233] Can't reduce memory use below 56.28GiB (60426148904 bytes) by rematerialization; only reduced to 63.93GiB (68649881612 bytes), down from 63.93GiB (68649881612 bytes) originally
+E0925 10:18:08.834236    1860 gpu_cudamallocasync_allocator.cc:359] gpu_async_0 cuMemAllocAsync failed to allocate 34053335184 bytes: RESOURCE_EXHAUSTED: : CUDA_ERROR_OUT_OF_MEMORY: out of memory
+ Reported by CUDA: Free memory/Total memory: 31981568/101971460096
+E0925 10:18:08.834288    1860 gpu_cudamallocasync_allocator.cc:364] Stats: Limit:                              0B
+InUse:                        67.50GiB
+MaxInUse:                     67.50GiB
+NumAllocs:                        9259
+MaxAllocSize:                 24.00GiB
+Reserved:                           0B
+PeakReserved:                       0B
+LargestFreeBlock:                   0B
+
+E0925 10:18:08.834300    1860 gpu_cudamallocasync_allocator.cc:68] Histogram of current allocation: (allocation_size_in_bytes, nb_allocation_of_that_sizes), ...;
+E0925 10:18:08.834301    1860 gpu_cudamallocasync_allocator.cc:71] 512, 1
+E0925 10:18:08.834303    1860 gpu_cudamallocasync_allocator.cc:71] 32768, 1
+E0925 10:18:08.834304    1860 gpu_cudamallocasync_allocator.cc:71] 131056, 1
+E0925 10:18:08.834304    1860 gpu_cudamallocasync_allocator.cc:71] 131072, 3
+E0925 10:18:08.834305    1860 gpu_cudamallocasync_allocator.cc:71] 262136, 1
+E0925 10:18:08.834306    1860 gpu_cudamallocasync_allocator.cc:71] 262144, 3
+E0925 10:18:08.834307    1860 gpu_cudamallocasync_allocator.cc:71] 2416017408, 2
+E0925 10:18:08.834308    1860 gpu_cudamallocasync_allocator.cc:71] 9664069632, 1
+E0925 10:18:08.834308    1860 gpu_cudamallocasync_allocator.cc:71] 12884901888, 1
+E0925 10:18:08.834309    1860 gpu_cudamallocasync_allocator.cc:71] 19326959616, 1
+E0925 10:18:08.834309    1860 gpu_cudamallocasync_allocator.cc:71] 25769017344, 1
+E0925 10:18:08.834312    1860 gpu_cudamallocasync_allocator.cc:104] CU_MEMPOOL_ATTR_RESERVED_MEM_CURRENT: 101300830208
+E0925 10:18:08.834312    1860 gpu_cudamallocasync_allocator.cc:106] CU_MEMPOOL_ATTR_USED_MEM_CURRENT: 72478589416
+E0925 10:18:08.834313    1860 gpu_cudamallocasync_allocator.cc:107] CU_MEMPOOL_ATTR_RESERVED_MEM_HIGH: 101300830208
+E0925 10:18:08.834314    1860 gpu_cudamallocasync_allocator.cc:108] CU_MEMPOOL_ATTR_USED_MEM_HIGH: 72478589416
+Terminated
+BEGIN shtns 64 0
+Traceback (most recent call last):
+  File "cupy_backends/cuda/_softlink.pyx", line 25, in cupy_backends.cuda._softlink.SoftLink.__init__
+[SHTns 3.7.5] built Sep 22 2026, 21:07:35, id: v3.7-33-g4e69ceb,avx512,ishioka,openmp,cuda
+  cuda GPU #0 "NVIDIA RTX PRO 6000 Blackwell Workstation Edition" found (warp size = 32, compute capabilities = 12.0, CU=188, max_threads=288768, 95 GB, L2 cache=128MB).
+!!! Use theta-contiguous FFT on GPU !!!
+=> Using VkFFT v1.2.33
+  File "/usr/lib/python3.12/ctypes/__init__.py", line 379, in __init__
+    self._handle = _dlopen(self._name, mode)
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^
+OSError: libnvrtc.so.12: cannot open shared object file: No such file or directory
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/scratch/scratch-lxu/agent_dev/auto_research_agent/GMaster/benchmarks/independent/bench_three_way.py", line 182, in <module>
+    res = run_gm(nside, spin, reps) if engine == "gm" else run_shtns(nside, spin, reps)
+                                                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/scratch/scratch-lxu/agent_dev/auto_research_agent/GMaster/benchmarks/independent/bench_three_way.py", line 135, in run_shtns
+    keep = x_d.copy()
+           ^^^^^^^^^^
+  File "cupy/_core/core.pyx", line 691, in cupy._core.core._ndarray_base.copy
+  File "cupy/_core/core.pyx", line 717, in cupy._core.core._ndarray_base.copy
+  File "cupy/_core/core.pyx", line 686, in cupy._core.core._ndarray_base.astype
+  File "cupy/_core/_kernel.pyx", line 1374, in cupy._core._kernel.ufunc.__call__
+  File "cupy/_core/_kernel.pyx", line 1401, in cupy._core._kernel.ufunc._get_ufunc_kernel
+  File "cupy/_core/_kernel.pyx", line 1082, in cupy._core._kernel._get_ufunc_kernel
+  File "cupy/_core/_kernel.pyx", line 94, in cupy._core._kernel._get_simple_elementwise_kernel
+  File "cupy/_core/_kernel.pyx", line 82, in cupy._core._kernel._get_simple_elementwise_kernel_from_code
+  File "cupy/_core/core.pyx", line 2375, in cupy._core.core.compile_with_cache
+  File "cupy/_core/core.pyx", line 2320, in cupy._core.core.assemble_cupy_compiler_options
+  File "cupy_backends/cuda/libs/nvrtc.pyx", line 57, in cupy_backends.cuda.libs.nvrtc.getVersion
+  File "cupy_backends/cuda/libs/_cnvrtc.pxi", line 72, in cupy_backends.cuda.libs.nvrtc.initialize
+  File "cupy_backends/cuda/libs/_cnvrtc.pxi", line 75, in cupy_backends.cuda.libs.nvrtc._initialize
+  File "cupy_backends/cuda/libs/_cnvrtc.pxi", line 153, in cupy_backends.cuda.libs.nvrtc._get_softlink
+  File "cupy_backends/cuda/_softlink.pyx", line 32, in cupy_backends.cuda._softlink.SoftLink.__init__
+RuntimeError: CuPy failed to load libnvrtc.so.12: OSError: libnvrtc.so.12: cannot open shared object file: No such file or directory
+BEGIN shtns 64 2
+[SHTns 3.7.5] built Sep 22 2026, 21:07:35, id: v3.7-33-g4e69ceb,avx512,ishioka,openmp,cuda
+  cuda GPU #0 "NVIDIA RTX PRO 6000 Blackwell Workstation Edition" found (warp size = 32, compute capabilities = 12.0, CU=188, max_threads=288768, 95 GB, L2 cache=128MB).
+!!! Use theta-contiguous FFT on GPU !!!
+=> Using VkFFT v1.2.33
+Traceback (most recent call last):
+  File "cupy_backends/cuda/_softlink.pyx", line 25, in cupy_backends.cuda._softlink.SoftLink.__init__
+  File "/usr/lib/python3.12/ctypes/__init__.py", line 379, in __init__
+    self._handle = _dlopen(self._name, mode)
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^
+OSError: libnvrtc.so.12: cannot open shared object file: No such file or directory
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/scratch/scratch-lxu/agent_dev/auto_research_agent/GMaster/benchmarks/independent/bench_three_way.py", line 182, in <module>
+    res = run_gm(nside, spin, reps) if engine == "gm" else run_shtns(nside, spin, reps)
+                                                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/scratch/scratch-lxu/agent_dev/auto_research_agent/GMaster/benchmarks/independent/bench_three_way.py", line 165, in run_shtns
+    syn(); sync(); kt, kp = vt.copy(), vp.copy()
+                            ^^^^^^^^^
+  File "cupy/_core/core.pyx", line 691, in cupy._core.core._ndarray_base.copy
+  File "cupy/_core/core.pyx", line 717, in cupy._core.core._ndarray_base.copy
+  File "cupy/_core/core.pyx", line 686, in cupy._core.core._ndarray_base.astype
+  File "cupy/_core/_kernel.pyx", line 1374, in cupy._core._kernel.ufunc.__call__
+  File "cupy/_core/_kernel.pyx", line 1401, in cupy._core._kernel.ufunc._get_ufunc_kernel
+  File "cupy/_core/_kernel.pyx", line 1082, in cupy._core._kernel._get_ufunc_kernel
+  File "cupy/_core/_kernel.pyx", line 94, in cupy._core._kernel._get_simple_elementwise_kernel
+  File "cupy/_core/_kernel.pyx", line 82, in cupy._core._kernel._get_simple_elementwise_kernel_from_code
+  File "cupy/_core/core.pyx", line 2375, in cupy._core.core.compile_with_cache
+  File "cupy/_core/core.pyx", line 2320, in cupy._core.core.assemble_cupy_compiler_options
+  File "cupy_backends/cuda/libs/nvrtc.pyx", line 57, in cupy_backends.cuda.libs.nvrtc.getVersion
+  File "cupy_backends/cuda/libs/_cnvrtc.pxi", line 72, in cupy_backends.cuda.libs.nvrtc.initialize
+  File "cupy_backends/cuda/libs/_cnvrtc.pxi", line 75, in cupy_backends.cuda.libs.nvrtc._initialize
+  File "cupy_backends/cuda/libs/_cnvrtc.pxi", line 153, in cupy_backends.cuda.libs.nvrtc._get_softlink
+  File "cupy_backends/cuda/_softlink.pyx", line 32, in cupy_backends.cuda._softlink.SoftLink.__init__
+RuntimeError: CuPy failed to load libnvrtc.so.12: OSError: libnvrtc.so.12: cannot open shared object file: No such file or directory
+BEGIN shtns 128 0
+Traceback (most recent call last):
+  File "cupy_backends/cuda/_softlink.pyx", line 25, in cupy_backends.cuda._softlink.SoftLink.__init__
+[SHTns 3.7.5] built Sep 22 2026, 21:07:35, id: v3.7-33-g4e69ceb,avx512,ishioka,openmp,cuda
+  cuda GPU #0 "NVIDIA RTX PRO 6000 Blackwell Workstation Edition" found (warp size = 32, compute capabilities = 12.0, CU=188, max_threads=288768, 95 GB, L2 cache=128MB).
+!!! Use theta-contiguous FFT on GPU !!!
+=> Using VkFFT v1.2.33
+  File "/usr/lib/python3.12/ctypes/__init__.py", line 379, in __init__
+    self._handle = _dlopen(self._name, mode)
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^
+OSError: libnvrtc.so.12: cannot open shared object file: No such file or directory
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/scratch/scratch-lxu/agent_dev/auto_research_agent/GMaster/benchmarks/independent/bench_three_way.py", line 182, in <module>
+    res = run_gm(nside, spin, reps) if engine == "gm" else run_shtns(nside, spin, reps)
+                                                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/scratch/scratch-lxu/agent_dev/auto_research_agent/GMaster/benchmarks/independent/bench_three_way.py", line 135, in run_shtns
+    keep = x_d.copy()
+           ^^^^^^^^^^
+  File "cupy/_core/core.pyx", line 691, in cupy._core.core._ndarray_base.copy
+  File "cupy/_core/core.pyx", line 717, in cupy._core.core._ndarray_base.copy
+  File "cupy/_core/core.pyx", line 686, in cupy._core.core._ndarray_base.astype
+  File "cupy/_core/_kernel.pyx", line 1374, in cupy._core._kernel.ufunc.__call__
+  File "cupy/_core/_kernel.pyx", line 1401, in cupy._core._kernel.ufunc._get_ufunc_kernel
+  File "cupy/_core/_kernel.pyx", line 1082, in cupy._core._kernel._get_ufunc_kernel
+  File "cupy/_core/_kernel.pyx", line 94, in cupy._core._kernel._get_simple_elementwise_kernel
+  File "cupy/_core/_kernel.pyx", line 82, in cupy._core._kernel._get_simple_elementwise_kernel_from_code
+  File "cupy/_core/core.pyx", line 2375, in cupy._core.core.compile_with_cache
+  File "cupy/_core/core.pyx", line 2320, in cupy._core.core.assemble_cupy_compiler_options
+  File "cupy_backends/cuda/libs/nvrtc.pyx", line 57, in cupy_backends.cuda.libs.nvrtc.getVersion
+  File "cupy_backends/cuda/libs/_cnvrtc.pxi", line 72, in cupy_backends.cuda.libs.nvrtc.initialize
+  File "cupy_backends/cuda/libs/_cnvrtc.pxi", line 75, in cupy_backends.cuda.libs.nvrtc._initialize
+  File "cupy_backends/cuda/libs/_cnvrtc.pxi", line 153, in cupy_backends.cuda.libs.nvrtc._get_softlink
+  File "cupy_backends/cuda/_softlink.pyx", line 32, in cupy_backends.cuda._softlink.SoftLink.__init__
+RuntimeError: CuPy failed to load libnvrtc.so.12: OSError: libnvrtc.so.12: cannot open shared object file: No such file or directory
+BEGIN shtns 128 2
+[SHTns 3.7.5] built Sep 22 2026, 21:07:35, id: v3.7-33-g4e69ceb,avx512,ishioka,openmp,cuda
+  cuda GPU #0 "NVIDIA RTX PRO 6000 Blackwell Workstation Edition" found (warp size = 32, compute capabilities = 12.0, CU=188, max_threads=288768, 95 GB, L2 cache=128MB).
+!!! Use theta-contiguous FFT on GPU !!!
+=> Using VkFFT v1.2.33
+Traceback (most recent call last):
+  File "cupy_backends/cuda/_softlink.pyx", line 25, in cupy_backends.cuda._softlink.SoftLink.__init__
+  File "/usr/lib/python3.12/ctypes/__init__.py", line 379, in __init__
+    self._handle = _dlopen(self._name, mode)
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^
+OSError: libnvrtc.so.12: cannot open shared object file: No such file or directory
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/scratch/scratch-lxu/agent_dev/auto_research_agent/GMaster/benchmarks/independent/bench_three_way.py", line 182, in <module>
+    res = run_gm(nside, spin, reps) if engine == "gm" else run_shtns(nside, spin, reps)
+                                                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/scratch/scratch-lxu/agent_dev/auto_research_agent/GMaster/benchmarks/independent/bench_three_way.py", line 165, in run_shtns
+    syn(); sync(); kt, kp = vt.copy(), vp.copy()
+                            ^^^^^^^^^
+  File "cupy/_core/core.pyx", line 691, in cupy._core.core._ndarray_base.copy
+  File "cupy/_core/core.pyx", line 717, in cupy._core.core._ndarray_base.copy
+  File "cupy/_core/core.pyx", line 686, in cupy._core.core._ndarray_base.astype
+  File "cupy/_core/_kernel.pyx", line 1374, in cupy._core._kernel.ufunc.__call__
+  File "cupy/_core/_kernel.pyx", line 1401, in cupy._core._kernel.ufunc._get_ufunc_kernel
+  File "cupy/_core/_kernel.pyx", line 1082, in cupy._core._kernel._get_ufunc_kernel
+  File "cupy/_core/_kernel.pyx", line 94, in cupy._core._kernel._get_simple_elementwise_kernel
+  File "cupy/_core/_kernel.pyx", line 82, in cupy._core._kernel._get_simple_elementwise_kernel_from_code
+  File "cupy/_core/core.pyx", line 2375, in cupy._core.core.compile_with_cache
+  File "cupy/_core/core.pyx", line 2320, in cupy._core.core.assemble_cupy_compiler_options
+  File "cupy_backends/cuda/libs/nvrtc.pyx", line 57, in cupy_backends.cuda.libs.nvrtc.getVersion
+  File "cupy_backends/cuda/libs/_cnvrtc.pxi", line 72, in cupy_backends.cuda.libs.nvrtc.initialize
+  File "cupy_backends/cuda/libs/_cnvrtc.pxi", line 75, in cupy_backends.cuda.libs.nvrtc._initialize
+  File "cupy_backends/cuda/libs/_cnvrtc.pxi", line 153, in cupy_backends.cuda.libs.nvrtc._get_softlink
+  File "cupy_backends/cuda/_softlink.pyx", line 32, in cupy_backends.cuda._softlink.SoftLink.__init__
+RuntimeError: CuPy failed to load libnvrtc.so.12: OSError: libnvrtc.so.12: cannot open shared object file: No such file or directory
+BEGIN shtns 256 0
+Traceback (most recent call last):
+  File "cupy_backends/cuda/_softlink.pyx", line 25, in cupy_backends.cuda._softlink.SoftLink.__init__
+[SHTns 3.7.5] built Sep 22 2026, 21:07:35, id: v3.7-33-g4e69ceb,avx512,ishioka,openmp,cuda
+  cuda GPU #0 "NVIDIA RTX PRO 6000 Blackwell Workstation Edition" found (warp size = 32, compute capabilities = 12.0, CU=188, max_threads=288768, 95 GB, L2 cache=128MB).
+!!! Use theta-contiguous FFT on GPU !!!
+=> Using VkFFT v1.2.33
+  File "/usr/lib/python3.12/ctypes/__init__.py", line 379, in __init__
+    self._handle = _dlopen(self._name, mode)
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^
+OSError: libnvrtc.so.12: cannot open shared object file: No such file or directory
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/scratch/scratch-lxu/agent_dev/auto_research_agent/GMaster/benchmarks/independent/bench_three_way.py", line 182, in <module>
+    res = run_gm(nside, spin, reps) if engine == "gm" else run_shtns(nside, spin, reps)
+                                                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/scratch/scratch-lxu/agent_dev/auto_research_agent/GMaster/benchmarks/independent/bench_three_way.py", line 135, in run_shtns
+    keep = x_d.copy()
+           ^^^^^^^^^^
+  File "cupy/_core/core.pyx", line 691, in cupy._core.core._ndarray_base.copy
+  File "cupy/_core/core.pyx", line 717, in cupy._core.core._ndarray_base.copy
+  File "cupy/_core/core.pyx", line 686, in cupy._core.core._ndarray_base.astype
+  File "cupy/_core/_kernel.pyx", line 1374, in cupy._core._kernel.ufunc.__call__
+  File "cupy/_core/_kernel.pyx", line 1401, in cupy._core._kernel.ufunc._get_ufunc_kernel
+  File "cupy/_core/_kernel.pyx", line 1082, in cupy._core._kernel._get_ufunc_kernel
+  File "cupy/_core/_kernel.pyx", line 94, in cupy._core._kernel._get_simple_elementwise_kernel
+  File "cupy/_core/_kernel.pyx", line 82, in cupy._core._kernel._get_simple_elementwise_kernel_from_code
+  File "cupy/_core/core.pyx", line 2375, in cupy._core.core.compile_with_cache
+  File "cupy/_core/core.pyx", line 2320, in cupy._core.core.assemble_cupy_compiler_options
+  File "cupy_backends/cuda/libs/nvrtc.pyx", line 57, in cupy_backends.cuda.libs.nvrtc.getVersion
+  File "cupy_backends/cuda/libs/_cnvrtc.pxi", line 72, in cupy_backends.cuda.libs.nvrtc.initialize
+  File "cupy_backends/cuda/libs/_cnvrtc.pxi", line 75, in cupy_backends.cuda.libs.nvrtc._initialize
+  File "cupy_backends/cuda/libs/_cnvrtc.pxi", line 153, in cupy_backends.cuda.libs.nvrtc._get_softlink
+  File "cupy_backends/cuda/_softlink.pyx", line 32, in cupy_backends.cuda._softlink.SoftLink.__init__
+RuntimeError: CuPy failed to load libnvrtc.so.12: OSError: libnvrtc.so.12: cannot open shared object file: No such file or directory
+BEGIN shtns 256 2
+[SHTns 3.7.5] built Sep 22 2026, 21:07:35, id: v3.7-33-g4e69ceb,avx512,ishioka,openmp,cuda
+  cuda GPU #0 "NVIDIA RTX PRO 6000 Blackwell Workstation Edition" found (warp size = 32, compute capabilities = 12.0, CU=188, max_threads=288768, 95 GB, L2 cache=128MB).
+!!! Use theta-contiguous FFT on GPU !!!
+=> Using VkFFT v1.2.33
+Traceback (most recent call last):
+  File "cupy_backends/cuda/_softlink.pyx", line 25, in cupy_backends.cuda._softlink.SoftLink.__init__
+  File "/usr/lib/python3.12/ctypes/__init__.py", line 379, in __init__
+    self._handle = _dlopen(self._name, mode)
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^
+OSError: libnvrtc.so.12: cannot open shared object file: No such file or directory
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/scratch/scratch-lxu/agent_dev/auto_research_agent/GMaster/benchmarks/independent/bench_three_way.py", line 182, in <module>
+    res = run_gm(nside, spin, reps) if engine == "gm" else run_shtns(nside, spin, reps)
+                                                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/scratch/scratch-lxu/agent_dev/auto_research_agent/GMaster/benchmarks/independent/bench_three_way.py", line 165, in run_shtns
+    syn(); sync(); kt, kp = vt.copy(), vp.copy()
+                            ^^^^^^^^^
+  File "cupy/_core/core.pyx", line 691, in cupy._core.core._ndarray_base.copy
+  File "cupy/_core/core.pyx", line 717, in cupy._core.core._ndarray_base.copy
+  File "cupy/_core/core.pyx", line 686, in cupy._core.core._ndarray_base.astype
+  File "cupy/_core/_kernel.pyx", line 1374, in cupy._core._kernel.ufunc.__call__
+  File "cupy/_core/_kernel.pyx", line 1401, in cupy._core._kernel.ufunc._get_ufunc_kernel
+  File "cupy/_core/_kernel.pyx", line 1082, in cupy._core._kernel._get_ufunc_kernel
+  File "cupy/_core/_kernel.pyx", line 94, in cupy._core._kernel._get_simple_elementwise_kernel
+  File "cupy/_core/_kernel.pyx", line 82, in cupy._core._kernel._get_simple_elementwise_kernel_from_code
+  File "cupy/_core/core.pyx", line 2375, in cupy._core.core.compile_with_cache
+  File "cupy/_core/core.pyx", line 2320, in cupy._core.core.assemble_cupy_compiler_options
+  File "cupy_backends/cuda/libs/nvrtc.pyx", line 57, in cupy_backends.cuda.libs.nvrtc.getVersion
+  File "cupy_backends/cuda/libs/_cnvrtc.pxi", line 72, in cupy_backends.cuda.libs.nvrtc.initialize
+  File "cupy_backends/cuda/libs/_cnvrtc.pxi", line 75, in cupy_backends.cuda.libs.nvrtc._initialize
+  File "cupy_backends/cuda/libs/_cnvrtc.pxi", line 153, in cupy_backends.cuda.libs.nvrtc._get_softlink
+  File "cupy_backends/cuda/_softlink.pyx", line 32, in cupy_backends.cuda._softlink.SoftLink.__init__
+RuntimeError: CuPy failed to load libnvrtc.so.12: OSError: libnvrtc.so.12: cannot open shared object file: No such file or directory
+BEGIN shtns 512 0
+Traceback (most recent call last):
+  File "cupy_backends/cuda/_softlink.pyx", line 25, in cupy_backends.cuda._softlink.SoftLink.__init__
+  File "/usr/lib/python3.12/ctypes/__init__.py", line 379, in __init__
+[SHTns 3.7.5] built Sep 22 2026, 21:07:35, id: v3.7-33-g4e69ceb,avx512,ishioka,openmp,cuda
+  cuda GPU #0 "NVIDIA RTX PRO 6000 Blackwell Workstation Edition" found (warp size = 32, compute capabilities = 12.0, CU=188, max_threads=288768, 95 GB, L2 cache=128MB).
+!!! Use theta-contiguous FFT on GPU !!!
+=> Using VkFFT v1.2.33
+    self._handle = _dlopen(self._name, mode)
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^
+OSError: libnvrtc.so.12: cannot open shared object file: No such file or directory
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/scratch/scratch-lxu/agent_dev/auto_research_agent/GMaster/benchmarks/independent/bench_three_way.py", line 182, in <module>
+    res = run_gm(nside, spin, reps) if engine == "gm" else run_shtns(nside, spin, reps)
+                                                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/scratch/scratch-lxu/agent_dev/auto_research_agent/GMaster/benchmarks/independent/bench_three_way.py", line 135, in run_shtns
+    keep = x_d.copy()
+           ^^^^^^^^^^
+  File "cupy/_core/core.pyx", line 691, in cupy._core.core._ndarray_base.copy
+  File "cupy/_core/core.pyx", line 717, in cupy._core.core._ndarray_base.copy
+  File "cupy/_core/core.pyx", line 686, in cupy._core.core._ndarray_base.astype
+  File "cupy/_core/_kernel.pyx", line 1374, in cupy._core._kernel.ufunc.__call__
+  File "cupy/_core/_kernel.pyx", line 1401, in cupy._core._kernel.ufunc._get_ufunc_kernel
+  File "cupy/_core/_kernel.pyx", line 1082, in cupy._core._kernel._get_ufunc_kernel
+  File "cupy/_core/_kernel.pyx", line 94, in cupy._core._kernel._get_simple_elementwise_kernel
+  File "cupy/_core/_kernel.pyx", line 82, in cupy._core._kernel._get_simple_elementwise_kernel_from_code
+  File "cupy/_core/core.pyx", line 2375, in cupy._core.core.compile_with_cache
+  File "cupy/_core/core.pyx", line 2320, in cupy._core.core.assemble_cupy_compiler_options
+  File "cupy_backends/cuda/libs/nvrtc.pyx", line 57, in cupy_backends.cuda.libs.nvrtc.getVersion
+  File "cupy_backends/cuda/libs/_cnvrtc.pxi", line 72, in cupy_backends.cuda.libs.nvrtc.initialize
+  File "cupy_backends/cuda/libs/_cnvrtc.pxi", line 75, in cupy_backends.cuda.libs.nvrtc._initialize
+  File "cupy_backends/cuda/libs/_cnvrtc.pxi", line 153, in cupy_backends.cuda.libs.nvrtc._get_softlink
+  File "cupy_backends/cuda/_softlink.pyx", line 32, in cupy_backends.cuda._softlink.SoftLink.__init__
+RuntimeError: CuPy failed to load libnvrtc.so.12: OSError: libnvrtc.so.12: cannot open shared object file: No such file or directory
+BEGIN shtns 512 2
+Traceback (most recent call last):
+  File "cupy_backends/cuda/_softlink.pyx", line 25, in cupy_backends.cuda._softlink.SoftLink.__init__
+[SHTns 3.7.5] built Sep 22 2026, 21:07:35, id: v3.7-33-g4e69ceb,avx512,ishioka,openmp,cuda
+  cuda GPU #0 "NVIDIA RTX PRO 6000 Blackwell Workstation Edition" found (warp size = 32, compute capabilities = 12.0, CU=188, max_threads=288768, 95 GB, L2 cache=128MB).
+!!! Use theta-contiguous FFT on GPU !!!
+=> Using VkFFT v1.2.33
+  File "/usr/lib/python3.12/ctypes/__init__.py", line 379, in __init__
+    self._handle = _dlopen(self._name, mode)
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^
+OSError: libnvrtc.so.12: cannot open shared object file: No such file or directory
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/scratch/scratch-lxu/agent_dev/auto_research_agent/GMaster/benchmarks/independent/bench_three_way.py", line 182, in <module>
+    res = run_gm(nside, spin, reps) if engine == "gm" else run_shtns(nside, spin, reps)
+                                                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/scratch/scratch-lxu/agent_dev/auto_research_agent/GMaster/benchmarks/independent/bench_three_way.py", line 165, in run_shtns
+    syn(); sync(); kt, kp = vt.copy(), vp.copy()
+                            ^^^^^^^^^
+  File "cupy/_core/core.pyx", line 691, in cupy._core.core._ndarray_base.copy
+  File "cupy/_core/core.pyx", line 717, in cupy._core.core._ndarray_base.copy
+  File "cupy/_core/core.pyx", line 686, in cupy._core.core._ndarray_base.astype
+  File "cupy/_core/_kernel.pyx", line 1374, in cupy._core._kernel.ufunc.__call__
+  File "cupy/_core/_kernel.pyx", line 1401, in cupy._core._kernel.ufunc._get_ufunc_kernel
+  File "cupy/_core/_kernel.pyx", line 1082, in cupy._core._kernel._get_ufunc_kernel
+  File "cupy/_core/_kernel.pyx", line 94, in cupy._core._kernel._get_simple_elementwise_kernel
+  File "cupy/_core/_kernel.pyx", line 82, in cupy._core._kernel._get_simple_elementwise_kernel_from_code
+  File "cupy/_core/core.pyx", line 2375, in cupy._core.core.compile_with_cache
+  File "cupy/_core/core.pyx", line 2320, in cupy._core.core.assemble_cupy_compiler_options
+  File "cupy_backends/cuda/libs/nvrtc.pyx", line 57, in cupy_backends.cuda.libs.nvrtc.getVersion
+  File "cupy_backends/cuda/libs/_cnvrtc.pxi", line 72, in cupy_backends.cuda.libs.nvrtc.initialize
+  File "cupy_backends/cuda/libs/_cnvrtc.pxi", line 75, in cupy_backends.cuda.libs.nvrtc._initialize
+  File "cupy_backends/cuda/libs/_cnvrtc.pxi", line 153, in cupy_backends.cuda.libs.nvrtc._get_softlink
+  File "cupy_backends/cuda/_softlink.pyx", line 32, in cupy_backends.cuda._softlink.SoftLink.__init__
+RuntimeError: CuPy failed to load libnvrtc.so.12: OSError: libnvrtc.so.12: cannot open shared object file: No such file or directory
+BEGIN shtns 1024 0
+Traceback (most recent call last):
+  File "cupy_backends/cuda/_softlink.pyx", line 25, in cupy_backends.cuda._softlink.SoftLink.__init__
+[SHTns 3.7.5] built Sep 22 2026, 21:07:35, id: v3.7-33-g4e69ceb,avx512,ishioka,openmp,cuda
+  cuda GPU #0 "NVIDIA RTX PRO 6000 Blackwell Workstation Edition" found (warp size = 32, compute capabilities = 12.0, CU=188, max_threads=288768, 95 GB, L2 cache=128MB).
+!!! Use theta-contiguous FFT on GPU !!!
+=> Using VkFFT v1.2.33
+  File "/usr/lib/python3.12/ctypes/__init__.py", line 379, in __init__
+    self._handle = _dlopen(self._name, mode)
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^
+OSError: libnvrtc.so.12: cannot open shared object file: No such file or directory
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/scratch/scratch-lxu/agent_dev/auto_research_agent/GMaster/benchmarks/independent/bench_three_way.py", line 182, in <module>
+    res = run_gm(nside, spin, reps) if engine == "gm" else run_shtns(nside, spin, reps)
+                                                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/scratch/scratch-lxu/agent_dev/auto_research_agent/GMaster/benchmarks/independent/bench_three_way.py", line 135, in run_shtns
+    keep = x_d.copy()
+           ^^^^^^^^^^
+  File "cupy/_core/core.pyx", line 691, in cupy._core.core._ndarray_base.copy
+  File "cupy/_core/core.pyx", line 717, in cupy._core.core._ndarray_base.copy
+  File "cupy/_core/core.pyx", line 686, in cupy._core.core._ndarray_base.astype
+  File "cupy/_core/_kernel.pyx", line 1374, in cupy._core._kernel.ufunc.__call__
+  File "cupy/_core/_kernel.pyx", line 1401, in cupy._core._kernel.ufunc._get_ufunc_kernel
+  File "cupy/_core/_kernel.pyx", line 1082, in cupy._core._kernel._get_ufunc_kernel
+  File "cupy/_core/_kernel.pyx", line 94, in cupy._core._kernel._get_simple_elementwise_kernel
+  File "cupy/_core/_kernel.pyx", line 82, in cupy._core._kernel._get_simple_elementwise_kernel_from_code
+  File "cupy/_core/core.pyx", line 2375, in cupy._core.core.compile_with_cache
+  File "cupy/_core/core.pyx", line 2320, in cupy._core.core.assemble_cupy_compiler_options
+  File "cupy_backends/cuda/libs/nvrtc.pyx", line 57, in cupy_backends.cuda.libs.nvrtc.getVersion
+  File "cupy_backends/cuda/libs/_cnvrtc.pxi", line 72, in cupy_backends.cuda.libs.nvrtc.initialize
+  File "cupy_backends/cuda/libs/_cnvrtc.pxi", line 75, in cupy_backends.cuda.libs.nvrtc._initialize
+  File "cupy_backends/cuda/libs/_cnvrtc.pxi", line 153, in cupy_backends.cuda.libs.nvrtc._get_softlink
+  File "cupy_backends/cuda/_softlink.pyx", line 32, in cupy_backends.cuda._softlink.SoftLink.__init__
+RuntimeError: CuPy failed to load libnvrtc.so.12: OSError: libnvrtc.so.12: cannot open shared object file: No such file or directory
+BEGIN shtns 1024 2
+Traceback (most recent call last):
+  File "cupy_backends/cuda/_softlink.pyx", line 25, in cupy_backends.cuda._softlink.SoftLink.__init__
+[SHTns 3.7.5] built Sep 22 2026, 21:07:35, id: v3.7-33-g4e69ceb,avx512,ishioka,openmp,cuda
+  cuda GPU #0 "NVIDIA RTX PRO 6000 Blackwell Workstation Edition" found (warp size = 32, compute capabilities = 12.0, CU=188, max_threads=288768, 95 GB, L2 cache=128MB).
+!!! Use theta-contiguous FFT on GPU !!!
+=> Using VkFFT v1.2.33
+  File "/usr/lib/python3.12/ctypes/__init__.py", line 379, in __init__
+    self._handle = _dlopen(self._name, mode)
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^
+OSError: libnvrtc.so.12: cannot open shared object file: No such file or directory
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/scratch/scratch-lxu/agent_dev/auto_research_agent/GMaster/benchmarks/independent/bench_three_way.py", line 182, in <module>
+    res = run_gm(nside, spin, reps) if engine == "gm" else run_shtns(nside, spin, reps)
+                                                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/scratch/scratch-lxu/agent_dev/auto_research_agent/GMaster/benchmarks/independent/bench_three_way.py", line 165, in run_shtns
+    syn(); sync(); kt, kp = vt.copy(), vp.copy()
+                            ^^^^^^^^^
+  File "cupy/_core/core.pyx", line 691, in cupy._core.core._ndarray_base.copy
+  File "cupy/_core/core.pyx", line 717, in cupy._core.core._ndarray_base.copy
+  File "cupy/_core/core.pyx", line 686, in cupy._core.core._ndarray_base.astype
+  File "cupy/_core/_kernel.pyx", line 1374, in cupy._core._kernel.ufunc.__call__
+  File "cupy/_core/_kernel.pyx", line 1401, in cupy._core._kernel.ufunc._get_ufunc_kernel
+  File "cupy/_core/_kernel.pyx", line 1082, in cupy._core._kernel._get_ufunc_kernel
+  File "cupy/_core/_kernel.pyx", line 94, in cupy._core._kernel._get_simple_elementwise_kernel
+  File "cupy/_core/_kernel.pyx", line 82, in cupy._core._kernel._get_simple_elementwise_kernel_from_code
+  File "cupy/_core/core.pyx", line 2375, in cupy._core.core.compile_with_cache
+  File "cupy/_core/core.pyx", line 2320, in cupy._core.core.assemble_cupy_compiler_options
+  File "cupy_backends/cuda/libs/nvrtc.pyx", line 57, in cupy_backends.cuda.libs.nvrtc.getVersion
+  File "cupy_backends/cuda/libs/_cnvrtc.pxi", line 72, in cupy_backends.cuda.libs.nvrtc.initialize
+  File "cupy_backends/cuda/libs/_cnvrtc.pxi", line 75, in cupy_backends.cuda.libs.nvrtc._initialize
+  File "cupy_backends/cuda/libs/_cnvrtc.pxi", line 153, in cupy_backends.cuda.libs.nvrtc._get_softlink
+  File "cupy_backends/cuda/_softlink.pyx", line 32, in cupy_backends.cuda._softlink.SoftLink.__init__
+RuntimeError: CuPy failed to load libnvrtc.so.12: OSError: libnvrtc.so.12: cannot open shared object file: No such file or directory
+BEGIN shtns 2048 0
+Traceback (most recent call last):
+  File "cupy_backends/cuda/_softlink.pyx", line 25, in cupy_backends.cuda._softlink.SoftLink.__init__
+[SHTns 3.7.5] built Sep 22 2026, 21:07:35, id: v3.7-33-g4e69ceb,avx512,ishioka,openmp,cuda
+  cuda GPU #0 "NVIDIA RTX PRO 6000 Blackwell Workstation Edition" found (warp size = 32, compute capabilities = 12.0, CU=188, max_threads=288768, 95 GB, L2 cache=128MB).
+!!! Use theta-contiguous FFT on GPU !!!
+=> Using VkFFT v1.2.33
+  File "/usr/lib/python3.12/ctypes/__init__.py", line 379, in __init__
+    self._handle = _dlopen(self._name, mode)
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^
+OSError: libnvrtc.so.12: cannot open shared object file: No such file or directory
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/scratch/scratch-lxu/agent_dev/auto_research_agent/GMaster/benchmarks/independent/bench_three_way.py", line 182, in <module>
+    res = run_gm(nside, spin, reps) if engine == "gm" else run_shtns(nside, spin, reps)
+                                                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/scratch/scratch-lxu/agent_dev/auto_research_agent/GMaster/benchmarks/independent/bench_three_way.py", line 135, in run_shtns
+    keep = x_d.copy()
+           ^^^^^^^^^^
+  File "cupy/_core/core.pyx", line 691, in cupy._core.core._ndarray_base.copy
+  File "cupy/_core/core.pyx", line 717, in cupy._core.core._ndarray_base.copy
+  File "cupy/_core/core.pyx", line 686, in cupy._core.core._ndarray_base.astype
+  File "cupy/_core/_kernel.pyx", line 1374, in cupy._core._kernel.ufunc.__call__
+  File "cupy/_core/_kernel.pyx", line 1401, in cupy._core._kernel.ufunc._get_ufunc_kernel
+  File "cupy/_core/_kernel.pyx", line 1082, in cupy._core._kernel._get_ufunc_kernel
+  File "cupy/_core/_kernel.pyx", line 94, in cupy._core._kernel._get_simple_elementwise_kernel
+  File "cupy/_core/_kernel.pyx", line 82, in cupy._core._kernel._get_simple_elementwise_kernel_from_code
+  File "cupy/_core/core.pyx", line 2375, in cupy._core.core.compile_with_cache
+  File "cupy/_core/core.pyx", line 2320, in cupy._core.core.assemble_cupy_compiler_options
+  File "cupy_backends/cuda/libs/nvrtc.pyx", line 57, in cupy_backends.cuda.libs.nvrtc.getVersion
+  File "cupy_backends/cuda/libs/_cnvrtc.pxi", line 72, in cupy_backends.cuda.libs.nvrtc.initialize
+  File "cupy_backends/cuda/libs/_cnvrtc.pxi", line 75, in cupy_backends.cuda.libs.nvrtc._initialize
+  File "cupy_backends/cuda/libs/_cnvrtc.pxi", line 153, in cupy_backends.cuda.libs.nvrtc._get_softlink
+  File "cupy_backends/cuda/_softlink.pyx", line 32, in cupy_backends.cuda._softlink.SoftLink.__init__
+RuntimeError: CuPy failed to load libnvrtc.so.12: OSError: libnvrtc.so.12: cannot open shared object file: No such file or directory
+BEGIN shtns 2048 2
+Traceback (most recent call last):
+  File "cupy_backends/cuda/_softlink.pyx", line 25, in cupy_backends.cuda._softlink.SoftLink.__init__
+  File "/usr/lib/python3.12/ctypes/__init__.py", line 379, in __init__
+[SHTns 3.7.5] built Sep 22 2026, 21:07:35, id: v3.7-33-g4e69ceb,avx512,ishioka,openmp,cuda
+  cuda GPU #0 "NVIDIA RTX PRO 6000 Blackwell Workstation Edition" found (warp size = 32, compute capabilities = 12.0, CU=188, max_threads=288768, 95 GB, L2 cache=128MB).
+!!! Use theta-contiguous FFT on GPU !!!
+=> Using VkFFT v1.2.33
+    self._handle = _dlopen(self._name, mode)
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^
+OSError: libnvrtc.so.12: cannot open shared object file: No such file or directory
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/scratch/scratch-lxu/agent_dev/auto_research_agent/GMaster/benchmarks/independent/bench_three_way.py", line 182, in <module>
+    res = run_gm(nside, spin, reps) if engine == "gm" else run_shtns(nside, spin, reps)
+                                                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/scratch/scratch-lxu/agent_dev/auto_research_agent/GMaster/benchmarks/independent/bench_three_way.py", line 165, in run_shtns
+    syn(); sync(); kt, kp = vt.copy(), vp.copy()
+                            ^^^^^^^^^
+  File "cupy/_core/core.pyx", line 691, in cupy._core.core._ndarray_base.copy
+  File "cupy/_core/core.pyx", line 717, in cupy._core.core._ndarray_base.copy
+  File "cupy/_core/core.pyx", line 686, in cupy._core.core._ndarray_base.astype
+  File "cupy/_core/_kernel.pyx", line 1374, in cupy._core._kernel.ufunc.__call__
+  File "cupy/_core/_kernel.pyx", line 1401, in cupy._core._kernel.ufunc._get_ufunc_kernel
+  File "cupy/_core/_kernel.pyx", line 1082, in cupy._core._kernel._get_ufunc_kernel
+  File "cupy/_core/_kernel.pyx", line 94, in cupy._core._kernel._get_simple_elementwise_kernel
+  File "cupy/_core/_kernel.pyx", line 82, in cupy._core._kernel._get_simple_elementwise_kernel_from_code
+  File "cupy/_core/core.pyx", line 2375, in cupy._core.core.compile_with_cache
+  File "cupy/_core/core.pyx", line 2320, in cupy._core.core.assemble_cupy_compiler_options
+  File "cupy_backends/cuda/libs/nvrtc.pyx", line 57, in cupy_backends.cuda.libs.nvrtc.getVersion
+  File "cupy_backends/cuda/libs/_cnvrtc.pxi", line 72, in cupy_backends.cuda.libs.nvrtc.initialize
+  File "cupy_backends/cuda/libs/_cnvrtc.pxi", line 75, in cupy_backends.cuda.libs.nvrtc._initialize
+  File "cupy_backends/cuda/libs/_cnvrtc.pxi", line 153, in cupy_backends.cuda.libs.nvrtc._get_softlink
+  File "cupy_backends/cuda/_softlink.pyx", line 32, in cupy_backends.cuda._softlink.SoftLink.__init__
+RuntimeError: CuPy failed to load libnvrtc.so.12: OSError: libnvrtc.so.12: cannot open shared object file: No such file or directory
+BEGIN shtns 4096 0
+RESTART shtns
+PARTITION=root
+HOST_DENIED cpu 64
+BEGIN shtns 64 0
+[SHTns 3.7.5] built Sep 22 2026, 21:07:35, id: v3.7-33-g4e69ceb,avx512,ishioka,openmp,cuda
+  cuda GPU #0 "NVIDIA RTX PRO 6000 Blackwell Workstation Edition" found (warp size = 32, compute capabilities = 12.0, CU=188, max_threads=288768, 95 GB, L2 cache=128MB).
+!!! Use theta-contiguous FFT on GPU !!!
+=> Using VkFFT v1.2.33
+  cuda GPU #0 "NVIDIA RTX PRO 6000 Blackwell Workstation Edition" found (warp size = 32, compute capabilities = 12.0, CU=188, max_threads=288768, 95 GB, L2 cache=128MB).
+!!! Use theta-contiguous FFT on GPU !!!
+=> Using VkFFT v1.2.33
+RESULT {"engine": "shtns", "route": "shtns", "nside": 64, "spin": 0, "grid": "GL 192x384", "fp64_syn_ms": 0.06450997898355126, "fp64_syn_times_ms": [0.06705097621306777, 0.06410098285414279, 0.06481999298557639, 0.06333101191557944, 0.06450997898355126], "fp64_rt_err": 3.8073449964900107e-14, "fp64_ana_ms": 0.04198099486529827, "fp64_ana_times_ms": [0.044110987801104784, 0.045769993448629975, 0.04127100692130625, 0.040929997339844704, 0.04198099486529827], "fp64_syn_err": 2.074125599467862e-13, "fp64_dev_gib": 0.0078125, "fp32_syn_ms": 0.04399099270813167, "fp32_syn_times_ms": [0.04538099165074527, 0.04434000584296882, 0.043960026232525706, 0.04399099270813167, 0.043899985030293465], "fp32_rt_err": 1.1859116033107834e-06, "fp32_ana_ms": 0.026790978154167533, "fp32_ana_times_ms": [0.026920984964817762, 0.025129993446171284, 0.026910012820735574, 0.026790978154167533, 0.026559981051832438], "fp32_syn_err": 1.84508214486074e-06, "fp32_dev_gib": 0.00390625}
+BEGIN shtns 64 2
+[SHTns 3.7.5] built Sep 22 2026, 21:07:35, id: v3.7-33-g4e69ceb,avx512,ishioka,openmp,cuda
+  cuda GPU #0 "NVIDIA RTX PRO 6000 Blackwell Workstation Edition" found (warp size = 32, compute capabilities = 12.0, CU=188, max_threads=288768, 95 GB, L2 cache=128MB).
+!!! Use theta-contiguous FFT on GPU !!!
+=> Using VkFFT v1.2.33
+RESULT {"engine": "shtns", "route": "shtns", "nside": 64, "spin": 2, "grid": "GL 192x384", "vec1_syn_ms": 0.12637200416065753, "vec1_syn_times_ms": [0.12741101090796292, 0.12671100557781756, 0.12637200416065753, 0.12592098210006952, 0.12584100477397442], "vec1_ana_ms": 0.08110998896881938, "vec1_ana_times_ms": [0.08466097642667592, 0.08110998896881938, 0.08006999269127846, 0.0815809762571007, 0.07839099271222949], "vec1_rt_err": 4.482902636726187e-13, "vec1_dev_gib": 0.009765625}
+BEGIN shtns 128 0
+[SHTns 3.7.5] built Sep 22 2026, 21:07:35, id: v3.7-33-g4e69ceb,avx512,ishioka,openmp,cuda
+  cuda GPU #0 "NVIDIA RTX PRO 6000 Blackwell Workstation Edition" found (warp size = 32, compute capabilities = 12.0, CU=188, max_threads=288768, 95 GB, L2 cache=128MB).
+!!! Use theta-contiguous FFT on GPU !!!
+=> Using VkFFT v1.2.33
+  cuda GPU #0 "NVIDIA RTX PRO 6000 Blackwell Workstation Edition" found (warp size = 32, compute capabilities = 12.0, CU=188, max_threads=288768, 95 GB, L2 cache=128MB).
+!!! Use theta-contiguous FFT on GPU !!!
+=> Using VkFFT v1.2.33
+RESULT {"engine": "shtns", "route": "shtns", "nside": 128, "spin": 0, "grid": "GL 384x768", "fp64_syn_ms": 0.10947100236080587, "fp64_syn_times_ms": [0.11028099106624722, 0.10940100764855742, 0.11002100654877722, 0.10947100236080587, 0.10947097325697541], "fp64_rt_err": 1.7297186012740473e-13, "fp64_ana_ms": 0.08236098801717162, "fp64_ana_times_ms": [0.08286998490802944, 0.08142099250108004, 0.08054100908339024, 0.08259102469310164, 0.08236098801717162], "fp64_syn_err": 7.038874830590708e-13, "fp64_dev_gib": 0.029296875, "fp32_syn_ms": 0.07778100552968681, "fp32_syn_times_ms": [0.0792010105215013, 0.07809998351149261, 0.07778097642585635, 0.07766098133288324, 0.07778100552968681], "fp32_rt_err": 1.844225395041331e-06, "fp32_ana_ms": 0.054320989875122905, "fp32_ana_times_ms": [0.05491101182997227, 0.05324999801814556, 0.054320989875122905, 0.05415099440142512, 0.05547999171540141], "fp32_syn_err": 4.5107682253828965e-06, "fp32_dev_gib": -0.00390625}
+BEGIN shtns 128 2
+[SHTns 3.7.5] built Sep 22 2026, 21:07:35, id: v3.7-33-g4e69ceb,avx512,ishioka,openmp,cuda
+  cuda GPU #0 "NVIDIA RTX PRO 6000 Blackwell Workstation Edition" found (warp size = 32, compute capabilities = 12.0, CU=188, max_threads=288768, 95 GB, L2 cache=128MB).
+!!! Use theta-contiguous FFT on GPU !!!
+=> Using VkFFT v1.2.33
+RESULT {"engine": "shtns", "route": "shtns", "nside": 128, "spin": 2, "grid": "GL 384x768", "vec1_syn_ms": 0.216532003832981, "vec1_syn_times_ms": [0.21739199291914701, 0.21692202426493168, 0.216532003832981, 0.21609198302030563, 0.21596200531348586], "vec1_ana_ms": 0.16056199092417955, "vec1_ana_times_ms": [0.16519101336598396, 0.1620519906282425, 0.16025200602598488, 0.1593109918758273, 0.16056199092417955], "vec1_rt_err": 3.294951694532234e-12, "vec1_dev_gib": 0.041015625}
+BEGIN shtns 256 0
+[SHTns 3.7.5] built Sep 22 2026, 21:07:35, id: v3.7-33-g4e69ceb,avx512,ishioka,openmp,cuda
+  cuda GPU #0 "NVIDIA RTX PRO 6000 Blackwell Workstation Edition" found (warp size = 32, compute capabilities = 12.0, CU=188, max_threads=288768, 95 GB, L2 cache=128MB).
+!!! Use theta-contiguous FFT on GPU !!!
+=> Using VkFFT v1.2.33
+  cuda GPU #0 "NVIDIA RTX PRO 6000 Blackwell Workstation Edition" found (warp size = 32, compute capabilities = 12.0, CU=188, max_threads=288768, 95 GB, L2 cache=128MB).
+!!! Use theta-contiguous FFT on GPU !!!
+=> Using VkFFT v1.2.33
+RESULT {"engine": "shtns", "route": "shtns", "nside": 256, "spin": 0, "grid": "GL 768x1536", "fp64_syn_ms": 0.4645349981728941, "fp64_syn_times_ms": [0.4661249986384064, 0.4652439965866506, 0.4645239969249815, 0.4645349981728941, 0.46280398964881897], "fp64_rt_err": 2.7878501910083703e-13, "fp64_ana_ms": 0.3958040033467114, "fp64_ana_times_ms": [0.3985439834650606, 0.39002401172183454, 0.3958040033467114, 0.3939230227842927, 0.397453986806795], "fp64_syn_err": 1.3673249035195526e-12, "fp64_dev_gib": 0.083984375, "fp32_syn_ms": 0.31845300691202283, "fp32_syn_times_ms": [0.31948299147188663, 0.3180930216331035, 0.32028299756348133, 0.31845300691202283, 0.3183630178682506], "fp32_rt_err": 3.583846299675071e-06, "fp32_ana_ms": 0.2707329986151308, "fp32_ana_times_ms": [0.2732319990172982, 0.2707329986151308, 0.26584300212562084, 0.27076201513409615, 0.26983299176208675], "fp32_syn_err": 6.8273070285732926e-06, "fp32_dev_gib": -0.001953125}
+BEGIN shtns 256 2
+[SHTns 3.7.5] built Sep 22 2026, 21:07:35, id: v3.7-33-g4e69ceb,avx512,ishioka,openmp,cuda
+  cuda GPU #0 "NVIDIA RTX PRO 6000 Blackwell Workstation Edition" found (warp size = 32, compute capabilities = 12.0, CU=188, max_threads=288768, 95 GB, L2 cache=128MB).
+!!! Use theta-contiguous FFT on GPU !!!
+=> Using VkFFT v1.2.33
+RESULT {"engine": "shtns", "route": "shtns", "nside": 256, "spin": 2, "grid": "GL 768x1536", "vec1_syn_ms": 0.9367690072394907, "vec1_syn_times_ms": [0.9367690072394907, 0.9377589740324765, 0.9357689996249974, 0.9354889916721731, 0.9367890015710145], "vec1_ana_ms": 0.7891279819887131, "vec1_ana_times_ms": [0.7946669938974082, 0.7891279819887131, 0.7898879994172603, 0.787777011282742, 0.7878979959059507], "vec1_rt_err": 5.531274153698871e-12, "vec1_dev_gib": 0.115234375}
+BEGIN shtns 512 0
+[SHTns 3.7.5] built Sep 22 2026, 21:07:35, id: v3.7-33-g4e69ceb,avx512,ishioka,openmp,cuda
+  cuda GPU #0 "NVIDIA RTX PRO 6000 Blackwell Workstation Edition" found (warp size = 32, compute capabilities = 12.0, CU=188, max_threads=288768, 95 GB, L2 cache=128MB).
+!!! Use theta-contiguous FFT on GPU !!!
+=> Using VkFFT v1.2.33
+  cuda GPU #0 "NVIDIA RTX PRO 6000 Blackwell Workstation Edition" found (warp size = 32, compute capabilities = 12.0, CU=188, max_threads=288768, 95 GB, L2 cache=128MB).
+!!! Use theta-contiguous FFT on GPU !!!
+=> Using VkFFT v1.2.33
+RESULT {"engine": "shtns", "route": "shtns", "nside": 512, "spin": 0, "grid": "GL 1536x3072", "fp64_syn_ms": 2.7573670085985214, "fp64_syn_times_ms": [2.762476011412218, 2.7601170004345477, 2.7570759993977845, 2.7573670085985214, 2.757306006969884], "fp64_rt_err": 9.12727107278784e-13, "fp64_ana_ms": 2.4550929956603795, "fp64_ana_times_ms": [2.46891297865659, 2.453242981573567, 2.4536240089219064, 2.455363981425762, 2.4550929956603795], "fp64_syn_err": 8.519371875321145e-12, "fp64_dev_gib": 0.296875, "fp32_syn_ms": 1.9285290036350489, "fp32_syn_times_ms": [1.93179800407961, 1.9285290036350489, 1.9280379929114133, 1.9300489802844822, 1.9281190179754049], "fp32_rt_err": 8.391547160450418e-06, "fp32_ana_ms": 1.7210369987878948, "fp32_ana_times_ms": [1.7375170136801898, 1.7174259992316365, 1.7228960059583187, 1.7210369987878948, 1.7186359909828752], "fp32_syn_err": 1.406398768209117e-05, "fp32_dev_gib": -0.03125}
+BEGIN shtns 512 2
+[SHTns 3.7.5] built Sep 22 2026, 21:07:35, id: v3.7-33-g4e69ceb,avx512,ishioka,openmp,cuda
+  cuda GPU #0 "NVIDIA RTX PRO 6000 Blackwell Workstation Edition" found (warp size = 32, compute capabilities = 12.0, CU=188, max_threads=288768, 95 GB, L2 cache=128MB).
+!!! Use theta-contiguous FFT on GPU !!!
+=> Using VkFFT v1.2.33
+RESULT {"engine": "shtns", "route": "shtns", "nside": 512, "spin": 2, "grid": "GL 1536x3072", "vec1_syn_ms": 5.551142996409908, "vec1_syn_times_ms": [5.551142996409908, 5.55627400171943, 5.545902997255325, 5.558003002079204, 5.5505130148958415], "vec1_ana_ms": 4.94286700268276, "vec1_ana_times_ms": [4.95582798612304, 4.941467981552705, 4.939297010423616, 4.94286700268276, 4.94301799335517], "vec1_rt_err": 5.5880786558567486e-11, "vec1_dev_gib": 0.40625}
+BEGIN shtns 1024 0
+[SHTns 3.7.5] built Sep 22 2026, 21:07:35, id: v3.7-33-g4e69ceb,avx512,ishioka,openmp,cuda
+  cuda GPU #0 "NVIDIA RTX PRO 6000 Blackwell Workstation Edition" found (warp size = 32, compute capabilities = 12.0, CU=188, max_threads=288768, 95 GB, L2 cache=128MB).
+!!! Use theta-contiguous FFT on GPU !!!
+=> Using VkFFT v1.2.33
+  cuda GPU #0 "NVIDIA RTX PRO 6000 Blackwell Workstation Edition" found (warp size = 32, compute capabilities = 12.0, CU=188, max_threads=288768, 95 GB, L2 cache=128MB).
+!!! Use theta-contiguous FFT on GPU !!!
+=> Using VkFFT v1.2.33
+RESULT {"engine": "shtns", "route": "shtns", "nside": 1024, "spin": 0, "grid": "GL 3072x6144", "fp64_syn_ms": 17.497537977760658, "fp64_syn_times_ms": [17.52175801084377, 17.497537977760658, 17.515118001028895, 17.480668000644073, 17.492327984655276], "fp64_rt_err": 2.4646052434929805e-12, "fp64_ana_ms": 17.453426989959553, "fp64_ana_times_ms": [17.413806985132396, 17.386747000273317, 17.453426989959553, 17.478677997132763, 17.48230800149031], "fp64_syn_err": 2.2420415402482698e-11, "fp64_dev_gib": 1.294921875, "fp32_syn_ms": 13.31613800721243, "fp32_syn_times_ms": [13.326337997568771, 13.313667004695162, 13.314487994648516, 13.319688005140051, 13.31613800721243], "fp32_rt_err": 2.1333510043092383e-05, "fp32_ana_ms": 12.707831978332251, "fp32_ana_times_ms": [12.740522011881694, 12.704421998932958, 12.707831978332251, 12.711741990642622, 12.70415200269781], "fp32_syn_err": 2.6402550105982216e-05, "fp32_dev_gib": -0.19921875}
+BEGIN shtns 1024 2
+[SHTns 3.7.5] built Sep 22 2026, 21:07:35, id: v3.7-33-g4e69ceb,avx512,ishioka,openmp,cuda
+  cuda GPU #0 "NVIDIA RTX PRO 6000 Blackwell Workstation Edition" found (warp size = 32, compute capabilities = 12.0, CU=188, max_threads=288768, 95 GB, L2 cache=128MB).
+!!! Use theta-contiguous FFT on GPU !!!
+=> Using VkFFT v1.2.33
+RESULT {"engine": "shtns", "route": "shtns", "nside": 1024, "spin": 2, "grid": "GL 3072x6144", "vec1_syn_ms": 35.04825700656511, "vec1_syn_times_ms": [35.04825700656511, 35.0729460187722, 35.03577597439289, 35.03875702153891, 35.148256982211024], "vec1_ana_ms": 35.06408701650798, "vec1_ana_times_ms": [35.27069897972979, 35.06548600853421, 35.06408701650798, 35.060705995419994, 35.062265989836305], "vec1_rt_err": 1.774976071283274e-10, "vec1_dev_gib": 1.720703125}
+BEGIN shtns 2048 0
+[SHTns 3.7.5] built Sep 22 2026, 21:07:35, id: v3.7-33-g4e69ceb,avx512,ishioka,openmp,cuda
+  cuda GPU #0 "NVIDIA RTX PRO 6000 Blackwell Workstation Edition" found (warp size = 32, compute capabilities = 12.0, CU=188, max_threads=288768, 95 GB, L2 cache=128MB).
+!!! Use theta-contiguous FFT on GPU !!!
+=> Using VkFFT v1.2.33
+  cuda GPU #0 "NVIDIA RTX PRO 6000 Blackwell Workstation Edition" found (warp size = 32, compute capabilities = 12.0, CU=188, max_threads=288768, 95 GB, L2 cache=128MB).
+!!! Use theta-contiguous FFT on GPU !!!
+=> Using VkFFT v1.2.33
+RESULT {"engine": "shtns", "route": "shtns", "nside": 2048, "spin": 0, "grid": "GL 6144x12288", "fp64_syn_ms": 129.46691099205054, "fp64_syn_times_ms": [129.41538201994263, 129.46691099205054, 129.46021201787516, 129.50736199854873, 129.47139199241064], "fp64_rt_err": 7.193090159700834e-12, "fp64_ana_ms": 132.44345999555662, "fp64_ana_times_ms": [132.27746900520287, 132.43877000059, 132.44489999487996, 132.44538998696953, 132.44345999555662], "fp64_syn_err": 4.88010754659671e-10, "fp64_dev_gib": 5.14453125, "fp32_syn_ms": 99.88152698497288, "fp32_syn_times_ms": [99.53990500071086, 99.88316800445318, 99.86965797725134, 99.88152698497288, 99.89469801075757], "fp32_rt_err": 3.6725900510360214e-05, "fp32_ana_ms": 98.12106098979712, "fp32_ana_times_ms": [97.96138902311213, 98.12178101856261, 98.12106098979712, 98.12725099618547, 98.11658097896725], "fp32_syn_err": 5.350780748548297e-05, "fp32_dev_gib": -0.8046875}
+BEGIN shtns 2048 2
+[SHTns 3.7.5] built Sep 22 2026, 21:07:35, id: v3.7-33-g4e69ceb,avx512,ishioka,openmp,cuda
+  cuda GPU #0 "NVIDIA RTX PRO 6000 Blackwell Workstation Edition" found (warp size = 32, compute capabilities = 12.0, CU=188, max_threads=288768, 95 GB, L2 cache=128MB).
+!!! Use theta-contiguous FFT on GPU !!!
+=> Using VkFFT v1.2.33
+RESULT {"engine": "shtns", "route": "shtns", "nside": 2048, "spin": 2, "grid": "GL 6144x12288", "vec1_syn_ms": 259.18847499997355, "vec1_syn_times_ms": [259.19747501029633, 259.1421240067575, 259.23589599551633, 259.18847499997355, 259.16706401039846], "vec1_ana_ms": 265.09484098642133, "vec1_ana_times_ms": [265.0998310127761, 265.0825520104263, 265.09136200184, 265.1036820025183, 265.09484098642133], "vec1_rt_err": 3.564852942763457e-09, "vec1_dev_gib": 6.837890625}
+BEGIN shtns 4096 0
+[SHTns 3.7.5] built Sep 22 2026, 21:07:35, id: v3.7-33-g4e69ceb,avx512,ishioka,openmp,cuda
+  cuda GPU #0 "NVIDIA RTX PRO 6000 Blackwell Workstation Edition" found (warp size = 32, compute capabilities = 12.0, CU=188, max_threads=288768, 95 GB, L2 cache=128MB).
+!!! Use theta-contiguous FFT on GPU !!!
+=> Using VkFFT v1.2.33
+  cuda GPU #0 "NVIDIA RTX PRO 6000 Blackwell Workstation Edition" found (warp size = 32, compute capabilities = 12.0, CU=188, max_threads=288768, 95 GB, L2 cache=128MB).
+!!! Use theta-contiguous FFT on GPU !!!
+=> Using VkFFT v1.2.33
+RESULT {"engine": "shtns", "route": "shtns", "nside": 4096, "spin": 0, "grid": "GL 12288x24576", "fp64_syn_ms": 989.9766889866441, "fp64_syn_times_ms": [990.2277509972919, 989.9766889866441, 989.9806379980873, 989.9690879974514, 989.9700369860511], "fp64_rt_err": 1.6289700746293904e-11, "fp64_ana_ms": 1027.741697995225, "fp64_ana_times_ms": [1027.8263000072911, 1027.7206680038944, 1027.7442490041722, 1027.741697995225, 1027.7355079888366], "fp64_syn_err": 1.3447940596900717e-09, "fp64_dev_gib": 20.546875, "fp32_syn_ms": 766.888636018848, "fp32_syn_times_ms": [766.9053369900212, 766.888636018848, 766.8853969953489, 766.9326069881208, 766.8764959962573], "fp32_rt_err": 7.58948207850709e-05, "fp32_ana_ms": 766.7862749949563, "fp32_ana_times_ms": [766.742804000387, 766.8067249760497, 766.8414849904366, 766.7862749949563, 766.7833949963097], "fp32_syn_err": 9.639456929944935e-05, "fp32_dev_gib": -3.228515625}
+BEGIN shtns 4096 2
+[SHTns 3.7.5] built Sep 22 2026, 21:07:35, id: v3.7-33-g4e69ceb,avx512,ishioka,openmp,cuda
+  cuda GPU #0 "NVIDIA RTX PRO 6000 Blackwell Workstation Edition" found (warp size = 32, compute capabilities = 12.0, CU=188, max_threads=288768, 95 GB, L2 cache=128MB).
+!!! Use theta-contiguous FFT on GPU !!!
+=> Using VkFFT v1.2.33
+RESULT {"engine": "shtns", "route": "shtns", "nside": 4096, "spin": 2, "grid": "GL 12288x24576", "vec1_syn_ms": 1980.7055720011704, "vec1_syn_times_ms": [1980.6352730083745, 1980.5463329830673, 1980.8150040043984, 1980.7211220031604, 1980.7055720011704], "vec1_ana_ms": 2064.617772004567, "vec1_ana_times_ms": [2063.7637049949262, 2064.757332991576, 2064.617772004567, 2064.5337399910204, 2064.764192007715], "vec1_rt_err": 7.503692903296077e-09, "vec1_dev_gib": 27.3046875}
+BEGIN shtns 8192 0
+[SHTns 3.7.5] built Sep 22 2026, 21:07:35, id: v3.7-33-g4e69ceb,avx512,ishioka,openmp,cuda
+  cuda GPU #0 "NVIDIA RTX PRO 6000 Blackwell Workstation Edition" found (warp size = 32, compute capabilities = 12.0, CU=188, max_threads=288768, 95 GB, L2 cache=128MB).
+!!! Use theta-contiguous FFT on GPU !!!
+=> Using VkFFT v1.2.33
+  cuda GPU #0 "NVIDIA RTX PRO 6000 Blackwell Workstation Edition" found (warp size = 32, compute capabilities = 12.0, CU=188, max_threads=288768, 95 GB, L2 cache=128MB).
+!!! Use theta-contiguous FFT on GPU !!!
+=> Using VkFFT v1.2.33
+RESULT {"engine": "shtns", "route": "shtns", "nside": 8192, "spin": 0, "grid": "GL 24576x49152", "fp64_syn_ms": 7735.918453021441, "fp64_syn_times_ms": [7735.918453021441, 7735.720494994894, 7735.846241004765, 7747.763118997682, 7764.221160003217], "fp64_rt_err": 7.108387060958501e-11, "fp64_ana_ms": 8132.043997000437, "fp64_ana_times_ms": [8130.310141976224, 8130.466848000651, 8132.043997000437, 8132.37260497408, 8134.252667019609], "fp64_syn_err": 2.311662828383134e-09, "fp64_dev_gib": 82.154296875, "fp32_syn_ms": 6012.002717005089, "fp32_syn_times_ms": [6011.343105026754, 6011.689217004459, 6012.002717005089, 6032.017485995311, 6032.5033069821075], "fp32_rt_err": 0.0001727858021783791, "fp32_ana_ms": 6096.634178014938, "fp32_ana_times_ms": [6095.610442018369, 6095.964022999397, 6096.634178014938, 6097.097670019139, 6097.470231004991], "fp32_syn_err": 0.00022400258840189746, "fp32_dev_gib": -12.927734375}
+BEGIN shtns 8192 2
+[SHTns 3.7.5] built Sep 22 2026, 21:07:35, id: v3.7-33-g4e69ceb,avx512,ishioka,openmp,cuda
+  cuda GPU #0 "NVIDIA RTX PRO 6000 Blackwell Workstation Edition" found (warp size = 32, compute capabilities = 12.0, CU=188, max_threads=288768, 95 GB, L2 cache=128MB).
+!!! Use theta-contiguous FFT on GPU !!!
+=> Using VkFFT v1.2.33
+Traceback (most recent call last):
+  File "/scratch/scratch-lxu/agent_dev/auto_research_agent/GMaster/benchmarks/independent/bench_three_way.py", line 182, in <module>
+    res = run_gm(nside, spin, reps) if engine == "gm" else run_shtns(nside, spin, reps)
+                                                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/scratch/scratch-lxu/agent_dev/auto_research_agent/GMaster/benchmarks/independent/bench_three_way.py", line 165, in run_shtns
+    syn(); sync(); kt, kp = vt.copy(), vp.copy()
+                            ^^^^^^^^^
+  File "cupy/_core/core.pyx", line 691, in cupy._core.core._ndarray_base.copy
+  File "cupy/_core/core.pyx", line 717, in cupy._core.core._ndarray_base.copy
+  File "cupy/_core/core.pyx", line 676, in cupy._core.core._ndarray_base.astype
+  File "cupy/_core/core.pyx", line 167, in cupy._core.core.ndarray.__new__
+  File "cupy/_core/core.pyx", line 254, in cupy._core.core._ndarray_base._init
+  File "cupy/cuda/memory.pyx", line 875, in cupy.cuda.memory.alloc
+  File "cupy/cuda/memory.pyx", line 1579, in cupy.cuda.memory.MemoryPool.malloc
+  File "cupy/cuda/memory.pyx", line 1600, in cupy.cuda.memory.MemoryPool.malloc
+  File "cupy/cuda/memory.pyx", line 1271, in cupy.cuda.memory.SingleDeviceMemoryPool.malloc
+  File "cupy/cuda/memory.pyx", line 1292, in cupy.cuda.memory.SingleDeviceMemoryPool._malloc
+  File "cupy/cuda/memory.pyx", line 1537, in cupy.cuda.memory.SingleDeviceMemoryPool._try_malloc
+  File "cupy/cuda/memory.pyx", line 1540, in cupy.cuda.memory.SingleDeviceMemoryPool._try_malloc
+cupy.cuda.memory.OutOfMemoryError: Out of memory allocating 9,663,676,416 bytes (allocated so far: 38,655,492,096 bytes).
+done

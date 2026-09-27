@@ -716,9 +716,9 @@ def forward_latitudinal_positive_pair(positive_a, positive_b, weights, phase, *,
                                    L=L, nside=nside)
 
 
-@partial(jax.jit, static_argnames=("L", "nside"))
-def _inverse_fold_impl(positive, phase, garr, tabs, *, L, nside):
-    return _fold_synthesise([positive], phase, garr, tabs, L=L, nside=nside)[0]
+@partial(jax.jit, static_argnames=("L", "nside", "cdtype"))
+def _inverse_fold_impl(positive, phase, garr, tabs, *, L, nside, cdtype=jnp.complex128):
+    return _fold_synthesise([positive], phase, garr, tabs, L=L, nside=nside, cdtype=cdtype)[0]
 
 
 @partial(jax.jit, static_argnames=("L", "nside"))
@@ -726,8 +726,10 @@ def _inverse_fold_pair_impl(positive_a, positive_b, phase, garr, tabs, *, L, nsi
     return _fold_synthesise([positive_a, positive_b], phase, garr, tabs, L=L, nside=nside)
 
 
-def _fold_synthesise(positives, phase, garr, tabs, *, L, nside):
+def _fold_synthesise(positives, phase, garr, tabs, *, L, nside, cdtype=jnp.complex128):
     """One folded synthesis march driving any number of scalar coefficient sets.
+
+    ``cdtype`` is the output type; the phased rows are rounded to it where they are formed.
 
     Like the analysis pair, the recurrence is shared and each extra map costs its own
     accumulators -- which for spin 0 are the lanes the spin-2 kernel uses for its second
@@ -759,8 +761,8 @@ def _fold_synthesise(positives, phase, garr, tabs, *, L, nside):
         for k in range(nmaps):
             fn = v[..., 4 * k] + 1j * v[..., 4 * k + 1]
             fs = v[..., 4 * k + 2] + 1j * v[..., 4 * k + 3]
-            rows_n[k].append((fn[:, :north] * nf).astype(jnp.complex128))
-            rows_s[k].append((fs[:, :north - 1] * sf).astype(jnp.complex128))
+            rows_n[k].append((fn[:, :north] * nf).astype(cdtype))
+            rows_s[k].append((fs[:, :north - 1] * sf).astype(cdtype))
     out = []
     for k in range(nmaps):
         north_vals = jnp.concatenate(rows_n[k], axis=0)               # (L, north)
@@ -770,12 +772,12 @@ def _fold_synthesise(positives, phase, garr, tabs, *, L, nside):
     return out
 
 
-def inverse_latitudinal_positive(positive, phase, *, L, nside):
+def inverse_latitudinal_positive(positive, phase, *, L, nside, cdtype=jnp.complex128):
     dc = _dc(L, positive)
     if dc is not None:
         return dc.inverse_latitudinal_positive(positive, phase, L=L, nside=nside)
     return _inverse_fold_impl(positive, phase, geo_arrays(L, nside, 0), tables_for(L, nside, 0),
-                              L=L, nside=nside)
+                              L=L, nside=nside, cdtype=cdtype)
 
 
 def inverse_latitudinal_positive_pair(positive_a, positive_b, phase, *, L, nside):
@@ -788,9 +790,13 @@ def inverse_latitudinal_positive_pair(positive_a, positive_b, phase, *, L, nside
 
 
 # ------------------------------------------------------------------------------------- spin 2
-@partial(jax.jit, static_argnames=("L", "nside"))
-def _forward_impl(ftm, garr, tabs, *, L, nside):
-    """``(ntheta, 2L)`` ring spectrum (column ``L + m`` is order ``m``) to ``(L, 2L-1)``."""
+@partial(jax.jit, static_argnames=("L", "nside", "cdtype"))
+def _forward_impl(ftm, garr, tabs, *, L, nside, cdtype=jnp.complex128):
+    """``(ntheta, 2L)`` ring spectrum (column ``L + m`` is order ``m``) to ``(L, 2L-1)``.
+
+    ``cdtype`` is the output's element type.  The kernel's partials are float32, so complex64
+    holds them exactly; Nside 8192 asks for it (its complex128 block is 18 GiB).
+    """
     spin = 2
     geo = _geo_dict(garr, L, nside, spin)
     ftm = jnp.asarray(ftm)
@@ -841,25 +847,31 @@ def _forward_impl(ftm, garr, tabs, *, L, nside):
     # complex128 buffer, against 50 ms for the march itself (`.qwen/tmp/nsys_s2.nsys-rep`).
     dpart = jnp.concatenate(rows, axis=0)                       # (L, L, 2) rows ascending in m
     mpart = jnp.concatenate(mrows[::-1], axis=0)                # (L, L, 2) rows descending in m
-    direct = (dpart[..., 0] + 1j * dpart[..., 1]).astype(jnp.complex128).T
-    mirror = (mpart[..., 0] + 1j * mpart[..., 1]).astype(jnp.complex128).T * sign[:, None]
+    direct = (dpart[..., 0] + 1j * dpart[..., 1]).astype(cdtype).T
+    mirror = (mpart[..., 0] + 1j * mpart[..., 1]).astype(cdtype).T * sign[:, None].astype(cdtype)
     # `mirror` column c already holds order -(L-1-c), which is the output column for the negative
     # half; column L-1 (order 0) belongs to the direct half and is dropped.
     return jnp.concatenate([mirror[:, :L - 1], direct], axis=1)
 
 
-def forward_latitudinal(ftm, *, L, spin, nside):
+def forward_latitudinal(ftm, *, L, spin, nside, cdtype=jnp.complex128):
     if int(spin) != 2:
         raise ValueError(f"v2 march implements spin=+2, got spin={spin}")
     dc = _dc(L, ftm)
     if dc is not None:
         return dc.forward_latitudinal_spin(ftm, L=L, spin=2, nside=nside)
-    return _forward_impl(ftm, geo_arrays(L, nside, 2), tables_for(L, nside, 2), L=L, nside=nside)
+    return _forward_impl(ftm, geo_arrays(L, nside, 2), tables_for(L, nside, 2), L=L, nside=nside,
+                         cdtype=cdtype)
 
 
-@partial(jax.jit, static_argnames=("L", "nside"))
-def _inverse_impl(flm, garr, tabs, *, L, nside):
-    """``(L, 2L-1)`` (``flm[ell, L-1+m]``) to ``(ntheta, 2L)`` (column ``L + m``; column 0 zero)."""
+@partial(jax.jit, static_argnames=("L", "nside", "cdtype", "group"))
+def _inverse_impl(flm, garr, tabs, *, L, nside, cdtype=jnp.complex128, group=None):
+    """``(L, 2L-1)`` (``flm[ell, L-1+m]``) to ``(ntheta, 2L)`` (column ``L + m``; column 0 zero).
+
+    ``cdtype`` as in :func:`_forward_impl`: the kernel writes float32.  ``group = (w0, w1)`` runs
+    only those windows and returns their direct block and their mirror block column-reversed, so
+    that `inverse_latitudinal` places every block with one concatenation.
+    """
     spin = 2
     geo = _geo_dict(garr, L, nside, spin)
     flm = jnp.asarray(flm)
@@ -869,6 +881,8 @@ def _inverse_impl(flm, garr, tabs, *, L, nside):
     lane_of_mirror = lane_of_ring[::-1]                      # lane holding ring pi - theta_r
     dirs, mirs = [], []
     for w, (m0, mb, mbp) in enumerate(_windows(L, nside, spin)):
+        if group is not None and not group[0] <= w < group[1]:
+            continue
         man, ex0, tab = _win_tables(tabs, w, m0, mbp, geo, L, spin)
         rs = (1.0 - 2.0 * ((m0 + jnp.arange(mb)) % 2))[:, None]                    # (-1)^m of the row
         ap = flm[:, L - 1 + m0:L - 1 + m0 + mb].T * rs                             # (mb, L)
@@ -879,23 +893,45 @@ def _inverse_impl(flm, garr, tabs, *, L, nside):
         coef = coef.at[:mb, :L, 2].set(am.real.astype(jnp.float32))
         coef = coef.at[:mb, :L, 3].set(am.imag.astype(jnp.float32))
         v = _ffi_synthesis(spin, geo, m0, mbp, L, man, ex0, tab, coef)[:mb]        # (mb, npad, 4)
-        fp = (v[..., 0] + 1j * v[..., 1]).astype(jnp.complex128).T                 # (npad, mb) f+(theta)
-        fm = (v[..., 2] + 1j * v[..., 3]).astype(jnp.complex128).T                 # f-(pi - theta)
+        fp = (v[..., 0] + 1j * v[..., 1]).astype(cdtype).T                         # (npad, mb) f+(theta)
+        fm = (v[..., 2] + 1j * v[..., 3]).astype(cdtype).T                         # f-(pi - theta)
         dirs.append(fp[lane_of_ring])                                              # (ntheta, mb), order m
         mirs.append(fm[lane_of_mirror])                                            # (ntheta, mb), order -m
     direct = jnp.concatenate(dirs, axis=1)                                         # column m: order m
     mirror = jnp.concatenate(mirs, axis=1)                                         # column m: order -m
-    return jnp.concatenate([jnp.zeros((ntheta, 1), jnp.complex128), mirror[:, 1:][:, ::-1], direct],
+    if group is not None:
+        return direct, mirror[:, ::-1]
+    return jnp.concatenate([jnp.zeros((ntheta, 1), cdtype), mirror[:, 1:][:, ::-1], direct],
                            axis=1)
 
+# Windows per program when the synthesis runs in complex64 (Nside 8192).  As one program it needed
+# 34.5 GiB beside its input (12 GiB output, 22.5 GiB temporaries) and the second call of an Nside
+# 8192 spin-2 pipeline ran out of memory there.  In groups of 64 (6 programs of 384 windows) it is
+# 24.0 GiB, the blocks plus the output; 4 or 16 per group measured 35.9 (`.qwen/tmp/s39/inv_peak.py`).
+_INVERSE_GROUP = int(os.environ.get("GMASTER_V2_INVERSE_GROUP", "64"))
 
-def inverse_latitudinal(flm, *, L, spin, nside):
+
+def inverse_latitudinal(flm, *, L, spin, nside, cdtype=jnp.complex128):
     if int(spin) != 2:
         raise ValueError(f"v2 march implements spin=+2, got spin={spin}")
     dc = _dc(L, flm)
     if dc is not None:
         return dc.inverse_latitudinal_spin(flm, L=L, spin=2, nside=nside)
-    return _inverse_impl(flm, geo_arrays(L, nside, 2), tables_for(L, nside, 2), L=L, nside=nside)
+    garr, tabs = geo_arrays(L, nside, 2), tables_for(L, nside, 2)
+    if cdtype != jnp.complex64:
+        return _inverse_impl(flm, garr, tabs, L=L, nside=nside, cdtype=cdtype)
+    nwin = len(_windows(L, nside, 2))
+    parts = [_inverse_impl(flm, garr, tabs, L=L, nside=nside, cdtype=cdtype,
+                           group=(w0, min(w0 + _INVERSE_GROUP, nwin)))
+             for w0 in range(0, nwin, _INVERSE_GROUP)]
+    # Column-reversed mirror blocks in reverse group order run from order -(L-1) up; the last
+    # column of the first group's block is order 0, which belongs to the direct half.
+    mirrors = [m for _, m in parts[::-1]]
+    mirrors[-1] = mirrors[-1][:, :-1]
+    directs = [d for d, _ in parts]
+    del parts
+    zero = jnp.zeros((directs[0].shape[0], 1), cdtype)
+    return jnp.concatenate([zero] + mirrors + directs, axis=1)
 
 
 def clear_cache():

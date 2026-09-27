@@ -606,6 +606,9 @@ def _wigner_d_table(beta, *, m, n, lmax):
         )
         return (current, following), following
 
+    # The scan's stacked values are a second full table.  Ask for that room here, not
+    # at the start of the workspace: by this point the field transform is resident.
+    utils.make_room(int(len(beta)) * int(lmax + 1) * 8 * 4)
     # The recurrence is stacked instead of written column by column: a traced
     # column index makes XLA copy the whole (nodes, ell) table on every degree.
     # It is also launch-bound -- at lmax 768 with 1535 nodes each step is only
@@ -768,11 +771,67 @@ def _wigner_d_triple(beta, *, s1, s2, n1, n2, lmax, lmax_mask):
     )
 
 
+# Above this many bytes of float64 Wigner-d tables the quadrature is summed over blocks of nodes
+# instead of holding the tables whole.  At Nside 8192 spin 2 the three tables are 38.6 GiB (the
+# mask one alone 49151^2 float64 = 18 GiB) on top of the resident field, and the build failed at
+# every attempt; Nside 4096 (9.7 GiB) keeps the cached whole-table path.
+_WD_STREAM_BYTES = int(float(os.environ.get("GMASTER_WD_STREAM_GIB", "16")) * 1024 ** 3)
+_WD_STREAM_NODES = int(os.environ.get("GMASTER_WD_STREAM_NODES", "4096"))
+
+
+def _folded(m, n):
+    """The `(m, n)` key `_wigner_d_shared` stores a table under."""
+    if (m - n) % 2 == 0 and (m < 0 or (m == 0 and n < 0)):
+        return -m, -n
+    return m, n
+
+
+@partial(jax.jit, static_argnames=("pairs", "lmax", "lmax_mask"), donate_argnames="acc")
+def _coupling_quadrature_block(acc, mask_cls, beta, weights, *, pairs, lmax, lmax_mask):
+    """`acc` plus one block of nodes' share of `_general_coupling_matrix_quadrature`."""
+    built = {}
+    tables = []
+    for (m, n), order in zip(pairs, (lmax, lmax, lmax_mask)):
+        key = (m, n, order)
+        if key not in built:
+            built[key] = _wigner_d_table(beta, m=m, n=n, lmax=order)
+        tables.append(built[key])
+    return acc + _general_coupling_matrix_quadrature(
+        mask_cls, weights, tuple(tables), lmax=lmax, lmax_mask=lmax_mask)
+
+
+def _general_coupling_matrix_streamed(mask_cls, nodes, weights, *, pairs, lmax, lmax_mask):
+    """The quadrature as a sum over node blocks; only one block's tables are live.
+
+    The last block is padded with weight-0 nodes at the equator, which add exactly zero.
+    """
+    block = _WD_STREAM_NODES
+    total = -(-len(nodes) // block) * block
+    beta = np.full(total, np.pi / 2)
+    beta[: len(nodes)] = np.arccos(nodes)
+    padded = np.zeros(total)
+    padded[: len(weights)] = weights
+    mask_cls = jnp.asarray(mask_cls)
+    acc = jnp.zeros((2, lmax + 1, lmax + 1))
+    for lo in range(0, total, block):
+        acc = _coupling_quadrature_block(
+            acc, mask_cls, jnp.asarray(beta[lo : lo + block]),
+            jnp.asarray(padded[lo : lo + block]),
+            pairs=pairs, lmax=lmax, lmax_mask=lmax_mask,
+        )
+    return acc
+
+
 def _general_coupling_matrix(
     mask_cls, *, s1, s2, n1, n2, lmax, lmax_mask, tables=None
 ):
     order = (2 * lmax + lmax_mask) // 2 + 1
     nodes, weights = _gauss_legendre(order)
+    if tables is None and order * (2 * lmax + lmax_mask + 3) * 8 > _WD_STREAM_BYTES:
+        _WD_TRIPLE_CACHE.clear()
+        pairs = (_folded(n1, n2), _folded(-s1, -s2), _folded(s1 - n1, s2 - n2))
+        return _general_coupling_matrix_streamed(
+            mask_cls, nodes, weights, pairs=pairs, lmax=lmax, lmax_mask=lmax_mask)
     nodes = jnp.asarray(nodes)
     if tables is None:
         tables = _wigner_d_triple(
@@ -1271,6 +1330,9 @@ def _binning_operators(bins):
 # and the two projections below are six more eager dispatches (~0.5ms) whose only varying
 # input is the coupling matrix itself.
 _expanded_binning_cache: dict = {}
+# Dense `kron(op, eye(ncls))` pairs: 5.1 GiB at Nside 8192 spin 2, kept from one workspace into the
+# next field's transform, which then did not fit.  Dropped when a transform asks for room.
+utils._ROOM_HOOKS.append(_expanded_binning_cache.clear)
 
 
 def _expanded_binning_operators(bins, ncls):
@@ -1496,6 +1558,15 @@ class NmtWorkspace:
         self.normalization = normalization
         self.norm_type = int(normalization == "FKP")
 
+        # The field transform's ring spectra are still live until its outputs are
+        # consumed.  Wait here so that ~26 GiB is back in the pool before the
+        # quadrature asks for its own table.  Nside 8192 spin 0 otherwise sits at
+        # 85.5 GiB and fails a further 34.3 GiB allocation.
+        jax.block_until_ready(fl1.get_alms())
+        jax.block_until_ready(fl1.get_mask_alms())
+        if fl2 is not fl1:
+            jax.block_until_ready(fl2.get_alms())
+            jax.block_until_ready(fl2.get_mask_alms())
         alm1 = fl1.get_mask_alms()[None, :]
         alm2 = alm1 if fl2 is fl1 else fl2.get_mask_alms()[None, :]
         # The stage needs room for the matrix twice over (its blocks and the assembled form) plus

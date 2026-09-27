@@ -1,0 +1,297 @@
+CORES_BENCH_START 2026-09-18T04:28:31+01:00 nproc=32
+index, memory.used [MiB], utilization.gpu [%]
+0, 10902 MiB, 0 %
+1, 265 MiB, 0 %
+=== GMaster GPU1 PREALLOCATE=false 2026-09-18T04:28:31+01:00 ===
+================================================================================
+ GMASTER v2_march vs NaMaster Benchmarks: fp32 vs fp64 Speed & Correctness
+================================================================================
+Target GPU: CUDA_VISIBLE_DEVICES=1
+Modes: all
+
+>>> SECTION 1: Isolated SHT Benchmarks (map2alm & alm2map vs DUCC) <<<
+Nside | Spin | DUCC ana (ms) | fp32 ana (ms) [x] | fp64 ana (ms) [x] | fp32 rel | fp64 rel | DUCC syn (ms) | fp32 syn (ms) [x] | fp64 syn (ms) [x]
+--------------------------------------------------------------------------------------------------------------------------------------------
+   64 |    0 |           nan |      0.13 [ nanx] |      0.17 [ nanx] |      nan |      nan |           nan |      0.13 [ nanx] |      0.17 [ nanx]
+   64 |    2 |           nan |      0.16 [ nanx] |      0.17 [ nanx] |      nan |      nan |           nan |      0.16 [ nanx] |      0.18 [ nanx]
+  128 |    0 |           nan |      0.27 [ nanx] |      0.24 [ nanx] |      nan |      nan |           nan |      0.27 [ nanx] |      0.33 [ nanx]
+  128 |    2 |           nan |      0.23 [ nanx] |      0.31 [ nanx] |      nan |      nan |           nan |      0.30 [ nanx] |      0.38 [ nanx]
+  256 |    0 |           nan |      0.42 [ nanx] |      0.72 [ nanx] |      nan |      nan |           nan |      0.45 [ nanx] |      0.77 [ nanx]
+  256 |    2 |           nan |      0.80 [ nanx] |      1.08 [ nanx] |      nan |      nan |           nan |      0.79 [ nanx] |      1.13 [ nanx]
+  512 |    0 |           nan |      2.17 [ nanx] |      2.34 [ nanx] |      nan |      nan |           nan |      2.05 [ nanx] |      3.24 [ nanx]
+  512 |    2 |           nan |      2.96 [ nanx] |      4.79 [ nanx] |      nan |      nan |           nan |      3.17 [ nanx] |      5.18 [ nanx]
+ 1024 |    0 |           nan |      7.53 [ nanx] |     10.45 [ nanx] |      nan |      nan |           nan |      8.30 [ nanx] |     12.74 [ nanx]
+ 1024 |    2 |           nan |     16.37 [ nanx] |     23.33 [ nanx] |      nan |      nan |           nan |     15.42 [ nanx] |     22.92 [ nanx]
+ 2048 |    0 |           nan |     44.03 [ nanx] |     55.09 [ nanx] |      nan |      nan |           nan |     42.81 [ nanx] |     60.00 [ nanx]
+ 2048 |    2 |           nan |     92.63 [ nanx] |    119.27 [ nanx] |      nan |      nan |           nan |     91.05 [ nanx] |    113.13 [ nanx]
+ 4096 |    0 |           nan |    438.24 [ nanx] |    507.60 [ nanx] |      nan |      nan |           nan |    510.08 [ nanx] |    573.46 [ nanx]
+ 4096 |    2 |           nan |    722.42 [ nanx] |    854.21 [ nanx] |      nan |      nan |           nan |    697.00 [ nanx] |    791.66 [ nanx]
+
+>>> SECTION 2: End-to-End MASTER Pipeline Benchmarks <<<
+Nside | Spin | NaMaster (ms) | GM fp32 (ms) [x] | GM fp64 (ms) [x] | fp32 rel dCl | fp64 rel dCl | Peak RSS (GB) | Peak VRAM (GB)
+-----------------------------------------------------------------------------------------------------------------------------
+   64 |    0 |           nan |      6.2 [ --- ] |      6.2 [ --- ] |          nan |          nan |           2.1 |            0.2
+   64 |    2 |           nan |      3.2 [ --- ] |      2.6 [ --- ] |          nan |          nan |           2.2 |            0.2
+  128 |    0 |           nan |     10.3 [ --- ] |     10.6 [ --- ] |          nan |          nan |           2.1 |            0.2
+  128 |    2 |           nan |      3.2 [ --- ] |      5.0 [ --- ] |          nan |          nan |           2.4 |            0.3
+  256 |    0 |           nan |     20.9 [ --- ] |     23.0 [ --- ] |          nan |          nan |           2.5 |            0.4
+  256 |    2 |           nan |      8.7 [ --- ] |     17.2 [ --- ] |          nan |          nan |           2.9 |            0.6
+  512 |    0 |           nan |     69.4 [ --- ] |     77.2 [ --- ] |          nan |          nan |           2.7 |            0.9
+  512 |    2 |           nan |     32.9 [ --- ] |     88.6 [ --- ] |          nan |          nan |           4.3 |            2.1
+ 1024 |    0 |           nan |    273.6 [ --- ] |    318.3 [ --- ] |          nan |          nan |           4.6 |            3.6
+ 1024 |    2 |           nan |    170.1 [ --- ] |    537.1 [ --- ] |          nan |          nan |          12.1 |            8.2
+ 2048 |    0 |           nan |   1591.7 [ --- ] |   1772.3 [ --- ] |          nan |          nan |          14.1 |           14.5
+ 2048 |    2 |           nan |   1077.4 [ --- ] |   3756.4 [ --- ] |          nan |          nan |          44.1 |           29.1
+ 4096 |    0 |           nan |  12434.7 [ --- ] |  13186.5 [ --- ] |          nan |          nan |          44.9 |           53.3
+Error running pipeline nside=4096 spin=2:
+E0918 05:01:30.313014 1831382 gpu_cudamallocasync_allocator.cc:359] gpu_async_0 cuMemAllocAsync failed to allocate 4848615424 bytes: RESOURCE_EXHAUSTED: : CUDA_ERROR_OUT_OF_MEMORY: out of memory
+ Reported by CUDA: Free memory/Total memory: 144572416/101948129280
+E0918 05:01:30.313062 1831382 gpu_cudamallocasync_allocator.cc:364] Stats: Limit:                              0B
+InUse:                        78.43GiB
+MaxInUse:                     78.43GiB
+NumAllocs:                        5584
+MaxAllocSize:                 17.73GiB
+Reserved:                           0B
+PeakReserved:                       0B
+LargestFreeBlock:                   0B
+
+E0918 05:01:30.313078 1831382 gpu_cudamallocasync_allocator.cc:68] Histogram of current allocation: (allocation_size_in_bytes, nb_allocation_of_that_sizes), ...;
+E0918 05:01:30.313080 1831382 gpu_cudamallocasync_allocator.cc:71] 8, 5
+E0918 05:01:30.313083 1831382 gpu_cudamallocasync_allocator.cc:71] 128, 1
+E0918 05:01:30.313084 1831382 gpu_cudamallocasync_allocator.cc:71] 256, 1
+E0918 05:01:30.313085 1831382 gpu_cudamallocasync_allocator.cc:71] 8192, 1
+E0918 05:01:30.313087 1831382 gpu_cudamallocasync_allocator.cc:71] 16384, 1
+E0918 05:01:30.313088 1831382 gpu_cudamallocasync_allocator.cc:71] 32768, 3
+E0918 05:01:30.313089 1831382 gpu_cudamallocasync_allocator.cc:71] 49080, 2
+E0918 05:01:30.313090 1831382 gpu_cudamallocasync_allocator.cc:71] 65520, 5
+E0918 05:01:30.313091 1831382 gpu_cudamallocasync_allocator.cc:71] 65536, 6
+E0918 05:01:30.313092 1831382 gpu_cudamallocasync_allocator.cc:71] 98160, 2
+E0918 05:01:30.313093 1831382 gpu_cudamallocasync_allocator.cc:71] 98304, 2
+E0918 05:01:30.313094 1831382 gpu_cudamallocasync_allocator.cc:71] 131064, 2
+E0918 05:01:30.313095 1831382 gpu_cudamallocasync_allocator.cc:71] 131072, 3
+E0918 05:01:30.313096 1831382 gpu_cudamallocasync_allocator.cc:71] 196600, 1
+E0918 05:01:30.313097 1831382 gpu_cudamallocasync_allocator.cc:71] 40206336, 2
+E0918 05:01:30.313098 1831382 gpu_cudamallocasync_allocator.cc:71] 177602560, 1
+E0918 05:01:30.313100 1831382 gpu_cudamallocasync_allocator.cc:71] 604028928, 2
+E0918 05:01:30.313101 1831382 gpu_cudamallocasync_allocator.cc:71] 643301376, 2
+E0918 05:01:30.313102 1831382 gpu_cudamallocasync_allocator.cc:71] 1207959552, 3
+E0918 05:01:30.313103 1831382 gpu_cudamallocasync_allocator.cc:71] 1208057856, 2
+E0918 05:01:30.313104 1831382 gpu_cudamallocasync_allocator.cc:71] 1610219520, 2
+E0918 05:01:30.313105 1831382 gpu_cudamallocasync_allocator.cc:71] 1610612736, 4
+E0918 05:01:30.313106 1831382 gpu_cudamallocasync_allocator.cc:71] 2146959360, 4
+E0918 05:01:30.313107 1831382 gpu_cudamallocasync_allocator.cc:71] 2416115712, 1
+E0918 05:01:30.313108 1831382 gpu_cudamallocasync_allocator.cc:71] 3220308000, 2
+E0918 05:01:30.313110 1831382 gpu_cudamallocasync_allocator.cc:71] 3221225472, 1
+E0918 05:01:30.313110 1831382 gpu_cudamallocasync_allocator.cc:71] 4293918720, 2
+E0918 05:01:30.313112 1831382 gpu_cudamallocasync_allocator.cc:71] 4831838208, 4
+E0918 05:01:30.313113 1831382 gpu_cudamallocasync_allocator.cc:71] 8587837440, 2
+E0918 05:01:30.313116 1831382 gpu_cudamallocasync_allocator.cc:104] CU_MEMPOOL_ATTR_RESERVED_MEM_CURRENT: 84825604096
+E0918 05:01:30.313117 1831382 gpu_cudamallocasync_allocator.cc:106] CU_MEMPOOL_ATTR_USED_MEM_CURRENT: 84214407120
+E0918 05:01:30.313118 1831382 gpu_cudamallocasync_allocator.cc:107] CU_MEMPOOL_ATTR_RESERVED_MEM_HIGH: 84959821824
+E0918 05:01:30.313119 1831382 gpu_cudamallocasync_allocator.cc:108] CU_MEMPOOL_ATTR_USED_MEM_HIGH: 84214407120
+E0918 05:01:30.314126 1831418 gpu_cudamallocasync_allocator.cc:359] gpu_async_0 cuMemAllocAsync failed to allocate 4848615424 bytes: RESOURCE_EXHAUSTED: : CUDA_ERROR_OUT_OF_MEMORY: out of memory
+ Reported by CUDA: Free memory/Total memory: 144572416/101948129280
+E0918 05:01:30.314150 1831418 gpu_cudamallocasync_allocator.cc:364] Stats: Limit:                              0B
+InUse:                        78.43GiB
+MaxInUse:                     78.43GiB
+NumAllocs:                        5585
+MaxAllocSize:                 17.73GiB
+Reserved:                           0B
+PeakReserved:                       0B
+LargestFreeBlock:                   0B
+
+E0918 05:01:30.314160 1831418 gpu_cudamallocasync_allocator.cc:68] Histogram of current allocation: (allocation_size_in_bytes, nb_allocation_of_that_sizes), ...;
+E0918 05:01:30.314161 1831418 gpu_cudamallocasync_allocator.cc:71] 8, 5
+E0918 05:01:30.314163 1831418 gpu_cudamallocasync_allocator.cc:71] 128, 1
+E0918 05:01:30.314164 1831418 gpu_cudamallocasync_allocator.cc:71] 256, 1
+E0918 05:01:30.314164 1831418 gpu_cudamallocasync_allocator.cc:71] 8192, 1
+E0918 05:01:30.314165 1831418 gpu_cudamallocasync_allocator.cc:71] 16384, 1
+E0918 05:01:30.314166 1831418 gpu_cudamallocasync_allocator.cc:71] 32768, 3
+E0918 05:01:30.314167 1831418 gpu_cudamallocasync_allocator.cc:71] 49080, 2
+E0918 05:01:30.314167 1831418 gpu_cudamallocasync_allocator.cc:71] 65520, 5
+E0918 05:01:30.314168 1831418 gpu_cudamallocasync_allocator.cc:71] 65536, 6
+E0918 05:01:30.314169 1831418 gpu_cudamallocasync_allocator.cc:71] 98160, 2
+E0918 05:01:30.314170 1831418 gpu_cudamallocasync_allocator.cc:71] 98304, 2
+E0918 05:01:30.314170 1831418 gpu_cudamallocasync_allocator.cc:71] 131064, 2
+E0918 05:01:30.314171 1831418 gpu_cudamallocasync_allocator.cc:71] 131072, 3
+E0918 05:01:30.314172 1831418 gpu_cudamallocasync_allocator.cc:71] 196600, 1
+E0918 05:01:30.314172 1831418 gpu_cudamallocasync_allocator.cc:71] 40206336, 2
+E0918 05:01:30.314173 1831418 gpu_cudamallocasync_allocator.cc:71] 177602560, 1
+E0918 05:01:30.314174 1831418 gpu_cudamallocasync_allocator.cc:71] 604028928, 2
+E0918 05:01:30.314175 1831418 gpu_cudamallocasync_allocator.cc:71] 643301376, 2
+E0918 05:01:30.314175 1831418 gpu_cudamallocasync_allocator.cc:71] 1207959552, 3
+E0918 05:01:30.314176 1831418 gpu_cudamallocasync_allocator.cc:71] 1208057856, 2
+E0918 05:01:30.314177 1831418 gpu_cudamallocasync_allocator.cc:71] 1610219520, 2
+E0918 05:01:30.314177 1831418 gpu_cudamallocasync_allocator.cc:71] 1610612736, 4
+E0918 05:01:30.314178 1831418 gpu_cudamallocasync_allocator.cc:71] 2146959360, 4
+E0918 05:01:30.314179 1831418 gpu_cudamallocasync_allocator.cc:71] 2416115712, 1
+E0918 05:01:30.314179 1831418 gpu_cudamallocasync_allocator.cc:71] 3220308000, 2
+E0918 05:01:30.314180 1831418 gpu_cudamallocasync_allocator.cc:71] 3221225472, 1
+E0918 05:01:30.314181 1831418 gpu_cudamallocasync_allocator.cc:71] 4293918720, 2
+E0918 05:01:30.314181 1831418 gpu_cudamallocasync_allocator.cc:71] 4831838208, 4
+E0918 05:01:30.314182 1831418 gpu_cudamallocasync_allocator.cc:71] 8587837440, 2
+E0918 05:01:30.314184 1831418 gpu_cudamallocasync_allocator.cc:104] CU_MEMPOOL_ATTR_RESERVED_MEM_CURRENT: 84825604096
+E0918 05:01:30.314185 1831418 gpu_cudamallocasync_allocator.cc:106] CU_MEMPOOL_ATTR_USED_MEM_CURRENT: 84214407120
+E0918 05:01:30.314186 1831418 gpu_cudamallocasync_allocator.cc:107] CU_MEMPOOL_ATTR_RESERVED_MEM_HIGH: 84959821824
+E0918 05:01:30.314187 1831418 gpu_cudamallocasync_allocator.cc:108] CU_MEMPOOL_ATTR_USED_MEM_HIGH: 84214407120
+E0918 05:01:30.314299 1830859 autotuner.cc:460] Could not get config for HLO: %cublas-lt-matmul.4 = (f64[1636,49152]{1,0}, s8[33554432]{0}) custom-call(%slice.4, %bitcast, %get-tuple-element), custom_call_target="__cublas$lt$matmul", output_to_operand_aliasing={{0}: (2, {})}, metadata={op_name="jit(_banded_operators)/dot_general" stack_frame_id=11}, backend_config={"operation_queue_id":"0","gemm_backend_config":{"alpha_real":1,"beta":1,"dot_dimension_numbers":{"lhs_contracting_dimensions":["1"],"rhs_contracting_dimensions":["0"],"lhs_batch_dimensions":[],"rhs_batch_dimensions":[]},"alpha_imag":0,"precision_config":{"operand_precision":["DEFAULT","DEFAULT"],"algorithm":"ALG_UNSET"},"epilogue":"DEFAULT","lhs_stride":"20103168","rhs_stride":"603979776","grad_x":false,"grad_y":false,"damax_output":false,"autotune_workspace_size":"0","scale_mode":0},"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID"}. Status: RESOURCE_EXHAUSTED: Autotuning failed for HLO: %cublas-lt-matmul.4 = (f64[1636,49152]{1,0}, s8[33554432]{0}) custom-call(%slice.4, %bitcast, %get-tuple-element), custom_call_target="__cublas$lt$matmul", output_to_operand_aliasing={{0}: (2, {})}, metadata={op_name="jit(_banded_operators)/dot_general" stack_frame_id=11}, backend_config={"operation_queue_id":"0","gemm_backend_config":{"alpha_real":1,"beta":1,"dot_dimension_numbers":{"lhs_contracting_dimensions":["1"],"rhs_contracting_dimensions":["0"],"lhs_batch_dimensions":[],"rhs_batch_dimensions":[]},"alpha_imag":0,"precision_config":{"operand_precision":["DEFAULT","DEFAULT"],"algorithm":"ALG_UNSET"},"epilogue":"DEFAULT","lhs_stride":"20103168","rhs_stride":"603979776","grad_x":false,"grad_y":false,"damax_output":false,"autotune_workspace_size":"0","scale_mode":0},"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID"}. Failed to profile configs: Out of memory while trying to allocate 4.52GiB. [tf-allocator-allocation-error='']
+E0918 05:01:30.314346 1830859 autotuner.cc:460] Could not get config for HLO: %custom-call.5 = (f64[1636,49152]{1,0}, s8[33554432]{0}) custom-call(%slice.5, %bitcast.1), custom_call_target="__cublas$lt$matmul", metadata={op_name="jit(_banded_operators)/dot_general" stack_frame_id=15}, backend_config={"operation_queue_id":"0","gemm_backend_config":{"alpha_real":1,"beta":0,"dot_dimension_numbers":{"lhs_contracting_dimensions":["1"],"rhs_contracting_dimensions":["0"],"lhs_batch_dimensions":[],"rhs_batch_dimensions":[]},"alpha_imag":0,"precision_config":{"operand_precision":["DEFAULT","DEFAULT"],"algorithm":"ALG_UNSET"},"epilogue":"DEFAULT","lhs_stride":"20103168","rhs_stride":"603979776","grad_x":false,"grad_y":false,"damax_output":false,"autotune_workspace_size":"0","scale_mode":0},"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID"}. Status: RESOURCE_EXHAUSTED: Autotuning failed for HLO: %custom-call.5 = (f64[1636,49152]{1,0}, s8[33554432]{0}) custom-call(%slice.5, %bitcast.1), custom_call_target="__cublas$lt$matmul", metadata={op_name="jit(_banded_operators)/dot_general" stack_frame_id=15}, backend_config={"operation_queue_id":"0","gemm_backend_config":{"alpha_real":1,"beta":0,"dot_dimension_numbers":{"lhs_contracting_dimensions":["1"],"rhs_contracting_dimensions":["0"],"lhs_batch_dimensions":[],"rhs_batch_dimensions":[]},"alpha_imag":0,"precision_config":{"operand_precision":["DEFAULT","DEFAULT"],"algorithm":"ALG_UNSET"},"epilogue":"DEFAULT","lhs_stride":"20103168","rhs_stride":"603979776","grad_x":false,"grad_y":false,"damax_output":false,"autotune_workspace_size":"0","scale_mode":0},"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID"}. Failed to profile configs: Out of memory while trying to allocate 4.52GiB. [tf-allocator-allocation-error='']
+Traceback (most recent call last):
+  File "/scratch/scratch-lxu/agent_dev/auto_research_agent/GMaster/benchmarks/run_paper_v2_benchmarks.py", line 652, in <module>
+    main()
+  File "/scratch/scratch-lxu/agent_dev/auto_research_agent/GMaster/benchmarks/run_paper_v2_benchmarks.py", line 387, in main
+    res = run_worker_pipeline(
+          ^^^^^^^^^^^^^^^^^^^^
+  File "/scratch/scratch-lxu/agent_dev/auto_research_agent/GMaster/benchmarks/run_paper_v2_benchmarks.py", line 313, in run_worker_pipeline
+    gm_d, gm_c, gm_times = _exec_pipeline(
+                           ^^^^^^^^^^^^^^^
+  File "/scratch/scratch-lxu/agent_dev/auto_research_agent/GMaster/benchmarks/run_paper_v2_benchmarks.py", line 214, in _exec_pipeline
+    w.compute_coupling_matrix(f, f, bins)
+  File "/scratch/scratch-lxu/agent_dev/auto_research_agent/GMaster/gmaster/workspaces.py", line 1600, in compute_coupling_matrix
+    self._postprocess()
+  File "/scratch/scratch-lxu/agent_dev/auto_research_agent/GMaster/gmaster/workspaces.py", line 1604, in _postprocess
+    self.mcm_binned, one_sided = _banded_operators(
+                                 ^^^^^^^^^^^^^^^^^^
+jax.errors.JaxRuntimeError: RESOURCE_EXHAUSTED: Failed to get configs for: 2 out of 3 instructions. See logs for all failures. Example failure: 
+Autotuning failed for HLO: %cublas-lt-matmul.4 = (f64[1636,49152]{1,0}, s8[33554432]{0}) custom-call(%slice.4, %bitcast, %get-tuple-element), custom_call_target="__cublas$lt$matmul", output_to_operand_aliasing={{0}: (2, {})}, metadata={op_name="jit(_banded_operators)/dot_general" stack_frame_id=11}, backend_config={"operation_queue_id":"0","gemm_backend_config":{"alpha_real":1,"beta":1,"dot_dimension_numbers":{"lhs_contracting_dimensions":["1"],"rhs_contracting_dimensions":["0"],"lhs_batch_dimensions":[],"rhs_batch_dimensions":[]},"alpha_imag":0,"precision_config":{"operand_precision":["DEFAULT","DEFAULT"],"algorithm":"ALG_UNSET"},"epilogue":"DEFAULT","lhs_stride":"20103168","rhs_stride":"603979776","grad_x":false,"grad_y":false,"damax_output":false,"autotune_workspace_size":"0","scale_mode":0},"force_earliest_schedule":false,"reification_cost":[],"device_type":"DEVICE_TYPE_INVALID"}. Failed to profile configs: Out of memory while trying to allocate 4.52GiB.
+--------------------
+For simplicity, JAX has removed its internal frames from the traceback of the following exception. Set JAX_TRACEBACK_FILTERING=off to include these.
+
+
+Benchmark runs finished successfully! Raw data written to: /home/lxu/scratch/agent_dev/auto_research_agent/GMaster/benchmarks/independent/results_gm_noprefill.json
+GM_DONE 2026-09-18T05:01:32+01:00
+=== NaMaster 32 cores 2026-09-18T05:01:32+01:00 ===
+================================================================================
+ GMASTER v2_march vs NaMaster Benchmarks: fp32 vs fp64 Speed & Correctness
+================================================================================
+Target GPU: CUDA_VISIBLE_DEVICES=
+Modes: all
+
+>>> SECTION 1: Isolated SHT Benchmarks (map2alm & alm2map vs DUCC) <<<
+Nside | Spin | DUCC ana (ms) | fp32 ana (ms) [x] | fp64 ana (ms) [x] | fp32 rel | fp64 rel | DUCC syn (ms) | fp32 syn (ms) [x] | fp64 syn (ms) [x]
+--------------------------------------------------------------------------------------------------------------------------------------------
+   64 |    0 |          0.31 |       nan [ nanx] |       nan [ nanx] |      nan |      nan |          0.49 |       nan [ nanx] |       nan [ nanx]
+   64 |    2 |          0.47 |       nan [ nanx] |       nan [ nanx] |      nan |      nan |          0.91 |       nan [ nanx] |       nan [ nanx]
+  128 |    0 |          0.97 |       nan [ nanx] |       nan [ nanx] |      nan |      nan |          1.26 |       nan [ nanx] |       nan [ nanx]
+  128 |    2 |          2.32 |       nan [ nanx] |       nan [ nanx] |      nan |      nan |          1.87 |       nan [ nanx] |       nan [ nanx]
+  256 |    0 |          5.17 |       nan [ nanx] |       nan [ nanx] |      nan |      nan |          3.55 |       nan [ nanx] |       nan [ nanx]
+  256 |    2 |          6.69 |       nan [ nanx] |       nan [ nanx] |      nan |      nan |          6.32 |       nan [ nanx] |       nan [ nanx]
+  512 |    0 |         18.38 |       nan [ nanx] |       nan [ nanx] |      nan |      nan |         17.58 |       nan [ nanx] |       nan [ nanx]
+  512 |    2 |         44.24 |       nan [ nanx] |       nan [ nanx] |      nan |      nan |         40.10 |       nan [ nanx] |       nan [ nanx]
+ 1024 |    0 |        115.47 |       nan [ nanx] |       nan [ nanx] |      nan |      nan |        109.08 |       nan [ nanx] |       nan [ nanx]
+ 1024 |    2 |        221.27 |       nan [ nanx] |       nan [ nanx] |      nan |      nan |        214.38 |       nan [ nanx] |       nan [ nanx]
+ 2048 |    0 |        646.17 |       nan [ nanx] |       nan [ nanx] |      nan |      nan |        655.21 |       nan [ nanx] |       nan [ nanx]
+ 2048 |    2 |       1345.49 |       nan [ nanx] |       nan [ nanx] |      nan |      nan |       1912.95 |       nan [ nanx] |       nan [ nanx]
+ 4096 |    0 |       4520.68 |       nan [ nanx] |       nan [ nanx] |      nan |      nan |       4676.90 |       nan [ nanx] |       nan [ nanx]
+ 4096 |    2 |       9083.17 |       nan [ nanx] |       nan [ nanx] |      nan |      nan |       9365.43 |       nan [ nanx] |       nan [ nanx]
+
+>>> SECTION 2: End-to-End MASTER Pipeline Benchmarks <<<
+Nside | Spin | NaMaster (ms) | GM fp32 (ms) [x] | GM fp64 (ms) [x] | fp32 rel dCl | fp64 rel dCl | Peak RSS (GB) | Peak VRAM (GB)
+-----------------------------------------------------------------------------------------------------------------------------
+   64 |    0 |          42.0 |      nan [ --- ] |      nan [ --- ] |          nan |          nan |           0.0 |            0.0
+   64 |    2 |          40.0 |      nan [ --- ] |      nan [ --- ] |          nan |          nan |           0.0 |            0.0
+  128 |    0 |          52.2 |      nan [ --- ] |      nan [ --- ] |          nan |          nan |           0.0 |            0.0
+  128 |    2 |         107.0 |      nan [ --- ] |      nan [ --- ] |          nan |          nan |           0.0 |            0.0
+  256 |    0 |         122.3 |      nan [ --- ] |      nan [ --- ] |          nan |          nan |           0.0 |            0.0
+  256 |    2 |         520.0 |      nan [ --- ] |      nan [ --- ] |          nan |          nan |           0.0 |            0.0
+  512 |    0 |         603.1 |      nan [ --- ] |      nan [ --- ] |          nan |          nan |           0.0 |            0.0
+  512 |    2 |        1873.0 |      nan [ --- ] |      nan [ --- ] |          nan |          nan |           0.0 |            0.0
+ 1024 |    0 |        3827.9 |      nan [ --- ] |      nan [ --- ] |          nan |          nan |           0.0 |            0.0
+ 1024 |    2 |        7877.8 |      nan [ --- ] |      nan [ --- ] |          nan |          nan |           0.0 |            0.0
+ 2048 |    0 |       25042.2 |      nan [ --- ] |      nan [ --- ] |          nan |          nan |           0.0 |            0.0
+ 2048 |    2 |       42737.9 |      nan [ --- ] |      nan [ --- ] |          nan |          nan |           0.0 |            0.0
+ 4096 |    0 |      160225.1 |      nan [ --- ] |      nan [ --- ] |          nan |          nan |           0.0 |            0.0
+Error running pipeline nside=4096 spin=2:
+
+
+Benchmark runs finished successfully! Raw data written to: /home/lxu/scratch/agent_dev/auto_research_agent/GMaster/benchmarks/independent/results_nm32.json
+NM32_DONE 2026-09-18T05:34:10+01:00
+=== NaMaster 96 cores 2026-09-18T05:34:10+01:00 ===
+================================================================================
+ GMASTER v2_march vs NaMaster Benchmarks: fp32 vs fp64 Speed & Correctness
+================================================================================
+Target GPU: CUDA_VISIBLE_DEVICES=
+Modes: all
+
+>>> SECTION 1: Isolated SHT Benchmarks (map2alm & alm2map vs DUCC) <<<
+Nside | Spin | DUCC ana (ms) | fp32 ana (ms) [x] | fp64 ana (ms) [x] | fp32 rel | fp64 rel | DUCC syn (ms) | fp32 syn (ms) [x] | fp64 syn (ms) [x]
+--------------------------------------------------------------------------------------------------------------------------------------------
+   64 |    0 |          0.38 |       nan [ nanx] |       nan [ nanx] |      nan |      nan |          0.52 |       nan [ nanx] |       nan [ nanx]
+   64 |    2 |          0.58 |       nan [ nanx] |       nan [ nanx] |      nan |      nan |          0.86 |       nan [ nanx] |       nan [ nanx]
+  128 |    0 |          1.14 |       nan [ nanx] |       nan [ nanx] |      nan |      nan |          1.32 |       nan [ nanx] |       nan [ nanx]
+  128 |    2 |          1.43 |       nan [ nanx] |       nan [ nanx] |      nan |      nan |          1.09 |       nan [ nanx] |       nan [ nanx]
+  256 |    0 |          2.46 |       nan [ nanx] |       nan [ nanx] |      nan |      nan |          1.97 |       nan [ nanx] |       nan [ nanx]
+  256 |    2 |          6.16 |       nan [ nanx] |       nan [ nanx] |      nan |      nan |          4.17 |       nan [ nanx] |       nan [ nanx]
+  512 |    0 |         14.50 |       nan [ nanx] |       nan [ nanx] |      nan |      nan |         12.81 |       nan [ nanx] |       nan [ nanx]
+  512 |    2 |         27.14 |       nan [ nanx] |       nan [ nanx] |      nan |      nan |         25.72 |       nan [ nanx] |       nan [ nanx]
+ 1024 |    0 |         62.43 |       nan [ nanx] |       nan [ nanx] |      nan |      nan |         56.13 |       nan [ nanx] |       nan [ nanx]
+ 1024 |    2 |        120.95 |       nan [ nanx] |       nan [ nanx] |      nan |      nan |        111.62 |       nan [ nanx] |       nan [ nanx]
+ 2048 |    0 |        309.75 |       nan [ nanx] |       nan [ nanx] |      nan |      nan |        297.94 |       nan [ nanx] |       nan [ nanx]
+ 2048 |    2 |        617.32 |       nan [ nanx] |       nan [ nanx] |      nan |      nan |        582.85 |       nan [ nanx] |       nan [ nanx]
+ 4096 |    0 |       1861.28 |       nan [ nanx] |       nan [ nanx] |      nan |      nan |       1849.63 |       nan [ nanx] |       nan [ nanx]
+ 4096 |    2 |       3715.30 |       nan [ nanx] |       nan [ nanx] |      nan |      nan |       3737.67 |       nan [ nanx] |       nan [ nanx]
+
+>>> SECTION 2: End-to-End MASTER Pipeline Benchmarks <<<
+Nside | Spin | NaMaster (ms) | GM fp32 (ms) [x] | GM fp64 (ms) [x] | fp32 rel dCl | fp64 rel dCl | Peak RSS (GB) | Peak VRAM (GB)
+-----------------------------------------------------------------------------------------------------------------------------
+   64 |    0 |          40.0 |      nan [ --- ] |      nan [ --- ] |          nan |          nan |           0.0 |            0.0
+   64 |    2 |          43.2 |      nan [ --- ] |      nan [ --- ] |          nan |          nan |           0.0 |            0.0
+  128 |    0 |          48.8 |      nan [ --- ] |      nan [ --- ] |          nan |          nan |           0.0 |            0.0
+  128 |    2 |          70.9 |      nan [ --- ] |      nan [ --- ] |          nan |          nan |           0.0 |            0.0
+  256 |    0 |          94.1 |      nan [ --- ] |      nan [ --- ] |          nan |          nan |           0.0 |            0.0
+  256 |    2 |         225.2 |      nan [ --- ] |      nan [ --- ] |          nan |          nan |           0.0 |            0.0
+  512 |    0 |         354.2 |      nan [ --- ] |      nan [ --- ] |          nan |          nan |           0.0 |            0.0
+  512 |    2 |         752.0 |      nan [ --- ] |      nan [ --- ] |          nan |          nan |           0.0 |            0.0
+ 1024 |    0 |        1794.1 |      nan [ --- ] |      nan [ --- ] |          nan |          nan |           0.0 |            0.0
+ 1024 |    2 |        3422.2 |      nan [ --- ] |      nan [ --- ] |          nan |          nan |           0.0 |            0.0
+ 2048 |    0 |       10393.2 |      nan [ --- ] |      nan [ --- ] |          nan |          nan |           0.0 |            0.0
+ 2048 |    2 |       20877.6 |      nan [ --- ] |      nan [ --- ] |          nan |          nan |           0.0 |            0.0
+ 4096 |    0 |       82110.9 |      nan [ --- ] |      nan [ --- ] |          nan |          nan |           0.0 |            0.0
+Error running pipeline nside=4096 spin=2:
+
+
+Benchmark runs finished successfully! Raw data written to: /home/lxu/scratch/agent_dev/auto_research_agent/GMaster/benchmarks/independent/results_nm96.json
+NM96_DONE 2026-09-18T05:50:10+01:00
+# GMaster v2 vs NaMaster 32-core and 96-core (times + residuals)
+
+Times: noprefill GMaster + pinned NaMaster. Residuals: independent same-kernel run vs NaMaster.
+
+## 1. map2alm (ms) and relative $\Delta a_{\ell m}$
+
+| Nside | spin | DUCC 32c | DUCC 96c | GM fp32 | GM fp64 | fp32 rel $\Delta a$ | fp64 rel $\Delta a$ | fp32 rms |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 64 | 0 | 0.31 | 0.38 | 0.13 | 0.17 | 1.53e-06 | 1.52e-06 | 1.00e-06 |
+| 64 | 2 | 0.47 | 0.58 | 0.16 | 0.17 | 1.39e-06 | 1.35e-06 | 1.00e-06 |
+| 128 | 0 | 0.97 | 1.14 | 0.27 | 0.24 | 3.27e-06 | 3.37e-06 | 1.78e-06 |
+| 128 | 2 | 2.32 | 1.43 | 0.23 | 0.31 | 4.07e-06 | 4.03e-06 | 1.77e-06 |
+| 256 | 0 | 5.17 | 2.46 | 0.42 | 0.72 | 6.52e-06 | 6.50e-06 | 3.30e-06 |
+| 256 | 2 | 6.69 | 6.16 | 0.80 | 1.08 | 7.09e-06 | 7.11e-06 | 3.29e-06 |
+| 512 | 0 | 18.38 | 14.50 | 2.17 | 2.34 | 1.36e-05 | 1.36e-05 | 6.33e-06 |
+| 512 | 2 | 44.24 | 27.14 | 2.96 | 4.79 | 1.49e-05 | 1.49e-05 | 6.34e-06 |
+| 1024 | 0 | 115.47 | 62.43 | 7.53 | 10.45 | 2.53e-05 | 2.54e-05 | 1.23e-05 |
+| 1024 | 2 | 221.27 | 120.95 | 16.37 | 23.33 | 2.59e-05 | 2.58e-05 | 1.23e-05 |
+| 2048 | 0 | 646.17 | 309.75 | 44.03 | 55.09 | 5.74e-05 | 5.74e-05 | 2.43e-05 |
+| 2048 | 2 | 1345.49 | 617.32 | 92.63 | 119.27 | 4.88e-05 | 4.88e-05 | 2.44e-05 |
+| 4096 | 0 | 4520.68 | 1861.28 | 438.24 | 507.60 | 1.09e-04 | 1.09e-04 | 4.84e-05 |
+| 4096 | 2 | 9083.17 | 3715.30 | 722.42 | 854.21 | 1.09e-04 | 1.10e-04 | 4.84e-05 |
+
+## 2. Full $C_\ell$ pipeline (ms) and relative $\Delta C_\ell$
+
+| Nside | spin | NM 32c | NM 96c | GM fp32 | GM fp64 | fp32 rel dCl | fp64 rel dCl | fp32 rel coupled |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 64 | 0 | 42.0 | 40.0 | 6.2 | 6.2 | 1.46e-07 | 1.54e-07 | 1.21e-06 |
+| 64 | 2 | 40.0 | 43.2 | 3.2 | 2.6 | 4.03e-07 | 3.57e-07 | 1.53e-06 |
+| 128 | 0 | 52.2 | 48.8 | 10.3 | 10.6 | 2.19e-07 | 1.66e-07 | 1.88e-06 |
+| 128 | 2 | 107.0 | 70.9 | 3.2 | 5.0 | 8.55e-07 | 6.81e-07 | 1.48e-06 |
+| 256 | 0 | 122.3 | 94.1 | 20.9 | 23.0 | 1.40e-06 | 1.40e-06 | 1.03e-05 |
+| 256 | 2 | 520.0 | 225.2 | 8.7 | 17.2 | 4.61e-07 | 4.78e-07 | 4.80e-06 |
+| 512 | 0 | 603.1 | 354.2 | 69.4 | 77.2 | 1.64e-06 | 1.60e-06 | 8.01e-06 |
+| 512 | 2 | 1873.0 | 752.0 | 32.9 | 88.6 | 2.39e-06 | 2.31e-06 | 1.29e-05 |
+| 1024 | 0 | 3827.9 | 1794.1 | 273.6 | 318.3 | 5.65e-06 | 5.69e-06 | 2.03e-05 |
+| 1024 | 2 | 7877.8 | 3422.2 | 170.1 | 537.1 | 5.63e-06 | 5.75e-06 | 2.87e-05 |
+| 2048 | 0 | 25042.2 | 10393.2 | 1591.7 | 1772.3 | 1.74e-05 | 1.75e-05 | 6.46e-05 |
+| 2048 | 2 | 42737.9 | 20877.6 | 1077.4 | 3756.4 | 1.37e-05 | 1.35e-05 | 2.62e-05 |
+| 4096 | 0 | 160225.1 | 82110.9 | 12434.7 | 13186.5 | 1.64e-04 | 1.64e-04 | 8.98e-05 |
+
+Wrote /scratch/scratch-lxu/agent_dev/auto_research_agent/GMaster/benchmarks/independent/results_for_plots.json
+CORES_BENCH_DONE 2026-09-18T05:50:10+01:00

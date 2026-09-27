@@ -1,0 +1,687 @@
+S2_START 2026-09-18T06:08:39+01:00
+index, memory.used [MiB], utilization.gpu [%]
+0, 14412 MiB, 0 %
+1, 269 MiB, 0 %
+=== GMaster 4096 spin2 PREALLOCATE=true GPU1 2026-09-18T06:08:39+01:00 ===
+================================================================================
+ GMASTER v2_march vs NaMaster Benchmarks: fp32 vs fp64 Speed & Correctness
+================================================================================
+Target GPU: CUDA_VISIBLE_DEVICES=1
+Modes: pipeline
+
+>>> SECTION 2: End-to-End MASTER Pipeline Benchmarks <<<
+Nside | Spin | NaMaster (ms) | GM fp32 (ms) [x] | GM fp64 (ms) [x] | fp32 rel dCl | fp64 rel dCl | Peak RSS (GB) | Peak VRAM (GB)
+-----------------------------------------------------------------------------------------------------------------------------
+Error running pipeline nside=4096 spin=2:
+E0918 06:53:57.170867 2073917 gpu_cudamallocasync_allocator.cc:359] gpu_async_0 cuMemAllocAsync failed to allocate 4293918720 bytes: RESOURCE_EXHAUSTED: : CUDA_ERROR_OUT_OF_MEMORY: out of memory
+ Reported by CUDA: Free memory/Total memory: 696713216/101948129280
+E0918 06:53:57.170910 2073917 gpu_cudamallocasync_allocator.cc:364] Stats: Limit:                        71.21GiB
+InUse:                        79.55GiB
+MaxInUse:                     80.30GiB
+NumAllocs:                        7091
+MaxAllocSize:                 17.73GiB
+Reserved:                           0B
+PeakReserved:                       0B
+LargestFreeBlock:                   0B
+
+E0918 06:53:57.170957 2073917 gpu_cudamallocasync_allocator.cc:68] Histogram of current allocation: (allocation_size_in_bytes, nb_allocation_of_that_sizes), ...;
+E0918 06:53:57.170959 2073917 gpu_cudamallocasync_allocator.cc:71] 8, 6
+E0918 06:53:57.170961 2073917 gpu_cudamallocasync_allocator.cc:71] 128, 1
+E0918 06:53:57.170962 2073917 gpu_cudamallocasync_allocator.cc:71] 256, 1
+E0918 06:53:57.170963 2073917 gpu_cudamallocasync_allocator.cc:71] 2048, 1
+E0918 06:53:57.170963 2073917 gpu_cudamallocasync_allocator.cc:71] 8192, 1
+E0918 06:53:57.170964 2073917 gpu_cudamallocasync_allocator.cc:71] 12296, 1
+E0918 06:53:57.170965 2073917 gpu_cudamallocasync_allocator.cc:71] 16384, 1
+E0918 06:53:57.170966 2073917 gpu_cudamallocasync_allocator.cc:71] 32768, 3
+E0918 06:53:57.170966 2073917 gpu_cudamallocasync_allocator.cc:71] 49080, 2
+E0918 06:53:57.170967 2073917 gpu_cudamallocasync_allocator.cc:71] 49184, 1
+E0918 06:53:57.170967 2073917 gpu_cudamallocasync_allocator.cc:71] 65520, 5
+E0918 06:53:57.170968 2073917 gpu_cudamallocasync_allocator.cc:71] 65536, 6
+E0918 06:53:57.170968 2073917 gpu_cudamallocasync_allocator.cc:71] 98160, 2
+E0918 06:53:57.170969 2073917 gpu_cudamallocasync_allocator.cc:71] 98304, 1
+E0918 06:53:57.170970 2073917 gpu_cudamallocasync_allocator.cc:71] 98368, 2
+E0918 06:53:57.170970 2073917 gpu_cudamallocasync_allocator.cc:71] 131064, 4
+E0918 06:53:57.170971 2073917 gpu_cudamallocasync_allocator.cc:71] 131072, 3
+E0918 06:53:57.170971 2073917 gpu_cudamallocasync_allocator.cc:71] 8388608, 96
+E0918 06:53:57.170972 2073917 gpu_cudamallocasync_allocator.cc:71] 12591104, 3
+E0918 06:53:57.170973 2073917 gpu_cudamallocasync_allocator.cc:71] 40206336, 2
+E0918 06:53:57.170973 2073917 gpu_cudamallocasync_allocator.cc:71] 151093248, 48
+E0918 06:53:57.170974 2073917 gpu_cudamallocasync_allocator.cc:71] 604028928, 2
+E0918 06:53:57.170974 2073917 gpu_cudamallocasync_allocator.cc:71] 643301376, 2
+E0918 06:53:57.170975 2073917 gpu_cudamallocasync_allocator.cc:71] 1208057856, 1
+E0918 06:53:57.170976 2073917 gpu_cudamallocasync_allocator.cc:71] 1610219520, 2
+E0918 06:53:57.170976 2073917 gpu_cudamallocasync_allocator.cc:71] 1610612736, 6
+E0918 06:53:57.170977 2073917 gpu_cudamallocasync_allocator.cc:71] 2146959360, 4
+E0918 06:53:57.170977 2073917 gpu_cudamallocasync_allocator.cc:71] 2415919104, 1
+E0918 06:53:57.170978 2073917 gpu_cudamallocasync_allocator.cc:71] 2416115712, 1
+E0918 06:53:57.170978 2073917 gpu_cudamallocasync_allocator.cc:71] 3220308000, 2
+E0918 06:53:57.170979 2073917 gpu_cudamallocasync_allocator.cc:71] 3221028864, 1
+E0918 06:53:57.170979 2073917 gpu_cudamallocasync_allocator.cc:71] 3221225472, 1
+E0918 06:53:57.170980 2073917 gpu_cudamallocasync_allocator.cc:71] 4293918720, 2
+E0918 06:53:57.170981 2073917 gpu_cudamallocasync_allocator.cc:71] 8587837440, 2
+E0918 06:53:57.170981 2073917 gpu_cudamallocasync_allocator.cc:71] 8589410304, 1
+E0918 06:53:57.170983 2073917 gpu_cudamallocasync_allocator.cc:104] CU_MEMPOOL_ATTR_RESERVED_MEM_CURRENT: 85698019328
+E0918 06:53:57.170984 2073917 gpu_cudamallocasync_allocator.cc:106] CU_MEMPOOL_ATTR_USED_MEM_CURRENT: 85420882040
+E0918 06:53:57.170985 2073917 gpu_cudamallocasync_allocator.cc:107] CU_MEMPOOL_ATTR_RESERVED_MEM_HIGH: 87241523200
+E0918 06:53:57.170985 2073917 gpu_cudamallocasync_allocator.cc:108] CU_MEMPOOL_ATTR_USED_MEM_HIGH: 86224763009
+E0918 06:53:57.170989 2073917 cuda_fft.cc:272] Failed to allocate work area.
+E0918 06:53:57.170991 2073917 cuda_fft.cc:323] Initialize Params: rank: 1 elem_count: 32768 input_embed: 32768 input_stride: 1 input_distance: 32768 output_embed: 32768 output_stride: 1 output_distance: 32768 batch_count: 8190
+E0918 06:53:57.170993 2073917 cuda_fft.cc:332] Failed to initialize batched cufft plan with customized allocator: Out of memory while trying to allocate 4.00GiB.
+E0918 06:53:57.185371 2073917 status_macros.cc:58] INTERNAL: RET_CHECK failure (external/xla/xla/backends/gpu/runtime/fft_thunk.cc:199) fft_plan != nullptr Failed to create cuFFT batched plan with scratch allocator
+*** Begin stack trace ***
+	
+	
+	
+	
+	
+	
+	
+	
+	
+	
+	
+	
+	
+	
+	
+	
+	
+	
+	
+	
+	
+	
+	PyObject_Vectorcall
+	_PyEval_EvalFrameDefault
+	_PyObject_Call_Prepend
+	
+	PyObject_Call
+	_PyEval_EvalFrameDefault
+	PyObject_Vectorcall
+	
+	
+	PyObject_Vectorcall
+	_PyEval_EvalFrameDefault
+	PyEval_EvalCode
+	
+	
+	_PyRun_SimpleFileObject
+	_PyRun_AnyFileObject
+	Py_RunMain
+	Py_BytesMain
+	
+	__libc_start_main
+	_start
+*** End stack trace ***
+
+Traceback (most recent call last):
+  File "/scratch/scratch-lxu/agent_dev/auto_research_agent/GMaster/benchmarks/run_paper_v2_benchmarks.py", line 664, in <module>
+    main()
+  File "/scratch/scratch-lxu/agent_dev/auto_research_agent/GMaster/benchmarks/run_paper_v2_benchmarks.py", line 399, in main
+    res = run_worker_pipeline(
+          ^^^^^^^^^^^^^^^^^^^^
+  File "/scratch/scratch-lxu/agent_dev/auto_research_agent/GMaster/benchmarks/run_paper_v2_benchmarks.py", line 325, in run_worker_pipeline
+    gm_d, gm_c, gm_times = _exec_pipeline(
+                           ^^^^^^^^^^^^^^^
+  File "/scratch/scratch-lxu/agent_dev/auto_research_agent/GMaster/benchmarks/run_paper_v2_benchmarks.py", line 229, in _exec_pipeline
+    _block(d_cell)
+  File "/scratch/scratch-lxu/agent_dev/auto_research_agent/GMaster/benchmarks/run_paper_v2_benchmarks.py", line 179, in _block
+    jax.tree.map(
+  File "/scratch/scratch-lxu/venv/cmbagent_env/lib/python3.12/site-packages/jax/_src/tree.py", line 156, in map
+    return tree_util.tree_map(f, tree, *rest, is_leaf=is_leaf)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/scratch/scratch-lxu/venv/cmbagent_env/lib/python3.12/site-packages/jax/_src/tree_util.py", line 397, in tree_map
+    return treedef.unflatten(f(*xs) for xs in zip(*all_leaves))
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/scratch/scratch-lxu/venv/cmbagent_env/lib/python3.12/site-packages/jax/_src/tree_util.py", line 397, in <genexpr>
+    return treedef.unflatten(f(*xs) for xs in zip(*all_leaves))
+                             ^^^^^^
+  File "/scratch/scratch-lxu/agent_dev/auto_research_agent/GMaster/benchmarks/run_paper_v2_benchmarks.py", line 180, in <lambda>
+    lambda leaf: leaf.block_until_ready() if hasattr(leaf, "block_until_ready") else None,
+                 ^^^^^^^^^^^^^^^^^^^^^^^^
+jax.errors.JaxRuntimeError: INTERNAL: RET_CHECK failure (external/xla/xla/backends/gpu/runtime/fft_thunk.cc:199) fft_plan != nullptr Failed to create cuFFT batched plan with scratch allocator
+
+Traceback (most recent call last):
+  File "/scratch/scratch-lxu/agent_dev/auto_research_agent/GMaster/benchmarks/run_paper_v2_benchmarks.py", line 664, in <module>
+    main()
+  File "/scratch/scratch-lxu/agent_dev/auto_research_agent/GMaster/benchmarks/run_paper_v2_benchmarks.py", line 561, in main
+    generate_summary_tables(all_results, out_file.parent)
+  File "/scratch/scratch-lxu/agent_dev/auto_research_agent/GMaster/benchmarks/run_paper_v2_benchmarks.py", line 633, in generate_summary_tables
+    r = row["ref"]
+        ~~~^^^^^^^
+KeyError: 'ref'
+S2_START 2026-09-18T07:18:37+01:00
+index, memory.used [MiB], utilization.gpu [%]
+0, 15384 MiB, 0 %
+1, 270 MiB, 0 %
+=== GMaster 4096 spin2 PREALLOCATE=true MEM_FRACTION=0.93 GPU1 skip-ref 2026-09-18T07:18:37+01:00 ===
+================================================================================
+ GMASTER v2_march vs NaMaster Benchmarks: fp32 vs fp64 Speed & Correctness
+================================================================================
+Target GPU: CUDA_VISIBLE_DEVICES=1
+Modes: pipeline
+
+>>> SECTION 2: End-to-End MASTER Pipeline Benchmarks <<<
+Nside | Spin | NaMaster (ms) | GM fp32 (ms) [x] | GM fp64 (ms) [x] | fp32 rel dCl | fp64 rel dCl | Peak RSS (GB) | Peak VRAM (GB)
+-----------------------------------------------------------------------------------------------------------------------------
+Error running pipeline nside=4096 spin=2:
+E0918 07:24:18.901098 2307858 gpu_cudamallocasync_allocator.cc:359] gpu_async_0 cuMemAllocAsync failed to allocate 4293918720 bytes: RESOURCE_EXHAUSTED: : CUDA_ERROR_OUT_OF_MEMORY: out of memory
+ Reported by CUDA: Free memory/Total memory: 27721728/101948129280
+E0918 07:24:18.901153 2307858 gpu_cudamallocasync_allocator.cc:364] Stats: Limit:                        88.30GiB
+InUse:                        79.55GiB
+MaxInUse:                     80.30GiB
+NumAllocs:                        7091
+MaxAllocSize:                 17.73GiB
+Reserved:                           0B
+PeakReserved:                       0B
+LargestFreeBlock:                   0B
+
+E0918 07:24:18.901174 2307858 gpu_cudamallocasync_allocator.cc:68] Histogram of current allocation: (allocation_size_in_bytes, nb_allocation_of_that_sizes), ...;
+E0918 07:24:18.901175 2307858 gpu_cudamallocasync_allocator.cc:71] 8, 6
+E0918 07:24:18.901177 2307858 gpu_cudamallocasync_allocator.cc:71] 128, 1
+E0918 07:24:18.901178 2307858 gpu_cudamallocasync_allocator.cc:71] 256, 1
+E0918 07:24:18.901178 2307858 gpu_cudamallocasync_allocator.cc:71] 2048, 1
+E0918 07:24:18.901179 2307858 gpu_cudamallocasync_allocator.cc:71] 8192, 1
+E0918 07:24:18.901179 2307858 gpu_cudamallocasync_allocator.cc:71] 12296, 1
+E0918 07:24:18.901180 2307858 gpu_cudamallocasync_allocator.cc:71] 16384, 1
+E0918 07:24:18.901180 2307858 gpu_cudamallocasync_allocator.cc:71] 32768, 3
+E0918 07:24:18.901181 2307858 gpu_cudamallocasync_allocator.cc:71] 49080, 2
+E0918 07:24:18.901181 2307858 gpu_cudamallocasync_allocator.cc:71] 49184, 1
+E0918 07:24:18.901182 2307858 gpu_cudamallocasync_allocator.cc:71] 65520, 5
+E0918 07:24:18.901182 2307858 gpu_cudamallocasync_allocator.cc:71] 65536, 6
+E0918 07:24:18.901183 2307858 gpu_cudamallocasync_allocator.cc:71] 98160, 2
+E0918 07:24:18.901183 2307858 gpu_cudamallocasync_allocator.cc:71] 98304, 1
+E0918 07:24:18.901184 2307858 gpu_cudamallocasync_allocator.cc:71] 98368, 2
+E0918 07:24:18.901184 2307858 gpu_cudamallocasync_allocator.cc:71] 131064, 4
+E0918 07:24:18.901185 2307858 gpu_cudamallocasync_allocator.cc:71] 131072, 3
+E0918 07:24:18.901185 2307858 gpu_cudamallocasync_allocator.cc:71] 8388608, 96
+E0918 07:24:18.901186 2307858 gpu_cudamallocasync_allocator.cc:71] 12591104, 3
+E0918 07:24:18.901186 2307858 gpu_cudamallocasync_allocator.cc:71] 40206336, 2
+E0918 07:24:18.901186 2307858 gpu_cudamallocasync_allocator.cc:71] 151093248, 48
+E0918 07:24:18.901187 2307858 gpu_cudamallocasync_allocator.cc:71] 604028928, 2
+E0918 07:24:18.901188 2307858 gpu_cudamallocasync_allocator.cc:71] 643301376, 2
+E0918 07:24:18.901188 2307858 gpu_cudamallocasync_allocator.cc:71] 1208057856, 1
+E0918 07:24:18.901188 2307858 gpu_cudamallocasync_allocator.cc:71] 1610219520, 2
+E0918 07:24:18.901189 2307858 gpu_cudamallocasync_allocator.cc:71] 1610612736, 6
+E0918 07:24:18.901189 2307858 gpu_cudamallocasync_allocator.cc:71] 2146959360, 4
+E0918 07:24:18.901190 2307858 gpu_cudamallocasync_allocator.cc:71] 2415919104, 1
+E0918 07:24:18.901190 2307858 gpu_cudamallocasync_allocator.cc:71] 2416115712, 1
+E0918 07:24:18.901191 2307858 gpu_cudamallocasync_allocator.cc:71] 3220308000, 2
+E0918 07:24:18.901191 2307858 gpu_cudamallocasync_allocator.cc:71] 3221028864, 1
+E0918 07:24:18.901192 2307858 gpu_cudamallocasync_allocator.cc:71] 3221225472, 1
+E0918 07:24:18.901192 2307858 gpu_cudamallocasync_allocator.cc:71] 4293918720, 2
+E0918 07:24:18.901193 2307858 gpu_cudamallocasync_allocator.cc:71] 8587837440, 2
+E0918 07:24:18.901193 2307858 gpu_cudamallocasync_allocator.cc:71] 8589410304, 1
+E0918 07:24:18.901195 2307858 gpu_cudamallocasync_allocator.cc:104] CU_MEMPOOL_ATTR_RESERVED_MEM_CURRENT: 86369107968
+E0918 07:24:18.901196 2307858 gpu_cudamallocasync_allocator.cc:106] CU_MEMPOOL_ATTR_USED_MEM_CURRENT: 85420882040
+E0918 07:24:18.901197 2307858 gpu_cudamallocasync_allocator.cc:107] CU_MEMPOOL_ATTR_RESERVED_MEM_HIGH: 94824824832
+E0918 07:24:18.901197 2307858 gpu_cudamallocasync_allocator.cc:108] CU_MEMPOOL_ATTR_USED_MEM_HIGH: 94811760959
+E0918 07:24:18.901201 2307858 cuda_fft.cc:272] Failed to allocate work area.
+E0918 07:24:18.901203 2307858 cuda_fft.cc:323] Initialize Params: rank: 1 elem_count: 32768 input_embed: 32768 input_stride: 1 input_distance: 32768 output_embed: 32768 output_stride: 1 output_distance: 32768 batch_count: 8190
+E0918 07:24:18.901205 2307858 cuda_fft.cc:332] Failed to initialize batched cufft plan with customized allocator: Out of memory while trying to allocate 4.00GiB.
+E0918 07:24:18.901569 2307858 status_macros.cc:58] INTERNAL: RET_CHECK failure (external/xla/xla/backends/gpu/runtime/fft_thunk.cc:199) fft_plan != nullptr Failed to create cuFFT batched plan with scratch allocator
+*** Begin stack trace ***
+	
+	
+	
+	
+	
+	
+	
+	
+	
+	
+	
+	
+	
+	
+	
+	
+	
+	
+	
+	
+	
+	
+	PyObject_Vectorcall
+	_PyEval_EvalFrameDefault
+	_PyObject_Call_Prepend
+	
+	PyObject_Call
+	_PyEval_EvalFrameDefault
+	PyObject_Vectorcall
+	
+	
+	PyObject_Vectorcall
+	_PyEval_EvalFrameDefault
+	PyEval_EvalCode
+	
+	
+	_PyRun_SimpleFileObject
+	_PyRun_AnyFileObject
+	Py_RunMain
+	Py_BytesMain
+	
+	__libc_start_main
+	_start
+*** End stack trace ***
+
+Traceback (most recent call last):
+  File "/scratch/scratch-lxu/agent_dev/auto_research_agent/GMaster/benchmarks/run_paper_v2_benchmarks.py", line 670, in <module>
+    main()
+  File "/scratch/scratch-lxu/agent_dev/auto_research_agent/GMaster/benchmarks/run_paper_v2_benchmarks.py", line 399, in main
+    res = run_worker_pipeline(
+          ^^^^^^^^^^^^^^^^^^^^
+  File "/scratch/scratch-lxu/agent_dev/auto_research_agent/GMaster/benchmarks/run_paper_v2_benchmarks.py", line 325, in run_worker_pipeline
+    gm_d, gm_c, gm_times = _exec_pipeline(
+                           ^^^^^^^^^^^^^^^
+  File "/scratch/scratch-lxu/agent_dev/auto_research_agent/GMaster/benchmarks/run_paper_v2_benchmarks.py", line 229, in _exec_pipeline
+    _block(d_cell)
+  File "/scratch/scratch-lxu/agent_dev/auto_research_agent/GMaster/benchmarks/run_paper_v2_benchmarks.py", line 179, in _block
+    jax.tree.map(
+  File "/scratch/scratch-lxu/venv/cmbagent_env/lib/python3.12/site-packages/jax/_src/tree.py", line 156, in map
+    return tree_util.tree_map(f, tree, *rest, is_leaf=is_leaf)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/scratch/scratch-lxu/venv/cmbagent_env/lib/python3.12/site-packages/jax/_src/tree_util.py", line 397, in tree_map
+    return treedef.unflatten(f(*xs) for xs in zip(*all_leaves))
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/scratch/scratch-lxu/venv/cmbagent_env/lib/python3.12/site-packages/jax/_src/tree_util.py", line 397, in <genexpr>
+    return treedef.unflatten(f(*xs) for xs in zip(*all_leaves))
+                             ^^^^^^
+  File "/scratch/scratch-lxu/agent_dev/auto_research_agent/GMaster/benchmarks/run_paper_v2_benchmarks.py", line 180, in <lambda>
+    lambda leaf: leaf.block_until_ready() if hasattr(leaf, "block_until_ready") else None,
+                 ^^^^^^^^^^^^^^^^^^^^^^^^
+jax.errors.JaxRuntimeError: INTERNAL: RET_CHECK failure (external/xla/xla/backends/gpu/runtime/fft_thunk.cc:199) fft_plan != nullptr Failed to create cuFFT batched plan with scratch allocator
+
+
+Benchmark runs finished successfully! Raw data written to: /home/lxu/scratch/agent_dev/auto_research_agent/GMaster/benchmarks/independent/results_gm_noprefill.json
+GM_4096S2_DONE 2026-09-18T07:26:09+01:00
+=== NaMaster 32c 4096 spin2 2026-09-18T07:26:09+01:00 ===
+================================================================================
+ GMASTER v2_march vs NaMaster Benchmarks: fp32 vs fp64 Speed & Correctness
+================================================================================
+Target GPU: CUDA_VISIBLE_DEVICES=
+Modes: pipeline
+
+>>> SECTION 2: End-to-End MASTER Pipeline Benchmarks <<<
+Nside | Spin | NaMaster (ms) | GM fp32 (ms) [x] | GM fp64 (ms) [x] | fp32 rel dCl | fp64 rel dCl | Peak RSS (GB) | Peak VRAM (GB)
+-----------------------------------------------------------------------------------------------------------------------------
+ 4096 |    2 |      228964.1 |      nan [ --- ] |      nan [ --- ] |          nan |          nan |           0.0 |            0.0
+
+Benchmark runs finished successfully! Raw data written to: /home/lxu/scratch/agent_dev/auto_research_agent/GMaster/benchmarks/independent/results_nm32.json
+NM32_4096S2_DONE 2026-09-18T07:37:39+01:00
+=== NaMaster 96c 4096 spin2 2026-09-18T07:37:39+01:00 ===
+================================================================================
+ GMASTER v2_march vs NaMaster Benchmarks: fp32 vs fp64 Speed & Correctness
+================================================================================
+Target GPU: CUDA_VISIBLE_DEVICES=
+Modes: pipeline
+
+>>> SECTION 2: End-to-End MASTER Pipeline Benchmarks <<<
+Nside | Spin | NaMaster (ms) | GM fp32 (ms) [x] | GM fp64 (ms) [x] | fp32 rel dCl | fp64 rel dCl | Peak RSS (GB) | Peak VRAM (GB)
+-----------------------------------------------------------------------------------------------------------------------------
+ 4096 |    2 |      109663.1 |      nan [ --- ] |      nan [ --- ] |          nan |          nan |           0.0 |            0.0
+
+Benchmark runs finished successfully! Raw data written to: /home/lxu/scratch/agent_dev/auto_research_agent/GMaster/benchmarks/independent/results_nm96.json
+NM96_4096S2_DONE 2026-09-18T07:43:15+01:00
+# GMaster v2 vs NaMaster 32-core and 96-core (times + residuals)
+
+Times: noprefill GMaster + pinned NaMaster. Residuals: independent same-kernel run vs NaMaster.
+
+## 1. map2alm (ms) and relative $\Delta a_{\ell m}$
+
+| Nside | spin | DUCC 32c | DUCC 96c | GM fp32 | GM fp64 | fp32 rel $\Delta a$ | fp64 rel $\Delta a$ | fp32 rms |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 64 | 0 | 0.31 | 0.38 | 0.13 | 0.17 | 1.53e-06 | 1.52e-06 | 1.00e-06 |
+| 64 | 2 | 0.47 | 0.58 | 0.16 | 0.17 | 1.39e-06 | 1.35e-06 | 1.00e-06 |
+| 128 | 0 | 0.97 | 1.14 | 0.27 | 0.24 | 3.27e-06 | 3.37e-06 | 1.78e-06 |
+| 128 | 2 | 2.32 | 1.43 | 0.23 | 0.31 | 4.07e-06 | 4.03e-06 | 1.77e-06 |
+| 256 | 0 | 5.17 | 2.46 | 0.42 | 0.72 | 6.52e-06 | 6.50e-06 | 3.30e-06 |
+| 256 | 2 | 6.69 | 6.16 | 0.80 | 1.08 | 7.09e-06 | 7.11e-06 | 3.29e-06 |
+| 512 | 0 | 18.38 | 14.50 | 2.17 | 2.34 | 1.36e-05 | 1.36e-05 | 6.33e-06 |
+| 512 | 2 | 44.24 | 27.14 | 2.96 | 4.79 | 1.49e-05 | 1.49e-05 | 6.34e-06 |
+| 1024 | 0 | 115.47 | 62.43 | 7.53 | 10.45 | 2.53e-05 | 2.54e-05 | 1.23e-05 |
+| 1024 | 2 | 221.27 | 120.95 | 16.37 | 23.33 | 2.59e-05 | 2.58e-05 | 1.23e-05 |
+| 2048 | 0 | 646.17 | 309.75 | 44.03 | 55.09 | 5.74e-05 | 5.74e-05 | 2.43e-05 |
+| 2048 | 2 | 1345.49 | 617.32 | 92.63 | 119.27 | 4.88e-05 | 4.88e-05 | 2.44e-05 |
+| 4096 | 0 | 4520.68 | 1861.28 | 438.24 | 507.60 | 1.09e-04 | 1.09e-04 | 4.84e-05 |
+| 4096 | 2 | 9083.17 | 3715.30 | 722.42 | 854.21 | 1.09e-04 | 1.10e-04 | 4.84e-05 |
+
+## 2. Full $C_\ell$ pipeline (ms) and relative $\Delta C_\ell$
+
+| Nside | spin | NM 32c | NM 96c | GM fp32 | GM fp64 | fp32 rel dCl | fp64 rel dCl | fp32 rel coupled |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 64 | 0 | 42.0 | 40.0 | 6.2 | 6.2 | 1.46e-07 | 1.54e-07 | 1.21e-06 |
+| 64 | 2 | 40.0 | 43.2 | 3.2 | 2.6 | 4.03e-07 | 3.57e-07 | 1.53e-06 |
+| 128 | 0 | 52.2 | 48.8 | 10.3 | 10.6 | 2.19e-07 | 1.66e-07 | 1.88e-06 |
+| 128 | 2 | 107.0 | 70.9 | 3.2 | 5.0 | 8.55e-07 | 6.81e-07 | 1.48e-06 |
+| 256 | 0 | 122.3 | 94.1 | 20.9 | 23.0 | 1.40e-06 | 1.40e-06 | 1.03e-05 |
+| 256 | 2 | 520.0 | 225.2 | 8.7 | 17.2 | 4.61e-07 | 4.78e-07 | 4.80e-06 |
+| 512 | 0 | 603.1 | 354.2 | 69.4 | 77.2 | 1.64e-06 | 1.60e-06 | 8.01e-06 |
+| 512 | 2 | 1873.0 | 752.0 | 32.9 | 88.6 | 2.39e-06 | 2.31e-06 | 1.29e-05 |
+| 1024 | 0 | 3827.9 | 1794.1 | 273.6 | 318.3 | 5.65e-06 | 5.69e-06 | 2.03e-05 |
+| 1024 | 2 | 7877.8 | 3422.2 | 170.1 | 537.1 | 5.63e-06 | 5.75e-06 | 2.87e-05 |
+| 2048 | 0 | 25042.2 | 10393.2 | 1591.7 | 1772.3 | 1.74e-05 | 1.75e-05 | 6.46e-05 |
+| 2048 | 2 | 42737.9 | 20877.6 | 1077.4 | 3756.4 | 1.37e-05 | 1.35e-05 | 2.62e-05 |
+| 4096 | 0 | 160225.1 | 82110.9 | 12434.7 | 13186.5 | 1.64e-04 | 1.64e-04 | 8.98e-05 |
+| 4096 | 2 | 228964.1 | 109663.1 | — | — | — | — | — |
+
+Wrote /scratch/scratch-lxu/agent_dev/auto_research_agent/GMaster/benchmarks/independent/results_for_plots.json
+S2_DONE 2026-09-18T07:43:15+01:00
+GM_RETRY2_START 2026-09-18T10:14:28+01:00
+================================================================================
+ GMASTER v2_march vs NaMaster Benchmarks: fp32 vs fp64 Speed & Correctness
+================================================================================
+Target GPU: CUDA_VISIBLE_DEVICES=1
+Modes: pipeline
+
+>>> SECTION 2: End-to-End MASTER Pipeline Benchmarks <<<
+Nside | Spin | NaMaster (ms) | GM fp32 (ms) [x] | GM fp64 (ms) [x] | fp32 rel dCl | fp64 rel dCl | Peak RSS (GB) | Peak VRAM (GB)
+-----------------------------------------------------------------------------------------------------------------------------
+Error running pipeline nside=4096 spin=2:
+E0918 10:14:37.830212 2851556 gpu_cudamallocasync_allocator.cc:359] gpu_async_0 cuMemAllocAsync failed to allocate 1610612736 bytes: RESOURCE_EXHAUSTED: : CUDA_ERROR_OUT_OF_MEMORY: out of memory
+ Reported by CUDA: Free memory/Total memory: 449970176/101948129280
+E0918 10:14:37.830253 2851556 gpu_cudamallocasync_allocator.cc:364] Stats: Limit:                              0B
+InUse:                         4.50GiB
+MaxInUse:                      4.50GiB
+NumAllocs:                           3
+MaxAllocSize:                  1.50GiB
+Reserved:                           0B
+PeakReserved:                       0B
+LargestFreeBlock:                   0B
+
+E0918 10:14:37.830264 2851556 gpu_cudamallocasync_allocator.cc:68] Histogram of current allocation: (allocation_size_in_bytes, nb_allocation_of_that_sizes), ...;
+E0918 10:14:37.830266 2851556 gpu_cudamallocasync_allocator.cc:71] 1610612736, 3
+E0918 10:14:37.830270 2851556 gpu_cudamallocasync_allocator.cc:104] CU_MEMPOOL_ATTR_RESERVED_MEM_CURRENT: 4831838208
+E0918 10:14:37.830271 2851556 gpu_cudamallocasync_allocator.cc:106] CU_MEMPOOL_ATTR_USED_MEM_CURRENT: 4831838208
+E0918 10:14:37.830272 2851556 gpu_cudamallocasync_allocator.cc:107] CU_MEMPOOL_ATTR_RESERVED_MEM_HIGH: 5268045824
+E0918 10:14:37.830272 2851556 gpu_cudamallocasync_allocator.cc:108] CU_MEMPOOL_ATTR_USED_MEM_HIGH: 4831838208
+Traceback (most recent call last):
+  File "/scratch/scratch-lxu/agent_dev/auto_research_agent/GMaster/benchmarks/run_paper_v2_benchmarks.py", line 670, in <module>
+    main()
+  File "/scratch/scratch-lxu/agent_dev/auto_research_agent/GMaster/benchmarks/run_paper_v2_benchmarks.py", line 399, in main
+    res = run_worker_pipeline(
+          ^^^^^^^^^^^^^^^^^^^^
+  File "/scratch/scratch-lxu/agent_dev/auto_research_agent/GMaster/benchmarks/run_paper_v2_benchmarks.py", line 306, in run_worker_pipeline
+    jnp.asarray(map_u),
+    ^^^^^^^^^^^^^^^^^^
+  File "/scratch/scratch-lxu/venv/cmbagent_env/lib/python3.12/site-packages/jax/_src/numpy/array_constructors.py", line 427, in asarray
+    return array(a, dtype=dtype, copy=bool(copy), order=order, device=device,
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/scratch/scratch-lxu/venv/cmbagent_env/lib/python3.12/site-packages/jax/_src/numpy/array_constructors.py", line 208, in array
+    return api.device_put(object)
+           ^^^^^^^^^^^^^^^^^^^^^^
+  File "/scratch/scratch-lxu/venv/cmbagent_env/lib/python3.12/site-packages/jax/_src/api.py", line 2189, in device_put
+    out_flat = dispatch._batched_device_put_impl(
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/scratch/scratch-lxu/venv/cmbagent_env/lib/python3.12/site-packages/jax/_src/dispatch.py", line 631, in _batched_device_put_impl
+    shard_arg_results = pxla.shard_args(dsa_shardings, [None] * len(dsa_xs),
+                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/scratch/scratch-lxu/venv/cmbagent_env/lib/python3.12/site-packages/jax/_src/profiler.py", line 384, in wrapper
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/scratch/scratch-lxu/venv/cmbagent_env/lib/python3.12/site-packages/jax/_src/interpreters/pxla.py", line 99, in shard_args
+    return shard_arg_handlers[type(arg)]([arg], shardings, layouts,
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/scratch/scratch-lxu/venv/cmbagent_env/lib/python3.12/site-packages/jax/_src/interpreters/pxla.py", line 185, in _shard_np_array
+    results.append(batched_device_put(aval, sharding, shards, devices))
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/scratch/scratch-lxu/venv/cmbagent_env/lib/python3.12/site-packages/jax/_src/interpreters/pxla.py", line 226, in batched_device_put
+    return xc.batched_device_put(aval, sharding, xs, list(devices), committed,
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+jax.errors.JaxRuntimeError: RESOURCE_EXHAUSTED: Out of memory while trying to allocate 1.50GiB.
+
+
+Benchmark runs finished successfully! Raw data written to: benchmarks/independent/results_gm_noprefill.json
+GM_RETRY2_EXIT 0 2026-09-18T10:14:38+01:00
+# GMaster v2 vs NaMaster 32-core and 96-core (times + residuals)
+
+Times: noprefill GMaster + pinned NaMaster. Residuals: independent same-kernel run vs NaMaster.
+
+## 1. map2alm (ms) and relative $\Delta a_{\ell m}$
+
+| Nside | spin | DUCC 32c | DUCC 96c | GM fp32 | GM fp64 | fp32 rel $\Delta a$ | fp64 rel $\Delta a$ | fp32 rms |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 64 | 0 | 0.31 | 0.38 | 0.13 | 0.17 | 1.53e-06 | 1.52e-06 | 1.00e-06 |
+| 64 | 2 | 0.47 | 0.58 | 0.16 | 0.17 | 1.39e-06 | 1.35e-06 | 1.00e-06 |
+| 128 | 0 | 0.97 | 1.14 | 0.27 | 0.24 | 3.27e-06 | 3.37e-06 | 1.78e-06 |
+| 128 | 2 | 2.32 | 1.43 | 0.23 | 0.31 | 4.07e-06 | 4.03e-06 | 1.77e-06 |
+| 256 | 0 | 5.17 | 2.46 | 0.42 | 0.72 | 6.52e-06 | 6.50e-06 | 3.30e-06 |
+| 256 | 2 | 6.69 | 6.16 | 0.80 | 1.08 | 7.09e-06 | 7.11e-06 | 3.29e-06 |
+| 512 | 0 | 18.38 | 14.50 | 2.17 | 2.34 | 1.36e-05 | 1.36e-05 | 6.33e-06 |
+| 512 | 2 | 44.24 | 27.14 | 2.96 | 4.79 | 1.49e-05 | 1.49e-05 | 6.34e-06 |
+| 1024 | 0 | 115.47 | 62.43 | 7.53 | 10.45 | 2.53e-05 | 2.54e-05 | 1.23e-05 |
+| 1024 | 2 | 221.27 | 120.95 | 16.37 | 23.33 | 2.59e-05 | 2.58e-05 | 1.23e-05 |
+| 2048 | 0 | 646.17 | 309.75 | 44.03 | 55.09 | 5.74e-05 | 5.74e-05 | 2.43e-05 |
+| 2048 | 2 | 1345.49 | 617.32 | 92.63 | 119.27 | 4.88e-05 | 4.88e-05 | 2.44e-05 |
+| 4096 | 0 | 4520.68 | 1861.28 | 438.24 | 507.60 | 1.09e-04 | 1.09e-04 | 4.84e-05 |
+| 4096 | 2 | 9083.17 | 3715.30 | 722.42 | 854.21 | 1.09e-04 | 1.10e-04 | 4.84e-05 |
+
+## 2. Full $C_\ell$ pipeline (ms) and relative $\Delta C_\ell$
+
+| Nside | spin | NM 32c | NM 96c | GM fp32 | GM fp64 | fp32 rel dCl | fp64 rel dCl | fp32 rel coupled |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 64 | 0 | 42.0 | 40.0 | 6.2 | 6.2 | 1.46e-07 | 1.54e-07 | 1.21e-06 |
+| 64 | 2 | 40.0 | 43.2 | 3.2 | 2.6 | 4.03e-07 | 3.57e-07 | 1.53e-06 |
+| 128 | 0 | 52.2 | 48.8 | 10.3 | 10.6 | 2.19e-07 | 1.66e-07 | 1.88e-06 |
+| 128 | 2 | 107.0 | 70.9 | 3.2 | 5.0 | 8.55e-07 | 6.81e-07 | 1.48e-06 |
+| 256 | 0 | 122.3 | 94.1 | 20.9 | 23.0 | 1.40e-06 | 1.40e-06 | 1.03e-05 |
+| 256 | 2 | 520.0 | 225.2 | 8.7 | 17.2 | 4.61e-07 | 4.78e-07 | 4.80e-06 |
+| 512 | 0 | 603.1 | 354.2 | 69.4 | 77.2 | 1.64e-06 | 1.60e-06 | 8.01e-06 |
+| 512 | 2 | 1873.0 | 752.0 | 32.9 | 88.6 | 2.39e-06 | 2.31e-06 | 1.29e-05 |
+| 1024 | 0 | 3827.9 | 1794.1 | 273.6 | 318.3 | 5.65e-06 | 5.69e-06 | 2.03e-05 |
+| 1024 | 2 | 7877.8 | 3422.2 | 170.1 | 537.1 | 5.63e-06 | 5.75e-06 | 2.87e-05 |
+| 2048 | 0 | 25042.2 | 10393.2 | 1591.7 | 1772.3 | 1.74e-05 | 1.75e-05 | 6.46e-05 |
+| 2048 | 2 | 42737.9 | 20877.6 | 1077.4 | 3756.4 | 1.37e-05 | 1.35e-05 | 2.62e-05 |
+| 4096 | 0 | 160225.1 | 82110.9 | 12434.7 | 13186.5 | 1.64e-04 | 1.64e-04 | 8.98e-05 |
+| 4096 | 2 | 228964.1 | 109663.1 | — | — | — | — | — |
+
+Wrote /scratch/scratch-lxu/agent_dev/auto_research_agent/GMaster/benchmarks/independent/results_for_plots.json
+GM_GPU0_START 2026-09-18T16:01:03+01:00
+index, memory.used [MiB], memory.free [MiB]
+0, 13336 MiB, 83913 MiB
+1, 91586 MiB, 5640 MiB
+================================================================================
+ GMASTER v2_march vs NaMaster Benchmarks: fp32 vs fp64 Speed & Correctness
+================================================================================
+Target GPU: CUDA_VISIBLE_DEVICES=0
+Modes: pipeline
+
+>>> SECTION 2: End-to-End MASTER Pipeline Benchmarks <<<
+Nside | Spin | NaMaster (ms) | GM fp32 (ms) [x] | GM fp64 (ms) [x] | fp32 rel dCl | fp64 rel dCl | Peak RSS (GB) | Peak VRAM (GB)
+-----------------------------------------------------------------------------------------------------------------------------
+Error running pipeline nside=4096 spin=2:
+E0918 16:06:36.178057 4088500 gpu_cudamallocasync_allocator.cc:359] gpu_async_0 cuMemAllocAsync failed to allocate 2146959360 bytes: RESOURCE_EXHAUSTED: : CUDA_ERROR_OUT_OF_MEMORY: out of memory
+ Reported by CUDA: Free memory/Total memory: 3604480/101971722240
+E0918 16:06:36.178148 4088500 gpu_cudamallocasync_allocator.cc:364] Stats: Limit:                        71.23GiB
+InUse:                        68.31GiB
+MaxInUse:                     68.31GiB
+NumAllocs:                        7062
+MaxAllocSize:                 17.73GiB
+Reserved:                           0B
+PeakReserved:                       0B
+LargestFreeBlock:                   0B
+
+E0918 16:06:36.178167 4088500 gpu_cudamallocasync_allocator.cc:68] Histogram of current allocation: (allocation_size_in_bytes, nb_allocation_of_that_sizes), ...;
+E0918 16:06:36.178168 4088500 gpu_cudamallocasync_allocator.cc:71] 8, 8
+E0918 16:06:36.178170 4088500 gpu_cudamallocasync_allocator.cc:71] 128, 1
+E0918 16:06:36.178171 4088500 gpu_cudamallocasync_allocator.cc:71] 256, 1
+E0918 16:06:36.178171 4088500 gpu_cudamallocasync_allocator.cc:71] 2048, 1
+E0918 16:06:36.178172 4088500 gpu_cudamallocasync_allocator.cc:71] 8192, 1
+E0918 16:06:36.178172 4088500 gpu_cudamallocasync_allocator.cc:71] 12296, 1
+E0918 16:06:36.178173 4088500 gpu_cudamallocasync_allocator.cc:71] 16384, 1
+E0918 16:06:36.178173 4088500 gpu_cudamallocasync_allocator.cc:71] 32768, 3
+E0918 16:06:36.178174 4088500 gpu_cudamallocasync_allocator.cc:71] 49080, 2
+E0918 16:06:36.178174 4088500 gpu_cudamallocasync_allocator.cc:71] 49184, 1
+E0918 16:06:36.178175 4088500 gpu_cudamallocasync_allocator.cc:71] 65520, 6
+E0918 16:06:36.178175 4088500 gpu_cudamallocasync_allocator.cc:71] 65536, 6
+E0918 16:06:36.178175 4088500 gpu_cudamallocasync_allocator.cc:71] 98160, 2
+E0918 16:06:36.178176 4088500 gpu_cudamallocasync_allocator.cc:71] 98304, 2
+E0918 16:06:36.178176 4088500 gpu_cudamallocasync_allocator.cc:71] 98368, 2
+E0918 16:06:36.178177 4088500 gpu_cudamallocasync_allocator.cc:71] 131064, 5
+E0918 16:06:36.178177 4088500 gpu_cudamallocasync_allocator.cc:71] 131072, 4
+E0918 16:06:36.178178 4088500 gpu_cudamallocasync_allocator.cc:71] 262144, 1
+E0918 16:06:36.178178 4088500 gpu_cudamallocasync_allocator.cc:71] 8388608, 96
+E0918 16:06:36.178179 4088500 gpu_cudamallocasync_allocator.cc:71] 12591104, 3
+E0918 16:06:36.178179 4088500 gpu_cudamallocasync_allocator.cc:71] 40206336, 2
+E0918 16:06:36.178180 4088500 gpu_cudamallocasync_allocator.cc:71] 151093248, 48
+E0918 16:06:36.178180 4088500 gpu_cudamallocasync_allocator.cc:71] 268419072, 1
+E0918 16:06:36.178181 4088500 gpu_cudamallocasync_allocator.cc:71] 604028928, 2
+E0918 16:06:36.178181 4088500 gpu_cudamallocasync_allocator.cc:71] 643301376, 2
+E0918 16:06:36.178182 4088500 gpu_cudamallocasync_allocator.cc:71] 1208057856, 1
+E0918 16:06:36.178182 4088500 gpu_cudamallocasync_allocator.cc:71] 1610219520, 2
+E0918 16:06:36.178183 4088500 gpu_cudamallocasync_allocator.cc:71] 1610612736, 5
+E0918 16:06:36.178183 4088500 gpu_cudamallocasync_allocator.cc:71] 2146959360, 5
+E0918 16:06:36.178184 4088500 gpu_cudamallocasync_allocator.cc:71] 2415919104, 1
+E0918 16:06:36.178184 4088500 gpu_cudamallocasync_allocator.cc:71] 2416115712, 1
+E0918 16:06:36.178184 4088500 gpu_cudamallocasync_allocator.cc:71] 3220308000, 2
+E0918 16:06:36.178185 4088500 gpu_cudamallocasync_allocator.cc:71] 3221028864, 1
+E0918 16:06:36.178185 4088500 gpu_cudamallocasync_allocator.cc:71] 3221225472, 1
+E0918 16:06:36.178186 4088500 gpu_cudamallocasync_allocator.cc:71] 4293918720, 1
+E0918 16:06:36.178186 4088500 gpu_cudamallocasync_allocator.cc:71] 8587837440, 2
+E0918 16:06:36.178188 4088500 gpu_cudamallocasync_allocator.cc:104] CU_MEMPOOL_ATTR_RESERVED_MEM_CURRENT: 74323066880
+E0918 16:06:36.178189 4088500 gpu_cudamallocasync_allocator.cc:106] CU_MEMPOOL_ATTR_USED_MEM_CURRENT: 73343006832
+E0918 16:06:36.178189 4088500 gpu_cudamallocasync_allocator.cc:107] CU_MEMPOOL_ATTR_RESERVED_MEM_HIGH: 77410074624
+E0918 16:06:36.178190 4088500 gpu_cudamallocasync_allocator.cc:108] CU_MEMPOOL_ATTR_USED_MEM_HIGH: 76478791680
+E0918 16:06:36.202343 4088500 gpu_cudamallocasync_allocator.cc:359] gpu_async_0 cuMemAllocAsync failed to allocate 2146959360 bytes: RESOURCE_EXHAUSTED: : CUDA_ERROR_OUT_OF_MEMORY: out of memory
+ Reported by CUDA: Free memory/Total memory: 3604480/101971722240
+E0918 16:06:36.202378 4088500 gpu_cudamallocasync_allocator.cc:364] Stats: Limit:                        71.23GiB
+InUse:                        67.81GiB
+MaxInUse:                     68.31GiB
+NumAllocs:                        7079
+MaxAllocSize:                 17.73GiB
+Reserved:                           0B
+PeakReserved:                       0B
+LargestFreeBlock:                   0B
+
+E0918 16:06:36.202393 4088500 gpu_cudamallocasync_allocator.cc:68] Histogram of current allocation: (allocation_size_in_bytes, nb_allocation_of_that_sizes), ...;
+E0918 16:06:36.202394 4088500 gpu_cudamallocasync_allocator.cc:71] 8, 6
+E0918 16:06:36.202395 4088500 gpu_cudamallocasync_allocator.cc:71] 128, 1
+E0918 16:06:36.202396 4088500 gpu_cudamallocasync_allocator.cc:71] 256, 1
+E0918 16:06:36.202396 4088500 gpu_cudamallocasync_allocator.cc:71] 2048, 1
+E0918 16:06:36.202397 4088500 gpu_cudamallocasync_allocator.cc:71] 8192, 1
+E0918 16:06:36.202398 4088500 gpu_cudamallocasync_allocator.cc:71] 12296, 1
+E0918 16:06:36.202398 4088500 gpu_cudamallocasync_allocator.cc:71] 16384, 1
+E0918 16:06:36.202398 4088500 gpu_cudamallocasync_allocator.cc:71] 32768, 3
+E0918 16:06:36.202399 4088500 gpu_cudamallocasync_allocator.cc:71] 49080, 2
+E0918 16:06:36.202399 4088500 gpu_cudamallocasync_allocator.cc:71] 49184, 1
+E0918 16:06:36.202400 4088500 gpu_cudamallocasync_allocator.cc:71] 65520, 6
+E0918 16:06:36.202400 4088500 gpu_cudamallocasync_allocator.cc:71] 65536, 6
+E0918 16:06:36.202401 4088500 gpu_cudamallocasync_allocator.cc:71] 98160, 2
+E0918 16:06:36.202401 4088500 gpu_cudamallocasync_allocator.cc:71] 98304, 2
+E0918 16:06:36.202402 4088500 gpu_cudamallocasync_allocator.cc:71] 98368, 2
+E0918 16:06:36.202402 4088500 gpu_cudamallocasync_allocator.cc:71] 131064, 5
+E0918 16:06:36.202403 4088500 gpu_cudamallocasync_allocator.cc:71] 131072, 4
+E0918 16:06:36.202403 4088500 gpu_cudamallocasync_allocator.cc:71] 262144, 1
+E0918 16:06:36.202404 4088500 gpu_cudamallocasync_allocator.cc:71] 8388608, 96
+E0918 16:06:36.202405 4088500 gpu_cudamallocasync_allocator.cc:71] 12591104, 3
+E0918 16:06:36.202405 4088500 gpu_cudamallocasync_allocator.cc:71] 40206336, 2
+E0918 16:06:36.202406 4088500 gpu_cudamallocasync_allocator.cc:71] 151093248, 48
+E0918 16:06:36.202406 4088500 gpu_cudamallocasync_allocator.cc:71] 268419072, 1
+E0918 16:06:36.202407 4088500 gpu_cudamallocasync_allocator.cc:71] 604028928, 2
+E0918 16:06:36.202407 4088500 gpu_cudamallocasync_allocator.cc:71] 643301376, 2
+E0918 16:06:36.202407 4088500 gpu_cudamallocasync_allocator.cc:71] 1208057856, 1
+E0918 16:06:36.202408 4088500 gpu_cudamallocasync_allocator.cc:71] 1610219520, 3
+E0918 16:06:36.202408 4088500 gpu_cudamallocasync_allocator.cc:71] 1610612736, 5
+E0918 16:06:36.202409 4088500 gpu_cudamallocasync_allocator.cc:71] 2146959360, 4
+E0918 16:06:36.202409 4088500 gpu_cudamallocasync_allocator.cc:71] 2415919104, 1
+E0918 16:06:36.202410 4088500 gpu_cudamallocasync_allocator.cc:71] 2416115712, 1
+E0918 16:06:36.202411 4088500 gpu_cudamallocasync_allocator.cc:71] 3220308000, 2
+E0918 16:06:36.202411 4088500 gpu_cudamallocasync_allocator.cc:71] 3221028864, 1
+E0918 16:06:36.202412 4088500 gpu_cudamallocasync_allocator.cc:71] 3221225472, 1
+E0918 16:06:36.202412 4088500 gpu_cudamallocasync_allocator.cc:71] 4293918720, 1
+E0918 16:06:36.202413 4088500 gpu_cudamallocasync_allocator.cc:71] 8587837440, 2
+E0918 16:06:36.202414 4088500 gpu_cudamallocasync_allocator.cc:104] CU_MEMPOOL_ATTR_RESERVED_MEM_CURRENT: 74323066880
+E0918 16:06:36.202415 4088500 gpu_cudamallocasync_allocator.cc:106] CU_MEMPOOL_ATTR_USED_MEM_CURRENT: 72806266976
+E0918 16:06:36.202416 4088500 gpu_cudamallocasync_allocator.cc:107] CU_MEMPOOL_ATTR_RESERVED_MEM_HIGH: 77410074624
+E0918 16:06:36.202416 4088500 gpu_cudamallocasync_allocator.cc:108] CU_MEMPOOL_ATTR_USED_MEM_HIGH: 76478791680
+Traceback (most recent call last):
+  File "/scratch/scratch-lxu/agent_dev/auto_research_agent/GMaster/benchmarks/run_paper_v2_benchmarks.py", line 670, in <module>
+    main()
+  File "/scratch/scratch-lxu/agent_dev/auto_research_agent/GMaster/benchmarks/run_paper_v2_benchmarks.py", line 399, in main
+    res = run_worker_pipeline(
+          ^^^^^^^^^^^^^^^^^^^^
+  File "/scratch/scratch-lxu/agent_dev/auto_research_agent/GMaster/benchmarks/run_paper_v2_benchmarks.py", line 325, in run_worker_pipeline
+    gm_d, gm_c, gm_times = _exec_pipeline(
+                           ^^^^^^^^^^^^^^^
+  File "/scratch/scratch-lxu/agent_dev/auto_research_agent/GMaster/benchmarks/run_paper_v2_benchmarks.py", line 229, in _exec_pipeline
+    _block(d_cell)
+  File "/scratch/scratch-lxu/agent_dev/auto_research_agent/GMaster/benchmarks/run_paper_v2_benchmarks.py", line 179, in _block
+    jax.tree.map(
+  File "/scratch/scratch-lxu/venv/cmbagent_env/lib/python3.12/site-packages/jax/_src/tree.py", line 156, in map
+    return tree_util.tree_map(f, tree, *rest, is_leaf=is_leaf)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/scratch/scratch-lxu/venv/cmbagent_env/lib/python3.12/site-packages/jax/_src/tree_util.py", line 397, in tree_map
+    return treedef.unflatten(f(*xs) for xs in zip(*all_leaves))
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/scratch/scratch-lxu/venv/cmbagent_env/lib/python3.12/site-packages/jax/_src/tree_util.py", line 397, in <genexpr>
+    return treedef.unflatten(f(*xs) for xs in zip(*all_leaves))
+                             ^^^^^^
+  File "/scratch/scratch-lxu/agent_dev/auto_research_agent/GMaster/benchmarks/run_paper_v2_benchmarks.py", line 180, in <lambda>
+    lambda leaf: leaf.block_until_ready() if hasattr(leaf, "block_until_ready") else None,
+                 ^^^^^^^^^^^^^^^^^^^^^^^^
+jax.errors.JaxRuntimeError: RESOURCE_EXHAUSTED: Out of memory while trying to allocate 2.00GiB.
+
+
+Benchmark runs finished successfully! Raw data written to: benchmarks/independent/results_gm_4096s2_gpu0.json
+GM_GPU0_EXIT 0 2026-09-18T16:08:41+01:00
+GM_GPU0_FP32_START 2026-09-18T16:14:11+01:00
+index, memory.used [MiB], memory.free [MiB]
+0, 13512 MiB, 83737 MiB
+1, 91586 MiB, 5640 MiB
+================================================================================
+ GMASTER v2_march vs NaMaster Benchmarks: fp32 vs fp64 Speed & Correctness
+================================================================================
+Target GPU: CUDA_VISIBLE_DEVICES=0
+Modes: pipeline
+
+>>> SECTION 2: End-to-End MASTER Pipeline Benchmarks <<<
+Nside | Spin | NaMaster (ms) | GM fp32 (ms) [x] | GM fp64 (ms) [x] | fp32 rel dCl | fp64 rel dCl | Peak RSS (GB) | Peak VRAM (GB)
+-----------------------------------------------------------------------------------------------------------------------------
+ 4096 |    2 |           nan |   8859.0 [ --- ] |      nan [ --- ] |          nan |          nan |          64.2 |           63.6
+
+Benchmark runs finished successfully! Raw data written to: benchmarks/independent/results_gm_4096s2_gpu0.json
+GM_GPU0_FP32_EXIT 0 2026-09-18T16:17:35+01:00
+# GMaster v2 vs NaMaster 32-core and 96-core (times + residuals)
+
+Times: noprefill GMaster + pinned NaMaster. Residuals: independent same-kernel run vs NaMaster.
+
+## 1. map2alm (ms) and relative $\Delta a_{\ell m}$
+
+| Nside | spin | DUCC 32c | DUCC 96c | GM fp32 | GM fp64 | fp32 rel $\Delta a$ | fp64 rel $\Delta a$ | fp32 rms |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 64 | 0 | 0.31 | 0.38 | 0.13 | 0.17 | 1.53e-06 | 1.52e-06 | 1.00e-06 |
+| 64 | 2 | 0.47 | 0.58 | 0.16 | 0.17 | 1.39e-06 | 1.35e-06 | 1.00e-06 |
+| 128 | 0 | 0.97 | 1.14 | 0.27 | 0.24 | 3.27e-06 | 3.37e-06 | 1.78e-06 |
+| 128 | 2 | 2.32 | 1.43 | 0.23 | 0.31 | 4.07e-06 | 4.03e-06 | 1.77e-06 |
+| 256 | 0 | 5.17 | 2.46 | 0.42 | 0.72 | 6.52e-06 | 6.50e-06 | 3.30e-06 |
+| 256 | 2 | 6.69 | 6.16 | 0.80 | 1.08 | 7.09e-06 | 7.11e-06 | 3.29e-06 |
+| 512 | 0 | 18.38 | 14.50 | 2.17 | 2.34 | 1.36e-05 | 1.36e-05 | 6.33e-06 |
+| 512 | 2 | 44.24 | 27.14 | 2.96 | 4.79 | 1.49e-05 | 1.49e-05 | 6.34e-06 |
+| 1024 | 0 | 115.47 | 62.43 | 7.53 | 10.45 | 2.53e-05 | 2.54e-05 | 1.23e-05 |
+| 1024 | 2 | 221.27 | 120.95 | 16.37 | 23.33 | 2.59e-05 | 2.58e-05 | 1.23e-05 |
+| 2048 | 0 | 646.17 | 309.75 | 44.03 | 55.09 | 5.74e-05 | 5.74e-05 | 2.43e-05 |
+| 2048 | 2 | 1345.49 | 617.32 | 92.63 | 119.27 | 4.88e-05 | 4.88e-05 | 2.44e-05 |
+| 4096 | 0 | 4520.68 | 1861.28 | 438.24 | 507.60 | 1.09e-04 | 1.09e-04 | 4.84e-05 |
+| 4096 | 2 | 9083.17 | 3715.30 | 722.42 | 854.21 | 1.09e-04 | 1.10e-04 | 4.84e-05 |
+
+## 2. Full $C_\ell$ pipeline (ms) and relative $\Delta C_\ell$
+
+| Nside | spin | NM 32c | NM 96c | GM fp32 | GM fp64 | fp32 rel dCl | fp64 rel dCl | fp32 rel coupled |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 64 | 0 | 42.0 | 40.0 | 6.2 | 6.2 | 1.46e-07 | 1.54e-07 | 1.21e-06 |
+| 64 | 2 | 40.0 | 43.2 | 3.2 | 2.6 | 4.03e-07 | 3.57e-07 | 1.53e-06 |
+| 128 | 0 | 52.2 | 48.8 | 10.3 | 10.6 | 2.19e-07 | 1.66e-07 | 1.88e-06 |
+| 128 | 2 | 107.0 | 70.9 | 3.2 | 5.0 | 8.55e-07 | 6.81e-07 | 1.48e-06 |
+| 256 | 0 | 122.3 | 94.1 | 20.9 | 23.0 | 1.40e-06 | 1.40e-06 | 1.03e-05 |
+| 256 | 2 | 520.0 | 225.2 | 8.7 | 17.2 | 4.61e-07 | 4.78e-07 | 4.80e-06 |
+| 512 | 0 | 603.1 | 354.2 | 69.4 | 77.2 | 1.64e-06 | 1.60e-06 | 8.01e-06 |
+| 512 | 2 | 1873.0 | 752.0 | 32.9 | 88.6 | 2.39e-06 | 2.31e-06 | 1.29e-05 |
+| 1024 | 0 | 3827.9 | 1794.1 | 273.6 | 318.3 | 5.65e-06 | 5.69e-06 | 2.03e-05 |
+| 1024 | 2 | 7877.8 | 3422.2 | 170.1 | 537.1 | 5.63e-06 | 5.75e-06 | 2.87e-05 |
+| 2048 | 0 | 25042.2 | 10393.2 | 1591.7 | 1772.3 | 1.74e-05 | 1.75e-05 | 6.46e-05 |
+| 2048 | 2 | 42737.9 | 20877.6 | 1077.4 | 3756.4 | 1.37e-05 | 1.35e-05 | 2.62e-05 |
+| 4096 | 0 | 160225.1 | 82110.9 | 12434.7 | 13186.5 | 1.64e-04 | 1.64e-04 | 8.98e-05 |
+| 4096 | 2 | 228964.1 | 109663.1 | 8859.0 | — | — | — | — |
+
+Wrote /scratch/scratch-lxu/agent_dev/auto_research_agent/GMaster/benchmarks/independent/results_for_plots.json

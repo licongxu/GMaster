@@ -1,0 +1,187 @@
+BEGIN gmaster 8192 spin0 after make_room fix
+PARTITION=root
+HOST_DENIED cpu 64
+RESTART gmaster 8192 spin0
+PARTITION=root
+HOST_DENIED cpu 64
+E0925 11:19:54.892773     103 gpu_cudamallocasync_allocator.cc:359] gpu_async_0 cuMemAllocAsync failed to allocate 36862845640 bytes: RESOURCE_EXHAUSTED: : CUDA_ERROR_OUT_OF_MEMORY: out of memory
+ Reported by CUDA: Free memory/Total memory: 34078720/101971460096
+E0925 11:19:54.892837     103 gpu_cudamallocasync_allocator.cc:364] Stats: Limit:                              0B
+InUse:                        85.50GiB
+MaxInUse:                     85.50GiB
+NumAllocs:                        7243
+MaxAllocSize:                 30.53GiB
+Reserved:                           0B
+PeakReserved:                       0B
+LargestFreeBlock:                   0B
+
+E0925 11:19:54.892851     103 gpu_cudamallocasync_allocator.cc:68] Histogram of current allocation: (allocation_size_in_bytes, nb_allocation_of_that_sizes), ...;
+E0925 11:19:54.892852     103 gpu_cudamallocasync_allocator.cc:71] 4, 3
+E0925 11:19:54.892854     103 gpu_cudamallocasync_allocator.cc:71] 8, 3
+E0925 11:19:54.892855     103 gpu_cudamallocasync_allocator.cc:71] 16, 1
+E0925 11:19:54.892855     103 gpu_cudamallocasync_allocator.cc:71] 256, 1
+E0925 11:19:54.892856     103 gpu_cudamallocasync_allocator.cc:71] 16384, 1
+E0925 11:19:54.892857     103 gpu_cudamallocasync_allocator.cc:71] 65528, 3
+E0925 11:19:54.892857     103 gpu_cudamallocasync_allocator.cc:71] 65536, 3
+E0925 11:19:54.892859     103 gpu_cudamallocasync_allocator.cc:71] 98280, 2
+E0925 11:19:54.892860     103 gpu_cudamallocasync_allocator.cc:71] 131056, 3
+E0925 11:19:54.892860     103 gpu_cudamallocasync_allocator.cc:71] 131072, 3
+E0925 11:19:54.892861     103 gpu_cudamallocasync_allocator.cc:71] 196560, 2
+E0925 11:19:54.892862     103 gpu_cudamallocasync_allocator.cc:71] 196608, 1
+E0925 11:19:54.892862     103 gpu_cudamallocasync_allocator.cc:71] 262136, 3
+E0925 11:19:54.892863     103 gpu_cudamallocasync_allocator.cc:71] 2416017408, 2
+E0925 11:19:54.892864     103 gpu_cudamallocasync_allocator.cc:71] 4832034816, 2
+E0925 11:19:54.892864     103 gpu_cudamallocasync_allocator.cc:71] 6442254336, 2
+E0925 11:19:54.892865     103 gpu_cudamallocasync_allocator.cc:71] 6442450944, 3
+E0925 11:19:54.892865     103 gpu_cudamallocasync_allocator.cc:71] 9663676416, 2
+E0925 11:19:54.892866     103 gpu_cudamallocasync_allocator.cc:71] 12884508672, 2
+E0925 11:19:54.892868     103 gpu_cudamallocasync_allocator.cc:104] CU_MEMPOOL_ATTR_RESERVED_MEM_CURRENT: 101233721344
+E0925 11:19:54.892869     103 gpu_cudamallocasync_allocator.cc:106] CU_MEMPOOL_ATTR_USED_MEM_CURRENT: 91807105092
+E0925 11:19:54.892870     103 gpu_cudamallocasync_allocator.cc:107] CU_MEMPOOL_ATTR_RESERVED_MEM_HIGH: 101233721344
+E0925 11:19:54.892871     103 gpu_cudamallocasync_allocator.cc:108] CU_MEMPOOL_ATTR_USED_MEM_HIGH: 91807105092
+RESTART2 gmaster 8192 spin0 late make_room
+PARTITION=root
+HOST_DENIED cpu 64
+E0925 11:25:59.943339     103 gpu_cudamallocasync_allocator.cc:359] gpu_async_0 cuMemAllocAsync failed to allocate 36862845640 bytes: RESOURCE_EXHAUSTED: : CUDA_ERROR_OUT_OF_MEMORY: out of memory
+ Reported by CUDA: Free memory/Total memory: 34078720/101971460096
+E0925 11:25:59.943407     103 gpu_cudamallocasync_allocator.cc:364] Stats: Limit:                              0B
+InUse:                        85.50GiB
+MaxInUse:                     85.50GiB
+NumAllocs:                        7243
+MaxAllocSize:                 30.53GiB
+Reserved:                           0B
+PeakReserved:                       0B
+LargestFreeBlock:                   0B
+
+E0925 11:25:59.943422     103 gpu_cudamallocasync_allocator.cc:68] Histogram of current allocation: (allocation_size_in_bytes, nb_allocation_of_that_sizes), ...;
+E0925 11:25:59.943423     103 gpu_cudamallocasync_allocator.cc:71] 4, 3
+E0925 11:25:59.943426     103 gpu_cudamallocasync_allocator.cc:71] 8, 3
+E0925 11:25:59.943426     103 gpu_cudamallocasync_allocator.cc:71] 16, 1
+E0925 11:25:59.943427     103 gpu_cudamallocasync_allocator.cc:71] 256, 1
+E0925 11:25:59.943427     103 gpu_cudamallocasync_allocator.cc:71] 16384, 1
+E0925 11:25:59.943428     103 gpu_cudamallocasync_allocator.cc:71] 65528, 3
+E0925 11:25:59.943429     103 gpu_cudamallocasync_allocator.cc:71] 65536, 3
+E0925 11:25:59.943430     103 gpu_cudamallocasync_allocator.cc:71] 98280, 2
+E0925 11:25:59.943431     103 gpu_cudamallocasync_allocator.cc:71] 131056, 3
+E0925 11:25:59.943431     103 gpu_cudamallocasync_allocator.cc:71] 131072, 3
+E0925 11:25:59.943432     103 gpu_cudamallocasync_allocator.cc:71] 196560, 2
+E0925 11:25:59.943432     103 gpu_cudamallocasync_allocator.cc:71] 196608, 1
+E0925 11:25:59.943433     103 gpu_cudamallocasync_allocator.cc:71] 262136, 3
+E0925 11:25:59.943433     103 gpu_cudamallocasync_allocator.cc:71] 2416017408, 2
+E0925 11:25:59.943434     103 gpu_cudamallocasync_allocator.cc:71] 4832034816, 2
+E0925 11:25:59.943434     103 gpu_cudamallocasync_allocator.cc:71] 6442254336, 2
+E0925 11:25:59.943435     103 gpu_cudamallocasync_allocator.cc:71] 6442450944, 3
+E0925 11:25:59.943435     103 gpu_cudamallocasync_allocator.cc:71] 9663676416, 2
+E0925 11:25:59.943436     103 gpu_cudamallocasync_allocator.cc:71] 12884508672, 2
+E0925 11:25:59.943438     103 gpu_cudamallocasync_allocator.cc:104] CU_MEMPOOL_ATTR_RESERVED_MEM_CURRENT: 101233721344
+E0925 11:25:59.943439     103 gpu_cudamallocasync_allocator.cc:106] CU_MEMPOOL_ATTR_USED_MEM_CURRENT: 91807105092
+E0925 11:25:59.943440     103 gpu_cudamallocasync_allocator.cc:107] CU_MEMPOOL_ATTR_RESERVED_MEM_HIGH: 101233721344
+E0925 11:25:59.943440     103 gpu_cudamallocasync_allocator.cc:108] CU_MEMPOOL_ATTR_USED_MEM_HIGH: 91807105092
+RESTART3 gmaster 8192 spin0 block field before coupling
+PARTITION=root
+HOST_DENIED cpu 64
+E0925 11:33:11.428330     103 gpu_cudamallocasync_allocator.cc:359] gpu_async_0 cuMemAllocAsync failed to allocate 36862845640 bytes: RESOURCE_EXHAUSTED: : CUDA_ERROR_OUT_OF_MEMORY: out of memory
+ Reported by CUDA: Free memory/Total memory: 34078720/101971460096
+E0925 11:33:11.428388     103 gpu_cudamallocasync_allocator.cc:364] Stats: Limit:                              0B
+InUse:                        85.50GiB
+MaxInUse:                     85.50GiB
+NumAllocs:                        7243
+MaxAllocSize:                 30.53GiB
+Reserved:                           0B
+PeakReserved:                       0B
+LargestFreeBlock:                   0B
+
+E0925 11:33:11.428402     103 gpu_cudamallocasync_allocator.cc:68] Histogram of current allocation: (allocation_size_in_bytes, nb_allocation_of_that_sizes), ...;
+E0925 11:33:11.428403     103 gpu_cudamallocasync_allocator.cc:71] 4, 3
+E0925 11:33:11.428405     103 gpu_cudamallocasync_allocator.cc:71] 8, 3
+E0925 11:33:11.428406     103 gpu_cudamallocasync_allocator.cc:71] 16, 1
+E0925 11:33:11.428407     103 gpu_cudamallocasync_allocator.cc:71] 256, 1
+E0925 11:33:11.428408     103 gpu_cudamallocasync_allocator.cc:71] 16384, 1
+E0925 11:33:11.428409     103 gpu_cudamallocasync_allocator.cc:71] 65528, 3
+E0925 11:33:11.428409     103 gpu_cudamallocasync_allocator.cc:71] 65536, 3
+E0925 11:33:11.428410     103 gpu_cudamallocasync_allocator.cc:71] 98280, 2
+E0925 11:33:11.428410     103 gpu_cudamallocasync_allocator.cc:71] 131056, 3
+E0925 11:33:11.428411     103 gpu_cudamallocasync_allocator.cc:71] 131072, 3
+E0925 11:33:11.428411     103 gpu_cudamallocasync_allocator.cc:71] 196560, 2
+E0925 11:33:11.428412     103 gpu_cudamallocasync_allocator.cc:71] 196608, 1
+E0925 11:33:11.428412     103 gpu_cudamallocasync_allocator.cc:71] 262136, 3
+E0925 11:33:11.428413     103 gpu_cudamallocasync_allocator.cc:71] 2416017408, 2
+E0925 11:33:11.428413     103 gpu_cudamallocasync_allocator.cc:71] 4832034816, 2
+E0925 11:33:11.428414     103 gpu_cudamallocasync_allocator.cc:71] 6442254336, 2
+E0925 11:33:11.428414     103 gpu_cudamallocasync_allocator.cc:71] 6442450944, 3
+E0925 11:33:11.428415     103 gpu_cudamallocasync_allocator.cc:71] 9663676416, 2
+E0925 11:33:11.428415     103 gpu_cudamallocasync_allocator.cc:71] 12884508672, 2
+E0925 11:33:11.428418     103 gpu_cudamallocasync_allocator.cc:104] CU_MEMPOOL_ATTR_RESERVED_MEM_CURRENT: 101233721344
+E0925 11:33:11.428419     103 gpu_cudamallocasync_allocator.cc:106] CU_MEMPOOL_ATTR_USED_MEM_CURRENT: 91807105092
+E0925 11:33:11.428419     103 gpu_cudamallocasync_allocator.cc:107] CU_MEMPOOL_ATTR_RESERVED_MEM_HIGH: 101233721344
+E0925 11:33:11.428420     103 gpu_cudamallocasync_allocator.cc:108] CU_MEMPOOL_ATTR_USED_MEM_HIGH: 91807105092
+FAIL nside=8192 spin=0 JaxRuntimeError: RESOURCE_EXHAUSTED: Out of memory while trying to allocate 34.33GiB.
+RESTART4 gmaster 8192 spin0 stage marks
+PARTITION=root
+HOST_DENIED cpu 64
+STAGE field
+E0925 11:39:19.707037     102 gpu_cudamallocasync_allocator.cc:359] gpu_async_0 cuMemAllocAsync failed to allocate 36862845640 bytes: RESOURCE_EXHAUSTED: : CUDA_ERROR_OUT_OF_MEMORY: out of memory
+ Reported by CUDA: Free memory/Total memory: 34078720/101971460096
+E0925 11:39:19.707102     102 gpu_cudamallocasync_allocator.cc:364] Stats: Limit:                              0B
+InUse:                        85.50GiB
+MaxInUse:                     85.50GiB
+NumAllocs:                        7243
+MaxAllocSize:                 30.53GiB
+Reserved:                           0B
+PeakReserved:                       0B
+LargestFreeBlock:                   0B
+
+E0925 11:39:19.707117     102 gpu_cudamallocasync_allocator.cc:68] Histogram of current allocation: (allocation_size_in_bytes, nb_allocation_of_that_sizes), ...;
+E0925 11:39:19.707122     102 gpu_cudamallocasync_allocator.cc:71] 4, 3
+E0925 11:39:19.707124     102 gpu_cudamallocasync_allocator.cc:71] 8, 3
+E0925 11:39:19.707125     102 gpu_cudamallocasync_allocator.cc:71] 16, 1
+E0925 11:39:19.707126     102 gpu_cudamallocasync_allocator.cc:71] 256, 1
+E0925 11:39:19.707127     102 gpu_cudamallocasync_allocator.cc:71] 16384, 1
+E0925 11:39:19.707127     102 gpu_cudamallocasync_allocator.cc:71] 65528, 3
+E0925 11:39:19.707128     102 gpu_cudamallocasync_allocator.cc:71] 65536, 3
+E0925 11:39:19.707129     102 gpu_cudamallocasync_allocator.cc:71] 98280, 2
+E0925 11:39:19.707130     102 gpu_cudamallocasync_allocator.cc:71] 131056, 3
+E0925 11:39:19.707130     102 gpu_cudamallocasync_allocator.cc:71] 131072, 3
+E0925 11:39:19.707131     102 gpu_cudamallocasync_allocator.cc:71] 196560, 2
+E0925 11:39:19.707132     102 gpu_cudamallocasync_allocator.cc:71] 196608, 1
+E0925 11:39:19.707132     102 gpu_cudamallocasync_allocator.cc:71] 262136, 3
+E0925 11:39:19.707134     102 gpu_cudamallocasync_allocator.cc:71] 2416017408, 2
+E0925 11:39:19.707135     102 gpu_cudamallocasync_allocator.cc:71] 4832034816, 2
+E0925 11:39:19.707137     102 gpu_cudamallocasync_allocator.cc:71] 6442254336, 2
+E0925 11:39:19.707138     102 gpu_cudamallocasync_allocator.cc:71] 6442450944, 3
+E0925 11:39:19.707139     102 gpu_cudamallocasync_allocator.cc:71] 9663676416, 2
+E0925 11:39:19.707141     102 gpu_cudamallocasync_allocator.cc:71] 12884508672, 2
+E0925 11:39:19.707144     102 gpu_cudamallocasync_allocator.cc:104] CU_MEMPOOL_ATTR_RESERVED_MEM_CURRENT: 101233721344
+E0925 11:39:19.707145     102 gpu_cudamallocasync_allocator.cc:106] CU_MEMPOOL_ATTR_USED_MEM_CURRENT: 91807105092
+E0925 11:39:19.707146     102 gpu_cudamallocasync_allocator.cc:107] CU_MEMPOOL_ATTR_RESERVED_MEM_HIGH: 101233721344
+E0925 11:39:19.707148     102 gpu_cudamallocasync_allocator.cc:108] CU_MEMPOOL_ATTR_USED_MEM_HIGH: 91807105092
+FAIL nside=8192 spin=0 JaxRuntimeError: RESOURCE_EXHAUSTED: Out of memory while trying to allocate 34.33GiB.
+Traceback (most recent call last):
+  File "/scratch/scratch-lxu/agent_dev/auto_research_agent/GMaster/benchmarks/independent/bench_act_warm.py", line 104, in main
+    one(nside, spin, engine, cores)
+  File "/scratch/scratch-lxu/agent_dev/auto_research_agent/GMaster/benchmarks/independent/bench_act_warm.py", line 82, in one
+    once()
+  File "/scratch/scratch-lxu/agent_dev/auto_research_agent/GMaster/benchmarks/independent/bench_act_warm.py", line 73, in once
+    block(field.get_alms())
+  File "/scratch/scratch-lxu/venv/cmbagent_env/lib/python3.12/site-packages/jax/_src/api.py", line 2581, in block_until_ready
+    try_to_block(arrays[0])
+  File "/scratch/scratch-lxu/venv/cmbagent_env/lib/python3.12/site-packages/jax/_src/api.py", line 2564, in try_to_block
+    return x.block_until_ready()
+           ^^^^^^^^^^^^^^^^^^^^^
+jax.errors.JaxRuntimeError: RESOURCE_EXHAUSTED: Out of memory while trying to allocate 34.33GiB.
+RESTART5 gmaster 8192 spin0 sequential map then mask
+PARTITION=root
+HOST_DENIED cpu 64
+STAGE field
+STAGE coupling
+STAGE field
+STAGE coupling
+STAGE field
+STAGE coupling
+STAGE field
+STAGE coupling
+STAGE field
+STAGE coupling
+STAGE field
+STAGE coupling
+RESULT {"engine": "gmaster", "cores": 8, "nside": 8192, "spin": 0, "seconds": [43.473127486009616, 43.67692615900887, 43.77080994300195, 43.78478669398464, 43.84477070698631], "cl_path": "benchmarks/independent/act_cl_gmaster8_n8192_s0.npy", "nell": 819}

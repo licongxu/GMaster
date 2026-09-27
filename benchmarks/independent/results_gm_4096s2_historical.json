@@ -1,0 +1,26 @@
+{
+  "note": "This campaign OOM'd 4096 spin-2 on GPU0/GPU1. Times from session-37 empty-card GMaster-only run (.qwen/tmp/chain_s37j.log) and docs/v2_march_benchmark_report.md fp64 column.",
+  "pipeline": [
+    {
+      "nside": 4096,
+      "spin": 2,
+      "source": ".qwen/tmp/chain_s37j.log + docs/v2_march_benchmark_report.md",
+      "preallocate": "true",
+      "fp32": {
+        "times": { "total": 8805.0 },
+        "peak_rss_gb": 64.2,
+        "gpu_peak_gb": 63.6,
+        "accuracy": {
+          "rel_dCl": 6.5e-05,
+          "rel_coupled_diff": 0.00011
+        }
+      },
+      "fp64": {
+        "times": { "total": 14210.0 },
+        "accuracy": {
+          "rel_dCl": 6.45e-05
+        }
+      }
+    }
+  ]
+}

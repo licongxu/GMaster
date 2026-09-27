@@ -3,6 +3,7 @@
 from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache, partial
 
+import gc
 import os
 
 import jax
@@ -47,6 +48,9 @@ class NmtParams:
         # march serves the latitudinal stage and complex128 below it; "follow" keeps the
         # historical coupling to the table precision; "fp64"/"fp32" pin it independently.
         self.ring_precision = "auto"
+        # "auto": divide-and-conquer where its plan exists, fp32 v2 march elsewhere.
+        # "march": always the fp32 difference-form march. "dc": divide-and-conquer.
+        self.latitudinal_method = "auto"
 
 
 nmt_params = NmtParams()
@@ -135,7 +139,18 @@ def make_room(nbytes):
     def short():
         stats = jax.devices()[0].memory_stats() or {}
         limit, in_use = stats.get("bytes_limit"), stats.get("bytes_in_use")
-        return bool(limit) and in_use is not None and limit - in_use < nbytes
+        if limit and in_use is not None:
+            return limit - in_use < nbytes
+        # PREALLOCATE=false reports bytes_limit 0, which used to skip eviction entirely.
+        # Same driver fallback as workspaces._pool_limit_and_free.
+        from . import _march_v2
+        info = _march_v2.device_memory_info()
+        if info is None:
+            return False
+        free, total = info
+        if in_use is not None and int(0.9 * total) - in_use < nbytes:
+            return True
+        return free < nbytes
 
     if not short():
         return
@@ -191,6 +206,32 @@ def set_table_precision(name):
     _spin_ring_synthesis_tables.cache_clear()
 
 
+_LATITUDINAL_METHODS = ("auto", "march", "dc")
+
+
+def latitudinal_method():
+    """``"march"`` (fp32 v2 difference form), ``"dc"`` (divide-and-conquer), or ``"auto"``."""
+    return nmt_params.latitudinal_method
+
+
+def set_latitudinal_method(name):
+    """Choose the latitudinal transform.
+
+    ``"march"`` is the fp32 difference-form v2 march at every size.
+    ``"dc"`` is the divide-and-conquer engine wherever its plan can be built
+    (bandlimit up to ``GMASTER_DC_MAX_L``, default 12288, i.e. ``Nside`` 4096).
+    Above that the march is used, because the plan is not built.
+    ``"auto"`` uses the divide-and-conquer engine between ``GMASTER_DC_MIN_L`` and
+    ``GMASTER_DC_MAX_L`` and the march outside that window.
+    """
+    if name not in _LATITUDINAL_METHODS:
+        raise KeyError(
+            "latitudinal method must be 'auto', 'march' (fp32 v2 difference form), "
+            "or 'dc' (divide-and-conquer)"
+        )
+    nmt_params.latitudinal_method = name
+
+
 def set_sht_calculator(calc_name):
     if calc_name not in (
         "jax",
@@ -228,6 +269,7 @@ def get_default_params():
             "n_iter_default",
             "n_iter_mask_default",
             "tol_pinv_default",
+            "latitudinal_method",
         )
     }
 
@@ -802,8 +844,8 @@ def _copy_to_device(array, target):
     source = getattr(array, "device", None)
     if source == target:
         return array
-    if source is not None:
-        array = np.asarray(array)
+    if hasattr(array, "block_until_ready"):
+        array.block_until_ready()
     copied = jax.device_put(array, target)
     copied.block_until_ready()
     return copied
@@ -973,7 +1015,10 @@ def _fused_forward_sht(positive, theta, weights, phase, *, L, block_size,
     :func:`gmaster._spin_march_pallas.fold_requested`.
     """
     nside = (len(theta) + 1) // 4
-    if (m_start == 0 and nmt_params.sht_calculator in ("jax", "jax-matrix")
+    # The folded march builds phases for m = 0..L-1. An m-split hands it only
+    # one slice (Nside 8192 low half is 7198 columns, not 24576).
+    if (m_start == 0 and positive.shape[-1] == L
+            and nmt_params.sht_calculator in ("jax", "jax-matrix")
             and _spin_march.fold_requested(nside, L)):
         return _spin_march.forward_latitudinal_positive(
             positive, weights, phase, L=L, nside=nside
@@ -1131,7 +1176,7 @@ def _size_cached(fn):
     return wrapper
 
 
-def _chirp(index, two_nphi, sign, L):
+def _chirp(index, two_nphi, sign, L, wide=None):
     """exp(sign i pi q^2 / nphi) in the ring stage's dtype.
 
     The angle is reduced exactly in integers as in `_chirp_angle`; for a complex64 ring stage the
@@ -1144,7 +1189,8 @@ def _chirp(index, two_nphi, sign, L):
     """
     if jnp.dtype(ring_dtype(L)) == jnp.complex64:
         two_nphi = jnp.asarray(two_nphi)
-        wide = int(np.max(np.asarray(two_nphi))) > 65536
+        if wide is None:
+            wide = int(np.max(np.asarray(two_nphi))) > 65536
         return _chirp_c64(jnp.asarray(index), two_nphi, sign=float(sign), wide=wide)
     reduced = (index.astype(jnp.int64) ** 2) % two_nphi
     return jnp.exp(sign * 1j * reduced * (jnp.pi / two_nphi) * 2.0)
@@ -1225,20 +1271,33 @@ def _ring_analysis_tables(L, nside, device=None):
         nphi, _, _, _, width = _ring_czt_constants(L, nside)
         caps = _ring_split_numpy(L, nside)[-1]
         two_nphi = (2 * nphi[caps])[:, None] if caps.size else (2 * nphi[:1])[:, None]
-        transform_size = _next_fast_len_pow2(L + width)
-        n_index = jnp.arange(width, dtype=jnp.int64)
-        m_index = jnp.arange(L, dtype=jnp.int64)
-        shift = jnp.arange(transform_size, dtype=jnp.int64) - (width - 1)
-        tables = (
-            _chirp(n_index, two_nphi, -1.0, L),
-            jnp.fft.fft(_chirp(shift, two_nphi, 1.0, L), axis=-1),
-            _chirp(m_index, two_nphi, -1.0, L),
-        )
-        cplx = ring_dtype(L)
-        tables = tuple(t.astype(cplx) for t in tables)
+        # Above `_RING_FACTORS_KEPT_MAX_L` only the ring lengths are kept, as for the polarised
+        # tables: at Nside 8192 the three factors are 15 GiB and the one-shot cap transform
+        # another ~32 GiB, which on top of a polarised field failed the mask's cuFFT plan.
+        tables = ((jnp.asarray(two_nphi),) if L > _RING_FACTORS_KEPT_MAX_L
+                  else _scalar_czt_factors(two_nphi, L, nside))
     return tables if device is None else tuple(
         jax.device_put(t, device) for t in tables
     )
+
+
+def _scalar_czt_factors(two_nphi, L, nside):
+    """The three chirp-Z factors of the spin-0 analysis for polar rows of ring lengths
+    `two_nphi / 2`.  `wide` is taken from every polar ring of the geometry, as the whole-table
+    build takes it, so a row block gets the same factors the table would hold."""
+    width = 4 * nside
+    transform_size = _next_fast_len_pow2(L + width)
+    nphi, _, _, _, _ = _ring_czt_constants_numpy(L, nside)
+    caps = _ring_split_numpy(L, nside)[-1]
+    wide = int(2 * nphi[caps].max()) > 65536 if caps.size else int(2 * nphi[0]) > 65536
+    factors = (
+        _chirp(jnp.arange(width, dtype=jnp.int64), two_nphi, -1.0, L, wide),
+        jnp.fft.fft(_chirp(jnp.arange(transform_size, dtype=jnp.int64) - (width - 1),
+                           two_nphi, 1.0, L, wide), axis=-1),
+        _chirp(jnp.arange(L, dtype=jnp.int64), two_nphi, -1.0, L, wide),
+    )
+    cplx = ring_dtype(L)
+    return tuple(t.astype(cplx) for t in factors)
 
 
 @partial(jax.jit, static_argnames=("L", "nside"))
@@ -1258,20 +1317,31 @@ def _forward_ring_fft_positive(map_flat, tables, *, L, nside):
     same sums the chirp-Z would have produced — `nphi = 4*nside > L` there, so nothing is
     aliased and nothing is padded.
     """
-    chirp_in, kernel_spec, chirp_out = tables
+    tables = tuple(tables)
     belt_lo, belt_hi, belt_start, caps = _ring_split_numpy(L, nside)
     width = 4 * nside
-    pixels = jnp.reshape(jnp.asarray(map_flat), (-1,)).astype(chirp_in.real.dtype)
+    cplx = ring_dtype(L) if len(tables) == 1 else tables[0].dtype
+    pixels = jnp.reshape(jnp.asarray(map_flat), (-1,)).astype(jnp.zeros((), cplx).real.dtype)
 
     cap_out = None
     if caps.size:
         cap_pixels = _cap_pixels(pixels, caps, L, nside)
         transform_size = _next_fast_len_pow2(L + width)
-        embedded = jnp.pad(cap_pixels * chirp_in, ((0, 0), (0, transform_size - width)))
-        convolution = jnp.fft.ifft(
-            jnp.fft.fft(embedded, axis=-1) * kernel_spec, axis=-1
-        )
-        cap_out = chirp_out * convolution[:, width - 1 : width - 1 + L]
+
+        def czt(px, *factors):
+            if len(factors) == 1:
+                factors = _scalar_czt_factors(factors[0], L, nside)
+            chirp_in, kernel_spec, chirp_out = factors
+            embedded = jnp.pad(px * chirp_in, ((0, 0), (0, transform_size - width)))
+            convolution = jnp.fft.ifft(
+                jnp.fft.fft(embedded, axis=-1) * kernel_spec, axis=-1
+            )
+            return chirp_out * convolution[:, width - 1 : width - 1 + L]
+
+        if len(tables) == 1:
+            cap_out = _chunked_rows_seq(_CAP_CHUNK_ROWS, czt, cap_pixels, tables[0])
+        else:
+            cap_out = czt(cap_pixels, *tables)
 
     belt_rows = belt_hi - belt_lo
     if belt_rows == 0:
@@ -1357,6 +1427,108 @@ def _ring_synthesis_tables(L, nside, device=None):
     )
 
 
+@partial(jax.jit, static_argnames=("L", "width", "transform_size"))
+def _cap_inverse_rows(cap_pos, chirp_m, kernel_spec, chirp_p, *, L, width, transform_size):
+    embedded = jnp.pad(cap_pos * chirp_m, ((0, 0), (0, transform_size - L)))
+    convolution = jnp.fft.ifft(
+        jnp.fft.fft(embedded, axis=-1) * kernel_spec, axis=-1
+    )
+    return 2.0 * (chirp_p * convolution[:, L - 1 : L - 1 + width]) - cap_pos[:, :1]
+
+
+@partial(jax.jit, static_argnames=("L", "width"))
+def _belt_inverse_rows(rows, *, L, width):
+    belt_pad = jnp.pad(rows, ((0, 0), (0, width - L)))
+    return 2.0 * (jnp.fft.ifft(belt_pad, axis=-1) * width) - rows[:, :1]
+
+
+def _pack_ring_rows(part, nphi_rows):
+    """Valid pixels of one ring batch, in ring order. Short rings drop the pad."""
+    real = jnp.real(part)
+    counts = np.asarray(nphi_rows)
+    if int(counts.min()) == real.shape[1]:
+        packed = real.reshape(-1)
+    else:
+        cols = jnp.arange(real.shape[1])
+        mask = cols[None, :] < jnp.asarray(counts)[:, None]
+        packed = real[mask]
+    packed = packed.astype(jnp.float64)
+    packed.block_until_ready()
+    return packed
+
+
+def _inverse_ring_fft_herm_chunked(ftm_positive, *, L, nside):
+    """Same ring inverse as `_inverse_ring_fft_herm`, one row-batch at a time.
+
+    The batched form is jitted, so a Python loop inside it is one program and
+    still asks for the full cuFFT work area. This loop runs outside jit. Each
+    batch is packed to its real pixels; the full map is concatenated only
+    after the spectrum is dropped.
+    """
+    belt_lo, belt_hi, _, caps = _ring_split_numpy(L, nside)
+    width = 4 * nside
+    device = getattr(ftm_positive, "device", None)
+    if ftm_positive.dtype == ring_dtype(L):
+        positive = ftm_positive
+    else:
+        positive = ftm_positive.astype(ring_dtype(L))
+    positive.block_until_ready()
+    chunk = 1024
+    transform_size = _next_fast_len_pow2(L + width - 1)
+    nphi, start, _, _, _ = _ring_czt_constants_numpy(L, nside)
+    pieces = []
+
+    def take_caps(lo, hi):
+        rings = caps[lo:hi]
+        if int(rings[-1]) - int(rings[0]) + 1 != hi - lo:
+            raise RuntimeError("polar chunk is not one contiguous ring range")
+        with jax.ensure_compile_time_eval(), jax.default_device(device):
+            two_nphi = (2 * jnp.asarray(nphi)[rings])[:, None]
+            chirp_m = _chirp(jnp.arange(L, dtype=jnp.int64), two_nphi, 1.0, L)
+            kernel_spec = jnp.fft.fft(
+                _chirp(
+                    jnp.arange(transform_size, dtype=jnp.int64) - (L - 1),
+                    two_nphi, -1.0, L,
+                ),
+                axis=-1,
+            )
+            chirp_p = _chirp(jnp.arange(width, dtype=jnp.int64), two_nphi, 1.0, L)
+            kernel_spec.block_until_ready()
+        part = _cap_inverse_rows(
+            positive[jnp.asarray(rings)],
+            chirp_m, kernel_spec, chirp_p,
+            L=L, width=width, transform_size=transform_size,
+        )
+        part.block_until_ready()
+        packed = _pack_ring_rows(part, nphi[rings])
+        expect = int(start[int(rings[-1])] + nphi[int(rings[-1])] - start[int(rings[0])])
+        if int(packed.shape[0]) != expect:
+            raise RuntimeError("polar chunk packed the wrong number of pixels")
+        return packed
+
+    for lo in range(0, belt_lo, chunk):
+        pieces.append(take_caps(lo, min(lo + chunk, belt_lo)))
+        gc.collect()
+    belt_pos = positive[belt_lo:belt_hi]
+    for lo in range(0, belt_hi - belt_lo, chunk):
+        part = _belt_inverse_rows(belt_pos[lo : lo + chunk], L=L, width=width)
+        part.block_until_ready()
+        rows = nphi[belt_lo + lo : belt_lo + lo + part.shape[0]]
+        pieces.append(_pack_ring_rows(part, rows))
+        gc.collect()
+    for lo in range(belt_lo, int(caps.size), chunk):
+        pieces.append(take_caps(lo, min(lo + chunk, int(caps.size))))
+        gc.collect()
+    positive = None
+    belt_pos = None
+    gc.collect()
+    out = jnp.concatenate(pieces)
+    out.block_until_ready()
+    if int(out.shape[0]) != 12 * nside * nside:
+        raise RuntimeError("ring inverse did not cover the map")
+    return out
+
+
 @partial(jax.jit, static_argnames=("L", "nside"))
 def _inverse_ring_fft_herm(ftm_positive, tables, *, L, nside):
     """Real HEALPix synthesis ring transform, from the positive-m half only.
@@ -1409,6 +1581,41 @@ def _inverse_ring_fft_herm(ftm_positive, tables, *, L, nside):
     return jnp.where(used, slots[source], 0.0)
 
 
+# Largest bandlimit whose polar-cap chirp-Z factors are kept as tables.  Above it (Nside 8192) the
+# analysis kernel spectrum alone is (16382, 131072) complex64 = 16 GiB and the three synthesis
+# factors 28 GiB, which with the fused transform's working set does not fit the card
+# (`Failed to create cuFFT batched plan`); there the tables are each row's `2 nphi` and every
+# row block builds its own factors -- elementwise chirps and one extra FFT per block.
+_RING_FACTORS_KEPT_MAX_L = int(os.environ.get("GMASTER_RING_FACTORS_KEPT_MAX_L", "12288"))
+
+
+def _spin_czt_factors(two_nphi, L, nside, *, synthesis):
+    """The three chirp-Z factors of the polar rows with ring lengths `two_nphi / 2`.
+
+    Analysis (pixels -> centred window m in [-(L-1), L)): the kernel is shifted by
+    `(width-1) + (L-1)` to bring order `m = -(L-1)` under the output window and the convolution
+    bound is `width + 2L - 1`.  Synthesis is the transpose.  `wide` is fixed from the geometry
+    (every polar ring has `2 nphi < 8 nside`) so this also runs on traced row blocks.
+    """
+    width = 4 * nside
+    wide = 8 * nside > 65536
+    if synthesis:
+        size = _next_fast_len_pow2(2 * L - 1 + width)
+        first, last = jnp.arange(2 * L - 1, dtype=jnp.int64), jnp.arange(width, dtype=jnp.int64)
+        shift, sign = jnp.arange(size, dtype=jnp.int64) - (2 * L - 2), 1.0
+    else:
+        size = _next_fast_len_pow2(width + 2 * L)
+        first, last = jnp.arange(width, dtype=jnp.int64), jnp.arange(-(L - 1), L, dtype=jnp.int64)
+        shift, sign = jnp.arange(size, dtype=jnp.int64) - (width - 1) - (L - 1), -1.0
+    factors = (
+        _chirp(first, two_nphi, sign, L, wide),
+        jnp.fft.fft(_chirp(shift, two_nphi, -sign, L, wide), axis=-1),
+        _chirp(last, two_nphi, sign, L, wide),
+    )
+    cplx = ring_dtype(L)
+    return tuple(t.astype(cplx) for t in factors)
+
+
 @_size_cached
 def _spin_ring_analysis_tables(L, nside, device=None):
     """Constant factors of the polarised analysis ring chirp-Z.
@@ -1422,17 +1629,8 @@ def _spin_ring_analysis_tables(L, nside, device=None):
         nphi, _, _, _, width = _ring_czt_constants(L, nside)
         caps = _ring_split_numpy(L, nside)[-1]
         two_nphi = (2 * nphi[caps])[:, None] if caps.size else (2 * nphi[:1])[:, None]
-        transform_size = _next_fast_len_pow2(width + 2 * L)
-        n_index = jnp.arange(width, dtype=jnp.int64)
-        m_index = jnp.arange(-(L - 1), L, dtype=jnp.int64)
-        shift = jnp.arange(transform_size, dtype=jnp.int64) - (width - 1) - (L - 1)
-        tables = (
-            _chirp(n_index, two_nphi, -1.0, L),
-            jnp.fft.fft(_chirp(shift, two_nphi, 1.0, L), axis=-1),
-            _chirp(m_index, two_nphi, -1.0, L),
-        )
-        cplx = ring_dtype(L)
-        tables = tuple(t.astype(cplx) for t in tables)
+        tables = ((jnp.asarray(two_nphi),) if L > _RING_FACTORS_KEPT_MAX_L
+                  else _spin_czt_factors(two_nphi, L, nside, synthesis=False))
     return tables if device is None else tuple(
         jax.device_put(t, device) for t in tables
     )
@@ -1460,6 +1658,33 @@ def _chunked_rows(nrows, chunk, body):
         [body(lo, min(lo + chunk, nrows)) for lo in range(0, nrows, chunk)], axis=0)
 
 
+def _chunked_rows_seq(chunk, body, *rows):
+    """`body(*blocks)` once per `chunk` rows, so only one block's FFT is live.
+
+    Used when the chirp-Z factors are built inside the block (Nside 8192). Unrolling those
+    blocks makes one program of every FFT at once: 64 GiB, then a 30 GiB allocation on a
+    pool that has already reserved the whole 96 GB card.
+    """
+    nrows = rows[0].shape[0]
+    if nrows <= chunk:
+        return body(*rows)
+    pad = (-nrows) % chunk
+    padded = [jnp.pad(r, [(0, pad)] + [(0, 0)] * (r.ndim - 1)) for r in rows]
+    nchunk = padded[0].shape[0] // chunk
+
+    def step(i):
+        blocks = []
+        for r in padded:
+            tail = r.shape[1:]
+            blocks.append(jax.lax.dynamic_slice(
+                r, (i * chunk,) + (0,) * (r.ndim - 1), (chunk,) + tail))
+        return body(*blocks)
+
+    parts = jax.lax.map(step, jnp.arange(nchunk))
+    out_tail = parts.shape[2:]
+    return jnp.reshape(parts, (nchunk * chunk,) + out_tail)[:nrows]
+
+
 @partial(jax.jit, static_argnames=("L", "nside"))
 def _forward_ring_fft_full(signal, tables, *, L, nside):
     """Complex ring FFT returning the full centered window m in [-(L-1), L).
@@ -1476,31 +1701,37 @@ def _forward_ring_fft_full(signal, tables, *, L, nside):
     The polar rows keep the chirp-Z; `tables` is `_spin_ring_analysis_tables(L, nside)` so
     its ramps and kernel are built once per geometry instead of inside every trace.
     """
-    chirp_in, kernel_spec, chirp_out = tables
+    tables = tuple(tables)
     belt_lo, belt_hi, belt_start, caps = _ring_split_numpy(L, nside)
     width = 4 * nside
     # The signal here is a helicity combination `Q -/+ iU`, so it takes the tables'
     # *complex* type: casting to their real type would silently drop the imaginary part.
-    pixels = jnp.reshape(jnp.asarray(signal), (-1,)).astype(chirp_in.dtype)
+    cplx = ring_dtype(L) if len(tables) == 1 else tables[0].dtype
+    pixels = jnp.reshape(jnp.asarray(signal), (-1,)).astype(cplx)
 
     cap_out = None
     if caps.size:
         cap_pixels = _cap_pixels(pixels, caps, L, nside)
         transform_size = _next_fast_len_pow2(width + 2 * L)
 
-        def czt(px, c_in, k_spec, c_out):
+        def czt(px, *factors):
+            if len(factors) == 1:
+                factors = _spin_czt_factors(factors[0], L, nside, synthesis=False)
+            c_in, k_spec, c_out = factors
             embedded = jnp.pad(px * c_in, ((0, 0), (0, transform_size - width)))
             convolution = jnp.fft.ifft(jnp.fft.fft(embedded, axis=-1) * k_spec, axis=-1)
             return c_out * convolution[:, width - 1 : width - 1 + 2 * L - 1]
 
         nrows = int(caps.size)
         if nrows <= _CAP_CHUNK_ROWS:
-            cap_out = czt(cap_pixels, chirp_in, kernel_spec, chirp_out)
+            cap_out = czt(cap_pixels, *tables)
+        elif len(tables) == 1:
+            cap_out = _chunked_rows_seq(
+                _CAP_CHUNK_ROWS, lambda px, two: czt(px, two), cap_pixels, tables[0])
         else:
             cap_out = _chunked_rows(
                 nrows, _CAP_CHUNK_ROWS,
-                lambda lo, hi: czt(*(a[lo:hi] for a in (cap_pixels, chirp_in, kernel_spec,
-                                                         chirp_out))))
+                lambda lo, hi: czt(*(a[lo:hi] for a in (cap_pixels, *tables))))
 
     belt_rows = belt_hi - belt_lo
     if belt_rows == 0:
@@ -1521,17 +1752,8 @@ def _spin_ring_synthesis_tables(L, nside, device=None):
         nphi, _, _, _, width = _ring_czt_constants(L, nside)
         caps = _ring_split_numpy(L, nside)[-1]
         two_nphi = (2 * nphi[caps])[:, None] if caps.size else (2 * nphi[:1])[:, None]
-        transform_size = _next_fast_len_pow2(2 * L - 1 + width)
-        c_index = jnp.arange(2 * L - 1, dtype=jnp.int64)
-        p_index = jnp.arange(width, dtype=jnp.int64)
-        shift = jnp.arange(transform_size, dtype=jnp.int64) - (2 * L - 2)
-        tables = (
-            _chirp(c_index, two_nphi, 1.0, L),
-            jnp.fft.fft(_chirp(shift, two_nphi, -1.0, L), axis=-1),
-            _chirp(p_index, two_nphi, 1.0, L),
-        )
-        cplx = ring_dtype(L)
-        tables = tuple(t.astype(cplx) for t in tables)
+        tables = ((jnp.asarray(two_nphi),) if L > _RING_FACTORS_KEPT_MAX_L
+                  else _spin_czt_factors(two_nphi, L, nside, synthesis=True))
     return tables if device is None else tuple(
         jax.device_put(t, device) for t in tables
     )
@@ -1554,10 +1776,10 @@ def _inverse_ring_fft_complex(centered, tables, *, L, nside):
     The polar rows keep the chirp-Z with `tables` = `_spin_ring_synthesis_tables(L, nside)`
     and the `wrap_phase` correction that accounts for the shift of their coefficient index.
     """
-    chirp_c, kernel_spec, chirp_p = tables
+    tables = tuple(tables)
     belt_lo, belt_hi, _, caps = _ring_split_numpy(L, nside)
     nphi, _, _, _, width = _ring_czt_constants(L, nside)
-    grid = jnp.asarray(centered).astype(chirp_c.dtype)
+    grid = jnp.asarray(centered).astype(ring_dtype(L) if len(tables) == 1 else tables[0].dtype)
 
     cap_res = None
     if caps.size:
@@ -1566,7 +1788,10 @@ def _inverse_ring_fft_complex(centered, tables, *, L, nside):
         p_index = jnp.arange(width, dtype=jnp.int64)
         caps_nphi = nphi[jnp.asarray(caps)]
 
-        def czt(g, c_c, k_spec, c_p, rows_nphi):
+        def czt(g, rows_nphi, *factors):
+            if len(factors) == 1:
+                factors = _spin_czt_factors(factors[0], L, nside, synthesis=True)
+            c_c, k_spec, c_p = factors
             embedded = jnp.pad(g * c_c, ((0, 0), (0, transform_size - (2 * L - 1))))
             convolution = jnp.fft.ifft(jnp.fft.fft(embedded, axis=-1) * k_spec, axis=-1)
             res = c_p * convolution[:, 2 * L - 2 : 2 * L - 2 + width]
@@ -1576,12 +1801,16 @@ def _inverse_ring_fft_complex(centered, tables, *, L, nside):
 
         nrows = int(caps.size)
         if nrows <= _CAP_CHUNK_ROWS:
-            cap_res = czt(cap_grid, chirp_c, kernel_spec, chirp_p, caps_nphi)
+            cap_res = czt(cap_grid, caps_nphi, *tables)
+        elif len(tables) == 1:
+            cap_res = _chunked_rows_seq(
+                _CAP_CHUNK_ROWS,
+                lambda g, nphi, two: czt(g, nphi[:, 0], two),
+                cap_grid, caps_nphi[:, None], tables[0])
         else:
             cap_res = _chunked_rows(
                 nrows, _CAP_CHUNK_ROWS,
-                lambda lo, hi: czt(*(a[lo:hi] for a in (cap_grid, chirp_c, kernel_spec, chirp_p,
-                                                         caps_nphi))))
+                lambda lo, hi: czt(*(a[lo:hi] for a in (cap_grid, caps_nphi, *tables))))
 
     belt_rows = belt_hi - belt_lo
     if belt_rows == 0:
@@ -1634,6 +1863,10 @@ def _forward_healpix_fft(maps, *, L, nside, reality):
 
 
 def _finish_inverse_pallas(ftm_positive, *, L, nside):
+    # The full polar-cap kernel at Nside 8192 is (16382, 65536) complex64,
+    # exactly the 8 GiB cuFFT buffer that does not fit beside the spectrum.
+    if nside >= 8192:
+        return _inverse_ring_fft_herm_chunked(ftm_positive, L=L, nside=nside)
     return _inverse_ring_fft_herm(
         ftm_positive,
         _ring_synthesis_tables(L, nside, getattr(ftm_positive, "device", None)),
@@ -1676,11 +1909,27 @@ def _inverse_latitudinal_device(L, spin, nside, reality, half, device_index):
 
 def _forward_s2fft_multi_gpu(maps, *, L, spin, nside, reality):
     primary, secondary = _gpu_devices()[:2]
+    if not reality:
+        # The ring FFT's 16 GiB workspace does not fit on the card that already
+        # holds the map. Build it on the other GPU and march there too.
+        maps = _copy_to_device(maps, secondary)
+        ftm = _forward_s2fft_ftm(
+            maps,
+            _spin_ring_analysis_tables(L, nside, secondary),
+            L=L, nside=nside, reality=reality,
+        )
+        ftm.block_until_ready()
+        transform = _forward_latitudinal_device(L, spin, nside, reality, 0, 1)
+        flm = _run_blocking(transform, ftm)
+        ftm = None
+        # Keep the spectrum on this GPU. Copying it back fills the other card,
+        # and the alm gather then has no room for its 4.5 GiB temporary.
+        flm = _finish_forward_s2fft(flm, L=L, spin=spin, reality=reality)
+        flm.block_until_ready()
+        return flm
     maps = _copy_to_device(maps, primary)
     ftm = _forward_s2fft_ftm(
-        maps,
-        () if reality else _spin_ring_analysis_tables(L, nside, primary),
-        L=L, nside=nside, reality=reality,
+        maps, (), L=L, nside=nside, reality=reality,
     )
     split = max(abs(spin) + 1, 2 * L // 3)
     if split >= L:
@@ -1706,6 +1955,17 @@ def _inverse_s2fft_multi_gpu(flm, *, L, spin, nside, reality):
     primary, secondary = _gpu_devices()[:2]
     flm = _copy_to_device(flm, primary)
     flm = _prepare_inverse_s2fft(flm, L=L)
+    if not reality:
+        # Spin synthesis ignores the theta half, so the north/south split is
+        # two full marches. Keep the single march on the second GPU.
+        flm = _copy_to_device(flm, secondary)
+        transform = _inverse_latitudinal_device(L, spin, nside, reality, 0, 1)
+        ftm = _run_blocking(transform, flm)
+        return _finish_inverse_s2fft(
+            ftm,
+            _spin_ring_synthesis_tables(L, nside, secondary),
+            L=L, spin=spin, nside=nside, reality=reality,
+        )
     other = _copy_to_device(flm, secondary)
     north_transform = _inverse_latitudinal_device(L, spin, nside, reality, 0, 0)
     south_transform = _inverse_latitudinal_device(L, spin, nside, reality, 1, 1)
@@ -1784,6 +2044,91 @@ def _dc_spin(L_work, spin):
     return _spin_march._march_v2._dc(L_work) if spin != 0 else None
 
 
+@partial(jax.jit, static_argnames=("L", "spin", "nside"))
+def _march_forward_latitudinal_spin(ftm, *, L, spin, nside):
+    return _forward_latitudinal(ftm, L=L, spin=spin, nside=nside, reality=False, L_lower=0)
+
+
+@partial(jax.jit, static_argnames=("L", "spin", "nside"))
+def _march_inverse_latitudinal_spin(flm, *, L, spin, nside):
+    return _inverse_latitudinal(flm, _stable_thetas(L, nside), L=L, spin=spin, nside=nside,
+                                reality=False)
+
+
+class _MarchStages:
+    forward_latitudinal_spin = staticmethod(_march_forward_latitudinal_spin)
+    inverse_latitudinal_spin = staticmethod(_march_inverse_latitudinal_spin)
+
+
+# The staged march at Nside 8192 carries its spectra in complex64 between programs.  The v2
+# kernels read and write float32, so the values the kernel sees and emits are the same; complex128
+# made the synthesis program 18 GiB in + 24 GiB out + 32 GiB temporaries, which with the maps and
+# alms resident was past the 96 GB card at the first refinement iteration.
+@partial(jax.jit, static_argnums=(1, 2))
+def _prepare_spin_c64(alm, L, L_work):
+    return _prepare_inverse_s2fft(_unpack_spin(alm, L, L_work), L=L_work).astype(jnp.complex64)
+
+
+@partial(jax.jit, static_argnames=("L", "nside"))
+def _forward_s2fft_ftm_c64(maps, tables, *, L, nside):
+    return _forward_s2fft_ftm(maps[0] + 1j * maps[1], tables, L=L, nside=nside,
+                              reality=False).astype(jnp.complex64)
+
+
+@partial(jax.jit, static_argnames=("L", "nside"))
+def _residual_ftm_c64(synth, maps, tables, *, L, nside):
+    """Ring spectrum of `synth - maps` with the difference formed inside the program: held as
+    its own array it was a third 12 GiB map beside the input and the march's temporaries."""
+    return _forward_s2fft_ftm_c64(synth - maps, tables, L=L, nside=nside)
+
+
+def _march_c64_analysis(ftm_box, ell, order, *, L_work, spin, nside):
+    """March analysis of the complex64 ring spectrum in `ftm_box` (a one-element list, emptied so
+    the spectrum is freed as soon as the march has read it)."""
+    flm = _spin_march._march_v2.forward_latitudinal(ftm_box.pop(), L=L_work, spin=spin,
+                                                    nside=nside, cdtype=jnp.complex64)
+    return _finish_pack_spin(flm, ell, order, L_work=L_work, spin=spin)
+
+
+@partial(jax.jit, static_argnames=("L_work", "spin"))
+def _finish_pack_spin(flm, ell, order, *, L_work, spin):
+    """`_spin_pack_plus(_finish_forward_s2fft(flm))` with no `(L, 2L-1)` block between them.
+
+    The finish factor is diagonal in `ell`, so it is applied to the gathered entries instead.
+    """
+    factor = (jnp.sqrt((2 * ell + 1) / (4 * jnp.pi)) * jnp.where(ell < abs(spin), 0.0, 1.0)
+              * (-1.0) ** abs(spin))
+    plus_m = flm[ell, L_work - 1 + order].astype(jnp.complex128) * factor
+    minus_m = (-1) ** order * jnp.conj(flm[ell, L_work - 1 - order].astype(jnp.complex128) * factor)
+    return jnp.stack([-(plus_m + minus_m) / 2, 0.5j * (plus_m - minus_m)])
+
+
+@partial(jax.jit, static_argnames=("L", "spin", "nside"))
+def _finish_inverse_c64(ftm, tables, *, L, spin, nside):
+    """`_finish_inverse_s2fft` on a complex64 march output: the ring phase is applied in complex128
+    as before, and the ring transform takes its complex64 input as it always did."""
+    return _finish_inverse_s2fft(ftm.astype(jnp.complex128), tables, L=L, spin=spin, nside=nside,
+                                 reality=False)
+
+
+def _march_c64_ready(L_work, spin):
+    return _spin_march._march_v2.enabled(L_work) and _spin_march.march_requested(
+        spin, L=L_work, nside=None) and _spin_march.synth_requested(spin, L=L_work, nside=None)
+
+
+def _staged_spin(L_work, spin):
+    """The latitudinal engine a polarised transform runs as separate programs, if any.
+
+    The D&C engine where it serves; above `_RING_FACTORS_KEPT_MAX_L` (Nside 8192) also the march,
+    whose fused synthesis program needed one 72 GiB temporary there -- split, each program's
+    working set is one stage's.
+    """
+    dc = _dc_spin(L_work, spin)
+    if dc is None and spin != 0 and L_work > _RING_FACTORS_KEPT_MAX_L:
+        return _MarchStages
+    return dc
+
+
 @partial(jax.jit, static_argnames=("L_work",))
 def _spin_pack_plus(plus, ell, order, *, L_work):
     plus_m = plus[ell, L_work - 1 + order]
@@ -1798,7 +2143,14 @@ def _complex_to_qu(maps):
 
 def _alm2map_core(alm, ell, order, *, spin, nside, L, L_work):
     tables = _polarised_ring_tables(spin, L_work, nside, alm, synthesis=True)
-    dc = _dc_spin(L_work, spin)
+    dc = _staged_spin(L_work, spin)
+    if dc is _MarchStages and _march_c64_ready(L_work, spin):
+        flm = _prepare_spin_c64(alm, L, L_work)
+        ftm = _spin_march._march_v2.inverse_latitudinal(flm, L=L_work, spin=spin, nside=nside,
+                                            cdtype=jnp.complex64)
+        del flm
+        maps = _finish_inverse_c64(ftm, tables, L=L_work, spin=spin, nside=nside)
+        return _complex_to_qu(maps)
     if dc is not None:
         flm = _prepare_inverse_s2fft(_unpack_spin(alm, L, L_work), L=L_work)
         ftm = dc.inverse_latitudinal_spin(flm, L=L_work, spin=spin, nside=nside)
@@ -1830,7 +2182,10 @@ def _alm2map_core_impl(alm, tables, ell, order, *, spin, nside, L, L_work):
 
 def _map2alm_once(maps, ell, order, *, spin, nside, L, L_work):
     tables = _polarised_ring_tables(spin, L_work, nside, maps, synthesis=False)
-    dc = _dc_spin(L_work, spin)
+    dc = _staged_spin(L_work, spin)
+    if dc is _MarchStages and _march_c64_ready(L_work, spin):
+        return _march_c64_analysis([_forward_s2fft_ftm_c64(maps, tables, L=L_work, nside=nside)],
+                                   ell, order, L_work=L_work, spin=spin, nside=nside)
     if dc is not None:
         ftm = _forward_s2fft_ftm(maps[0] + 1j * maps[1], tables, L=L_work, nside=nside, reality=False)
         flm = dc.forward_latitudinal_spin(ftm, L=L_work, spin=spin, nside=nside)
@@ -1870,7 +2225,14 @@ _ITERATION_SPLIT_BYTES = 4 * 1024 ** 3
 
 
 def _map2alm_iteration(alm, maps, ell, order, *, spin, nside, L, L_work):
-    if _dc_spin(L_work, spin) is not None:
+    if _staged_spin(L_work, spin) is _MarchStages and _march_c64_ready(L_work, spin):
+        synth = _alm2map_core(alm, ell, order, spin=spin, nside=nside, L=L, L_work=L_work)
+        box = [_residual_ftm_c64(
+            synth, maps, _polarised_ring_tables(spin, L_work, nside, maps, synthesis=False),
+            L=L_work, nside=nside)]
+        del synth
+        return alm - _march_c64_analysis(box, ell, order, L_work=L_work, spin=spin, nside=nside)
+    if _staged_spin(L_work, spin) is not None:
         residual = _alm2map_core(alm, ell, order, spin=spin, nside=nside, L=L, L_work=L_work) - maps
         return alm - _map2alm_once(residual, ell, order, spin=spin, nside=nside, L=L, L_work=L_work)
     a_tables = _polarised_ring_tables(spin, L_work, nside, maps, synthesis=False)
@@ -2361,7 +2723,15 @@ def _single_latitudinal_synthesis(alm, *, nside, L, L_work):
     """The latitudinal half of the scalar `_alm2map_core_pallas_eager`: one positive ring spectrum."""
     theta = _stable_thetas(L_work, nside)
     phase = healpix_ffts.p2phi_rings_jax(jnp.arange(len(theta)), nside)
-    return _fused_inverse_sht(_positive_alm(alm[0], L=L, L_work=L_work), theta, phase,
+    positive = _positive_alm(alm[0], L=L, L_work=L_work)
+    if (nmt_params.sht_calculator in ("jax", "jax-matrix")
+            and _spin_march.fold_synth_requested(nside, L_work)
+            and _spin_march._march_v2.enabled(L_work)):
+        # Every caller hands this to `ring_fold_residual`, which reads complex64: emitted as such
+        # it is the same numbers without the complex128 copy (12 GiB at Nside 8192).
+        return _spin_march._march_v2.inverse_latitudinal_positive(
+            positive, phase, L=L_work, nside=nside, cdtype=jnp.complex64)
+    return _fused_inverse_sht(positive, theta, phase,
                               L=L_work, nside=nside, block_size=_pallas_block_size(nside))
 
 
@@ -2660,15 +3030,26 @@ def _pallas_parameters(L, nside):
 
 def _map2alm_once_pallas_multi_gpu(maps, ell, order, *, nside, L_work):
     primary, secondary = _gpu_devices()[:2]
-    maps = _copy_to_device(maps, primary)
+    # A mask placed on the second GPU stays there. Copying its high-m slice
+    # off the first GPU is an extra 8 GiB while the spin maps are still resident.
+    home = secondary if getattr(maps, "device", None) == secondary else primary
+    maps = _copy_to_device(maps, home)
     ftm = _forward_healpix_fft(maps[0], L=L_work, nside=nside, reality=True)
     positive = ftm[:, L_work:]
     split = _pallas_order_split(L_work)
-    high_input = _copy_to_device(positive[:, split:], secondary)
+    high_input = positive[:, split:]
+    if home != secondary:
+        high_input = _copy_to_device(high_input, secondary)
     theta, weights, phase = _pallas_parameters(L_work, nside)
-    other_theta = _copy_to_device(theta, secondary)
-    other_weights = _copy_to_device(weights, secondary)
-    other_phase = _copy_to_device(phase, secondary)
+    if home == secondary:
+        theta = _copy_to_device(theta, secondary)
+        weights = _copy_to_device(weights, secondary)
+        phase = _copy_to_device(phase, secondary)
+        other_theta, other_weights, other_phase = theta, weights, phase
+    else:
+        other_theta = _copy_to_device(theta, secondary)
+        other_weights = _copy_to_device(weights, secondary)
+        other_phase = _copy_to_device(phase, secondary)
     block_size = _pallas_block_size(nside)
 
     def low_transform(values):
@@ -2692,27 +3073,47 @@ def _map2alm_once_pallas_multi_gpu(maps, ell, order, *, nside, L_work):
             m_start=split,
         )
 
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        low_future = executor.submit(
-            _run_blocking, low_transform, positive[:, :split]
-        )
-        high_future = executor.submit(_run_blocking, high_transform, high_input)
-        low, high = low_future.result(), high_future.result()
-    high = _copy_to_device(high, primary)
-    packed = _pack_pallas_parts(low, high, ell, order, split=split)
-    return packed[None, :]
+    if home == secondary:
+        low = _run_blocking(low_transform, positive[:, :split])
+        high = _run_blocking(high_transform, high_input)
+    else:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            low_future = executor.submit(
+                _run_blocking, low_transform, positive[:, :split]
+            )
+            high_future = executor.submit(_run_blocking, high_transform, high_input)
+            low, high = low_future.result(), high_future.result()
+        high = _copy_to_device(high, primary)
+    packed = _pack_pallas_parts(low, high, ell, order, split=split)[None, :]
+    packed.block_until_ready()
+    # The gather owns its buffer. Drop the ring FFT before the next iteration.
+    ftm = None
+    positive = None
+    low = None
+    high = None
+    high_input = None
+    gc.collect()
+    return packed
 
 
 def _alm2map_core_pallas_multi_gpu(alm, *, nside, L, L_work):
     primary, secondary = _gpu_devices()[:2]
-    alm = _copy_to_device(alm, primary)
+    home = secondary if getattr(alm, "device", None) == secondary else primary
+    alm = _copy_to_device(alm, home)
     positive = _positive_alm(alm[0], L=L, L_work=L_work)
     split = _pallas_order_split(L_work)
-    high_input = _copy_to_device(positive[:, split:], secondary)
+    high_input = positive[:, split:]
+    if home != secondary:
+        high_input = _copy_to_device(high_input, secondary)
     theta = _stable_thetas(L_work, nside)
     phase = healpix_ffts.p2phi_rings_jax(jnp.arange(len(theta)), nside)
-    other_theta = _copy_to_device(theta, secondary)
-    other_phase = _copy_to_device(phase, secondary)
+    if home == secondary:
+        theta = _copy_to_device(theta, secondary)
+        phase = _copy_to_device(phase, secondary)
+        other_theta, other_phase = theta, phase
+    else:
+        other_theta = _copy_to_device(theta, secondary)
+        other_phase = _copy_to_device(phase, secondary)
     block_size = _pallas_block_size(nside)
 
     def low_transform(values):
@@ -2734,16 +3135,32 @@ def _alm2map_core_pallas_multi_gpu(alm, *, nside, L, L_work):
             m_start=split,
         )
 
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        low_future = executor.submit(
-            _run_blocking, low_transform, positive[:, :split]
-        )
-        high_future = executor.submit(_run_blocking, high_transform, high_input)
-        low, high = low_future.result(), high_future.result()
-    high = _copy_to_device(high, primary)
+    if home == secondary:
+        low = _run_blocking(low_transform, positive[:, :split])
+        high = _run_blocking(high_transform, high_input)
+    else:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            low_future = executor.submit(
+                _run_blocking, low_transform, positive[:, :split]
+            )
+            high_future = executor.submit(_run_blocking, high_transform, high_input)
+            low, high = low_future.result(), high_future.result()
+        high = _copy_to_device(high, primary)
     ftm_positive = jnp.concatenate((low, high), axis=1)
-    maps = _finish_inverse_pallas(ftm_positive, L=L_work, nside=nside)
-    return jnp.real(maps)[None, :]
+    ftm_positive.block_until_ready()
+    low = None
+    high = None
+    gc.collect()
+    if nside >= 8192:
+        cast = ftm_positive.astype(ring_dtype(L_work))
+        cast.block_until_ready()
+        ftm_positive = None
+        gc.collect()
+        out = _inverse_ring_fft_herm_chunked(cast, L=L_work, nside=nside)[None, :]
+    else:
+        out = jnp.real(_finish_inverse_pallas(ftm_positive, L=L_work, nside=nside))[None, :]
+    out.block_until_ready()
+    return out
 
 
 def _map2alm_core_pallas_multi_gpu(
@@ -2753,15 +3170,16 @@ def _map2alm_core_pallas_multi_gpu(
         maps, ell, order, nside=nside, L_work=L_work
     )
     for _ in range(n_iter):
-        residual = (
-            _alm2map_core_pallas_multi_gpu(
-                alm, nside=nside, L=L, L_work=L_work
-            )
-            - maps
+        synthed = _alm2map_core_pallas_multi_gpu(
+            alm, nside=nside, L=L, L_work=L_work
         )
-        alm -= _map2alm_once_pallas_multi_gpu(
+        residual = synthed - maps
+        residual.block_until_ready()
+        synthed = None
+        alm = alm - _map2alm_once_pallas_multi_gpu(
             residual, ell, order, nside=nside, L_work=L_work
         )
+        residual = None
     return alm
 
 
@@ -2797,30 +3215,42 @@ def _map2alm_once_multi_gpu(maps, ell, order, *, spin, nside, L, L_work):
     )
     plus_m = plus[ell, L_work - 1 + order]
     minus_m = (-1) ** order * jnp.conj(plus[ell, L_work - 1 - order])
-    return jnp.stack([-(plus_m + minus_m) / 2, 0.5j * (plus_m - minus_m)])
+    alm = jnp.stack([-(plus_m + minus_m) / 2, 0.5j * (plus_m - minus_m)])
+    # A slice keeps the full ring spectrum alive. At Nside 8192 that spectrum
+    # plus the next pass's copy is the 16 GiB alloc that does not fit.
+    alm.block_until_ready()
+    owned = jax.device_put(np.array(alm), alm.device)
+    owned.block_until_ready()
+    return owned
 
 
 def _map2alm_core_multi_gpu(
     maps, ell, order, *, spin, nside, L, L_work, n_iter
 ):
-    maps = _copy_to_device(maps, _gpu_devices()[0])
+    primary = _gpu_devices()[0]
+    maps = _copy_to_device(maps, primary)
     alm = _map2alm_once_multi_gpu(
         maps, ell, order, spin=spin, nside=nside, L=L, L_work=L_work
     )
+    # The spin march fills the second GPU. Keep the packed spectrum and the
+    # residual on the first so the next march starts on an empty card.
+    if spin:
+        alm = _copy_to_device(alm, primary)
     for _ in range(n_iter):
-        residual = (
-            _alm2map_core_multi_gpu(
-                alm,
-                ell,
-                order,
-                spin=spin,
-                nside=nside,
-                L=L,
-                L_work=L_work,
-            )
-            - maps
+        synthed = _alm2map_core_multi_gpu(
+            alm,
+            ell,
+            order,
+            spin=spin,
+            nside=nside,
+            L=L,
+            L_work=L_work,
         )
-        alm -= _map2alm_once_multi_gpu(
+        if spin:
+            synthed = _copy_to_device(synthed, primary)
+        residual = synthed - maps
+        synthed = None
+        delta = _map2alm_once_multi_gpu(
             residual,
             ell,
             order,
@@ -2829,6 +3259,10 @@ def _map2alm_core_multi_gpu(
             L=L,
             L_work=L_work,
         )
+        if spin:
+            delta = _copy_to_device(delta, primary)
+        alm = alm - delta
+        delta = None
     return alm
 
 

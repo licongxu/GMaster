@@ -1,0 +1,58 @@
+RECHECK1 gmaster spin0 one shot
+PARTITION=root
+HOST_DENIED cpu 64
+STAGE field
+STAGE coupling
+STAGE field
+STAGE coupling
+RESULT {"engine": "gmaster", "cores": 8, "nside": 64, "spin": 0, "seconds": [0.005397750996053219], "cl_path": "benchmarks/independent/act_cl_re1_gmaster8_n64_s0.npy", "nell": 6}
+STAGE field
+STAGE coupling
+STAGE field
+STAGE coupling
+RESULT {"engine": "gmaster", "cores": 8, "nside": 128, "spin": 0, "seconds": [0.007158655964303762], "cl_path": "benchmarks/independent/act_cl_re1_gmaster8_n128_s0.npy", "nell": 12}
+STAGE field
+STAGE coupling
+STAGE field
+STAGE coupling
+RESULT {"engine": "gmaster", "cores": 8, "nside": 256, "spin": 0, "seconds": [0.00972923100925982], "cl_path": "benchmarks/independent/act_cl_re1_gmaster8_n256_s0.npy", "nell": 25}
+STAGE field
+STAGE coupling
+STAGE field
+STAGE coupling
+RESULT {"engine": "gmaster", "cores": 8, "nside": 512, "spin": 0, "seconds": [0.06027676200028509], "cl_path": "benchmarks/independent/act_cl_re1_gmaster8_n512_s0.npy", "nell": 51}
+STAGE field
+STAGE coupling
+FAIL nside=1024 spin=0 ValueError: Received incompatible devices for jitted computation. Got argument a of solve with shape float64[102,102] and with device ids [1] on platform GPU and argument b of solve with shape float64[102] and with device ids [0] on platform GPU
+Traceback (most recent call last):
+  File "/scratch/scratch-lxu/agent_dev/auto_research_agent/GMaster/benchmarks/independent/bench_act_warm.py", line 108, in main
+    one(nside, spin, engine, cores)
+  File "/scratch/scratch-lxu/agent_dev/auto_research_agent/GMaster/benchmarks/independent/bench_act_warm.py", line 84, in one
+    once()
+  File "/scratch/scratch-lxu/agent_dev/auto_research_agent/GMaster/benchmarks/independent/bench_act_warm.py", line 78, in once
+    cl = work.decouple_cell(nmt.compute_coupled_cell(field, field))
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/scratch/scratch-lxu/agent_dev/auto_research_agent/GMaster/gmaster/workspaces.py", line 1899, in decouple_cell
+    decoupled = jnp.linalg.solve(self.mcm_binned, binned)
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+ValueError: Received incompatible devices for jitted computation. Got argument a of solve with shape float64[102,102] and with device ids [1] on platform GPU and argument b of solve with shape float64[102] and with device ids [0] on platform GPU
+--------------------
+For simplicity, JAX has removed its internal frames from the traceback of the following exception. Set JAX_TRACEBACK_FILTERING=off to include these.
+STAGE field
+STAGE coupling
+FAIL nside=2048 spin=0 ValueError: Received incompatible devices for jitted computation. Got argument a of solve with shape float64[204,204] and with device ids [1] on platform GPU and argument b of solve with shape float64[204] and with device ids [0] on platform GPU
+Traceback (most recent call last):
+  File "/scratch/scratch-lxu/agent_dev/auto_research_agent/GMaster/benchmarks/independent/bench_act_warm.py", line 108, in main
+    one(nside, spin, engine, cores)
+  File "/scratch/scratch-lxu/agent_dev/auto_research_agent/GMaster/benchmarks/independent/bench_act_warm.py", line 84, in one
+    once()
+  File "/scratch/scratch-lxu/agent_dev/auto_research_agent/GMaster/benchmarks/independent/bench_act_warm.py", line 78, in once
+    cl = work.decouple_cell(nmt.compute_coupled_cell(field, field))
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/scratch/scratch-lxu/agent_dev/auto_research_agent/GMaster/gmaster/workspaces.py", line 1899, in decouple_cell
+    decoupled = jnp.linalg.solve(self.mcm_binned, binned)
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+ValueError: Received incompatible devices for jitted computation. Got argument a of solve with shape float64[204,204] and with device ids [1] on platform GPU and argument b of solve with shape float64[204] and with device ids [0] on platform GPU
+--------------------
+For simplicity, JAX has removed its internal frames from the traceback of the following exception. Set JAX_TRACEBACK_FILTERING=off to include these.
+STAGE field
