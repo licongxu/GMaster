@@ -99,15 +99,19 @@ and bandpower windows are built on demand.
 
 ## Precision
 
-GMaster's defaults on an NVIDIA GPU use float32 where the result stays below NaMaster's own
-HEALPix quadrature error: the latitudinal march, the ring FFTs, and the operands (not the
-accumulation) of the polarised coupling quadrature. The end-to-end difference from NaMaster is
-~1e-6 to 1e-4 of the spectrum depending on resolution (see `benchmarks/README.md`).
+GMaster's defaults on an NVIDIA GPU use float32 in the latitudinal march, the ring FFTs, and the
+operands (not the accumulation) of the polarised coupling quadrature. A transform is then accurate
+to ~1e-7 relative to its largest coefficient. For the spectra of maps this is far below cosmic
+variance. One place it shows is the mask: a smooth (apodized) mask has almost no power at high
+multipoles, and the float32 floor dominates it there. Because the mode-coupling matrix couples the
+large low-multipole power into the highest bandpowers, the decoupled spectra differ from
+NaMaster's by up to ~1e-4 at Nside 4096 and up to ~1e-3 (below 2 Nside) to ~7e-3 (at 3 Nside) at
+Nside 8192; see `benchmarks/README.md`.
 
 | knob | effect |
 |---|---|
 | `JAX_ENABLE_X64=1` | required; GMaster warns if it is off |
-| `GMASTER_MARCH_V2=0` | exact float64 table routes instead of the float32 march |
+| `GMASTER_MARCH_V2=0` | disable the CUDA march: float64 table routes where the tables fit in memory (small band limits), Pallas kernels otherwise (not all float64) |
 | `set_ring_precision("fp64")` | float64 ring FFTs |
 | `set_coupling_precision("fp64")` | float64 coupling-matrix operands |
 | `set_table_precision("fp32")` | float32 storage of precomputed tables (more geometries fit) |
@@ -127,7 +131,7 @@ User-facing:
 
 | variable | default | meaning |
 |---|---|---|
-| `GMASTER_MARCH_V2` | `1` | use the CUDA march (0: exact float64 routes) |
+| `GMASTER_MARCH_V2` | `1` | use the CUDA march (0: the older table and Pallas routes) |
 | `GMASTER_DC` | `1` | allow the divide-and-conquer engine in its band-limit window |
 | `GMASTER_DC_MIN_L`, `GMASTER_DC_MAX_L` | `6144`, `12288` | that window |
 | `GMASTER_DC_THREADS` | `8` | host threads for building a divide-and-conquer plan |
@@ -156,7 +160,8 @@ JAX_ENABLE_X64=1 pytest tests
 ```
 
 Most tests compare against NaMaster or ducc0 on the same inputs. Tests that exercise the CUDA
-march are marked `march_v2`; the others run the exact float64 routes (`tests/conftest.py`).
+march are marked `march_v2`; the others disable it and, at the small test sizes, run the float64
+table routes (`tests/conftest.py`).
 Leave `OMP_NUM_THREADS` unset when running the suite: some catalogue tests compare against
 NaMaster's ducc0 NUFFT, whose result depends slightly on its thread count.
 

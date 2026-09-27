@@ -2799,114 +2799,179 @@
   {
    "nside": 64,
    "spin": 0,
-   "max_rel_diff": 4.5819524411888914e-07,
    "reference": "NaMaster 96 cores",
-   "spectra": "TT"
+   "max_rel_diff_to_largest": 4.5819524411888914e-07,
+   "per_bandpower_rms": 4.660746648085963e-07,
+   "per_bandpower_max": 9.62217367117546e-07,
+   "per_bandpower_rms_below_2nside": 5.676299810235824e-07,
+   "per_bandpower_max_below_2nside": 9.62217367117546e-07,
+   "spectrum": "TT"
   },
   {
    "nside": 128,
    "spin": 0,
-   "max_rel_diff": 6.075692591534205e-07,
    "reference": "NaMaster 96 cores",
-   "spectra": "TT"
+   "max_rel_diff_to_largest": 6.075692591534205e-07,
+   "per_bandpower_rms": 5.210690970340464e-07,
+   "per_bandpower_max": 1.3641965652677612e-06,
+   "per_bandpower_rms_below_2nside": 6.264757272984938e-07,
+   "per_bandpower_max_below_2nside": 1.3641965652677612e-06,
+   "spectrum": "TT"
   },
   {
    "nside": 256,
    "spin": 0,
-   "max_rel_diff": 1.7897006433800784e-06,
    "reference": "NaMaster 96 cores",
-   "spectra": "TT"
+   "max_rel_diff_to_largest": 1.7897006433800784e-06,
+   "per_bandpower_rms": 6.112017938396206e-07,
+   "per_bandpower_max": 1.7897006433509333e-06,
+   "per_bandpower_rms_below_2nside": 7.120875250586048e-07,
+   "per_bandpower_max_below_2nside": 1.7897006433509333e-06,
+   "spectrum": "TT"
   },
   {
    "nside": 512,
    "spin": 0,
-   "max_rel_diff": 8.182297462733047e-06,
    "reference": "NaMaster 96 cores",
-   "spectra": "TT"
+   "max_rel_diff_to_largest": 8.182297462733047e-06,
+   "per_bandpower_rms": 1.5530725381945458e-06,
+   "per_bandpower_max": 8.182297462688837e-06,
+   "per_bandpower_rms_below_2nside": 1.8426322219072073e-06,
+   "per_bandpower_max_below_2nside": 8.182297462688837e-06,
+   "spectrum": "TT"
   },
   {
    "nside": 1024,
    "spin": 0,
-   "max_rel_diff": 1.5781796637599827e-05,
    "reference": "NaMaster 96 cores",
-   "spectra": "TT"
+   "max_rel_diff_to_largest": 1.5781796637599827e-05,
+   "per_bandpower_rms": 8.05150570135079e-06,
+   "per_bandpower_max": 3.0030387809132364e-05,
+   "per_bandpower_rms_below_2nside": 9.37314445861456e-06,
+   "per_bandpower_max_below_2nside": 3.0030387809132364e-05,
+   "spectrum": "TT"
   },
   {
    "nside": 2048,
    "spin": 0,
-   "max_rel_diff": 2.7512496562336338e-05,
    "reference": "NaMaster 96 cores",
-   "spectra": "TT"
+   "max_rel_diff_to_largest": 2.7512496562336338e-05,
+   "per_bandpower_rms": 2.4682760320958515e-05,
+   "per_bandpower_max": 5.239801334666616e-05,
+   "per_bandpower_rms_below_2nside": 2.6596118304655397e-05,
+   "per_bandpower_max_below_2nside": 5.239801334666616e-05,
+   "spectrum": "TT"
   },
   {
    "nside": 4096,
    "spin": 0,
-   "max_rel_diff": 6.676393952357997e-05,
    "reference": "NaMaster 96 cores",
-   "spectra": "TT"
+   "max_rel_diff_to_largest": 6.676393952357997e-05,
+   "per_bandpower_rms": 0.00012790852537604113,
+   "per_bandpower_max": 0.0001542132425333964,
+   "per_bandpower_rms_below_2nside": 0.0001238117688896643,
+   "per_bandpower_max_below_2nside": 0.0001542132425333964,
+   "spectrum": "TT"
   },
   {
    "nside": 8192,
    "spin": 0,
-   "max_rel_diff": 0.00020126194002058944,
    "reference": "NaMaster 96 cores",
-   "spectra": "TT"
+   "max_rel_diff_to_largest": 0.00020126194002058944,
+   "per_bandpower_rms": 0.0021388063985861134,
+   "per_bandpower_max": 0.007119845830280358,
+   "per_bandpower_rms_below_2nside": 0.0007706696857214482,
+   "per_bandpower_max_below_2nside": 0.0009761125103038282,
+   "spectrum": "TT"
   },
   {
    "nside": 64,
    "spin": 2,
-   "max_rel_diff": 1.3538463675020136e-06,
    "reference": "NaMaster 96 cores",
-   "spectra": "EE, EB, BE, BB"
+   "max_rel_diff_to_largest": 1.3538463675020136e-06,
+   "per_bandpower_rms": 1.048436237959823e-06,
+   "per_bandpower_max": 1.3538463674578338e-06,
+   "per_bandpower_rms_below_2nside": 1.1305545252519962e-06,
+   "per_bandpower_max_below_2nside": 1.3538463674578338e-06,
+   "spectrum": "EE"
   },
   {
    "nside": 128,
    "spin": 2,
-   "max_rel_diff": 5.608001142690155e-07,
    "reference": "NaMaster 96 cores",
-   "spectra": "EE, EB, BE, BB"
+   "max_rel_diff_to_largest": 5.608001142690155e-07,
+   "per_bandpower_rms": 8.694171203232112e-07,
+   "per_bandpower_max": 1.23977375565687e-06,
+   "per_bandpower_rms_below_2nside": 7.695099739302195e-07,
+   "per_bandpower_max_below_2nside": 1.0535209846729288e-06,
+   "spectrum": "EE"
   },
   {
    "nside": 256,
    "spin": 2,
-   "max_rel_diff": 2.6132813645256286e-06,
    "reference": "NaMaster 96 cores",
-   "spectra": "EE, EB, BE, BB"
+   "max_rel_diff_to_largest": 2.6132813645256286e-06,
+   "per_bandpower_rms": 4.667340904846026e-06,
+   "per_bandpower_max": 7.743058290765603e-06,
+   "per_bandpower_rms_below_2nside": 5.269821247644513e-06,
+   "per_bandpower_max_below_2nside": 7.743058290765603e-06,
+   "spectrum": "EE"
   },
   {
    "nside": 512,
    "spin": 2,
-   "max_rel_diff": 6.272610294146609e-06,
    "reference": "NaMaster 96 cores",
-   "spectra": "EE, EB, BE, BB"
+   "max_rel_diff_to_largest": 6.272610294146609e-06,
+   "per_bandpower_rms": 1.0735490328209697e-05,
+   "per_bandpower_max": 2.141067386818296e-05,
+   "per_bandpower_rms_below_2nside": 1.2522137966134033e-05,
+   "per_bandpower_max_below_2nside": 2.141067386818296e-05,
+   "spectrum": "EE"
   },
   {
    "nside": 1024,
    "spin": 2,
-   "max_rel_diff": 5.741881869912814e-06,
    "reference": "NaMaster 96 cores",
-   "spectra": "EE, EB, BE, BB"
+   "max_rel_diff_to_largest": 5.741881869912814e-06,
+   "per_bandpower_rms": 1.7149564107326326e-05,
+   "per_bandpower_max": 3.614416277741839e-05,
+   "per_bandpower_rms_below_2nside": 2.0490932952866022e-05,
+   "per_bandpower_max_below_2nside": 3.614416277741839e-05,
+   "spectrum": "EE"
   },
   {
    "nside": 2048,
    "spin": 2,
-   "max_rel_diff": 1.2932627177813779e-05,
    "reference": "NaMaster 96 cores",
-   "spectra": "EE, EB, BE, BB"
+   "max_rel_diff_to_largest": 1.2932627177813779e-05,
+   "per_bandpower_rms": 4.122811495063841e-05,
+   "per_bandpower_max": 9.038623119916878e-05,
+   "per_bandpower_rms_below_2nside": 4.758737533190077e-05,
+   "per_bandpower_max_below_2nside": 9.038623119916878e-05,
+   "spectrum": "EE"
   },
   {
    "nside": 4096,
    "spin": 2,
-   "max_rel_diff": 3.617887080810297e-05,
    "reference": "NaMaster 96 cores",
-   "spectra": "EE, EB, BE, BB"
+   "max_rel_diff_to_largest": 3.617887080810297e-05,
+   "per_bandpower_rms": 8.365520728411787e-05,
+   "per_bandpower_max": 0.00023515881470026478,
+   "per_bandpower_rms_below_2nside": 8.183493051171377e-05,
+   "per_bandpower_max_below_2nside": 0.00023515881470026478,
+   "spectrum": "EE"
   },
   {
    "nside": 8192,
    "spin": 2,
-   "max_rel_diff": 4.0321241577584945e-05,
    "reference": "NaMaster 96 cores",
-   "spectra": "EE, EB, BE, BB"
+   "max_rel_diff_to_largest": 4.0321241577584945e-05,
+   "per_bandpower_rms": 0.0021065379203007457,
+   "per_bandpower_max": 0.007324943653978178,
+   "per_bandpower_rms_below_2nside": 0.0007054734652725412,
+   "per_bandpower_max_below_2nside": 0.000959706312022135,
+   "spectrum": "EE"
   }
- ]
+ ],
+ "agreement_note": "GMaster vs NaMaster (96 cores) on the ACT DR6 end-to-end cells. max_rel_diff_to_largest: max |GM - NM| over the largest |NM| bandpower (all spectra of the cell). per_bandpower_*: |GM/NM - 1| of TT (spin 0) or EE (spin 2), over all bandpowers or those below ell = 2 nside."
 }

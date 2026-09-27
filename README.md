@@ -19,8 +19,9 @@ cl = workspace.decouple_cell(nmt.compute_coupled_cell(field, field))
 
 On one NVIDIA RTX PRO 6000 (96 GB), the full MASTER estimator on the ACT DR6 map runs
 **12-22x faster than NaMaster on all 96 cores** of an AMD Threadripper PRO 9995WX from Nside 1024
-to 8192 (7-22x from Nside 256), for both temperature and polarization, and agrees with it to
-better than $2\times10^{-4}$ of the spectrum.
+to 8192 (7-22x from Nside 256), for both temperature and polarization. On that map the bandpowers
+agree with NaMaster's to better than $10^{-4}$ up to Nside 2048 and $2.4\times10^{-4}$ at Nside 4096
+(details below).
 
 ![Warm wall time versus resolution](docs/figures/time_vs_nside.png)
 
@@ -52,7 +53,8 @@ The [tutorials](tutorials/) are executed Jupyter notebooks that run in a few min
 | [3. Simulations and covariance](tutorials/03_workspaces_simulations_covariance.ipynb) | reusing workspaces, saving them, the Gaussian covariance, a $\chi^2$ test |
 | [4. Beams, noise, deprojection](tutorials/04_beams_noise_deprojection.ipynb) | beam deconvolution, cross-spectra of data splits, template deprojection and its bias |
 | [5. NaMaster cross-check](tutorials/05_namaster_crosscheck_performance.ipynb) | the same estimator in both codes, timings, settings for large maps |
-| [Colab demo](tutorials/colab_gmaster_vs_namaster.ipynb) | GMaster and NaMaster side by side on a Colab GPU |
+| [Colab demo](tutorials/colab_gmaster_vs_namaster.ipynb) | GMaster and NaMaster side by side on a free Colab or Kaggle GPU |
+| [Kaggle ladder](tutorials/kaggle_nside_sweep.ipynb) | the same comparison over Nside 64-4096 on a Kaggle T4 |
 
 [Examples](examples/) are command-line scripts: `power_spectrum_from_fits.py` computes the
 spectra of your own HEALPix maps, and `act_dr6/` reproduces the real-data comparisons on the
@@ -99,12 +101,19 @@ Nside 8192 spin-2 GMaster cell is a single warm run.
 | 4096 | 2 | 8.8 s | 215 s | 110 s | 13x |
 | 8192 | 2 | 57 s | 1658 s | 805 s | 14x |
 
-The decoupled spectra agree with NaMaster's to between $5\times10^{-7}$ (Nside 64) and
-$2\times10^{-4}$ (Nside 8192, spin 0) of the largest bandpower. By default GMaster evaluates the
-latitudinal transforms and the operands of the polarised coupling matrices in float32, where the
-error stays below NaMaster's own HEALPix quadrature error; float64 routes are available (see
-[docs/architecture.md](docs/architecture.md#precision)). Up to Nside 8192 the whole spin-2
-estimator fits on one 96 GB GPU (peak 79 GiB); NaMaster needs 138 GiB of host memory for it.
+**Accuracy.** On the ACT DR6 map and footprint, GMaster's bandpowers differ from NaMaster's by at
+most $3\times10^{-5}$ (TT) and $4\times10^{-5}$ (EE) up to Nside 1024, $9\times10^{-5}$ at 2048 and
+$2.4\times10^{-4}$ at 4096. At Nside 8192 the difference is below $10^{-3}$ for
+$\ell < 2N_{\rm side}$ and reaches $7\times10^{-3}$ in the highest bandpowers. It comes from GMaster's
+float32 latitudinal transforms (relative error ~$10^{-7}$), which set a floor on the tiny
+high-$\ell$ power of a smooth mask; decoupling carries that into the highest bandpowers. It therefore
+depends on the mask: for a Galactic cut apodized over 1 degree at Nside 1024 it is $3\times10^{-4}$
+below $\ell = 2N_{\rm side}$ and $2\times10^{-3}$ at $\ell \approx 3N_{\rm side}$. HEALPix analyses are
+usually restricted to $\ell \lesssim 2N_{\rm side}$ anyway. See
+[docs/architecture.md](docs/architecture.md#precision).
+
+Up to Nside 8192 the whole spin-2 estimator fits on one 96 GB GPU (peak 79 GiB); NaMaster needs
+138 GiB of host memory for it.
 
 The individual transforms (one `map2alm` pass and `alm2map`) are 1.3-3.6x faster than
 [SHTns](https://bitbucket.org/nschaeff/shtns)'s float64 GPU transforms on the same card from

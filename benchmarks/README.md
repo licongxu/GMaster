@@ -42,9 +42,17 @@ made from it by `plot_time_vs_nside.py` and `plot_memory_vs_nside.py`.
 | 4096 | 2 | 8.8 s | 215 s | 110 s |
 | 8192 | 2 | 57 s (one warm run) | 1658 s | 805 s |
 
-GMaster's decoupled spectra agree with NaMaster's (96 cores) to between $5\times10^{-7}$
-(Nside 64) and $7\times10^{-5}$ (Nside 4096) of the largest bandpower, and to $2.0\times10^{-4}$
-(spin 0) and $4.0\times10^{-5}$ (spin 2) at Nside 8192 (`agreement` in `results.json`).
+Agreement with NaMaster (96 cores), largest per-bandpower difference |GM/NM - 1| of TT (spin 0)
+and EE (spin 2), from `agreement` in `results.json`:
+
+| Nside | 256 | 512 | 1024 | 2048 | 4096 | 8192, $\ell < 2N_{\rm side}$ | 8192, all |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| TT | 1.8e-6 | 8.2e-6 | 3.0e-5 | 5.2e-5 | 1.5e-4 | 9.8e-4 | 7.1e-3 |
+| EE | 7.7e-6 | 2.1e-5 | 3.6e-5 | 9.0e-5 | 2.4e-4 | 9.6e-4 | 7.3e-3 |
+
+The difference grows with resolution and with multipole: GMaster's float32 transforms have a
+relative error of ~1e-7, which sets a floor on the (very small) high-multipole power of the
+smooth footprint mask, and the decoupling carries it into the highest bandpowers.
 
 ### Transforms, median of the warm runs
 

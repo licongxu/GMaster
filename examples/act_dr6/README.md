@@ -30,7 +30,8 @@ python examples/act_dr6/gmaster_vs_namaster.py --cache act_cache --nside 4096 --
 
 Runs the full MASTER estimator (TT, footprint mask, `n_iter=3`, bins of 50) in both codes on the
 same arrays, times the estimator calls only, and writes both spectra, their ratio and a figure.
-`--skip-namaster` runs GMaster only; `--exact` uses GMaster's all-float64 route.
+`--skip-namaster` runs GMaster only; `--exact` disables GMaster's float32 CUDA march
+(`GMASTER_MARCH_V2=0`).
 
 ## 3. A noise-free TT spectrum from two splits
 

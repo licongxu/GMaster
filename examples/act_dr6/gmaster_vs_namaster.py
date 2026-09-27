@@ -35,7 +35,7 @@ def main():
     ap.add_argument("--n-iter", type=int, default=3)
     ap.add_argument("--skip-namaster", action="store_true")
     ap.add_argument("--exact", action="store_true",
-                    help="GMaster's exact float64 route (no float32 march) instead of the default")
+                    help="disable the float32 CUDA march (GMASTER_MARCH_V2=0)")
     ap.add_argument("--repeats", type=int, default=2,
                     help="GMaster runs; the first includes JIT compilation, the last is reported")
     args = ap.parse_args()
@@ -137,7 +137,7 @@ def main():
             f"MASK={'full-sky ones' if args.full_sky else 'weight npy, same array for both estimators'}, "
             f"f_sky={float(np.mean(w > 0)):.4f}\n"
             f"nside={nside} lmax={lmax} nlb={nlb} n_iter={args.n_iter} spin=0 "
-            f"route={'exact fp64' if args.exact else 'default (float32 march)'}\n"
+            f"route={'GMASTER_MARCH_V2=0' if args.exact else 'default (float32 march)'}\n"
             f"t_gmaster={t_gm:.3f}s (runs: {', '.join(f'{t:.3f}' for t in t_gm_runs)}; "
             f"first includes JIT compilation)\n"
             f"t_namaster={t_nm_s} (cores={len(os.sched_getaffinity(0))})\n"
