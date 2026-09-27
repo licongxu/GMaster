@@ -1,3 +1,5 @@
+"""Coupling matrices and curved-sky workspaces against pymaster, plus the large-matrix code paths."""
+
 import os
 import subprocess
 
@@ -22,6 +24,7 @@ from gmaster.workspaces import (
 
 
 def test_public_coupling_helpers_match_namaster():
+    """get_general_coupling_matrix matches NaMaster for several spin pairs and every parity option."""
     reference = pytest.importorskip("pymaster")
     rng = np.random.default_rng(12)
     mask_cell = rng.uniform(size=8)
@@ -48,6 +51,7 @@ def test_public_coupling_helpers_match_namaster():
 def test_public_master_coefficients_match_namaster(
     spin1, spin2, is_teb, pure_any
 ):
+    """get_master_coefficients matches NaMaster for spin, TEB and purified combinations."""
     reference = pytest.importorskip("pymaster")
     rng = np.random.default_rng(11)
     mask_cells = rng.uniform(size=(2, 8))
@@ -67,6 +71,9 @@ def test_public_master_coefficients_match_namaster(
 
 
 def test_high_l_spin2_coefficients_match_namaster():
+    """Spin-0 x spin-2 coefficients stay close to NaMaster at lmax 255, where the recurrences
+    accumulate more rounding than at the small sizes above (hence the 2e-9 tolerance).
+    """
     reference = pytest.importorskip("pymaster")
     lmax = 255
     mask_cell = np.exp(-np.arange(2 * lmax + 1) / 40)
@@ -84,6 +91,7 @@ def test_high_l_spin2_coefficients_match_namaster():
                             (0, 2, True), (1, 3, False)]
 )
 def test_toeplitz_master_coefficients_match_namaster(spin1, spin2, is_teb):
+    """The Toeplitz approximation to the coupling coefficients matches NaMaster."""
     reference = pytest.importorskip("pymaster")
     rng = np.random.default_rng(18)
     mask_cell = rng.uniform(size=13)
@@ -98,6 +106,7 @@ def test_toeplitz_master_coefficients_match_namaster(spin1, spin2, is_teb):
 
 
 def test_selective_scalar_toeplitz_matches_full_kernel():
+    """The direct Toeplitz TT kernel equals the Toeplitz approximation applied to the full TT matrix."""
     lmax = 31
     options = dict(l_toeplitz=16, l_exact=4, dl_band=3)
     window = np.random.default_rng(19).uniform(size=2 * lmax + 1)
@@ -111,7 +120,7 @@ def test_selective_scalar_toeplitz_matches_full_kernel():
 
 
 def _shrinking_offset_tt(window_cls, lmax):
-    """Per-offset threej recurrence the chunked kernel must match."""
+    """Reference TT coupling matrix, summed offset by offset from the threej closed form."""
     n_ell = lmax + 1
     p = np.arange(1, 2 * lmax + 1, dtype=np.float64)
     log_g = np.concatenate([[0.0], np.cumsum(np.log((p - 0.5) / p))])
@@ -137,6 +146,9 @@ def _shrinking_offset_tt(window_cls, lmax):
 
 @pytest.mark.parametrize("lmax", [15, 16, 17, 31])
 def test_scalar_coupling_matches_per_offset_recurrence(lmax):
+    """The chunked TT coupling kernel matches a per-offset reference recurrence, including lmax
+    values on either side of a chunk boundary.
+    """
     window = np.random.default_rng(20 + lmax).uniform(size=2 * lmax + 1)
     nmt.set_coupling_precision("fp64")
     jax.clear_caches()
@@ -149,7 +161,7 @@ def test_scalar_coupling_matches_per_offset_recurrence(lmax):
 
 
 def _triangle_cuda_indexing(window_cls, lmax, *, use_f32):
-    """Host replica of ``gmaster/_native/cuda/coupling_tt.cu`` (upper triangle, f32 products)."""
+    """Host replica of ``gmaster/_native/cuda/coupling_tt.cu``: upper-triangle loop, optional float32 products."""
     n_ell = lmax + 1
     table_dtype = np.float64
     element_dtype = np.float32 if use_f32 else np.float64
@@ -181,6 +193,9 @@ def _triangle_cuda_indexing(window_cls, lmax, *, use_f32):
 
 
 def test_cuda_triangle_indexing_matches_per_offset_recurrence():
+    """A host replica of the CUDA TT kernel's triangle indexing matches the reference recurrence:
+    exactly in float64, and to 1e-5 relative with float32 products.
+    """
     lmax = 24
     window = np.random.default_rng(23).uniform(size=2 * lmax + 1)
     expected = _shrinking_offset_tt(window, lmax)
@@ -192,6 +207,7 @@ def test_cuda_triangle_indexing_matches_per_offset_recurrence():
 
 
 def test_coupling_tt_cuda_source_compiles_with_nvcc():
+    """The CUDA TT coupling kernel compiles with nvcc (skipped if nvcc is not installed)."""
     import shutil
     from pathlib import Path
 
@@ -216,7 +232,7 @@ def test_coupling_tt_cuda_source_compiles_with_nvcc():
 
 
 def test_scalar_coupling_jaxpr_does_not_grow_with_lmax():
-    """A Python chunk loop unrolls with n_ell; the scan HLO must not."""
+    """The TT recurrence lowers to a loop, so its program size does not grow with lmax."""
 
     def lowered(lmax):
         window = jax.numpy.ones(2 * lmax + 1)
@@ -229,6 +245,9 @@ def test_scalar_coupling_jaxpr_does_not_grow_with_lmax():
 
 
 def test_scalar_quadrature_tt_matches_recurrence():
+    """The Legendre-quadrature TT coupling matrix matches the threej recurrence, and the dispatched
+    builder matches it exactly at this small lmax.
+    """
     lmax = 31
     window = np.random.default_rng(22).uniform(size=2 * lmax + 1)
     nmt.set_coupling_precision("fp64")
@@ -249,7 +268,7 @@ def test_scalar_quadrature_tt_matches_recurrence():
 
 
 def test_dispatched_quadrature_tt_matches_recurrence():
-    """lmax >= 48 takes the Legendre GEMM; it must still match threej."""
+    """At lmax >= 48 the TT matrix is built by Legendre quadrature; it must still match the recurrence."""
     lmax = 63
     window = np.random.default_rng(24).uniform(size=2 * lmax + 1)
     nmt.set_coupling_precision("fp64")
@@ -264,6 +283,7 @@ def test_dispatched_quadrature_tt_matches_recurrence():
 
 
 def test_uncorrelated_noise_deprojection_bias_matches_namaster():
+    """The uncorrelated-noise deprojection bias of a spin-2 field with templates matches NaMaster."""
     reference = pytest.importorskip("pymaster")
     rng = np.random.default_rng(10)
     nside = 4
@@ -288,6 +308,9 @@ def test_uncorrelated_noise_deprojection_bias_matches_namaster():
 
 @pytest.mark.parametrize("normalization", ["MASTER", "FKP"])
 def test_scalar_workspace_matches_namaster(normalization):
+    """A spin-0 workspace with a beam matches NaMaster (coupling matrix, binned matrix, couple and
+    decouple, bandpower windows) under both MASTER and FKP normalisation.
+    """
     reference = pytest.importorskip("pymaster")
     rng = np.random.default_rng(13)
     nside = 4
@@ -330,6 +353,7 @@ def test_scalar_workspace_matches_namaster(normalization):
 
 
 def test_scalar_workspace_updates():
+    """Beams, bins and the coupling matrix of a workspace can be replaced, and bad shapes are rejected."""
     npix = 12 * 4**2
     lmax = 7
     field = nmt.NmtField(
@@ -349,6 +373,7 @@ def test_scalar_workspace_updates():
 
 
 def test_binning_caches_are_keyed_on_band_content():
+    """Binning operators are cached by band content (equal bins share them) and have the expected entries."""
     lmax = 7
     wide = nmt.NmtBin.from_lmax_linear(lmax, 2)
     equal = nmt.NmtBin.from_lmax_linear(lmax, 2)
@@ -379,6 +404,7 @@ def test_binning_caches_are_keyed_on_band_content():
 
 
 def test_bandpower_operators_are_rebuilt_when_bins_change():
+    """After update_bins the bandpower windows are those of a workspace built with the new bins."""
     npix = 12 * 4**2
     lmax = 7
     field = nmt.NmtField(
@@ -405,6 +431,7 @@ def test_bandpower_operators_are_rebuilt_when_bins_change():
                       ((3, 3), False), ((0, 3), True)]
 )
 def test_arbitrary_spin_workspaces_match_namaster(spins, is_teb):
+    """Workspaces for spin 1 and spin 3 fields, including a TEB case, match NaMaster."""
     reference = pytest.importorskip("pymaster")
     rng = np.random.default_rng(17)
     lmax = 7
@@ -433,6 +460,9 @@ def test_arbitrary_spin_workspaces_match_namaster(spins, is_teb):
     "spins,is_teb", [((0, 2), False), ((2, 0), False), ((2, 2), False), ((0, 2), True)]
 )
 def test_spin2_workspaces_match_namaster(spins, is_teb):
+    """Spin-0 x spin-2 and spin-2 x spin-2 workspaces (including TEB) match NaMaster, including
+    bandpower windows and couple/decouple.
+    """
     reference = pytest.importorskip("pymaster")
     rng = np.random.default_rng(14)
     nside = 4
@@ -481,6 +511,7 @@ def test_spin2_workspaces_match_namaster(spins, is_teb):
     "pure1,pure2", [((True, False), (False, True)), ((True, True), (True, True))]
 )
 def test_pure_spin2_workspaces_match_namaster(pure1, pure2):
+    """Workspaces between E- and/or B-purified spin-2 fields match NaMaster."""
     reference = pytest.importorskip("pymaster")
     healpy = pytest.importorskip("healpy")
     rng = np.random.default_rng(15)
@@ -522,6 +553,7 @@ def test_pure_spin2_workspaces_match_namaster(pure1, pure2):
 
 @pytest.mark.parametrize("spins", [(0, 2), (2, 0), (2, 2)])
 def test_anisotropic_workspaces_match_namaster(spins):
+    """Workspaces involving a spin-2 field with an anisotropic mask match NaMaster."""
     reference = pytest.importorskip("pymaster")
     rng = np.random.default_rng(16)
     nside = 4
@@ -578,6 +610,7 @@ def test_anisotropic_workspaces_match_namaster(spins):
 
 
 def test_deprojection_bias_and_full_master_match_namaster():
+    """Deprojection bias and compute_full_master for template-cleaned spin-0 fields match NaMaster."""
     reference = pytest.importorskip("pymaster")
     rng = np.random.default_rng(17)
     nside = 4
@@ -621,6 +654,7 @@ def test_deprojection_bias_and_full_master_match_namaster():
 
 
 def test_pure_spin2_deprojection_bias_matches_namaster():
+    """Deprojection bias for a B-purified spin-2 field with templates matches NaMaster."""
     reference = pytest.importorskip("pymaster")
     healpy = pytest.importorskip("healpy")
     rng = np.random.default_rng(18)
@@ -648,6 +682,7 @@ def test_pure_spin2_deprojection_bias_matches_namaster():
 
 
 def test_workspace_fits_interoperability(tmp_path):
+    """Workspace FITS files written by GMaster load in pymaster, and files written by pymaster load in GMaster."""
     reference = pytest.importorskip("pymaster")
     npix = 12 * 4**2
     lmax = 7
@@ -682,11 +717,10 @@ def test_workspace_fits_interoperability(tmp_path):
 
 
 def test_spin2_pipeline_survives_releasing_the_first_field():
-    """The Nside-4096 spin-2 bench must drop the compile-time field before the warm run.
+    """Building a second spin-2 pipeline after deleting the first gives the same finite result.
 
-    Holding the first field+workspace while building a second one is what OOM'd the
-    overlapping stage timings (8 GiB chirp-Z with 70.9/71.2 GiB in use).  Two
-    sequential pipelines after deleting the first must both finish finite.
+    Large (e.g. Nside 4096) runs must be able to release one field and workspace before
+    building the next; this checks that doing so leaves no state behind.
     """
     rng = np.random.default_rng(21)
     nside, lmax = 8, 16
@@ -711,10 +745,10 @@ def test_spin2_pipeline_survives_releasing_the_first_field():
 
 
 def test_nside4096_spin2_matrix_exceeds_the_pieced_threshold():
-    """The Nside-4096 spin-2 operator is past `_MCM_PIECED_BYTES`; small cells are not.
+    """The Nside 4096 spin-2 coupling matrix is above `_MCM_PIECED_BYTES`; small ones are not.
 
-    `ncls=4`, `lmax=12287` is `5.4e9` elements, past `2**31` (the NaMaster segfault)
-    and past the 4 GiB pieced-assembly gate.  A nside-4 auto-spectrum is not.
+    With `ncls=4` and `lmax=12287` the matrix has 2.4e9 elements (19 GB), past both the 2**31
+    element limit and the 4 GiB threshold for piecewise assembly.
     """
     ncls, lmax = 4, 3 * 4096 - 1
     n = ncls * (lmax + 1)
@@ -724,11 +758,10 @@ def test_nside4096_spin2_matrix_exceeds_the_pieced_threshold():
 
 
 def test_pieced_coupling_matrix_matches_dense_and_decouples(monkeypatch):
-    """Forcing the Nside-4096 `_RowPieces` path at nside=4 keeps NaMaster agreement.
+    """The row-pieced coupling matrix used for very large sizes agrees with the dense one.
 
-    `_assemble_mcm` is Python-gated on `_MCM_PIECED_BYTES`.  Zeroing the gate takes
-    the shipped piece assembly, `couple_cell`, `decouple_cell` and
-    `get_coupling_matrix` at a geometry the suite already compares to pymaster.
+    Setting `_MCM_PIECED_BYTES` to zero forces `_RowPieces` assembly at Nside 4; the matrix,
+    `couple_cell` and `decouple_cell` must then match the dense workspace.
     """
     monkeypatch.setattr(ws, "_BLOCK_MCM", False)
     rng = np.random.default_rng(14)
@@ -765,10 +798,9 @@ def test_pieced_coupling_matrix_matches_dense_and_decouples(monkeypatch):
 
 
 def test_chunked_left_contract_matches_single_gemm(monkeypatch):
-    """The 4 GiB GEMM split is the same product as `output @ mcm`, up to summation order.
+    """Splitting `output @ mcm` into column chunks gives the same product up to summation order.
 
-    `n=32` has a divisor at every power of two, so a threshold that asks for
-    three chunks still finds `nchunk=4` rather than walking off `range(target, n+1)`.
+    With `n=32` a threshold asking for three chunks must round up to a divisor (four chunks).
     """
     rng = np.random.default_rng(0)
     n, n_out = 32, 5
@@ -783,7 +815,7 @@ def test_chunked_left_contract_matches_single_gemm(monkeypatch):
 
 
 def test_large_wigner_cache_is_dropped_above_keep_bytes(monkeypatch):
-    """A quadrature cache past the keep threshold is forgotten after the workspace."""
+    """A Wigner-d quadrature cache larger than the keep threshold is dropped after use."""
     monkeypatch.setattr(ws, "_wd_cache_keep_bytes", lambda: 1)
     ws._WD_TRIPLE_CACHE[("probe",)] = jax.numpy.zeros(8)
     ws._drop_large_wigner_cache()
@@ -792,10 +824,10 @@ def test_large_wigner_cache_is_dropped_above_keep_bytes(monkeypatch):
 
 @pytest.mark.parametrize("pure_b", [False, True])
 def test_block_coupling_matrix_matches_dense(monkeypatch, pure_b):
-    """The polarised matrix held as distinct blocks (`_BlockMCM`) is the dense matrix.
+    """The spin-2 coupling matrix stored as distinct blocks (`_BlockMCM`) behaves as the dense matrix.
 
-    Its contraction, matvec and dense form replace the dense matrix's; everything downstream
-    (`get_coupling_matrix`, `decouple_cell`, `couple_cell`) must agree with the dense path.
+    The dense form, `decouple_cell`, `couple_cell` and bandpower windows must all agree
+    with the dense path, with and without B-purification.
     """
     rng = np.random.default_rng(15)
     nside, lmax = 8, 23

@@ -1,58 +1,48 @@
-"""Precomputed Wigner-d slice for the polarised (spin != 0) latitudinal step.
+"""Spin-s latitudinal transform with precomputed Wigner-d slabs (small band limits).
 
-The generic s2fft latitudinal step recurses over ``m`` inside a ``lax.fori_loop``
-and scatters every ``m`` slice into ``dl``/``flm`` with a dynamic row index. That
-is scatter- and latency-bound: ~194 ms per call at nside 256, paid seven times per
-polarised field (one analysis plus three refinement analyse+synthesise rounds).
-
-On HEALPix the latitudinal step is a *single* contraction against the
-``m' = -spin`` slice of the Wigner-d matrix -- one ``m'``, no sum over ``m'``:
+The generic s2fft latitudinal step recurses over ``m`` in a ``lax.fori_loop`` and
+scatters each ``m`` slice with a dynamic row index, which is scatter- and
+latency-bound.  On HEALPix the step is a *single* contraction against the
+``m' = -spin`` slice of the Wigner-d matrix (one ``m'``, no sum over ``m'``):
 
     flm[ell, L-1+m] = sum_theta slice[theta, ell, m] * ftm[theta, L+m]
 
-(the ``+1`` on the ftm column is s2fft's HEALPix Fourier padding). Verified exact
-against ``healpix._forward_latitudinal`` to <1e-15 for spin +/-2 and +/-1 -- the path
-that already agrees with NaMaster -- and its transpose reproduces the synthesis
-step to the same accuracy.
+(the ``+1`` column offset on ``ftm`` is s2fft's HEALPix Fourier padding).  This
+agrees with ``healpix._forward_latitudinal`` to <1e-15 for spin +/-1 and +/-2,
+and its transpose reproduces the synthesis step to the same accuracy.  The slice
+is built once per geometry with a scatter-free ``lax.scan`` and cached on the
+device, so each transform is one memory-bound contraction (roughly 15-25x
+cheaper per call than the generic step).
 
-So the slice is built once per geometry with a scatter-free ``lax.scan`` and every
-transform afterwards is one memory-bound contraction, 15-25x cheaper per call.
+Layouts.  The contraction is diagonal in ``m`` (a batched matvec, not a GEMM),
+so speed is set by which axis is innermost: analysis reduces over ``theta`` and
+synthesis over ``ell``.  Two layouts are kept when memory allows:
+``THETA_CONTIG`` ``(m, ell, theta)`` for analysis and ``ELL_CONTIG``
+``(m, theta, ell)`` for synthesis.
 
-The contraction is diagonal in ``m`` (a batched matvec, not a GEMM): the row
-holding ``d^ell_{m,-spin}`` pairs with exactly one ``m`` column of ``ftm``, and
-each contiguous run of the reduction is one ``theta``.  So what decides the speed
-is which axis the buffer lays out innermost, not how big it is -- analysis reduces
-over ``theta``, synthesis over ``ell``, and making both directions reduce over a
-contiguous axis costs memory, not time (1.7 ms vs 6.0 ms per call at nside 128 for
-the strided spelling).
+Two storage reductions make the tables fit:
 
-Two independent shrinkages make the table fit.  Storing only the ``ell >= |m|``
-triangle of each layout -- the head below it is identically zero -- costs nothing in
-speed (12.1 vs 11.5 ms on analysis, 9.3 vs 9.3 ms on synthesis at nside 256) and saves
-1.85x of the bytes.  Storing only *non-negative orders* then halves what is left:
-for every order except ``m = 0``,
+* Only the ``ell >= |m|`` triangle is stored, per window of orders (the rows
+  below are identically zero): about 1.85x fewer bytes at no speed cost.
+* Only non-negative orders are stored.  For every ``m != 0``
 
-    d^l_{m,-spin}(pi - theta) = (-1)**(l + spin) * d^l_{-m,-spin}(theta)
+      d^l_{m,-spin}(pi - theta) = (-1)**(l + spin) * d^l_{-m,-spin}(theta)
 
-measured on the built slice over every row at spin 1 and 2 (worst per-row relative
-residue 2.3e-12).  The HEALPix ring grid is symmetric about pi/2 to 4e-15, so
-``theta -> pi - theta`` is exactly the ring reversal ``i -> ntheta-1-i``, and one
-stored row serves both ``+m`` and ``-m`` -- see :func:`forward_latitudinal`.
-``m = 0`` is its own mirror and does *not* satisfy the relation (residue 1.33 at spin
-2, 2.00 at spin 1), which is why an earlier whole-table residue test recorded this
-shortcut as absent.  The reconstruction is not free internally: against a float128
-oracle the full slab is 8e-16 / 1e-15 (analysis / synthesis) and the reconstructed
-path 1.5e-12 / 1.2e-11, because the two halves of the s2fft march agree only to
-~1e-13.  End to end it is invisible -- the pipeline's ``rel`` against NaMaster is
-identical either way.
+  (checked on the built slice to 2.3e-12 relative per row at spin 1 and 2).  The
+  HEALPix rings are symmetric about pi/2 to 4e-15, so ``theta -> pi - theta`` is
+  the ring reversal ``i -> ntheta-1-i`` and one stored row serves both ``+m`` and
+  ``-m`` (see :func:`forward_latitudinal`).  ``m = 0`` is its own mirror and does
+  *not* satisfy the relation, so only the direct channel writes it.  Against a
+  float128 reference the reconstructed half is accurate to ~1e-12 (vs ~1e-15 for
+  a full slab), because the two halves of the s2fft recursion agree only to
+  ~1e-13; the effect on the final power spectra is negligible.
 
-Net at nside 512 (lmax = 3*nside): a layout pair is 37.48 GiB instead of the 143.9 GiB
-two full slabs need, and at nside 256 it is 4.87 GiB instead of 18.  Both layouts still
-fit through 512; 640 gets one layout (36.31 GiB); 768 (62.42) and 1024 (146.96) are
-declined, so those sizes keep the generic scatter loop -- the table is cubic in nside
-and no further shrinking reaches 1024 on one card.  When only one layout fits, synthesis
-pays 2.1x reducing over a strided axis (19.2 vs 9.3 ms at nside 256) -- still ~10x
-cheaper than the scatter loop it replaces.  See :func:`slabs_for`.
+Memory (lmax = 3*nside, float64 storage): both layouts together are 4.9 GiB at
+nside 256 and 37.5 GiB at nside 512; nside 640 gets one layout (36.3 GiB); nside
+768 (62.4 GiB per layout) and above are declined and use the generic scatter
+loop.  The table grows as nside^3.  When only one layout fits, synthesis reduces
+over a strided axis at about 2.1x the cost, still ~10x cheaper than the scatter
+loop.  See :func:`slabs_for`.
 """
 
 import gc
@@ -70,20 +60,18 @@ from gmaster._sht.cuda_gpu import on_cuda_gpu
 THETA_CONTIG = "theta_contig"  # (m, ell, theta) -- analysis reduces over theta
 ELL_CONTIG = "ell_contig"  # (m, theta, ell) -- synthesis reduces over ell
 
-# Which contraction the latitudinal step runs.  `pallas` reads the slice *once* and
-# holds the four real channels in register accumulators (`_spin_contract_pallas`);
-# `xla` keeps the multiply-and-reduce form, whose four channel products XLA walks
-# the block set with separately.  `pallas` is the default wherever
-# :func:`_kernel_contract` applies -- float32 tables on an NVIDIA GPU -- and within
-# that regime there is no silent fallback: the kernel is used or the call raises,
-# because a swallowed exception here is what made the session-18 band emitter look
-# green while every band came from the old builder.
-# `GMASTER_POLAR_CONTRACT=xla` (or `set_polar_contract("xla")`) is the supported way back.
+# Contraction used by the latitudinal step, from GMASTER_POLAR_CONTRACT.  "pallas"
+# (default) reads each block once and holds the four real channels in register
+# accumulators (`gmaster._sht.spin_contract`); "xla" uses the multiply-and-reduce
+# form.  "pallas" applies wherever :func:`_kernel_contract` allows (float32 tables on
+# an NVIDIA GPU), and there it has no silent fallback: the kernel runs or the call
+# raises, so a kernel failure is never masked.  Use GMASTER_POLAR_CONTRACT=xla or
+# `set_polar_contract("xla")` to select the XLA form.
 _CONTRACT = os.environ.get("GMASTER_POLAR_CONTRACT", "pallas").strip().lower()
 
 
 def set_polar_contract(name):
-    """Select the latitudinal contraction: ``"pallas"`` (default) or ``"xla"``."""
+    """Select the latitudinal contraction, ``"pallas"`` (default) or ``"xla"``; return the previous one."""
     global _CONTRACT
     name = name.strip().lower()
     if name not in ("pallas", "xla"):
@@ -100,22 +88,19 @@ def polar_contract():
 
 @lru_cache(maxsize=1)
 def _pallas_ok():
-    """True on a CUDA GPU. Colab reports ``Tesla T4`` without ``NVIDIA``."""
+    """True on a CUDA GPU (some devices, e.g. ``Tesla T4``, omit ``NVIDIA``)."""
     return on_cuda_gpu()
 
 
 def _kernel_contract(slab, *, synthesis=False):
     """Whether the fused Triton contraction should serve this block set.
 
-    Three conditions, all measured:
+    All of the following must hold:
 
-    * **float32 storage.**  The kernel is a bandwidth design; with float64 tables the
-      products have to be float64, and Triton's float64 path on this card does not
-      reach XLA's -- 0.93 ms against 0.79 on analysis and 1.15 against 0.76 on
-      synthesis at Nside 128, 0.85x and 0.66x, control 1459 GB/s
-      (`.qwen/tmp/spin_contract_tune10_fp64.log`).  The default ``fp64`` configuration
-      therefore keeps the form it always used; the win belongs to
-      ``set_table_precision("fp32")``, like every other win in this project.
+    * **float32 storage.**  The kernel is bandwidth-oriented; with float64 tables
+      Triton's float64 path is slower than XLA's (about 0.85x on analysis and
+      0.66x on synthesis), so the default float64 configuration keeps the XLA
+      form and the kernel is used with ``set_table_precision("fp32")``.
     * **an NVIDIA GPU** (Triton), see :func:`_pallas_ok`.
     * **for synthesis, the ``(m, theta, ell)`` layout.**  The kernel reduces along the
       block's last axis; when :func:`slabs_for` could afford only the analysis layout,
@@ -129,74 +114,52 @@ def _kernel_contract(slab, *, synthesis=False):
 
 
 _CACHE = {}
-# Geometries whose build the pool refused.  Without this every latitudinal pass of a
-# pipeline re-attempts a multi-gigabyte build that just failed: the Nside 1024
-# float32 spin-2 pipeline spent 142 s per rep (.qwen/tmp/score_n1024_spin2_98.log,
-# ten `Allocator ran out of memory trying to allocate 2.69GiB` warnings, one block of
-# one window) instead of taking the generic loop in 6 s.  Dropped by `clear_cache`,
-# which is the call that reclaims the room.
+# Geometries whose build ran out of device memory.  Without this every latitudinal
+# pass of a pipeline would retry a multi-gigabyte build that just failed instead of
+# going straight to the generic loop.  Cleared by `clear_cache`.
 _BUILD_FAILED = set()
 _MAX_GEOMETRIES = 2
-# One windowed layout is the ``ell >= lo`` triangle of the slab, one block per
-# ``m``-window: 0.65 GiB at nside 128, 4.9 at 256, 37 at 512, 125 at 768
-# (lmax = 3*nside).  Both layouts are built while the pair fits, and one layout is
-# still worth far more than the generic scatter loop, so the budget admits 512
-# (37 GiB against a 71 GiB pool) and refuses 768.
+# Budget for the stored tables.  One windowed layout (float64, lmax = 3*nside) is
+# about 2.4 GiB at nside 256, 18.7 at 512, 36.3 at 640 and 62.4 at 768.  Both
+# layouts are built while the pair fits; a single layout is still far faster than
+# the generic scatter loop, so the budget admits one layout at 640 and refuses 768.
 _SLAB_BUDGET = 56 * 1024**3
-# Target size for the transient tables the build materialises per theta chunk; the
-# march cannot be split along ``m`` (see `_build_triangles`).  Smaller chunks look
-# cheaper and are not: at nside 512 a 2 GiB target makes 36 pieces per window, the
-# pool fills with 40 MB blocks, and the join then fails to find one contiguous
-# 1.3 GiB.  A 6 GiB target (12 pieces per window) builds the same 37.5 GiB layout
-# with the peak at 41 GiB.
+# Target size of the transient table built per theta chunk (the march cannot be
+# split along ``m``; see `_build_triangles`).  Smaller targets fragment the pool into
+# many small blocks so that the per-window join later fails to find contiguous space;
+# 6 GiB keeps the nside 512 build peak at about 1.1x the layout size.
 _BUILD_CHUNK_TARGET = 6 * 1024**3
-# Chunks built before the compilation caches are dropped mid-build.  The march is one
-# jit reused over every chunk, and a cached executable pins the buffers it last
-# produced, so without this two chunk tables are alive at once: the Nside 1024
-# float32 layout measured a peak of 86.2 GiB against 73.5 declared, and the excess is
-# almost exactly two 6 GiB float64 chunk tables.
+# Chunks built between `jax.clear_caches()` calls.  The march is one jit reused for
+# every chunk and a cached executable pins the buffers it last produced, so without
+# periodic clearing extra chunk tables stay alive and raise the peak.
 _BUILD_CLEAR_EVERY = 8
-# Headroom required on top of the layout before the build is approved: the chunk
-# table and its per-window copies are alive while the finished blocks accumulate
-# (measured peak/declared: 41.0/37.5 at nside 512, 86.2/73.5 at Nside 1024 float32 --
-# about two float64 chunk tables), the rest of the pipeline holds maps and coupling
-# matrices, and a pool that is nominally large enough but fragmented still refuses a
-# 1.6 GiB block.  It is also what keeps Nside 1024 spin 2 off a pool it cannot share:
-# 73.48 GiB in float32, and every pool tried so far refuses the build -- fractions
-# 0.95 (90.2 GiB) and 0.98 (93.0 GiB), `_BUILD_RESERVE` 16/10/6,
-# `TF_GPU_ALLOCATOR=cuda_malloc_async`, `PREALLOCATE=false` -- always on a ~2.7 GiB
-# request (exactly one joined window block) with the peak at 86.8 GiB and
-# `largest_free_block_bytes: 0`. The pipeline then runs the generic polar loop at 87 s:
-# every logged Nside 1024 spin-2 cell is 0.02-0.04x
-# (.qwen/tmp/score_n1024_spin2_halfmarch.log).
+# Free device memory required on top of the layout before a build is attempted.  It
+# covers the chunk table and its per-window copies during the build (the peak is
+# about the layout plus two float64 chunk tables), the rest of the pipeline (maps,
+# coupling matrices), and fragmentation: a pool with enough free bytes in total can
+# still refuse a single block of a few GiB.
 _BUILD_RESERVE = 16 * 1024**3
-# Row ``L-1+m`` of a slab holds ``d^ell_{m,-spin}``, which vanishes for ``ell <
-# |m|`` -- just under half the buffer, streamed on every polarised transform.  A
-# contiguous block of rows shares the bound ``lo = min |m|`` in the block, so the
-# contraction reads only ``[lo, L)`` (see :func:`forward_latitudinal`).  64 skips
-# 42% of the bytes and measures 1.67x on analysis / 1.60x on synthesis at nside
-# 128; 16-row blocks skip 48% but pay 4x the kernels and give only 1.34x/1.20x.
+# Width of the m-windows of the stored slabs (GMASTER_M_BLOCK).  ``d^ell_{m,-spin}``
+# vanishes for ``ell < |m|`` (just under half the full slab), and all rows in a
+# window share ``lo = min |m|``, so the contraction reads only ``ell`` in ``[lo, L)``
+# (see :func:`forward_latitudinal`).  64 skips 42% of the bytes (about 1.6x faster);
+# 16 skips 48% but the 4x kernel count makes it slower overall.
 _M_BLOCK = int(os.environ.get("GMASTER_M_BLOCK", "64"))
-# Width for the table-free marched routes, which have no stored slab and therefore no byte-skip
-# argument at all: for them the window is only how the same program count is split across launches
-# (``L/mb`` launches of ``mb * ntile`` programs, one program per ``(m, theta tile)`` pair).  128 is
-# used there up to a per-launch program ceiling, above which it measures 0.94-0.96x; see
-# :func:`gmaster._spin_march_pallas._march_windows` for the full measured table.  256 is worse than
-# 128 even where 128 wins (316.0 vs 300.8 ms on the folded spin-0 analysis at nside 2048) because the
-# per-window padded right-hand side doubles with the width, and 32 is much worse (634 ms).  The
-# stored-slab sweep that chose 64 (``HANDOFF`` "``_M_BLOCK`` ... is not a lever") is a different
-# route: there wider means reading more of the ``ell < |m|`` half.
+# Order-window width for the table-free marched routes (GMASTER_MARCH_M_BLOCK).  With
+# no stored slab there are no bytes to skip; the width only sets how the programs,
+# one per ``(m, theta tile)``, are split across ``L/mb`` launches.  128 is best up to
+# a per-launch program ceiling: 256 doubles the padded per-window right-hand side and
+# 32 multiplies the launches.  Both are slower.  See
+# :func:`gmaster._sht.spin_march._march_windows`.  (The stored-slab width above is a
+# separate choice, where a wider window reads more of the zero ``ell < |m|`` region.)
 _MARCH_M_BLOCK = int(os.environ.get("GMASTER_MARCH_M_BLOCK", "128"))
-# Ceiling for the order window of the *folded spin-0 synthesis* launch, which is the one marched
-# route with few enough theta tiles to fill the program ceiling with a wide window: `_ST0` gives it 4
-# tiles at 2048 and 8 at 4096, where the analysis route has 16 and 32.  Worth 1.14x at 2048 (246.3 ->
-# 215.6 ms, a 512-wide window over those 4 tiles) and 1.06x at 4096 (1740.0 -> 1649.2 ms, where the
-# ceiling itself holds the window to 256), `rel alm` unchanged (`.qwen/tmp/s29z.log` against
-# `.qwen/tmp/swinf_s29.log`).  Raising the global `_MARCH_M_BLOCK` cannot reach them -- the analysis
-# overflows the ceiling first and silently drops to `_M_BLOCK`, which is 1.37x worse there
-# (`.qwen/tmp/s29y.log`: the 256 arm at nside 2048 reads 405.3 ms on `map2alm`, i.e. the 64-window
-# value, not a 256-window one).  See
-# :func:`gmaster._spin_march_pallas._synth_windows` for the rule and its measured table.
+# Upper bound on the order window of the folded spin-0 *synthesis* launch
+# (GMASTER_MARCH_M_SYNTH0_MAX).  That route has few theta tiles (`_ST0` gives 4 at
+# nside 2048, 8 at 4096), so a wider window is needed to fill the program ceiling:
+# about 1.14x at nside 2048 and 1.06x at 4096, with unchanged alms.  Raising
+# `_MARCH_M_BLOCK` instead would not help, because the analysis route then exceeds
+# the ceiling and falls back to `_M_BLOCK`.  See
+# :func:`gmaster._sht.spin_march._synth_windows`.
 _MARCH_M_SYNTH0_MAX = int(os.environ.get("GMASTER_MARCH_M_SYNTH0_MAX", "512"))
 _WINDOW_CACHE = {}
 
@@ -204,17 +167,16 @@ _WINDOW_CACHE = {}
 def _windows(L, block=None):
     """``(m0, m1, lo)`` per stored window of *non-negative* orders.
 
-    Only orders ``0..L-1`` are stored.  ``T[m, pi-theta, ell] == (-1)**(ell - m') *
-    T[-m, theta, ell]`` -- measured over every row at spin 1 and 2, exact to
-    2.3e-12 relative -- makes the negative rows redundant, and each stored row is
-    then contracted twice in one pass: straight, and against the sky map with its
-    rings reversed (see :func:`forward_latitudinal`).  ``lo = m0`` because within a
-    window of non-negative orders the smallest ``|m|`` is the first one, and
-    ``d^ell_{m,-spin}`` vanishes below ``ell = |m|``.
+    Only orders ``0..L-1`` are stored: ``T[m, pi-theta, ell] == (-1)**(ell - m') *
+    T[-m, theta, ell]`` (``m != 0``) makes the negative rows redundant, and each
+    stored row is contracted twice in one pass, directly and against the
+    ring-reversed map (see :func:`forward_latitudinal`).  ``lo = m0`` because the
+    first order in a window has the smallest ``|m|`` and ``d^ell_{m,-spin}``
+    vanishes below ``ell = |m|``.
 
-    ``block`` overrides the width for callers that never see a slab (the table-free marches,
-    :data:`_MARCH_M_BLOCK`); every stored layout uses :data:`_M_BLOCK` so that the builder, the
-    budget and the contraction stay in agreement.
+    ``block`` overrides the width for the table-free marches
+    (:data:`_MARCH_M_BLOCK`); every stored layout uses :data:`_M_BLOCK` so that the
+    builder, the budget and the contraction agree.
     """
     block = _M_BLOCK if block is None else block
     cached = _WINDOW_CACHE.get((L, block))
@@ -291,15 +253,11 @@ def _march(theta_trig, half_slice, cpi, cp2, vsign_rows, lrenorm, indices, L, wh
 def _build(theta, L, spin):
     """(L, ntheta, L) slice of the Wigner-d matrix at m' = -spin, orders ``m >= 0``.
 
-    Row ``m`` holds ``d^l_{m,-spin}(theta)`` for every theta and ell.  The negative
-    orders are not marched: :func:`forward_latitudinal` reconstructs them with
-    ``T[m, pi-theta, ell] == (-1)**(ell-spin) * T[-m, theta, ell]``, so the old
-    ``(2L-1, ...)`` table's first ``L-1`` rows were never read by
-    :func:`_build_triangles`, which slices the non-negative window rows.  Dropping
-    that march halves the build work and the chunk table -- at Nside 1024 float32,
-    3 GiB off a peak that was refusing the layout.  Row 0 is the m = 0 row, which
-    both marches produce; as before it is the ``which=1`` copy, matching the generic
-    path's loop order.
+    Row ``m`` holds ``d^l_{m,-spin}(theta)`` for every theta and ell.  Negative
+    orders are not marched, since :func:`forward_latitudinal` reconstructs them
+    with ``T[m, pi-theta, ell] == (-1)**(ell-spin) * T[-m, theta, ell]``; this
+    halves the build work and the chunk table.  Row 0 (m = 0) is taken from the
+    ``which=1`` march, matching the generic path's loop order.
     """
     mm = -spin
     el = jnp.arange(L, dtype=jnp.float64)
@@ -320,9 +278,8 @@ def _table_bytes(ntheta, L):
 def triangle_bytes(nside, L, dtype=jnp.float64):
     """Bytes of one windowed layout: one block per m-window holding ``ell >= lo``.
 
-    ``dtype`` is the table *storage* precision (`set_table_precision`), which is
-    what the fit test has to count; the march that generates the values is always
-    float64.
+    ``dtype`` is the table *storage* precision (`set_table_precision`); the march
+    that generates the values is always float64.
     """
     ntheta = 4 * nside - 1
     itemsize = jnp.dtype(dtype).itemsize
@@ -345,10 +302,9 @@ class _BlockSet(tuple):
         return self
 
 
-# The block set travels through `jax.jit` boundaries as an argument, so it has to
-# be a container of array leaves (like the single slab it replaces) with the layout
-# and spin as aux data.  An unregistered tuple subclass is treated as a non-array
-# leaf and the trace rejects it.
+# The block set is passed through `jax.jit` boundaries, so it is registered as a
+# pytree of array leaves with layout and spin as aux data; an unregistered tuple
+# subclass would be treated as a non-array leaf and rejected by the trace.
 jax.tree_util.register_pytree_node(
     _BlockSet,
     lambda slab: (tuple(slab), (slab.layout, slab.spin)),
@@ -359,16 +315,17 @@ jax.tree_util.register_pytree_node(
 def _build_triangles(theta, L, spin, want_theta, want_ell, store=jnp.float64):
     """Per-m-window triangles (``ell >= lo``) in the requested layouts.
 
-    The march recurses over ``m``, so a window's rows cannot be produced without
-    their predecessors and one call always materialises the full slab.  It *can*
-    run over a subset of theta (the recurrence is independent per ring), so the
-    build walks theta in chunks and copies each window's triangle out immediately:
-    peak memory is the accumulated blocks plus two chunk tables instead of the
-    full slab plus its transpose.  Chunk lengths are uniform so the march
-    compiles once.
+    Returns a dict mapping `THETA_CONTIG` and/or `ELL_CONTIG` to a `_BlockSet`.
 
-    ``+ 0.0`` forces a real buffer: a bare transpose can stay a view, which is
-    exactly the layout the contraction punishes.
+    The march recurses over ``m``, so a window's rows need all their predecessors
+    and each call produces the full slab.  The recurrence is independent per ring,
+    so the build walks theta in chunks and copies each window's triangle out
+    immediately: peak memory is the accumulated blocks plus about two chunk tables
+    rather than the full slab plus its transpose.  Chunks have uniform length so
+    the march compiles once.
+
+    ``+ 0.0`` forces a real buffer: a bare transpose can remain a view, which the
+    contraction would then read strided.
     """
     ntheta = len(theta)
     chunks = max(1, -(-_table_bytes(ntheta, L) // _BUILD_CHUNK_TARGET))
@@ -390,12 +347,10 @@ def _build_triangles(theta, L, spin, want_theta, want_ell, store=jnp.float64):
             # Row m holds order m; the negative half is reconstructed from it.
             sub = table[m0:m1, :nvalid, lo:]
             if want_theta:
-                # The cast and the transpose go in one kernel: an fp32 copy of the
-                # slice followed by a transposed copy of *that* is two buffers per
-                # window per chunk, and it is the second one that made the Nside
-                # 1024 float32 build peak ~12 GiB above the layout it was writing.
-                # `astype` materialises, so the fp32 path needs no `+ 0.0`; the
-                # fp64 path does, because a bare transpose can stay a view.
+                # Transpose first, then cast, so only one new buffer is created per
+                # window per chunk.  `astype` materialises, so the fp32 path needs
+                # no `+ 0.0`; the fp64 path does, because a bare transpose can stay
+                # a view.
                 out = sub.transpose(0, 2, 1)
                 out = out.astype(store) if store != jnp.float64 else out + 0.0
                 theta_pieces[i].append(out)
@@ -405,26 +360,22 @@ def _build_triangles(theta, L, spin, want_theta, want_ell, store=jnp.float64):
                 ell_pieces[i].append(out)
                 pieces.append(out)
         del table
-        # Dispatch is asynchronous, so without this the chunk tables of every
-        # chunk stay alive at once -- tens of GiB of live buffer at nside 512
-        # instead of one chunk's worth on top of the finished blocks.
+        # Dispatch is asynchronous; without this wait every chunk's table could be
+        # alive at once instead of one chunk on top of the finished blocks.
         for arr in pieces:
             arr.block_until_ready()
-        # ... and a cached executable pins the buffers it produced, so with `chunks`
-        # programs alive the peak is the layout plus a second copy of every chunk:
-        # 86.2 GiB against the 73.5 GiB declared at Nside 1024 float32.  The program
-        # is identical from chunk to chunk (uniform lengths, static L/spin only), so
-        # dropping it periodically costs one recompile per clear and returns the peak
-        # to the layout plus one chunk.  Same trick as `_theta_matrix._band`.
+        # A cached executable pins the buffers it produced.  The program is the same
+        # for every chunk (uniform lengths, static L/spin), so clearing periodically
+        # costs one recompile per clear and keeps the peak at the layout plus one
+        # chunk.  Same approach as `theta_matrix._band`.
         if chunks > _BUILD_CLEAR_EVERY and (i_chunk + 1) % _BUILD_CLEAR_EVERY == 0:
             jax.clear_caches()
 
     def join(parts, axis):
-        """Join one window's chunks, releasing them as soon as the join lands.
+        """Join each window's chunks, releasing them as soon as the join completes.
 
-        Joining every window first would hold the chunk copies and the finished
-        blocks at once -- twice the layout, which is the memory this whole build
-        exists to avoid.
+        Joining all windows before releasing would hold the chunks and the
+        finished blocks at once, i.e. twice the layout.
         """
         joined = []
         for part in parts:
@@ -436,12 +387,9 @@ def _build_triangles(theta, L, spin, want_theta, want_ell, store=jnp.float64):
 
     out = {}
     if want_theta:
-        # Drop the chunk programs before the join.  A cached executable keeps the
-        # buffers it produced alive, and here those buffers are the *pieces* of the
-        # layout: at Nside 1024 float32 the pieces alone are 73.5 GiB, so the first
-        # window join (`2.69 GiB`, `.qwen/tmp/score_n1024_spin2_98.log`, peak 87.7 of
-        # a 93.0 GiB pool, `largest_free_block_bytes: 0`) is refused while 73.5 GiB of
-        # data nothing will read again sits pinned.
+        # Drop the chunk programs before the join: their cached executables pin
+        # the pieces being joined, which would otherwise stay alive alongside the
+        # joined blocks and can make the join run out of memory.
         jax.clear_caches()
         out[THETA_CONTIG] = _BlockSet(join(theta_pieces, 2), THETA_CONTIG, spin)
     if want_ell:
@@ -452,10 +400,10 @@ def _build_triangles(theta, L, spin, want_theta, want_ell, store=jnp.float64):
 def _build_or_none(theta, L, spin, want_theta, want_ell, store=jnp.float64):
     """Build the block sets; release everything reclaimable and retry once on OOM.
 
-    A pool can hold enough bytes in aggregate and still refuse a 1.6 GiB block, and
-    the reclaimable memory in the process is usually somebody else's table.  A
-    second refusal means the geometry genuinely does not fit here, so the caller
-    takes the generic scatter loop instead of dying.
+    A pool can have enough free bytes in total and still refuse a large block; the
+    retry first drops this module's cache and the scalar Legendre band
+    (`theta_matrix.release`).  Returns None if the second attempt also fails, so
+    the caller uses the generic scatter loop.
     """
     for attempt in (0, 1):
         try:
@@ -481,9 +429,7 @@ def _blocked(array):
 def _pool_headroom():
     """Bytes free in the active JAX pool, or +inf when the device won't say."""
     try:
-        # The CPU backend reports no allocator statistics at all and returns None rather than
-        # raising, which used to take down every spin-s transform on such a platform: the budget
-        # check below is the first thing to touch the returned object.
+        # The CPU backend returns None rather than raising.
         stats = jax.local_devices()[0].memory_stats() or {}
     except Exception:  # pragma: no cover - backend without statistics
         return float("inf")
@@ -496,16 +442,16 @@ def _pool_headroom():
 def slabs_for(theta, *, L, spin, nside):
     """``(analysis, synthesis)`` block sets for this geometry, or ``(None, None)``.
 
-    Both are tuples of per-``m``-window triangles: a window stores only
-    ``ell >= lo``, the head below that being identically zero.  Analysis is always
-    ``(m, ell, theta)`` so it reduces over its contiguous axis.  Synthesis prefers
-    ``(m, theta, ell)`` for the same reason and gets it while both layouts fit --
-    9.7 GiB at nside 256 against the 18 GiB full-slab pair, at the same speed in
-    both directions (0.95-1.01x).  When a single triangle is all that fits (nside
-    512: 37 GiB against a 71 GiB pool) both slots hold the theta-contiguous layout
-    and synthesis pays 2.1x reducing over a strided axis (19.2 vs 9.3 ms at nside
-    256).  ``(None, None)`` means the caller keeps the generic scatter
-    loop: too large, or a trace context with nothing concrete to cache.
+    Both are `_BlockSet` tuples of per-``m``-window triangles (only ``ell >= lo``
+    is stored).  Analysis is always ``(m, ell, theta)`` so it reduces over its
+    contiguous axis.  Synthesis uses ``(m, theta, ell)`` for the same reason when
+    both layouts fit `_SLAB_BUDGET`; otherwise both slots hold the analysis layout
+    and synthesis reduces over a strided axis (about 2.1x slower).  Results are
+    cached per ``(nside, L, spin, layout, storage dtype)``.
+
+    Returns ``(None, None)`` when the caller should use the generic scatter loop:
+    the table exceeds the budget or the free device memory, the build ran out of
+    memory, or this is a trace context with nothing concrete to cache.
     """
     from .._config import table_dtype
 
@@ -519,18 +465,15 @@ def slabs_for(theta, *, L, spin, nside):
         return None, None
     cached = _CACHE.get(key)
     if cached is not None:
-        # A resident layout is free to hand back.  Gating it would decline the very
-        # calls that already paid the build: the pool is by definition short by the
-        # size of the layout it is holding, so the gate fires on every call after
-        # the first and the pipeline silently reverts to the scatter loop.
+        # Return a resident layout without the headroom check: the pool is short by
+        # exactly the layout it holds, so the check would reject every later call.
         return cached
     need = (2 * tri if want_ell else tri) + _BUILD_RESERVE
     if need > _pool_headroom():
-        # The other large resident table in GMaster is the scalar Legendre band, up
-        # to 19 GiB at Nside 512.  It rebuilds on demand; the generic polar path
-        # costs more than that rebuild by a wide margin, so take its room rather
-        # than decline.  If that still is not enough, decline: the generic path is
-        # slow but never out of memory.
+        # Free the scalar Legendre band (the other large resident table; it
+        # rebuilds on demand far more cheaply than the generic polar path costs).
+        # If there is still not enough room, decline: the generic path is slow but
+        # does not run out of memory.
         from . import theta_matrix as _theta_matrix
         _theta_matrix.release()
         if need > _pool_headroom():
@@ -542,8 +485,8 @@ def slabs_for(theta, *, L, spin, nside):
         return None, None
     analysis = layouts[THETA_CONTIG]
     if _blocked(analysis[0]) is None:
-        # Inside a transpose/grad trace: nothing concrete to cache, so let the
-        # caller fall back to the generic path rather than bake a constant in.
+        # Inside a transpose/grad trace: nothing concrete to cache, so the caller
+        # uses the generic path rather than baking in a constant.
         return None, None
     synthesis = layouts[ELL_CONTIG] if want_ell else analysis
     if len({k[:3] for k in _CACHE}) >= _MAX_GEOMETRIES:
@@ -553,6 +496,7 @@ def slabs_for(theta, *, L, spin, nside):
 
 
 def clear_cache():
+    """Drop cached block sets and the record of failed builds."""
     _CACHE.clear()
     _BUILD_FAILED.clear()
 
@@ -560,18 +504,13 @@ def clear_cache():
 def _reduce_channels(prod, axis):
     """Sum a list of same-shaped products along ``axis``, one accumulator each.
 
-    Spelling the channel contraction as ``sum(block[..., None] * rhs[:, None, :, :],
-    axis=2)`` leaves the channels in a dimension *after* the axis being reduced, and
-    XLA then materialises the whole ``(m, ell, theta, 4)`` product instead of folding
-    the multiply into the reduce -- a write and a read of the product on top of the
-    block read.  One ``lax.reduce`` over a tuple of accumulators reads the block once
-    and nothing wide is ever materialised: the Nside 256 spin-2 ``field`` stage goes
-    64.9 -> 47.7 ms (1.36x, three interleaved rounds inside the production stage,
-    control 1430 GB/s, alms agree to 5.4e-16).  This is the polar twin of
-    ``_theta_matrix._contract_theta``, which wins 1.50x on the scalar band.
-
-    ``einsum`` is not the answer: it lowers this batched matvec to 717 GB/s (HANDOFF
-    session 8), and it loses to both of the forms above.
+    Returns the sums stacked on a new last axis.  The broadcast spelling
+    ``sum(block[..., None] * rhs[:, None, :, :], axis=2)`` places the channels
+    after the reduced axis, and XLA then materialises the full
+    ``(m, ell, theta, 4)`` product.  A tuple ``lax.reduce`` reads the block once
+    and materialises nothing wide (about 1.36x faster on the spin-2 field stage,
+    identical results to 5e-16).  ``einsum`` lowers this batched matvec poorly
+    and is slower than either.  Counterpart of `theta_matrix._contract_theta`.
     """
     return jnp.stack(lax.reduce(tuple(prod), (0.0,) * len(prod),
                                 lambda a, b: tuple(x + y for x, y in zip(a, b)),
@@ -581,20 +520,23 @@ def _reduce_channels(prod, axis):
 def forward_latitudinal(ftm, slab, *, L):
     """flm[ell, L-1+m] = sum_theta slice[theta, ell, m] * ftm[theta, L+m].
 
-    Dispatched: on an NVIDIA GPU the contraction runs as the fused Triton kernel in
-    :mod:`gmaster._spin_contract_pallas`, which reads each block *once* and holds the
-    four real channels in register accumulators; the products then happen in the
-    storage precision (float32 tables and float32 rings under
-    ``set_table_precision("fp32")``, float64 both otherwise) with float64 tile
-    partials.  Against the multiply-and-reduce form below that is 4.55x on analysis and
-    4.60x on synthesis at nside 512 float32 (6.97 ms and 7.26 ms against 31.69 and
-    33.39, the analysis contraction running at 1444 GB/s against a 6.16 ms pure-read
-    floor for the 9.37 GiB layout) and 3.77x / 4.01x at nside 256, with the answer
-    moving by 6.3e-08 -- the same order as the float32 table quantum the route already
-    accepts (`.qwen/tmp/spin_contract_tune9.log`).
-    ``GMASTER_POLAR_CONTRACT=xla`` or :func:`set_polar_contract` selects the form
-    below explicitly; it is also what a non-NVIDIA device or a float64 table gets (see
-    :func:`_kernel_contract` for the measured reason).
+    Parameters
+    ----------
+    ftm : (ntheta, 2L) complex array
+        Azimuthal FFT of the rings (s2fft HEALPix padding).
+    slab : _BlockSet
+        Analysis block set from :func:`slabs_for`.
+
+    Returns
+    -------
+    (L, 2L-1) complex array ``flm``.
+
+    When :func:`_kernel_contract` allows (float32 tables on an NVIDIA GPU), this
+    runs the fused Triton kernel in :mod:`gmaster._sht.spin_contract`, which reads
+    each block once, forms products in the storage precision and accumulates tile
+    partials in float64.  It is about 4x faster than the XLA form at nside 256-512,
+    with results differing by ~6e-8, the order of the float32 table precision.
+    Otherwise (or with ``GMASTER_POLAR_CONTRACT=xla``) the XLA form is used.
     """
     if _kernel_contract(slab):
         from gmaster._sht.spin_contract import forward
@@ -618,21 +560,14 @@ def _forward_latitudinal_xla(ftm, slab, *, L):
                                                     * ftm[pi-theta, L-m]
 
     Both channels read the same block, so half the table produces all of ``flm``.
-    Order ``m = 0`` is its own mirror and does *not* satisfy the relation (measured),
-    so only the direct channel writes that column.  Below ``ell = |m|`` the slice
-    vanishes, so the skipped output rows keep the zero they already hold.
+    Order ``m = 0`` is its own mirror and does *not* satisfy the relation, so only
+    the direct channel writes that column.  Below ``ell = |m|`` the slice
+    vanishes, so the skipped output rows keep their zeros.
 
     The contraction is a multiply-and-reduce over four *real* right-hand sides
-    (direct re, direct im, mirror re, mirror im) rather than an ``einsum`` over the
-    complex map.  ``einsum`` lowers the per-window batched matvec to 717 GB/s here,
-    and every alternative spelling of it -- one call over a stacked ``h`` axis
-    (nside 512 field 694 -> 1392 ms), the same two calls without the scatter chain
-    -- measured no better or worse.  The four real channels then have to be reduced
-    through ``_reduce_channels``, not a stacked broadcast: that second choice is
-    worth 1.36x on the ``field`` stage at nside 256 (64.9 -> 47.7 ms) at 5.4e-16.
-    The channel split itself is bit-for-bit the same answer as ``einsum``
-    (``|new - einsum| = 0.0`` at nside 128 against the full slab and at 512 against
-    shipped).
+    (direct re, direct im, mirror re, mirror im) via :func:`_reduce_channels`,
+    rather than an ``einsum`` over the complex map, which XLA lowers poorly here.
+    The result is bit-for-bit identical to the ``einsum`` form.
     """
     ftm = jnp.asarray(ftm)
     off = L - 1
@@ -661,11 +596,11 @@ def _forward_latitudinal_xla(ftm, slab, *, L):
 def inverse_latitudinal(flm, slab, *, L):
     """Transpose of :func:`forward_latitudinal`; ftm is padded to 2L columns.
 
-    Dispatched like :func:`forward_latitudinal`, with one extra condition: the Triton
-    kernel reduces over the *last* axis of the block, so it takes the
-    ``(m, theta, ell)`` synthesis layout only.  When the pool is tight enough that
-    :func:`slabs_for` built the analysis layout alone, that strided reduction stays
-    with XLA.
+    Takes ``flm`` of shape (L, 2L-1) and the synthesis block set from
+    :func:`slabs_for`; returns ``ftm`` of shape (ntheta, 2L).  Dispatched like
+    :func:`forward_latitudinal`, except that the Triton kernel reduces over the
+    block's last axis and so serves only the ``(m, theta, ell)`` layout; when only
+    the analysis layout is resident, the strided reduction runs in XLA.
     """
     if _kernel_contract(slab, synthesis=True):
         from gmaster._sht.spin_contract import inverse
@@ -684,10 +619,8 @@ def _inverse_latitudinal_xla(flm, slab, *, L):
 
     ``slab`` is the ``(m, theta, ell)`` synthesis block set, or the
     ``(m, ell, theta)`` analysis blocks when a single layout has to serve both
-    directions -- there the reduction runs over a strided axis and costs 2.1x
-    (19.2 vs 9.3 ms at nside 256).  Spelled as one multiply-and-reduce over four
-    real right-hand sides for the same reason as :func:`forward_latitudinal`
-    (57.4 -> 34.0 ms at nside 512, identical output).
+    directions; there the reduction runs over a strided axis (about 2.1x slower).
+    Uses the same four-real-channel multiply-and-reduce as the forward XLA form.
     """
     alm = jnp.asarray(flm)
     off = L - 1

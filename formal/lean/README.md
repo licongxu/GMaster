@@ -1,6 +1,6 @@
 # GMasterMarch — Lean 4 proofs for the table-free latitudinal march
 
-Proof of record for `docs/latitudinal_march_maths.md` and `docs/march_v2_maths.md` (the v2 difference-form march).  Built with the toolchain in
+Proofs for the derivations in `docs/notes/latitudinal_march_maths.md` and `docs/notes/march_v2_maths.md` (the v2 difference-form march).  Built with the toolchain in
 `lean-toolchain` against the pinned Mathlib (`lakefile.toml`).
 
 ```bash
@@ -25,6 +25,5 @@ Proof of record for `docs/latitudinal_march_maths.md` and `docs/march_v2_maths.m
 | `GMasterMarch/EmitV2.lean` | v2 note §4 | emit factorisation `v 2^ex N = v 2^(ex+⌊log₂N_b⌋) u`, the per-step ratio bounds in both `ε_m` branches and the range of `u` |
 
 Not formalised (documented as such in the note): the WKB decay estimate behind the polar-skip
-margin (§8).  The numerical cross-check `.qwen/tmp/closed_form_check_s36.py` remains as a sanity
-test of the definitions.
+margin (§8).
 Axioms of every theorem: `propext`, `Classical.choice`, `Quot.sound` only (`#print axioms`).

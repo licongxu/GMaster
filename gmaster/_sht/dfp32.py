@@ -1,19 +1,23 @@
-"""Double-fp32 Pallas kernels for the scalar latitudinal SHT.
+"""Multi-limb float32 ("double-fp32") variant of the scalar latitudinal analysis.
 
-Recurrence state (q_{ell-2}, q_{ell-1}) and the c1/c2/cos coefficients are
-kept as three-limb f32 tuples (~72-bit significand); the per-theta data
-factors (parity-selected ring-FFT combinations) stay two-limb (~48-bit),
-which is sufficient because their errors are not amplified by the
-recurrence.  All hot-loop arithmetic is f32 (FMA-based); only the block
-reduction into the output and the seed/scale setup use f64.
+Same transform as :func:`gmaster._sht.sht_pallas.scalar_forward_latitudinal`
+(analysis only), but the Legendre recurrence runs in float32 arithmetic on
+multi-limb values, for GPUs whose float64 throughput is much lower than their
+float32 throughput.  Selected with the ``"jax-dfp32"`` SHT calculator; slightly
+less precise than the float64 kernel.
 
-A 72-bit state is required: with a two-limb state the recurrence's slowly
-growing mode amplifies per-step roundoff and the m=0 state drifts by
-~1e-7 over 190 steps at Nside 64, while a three-limb state keeps the drift
-at ~1e-13 (numpy emulation vs the closed-form Legendre solution).
+Precision layout:
 
-The value leaking into the data path is scaled by the power-of-two renorm
-factor in f32: (h*fac, m*fac + l*fac), so no f64 op sits in the hot loop.
+* The recurrence state ``(q_{ell-2}, q_{ell-1})`` and the ``c1``/``c2``/``cos``
+  coefficients are three-limb float32 tuples (~72-bit significand).  Two limbs
+  are not enough: the recurrence's growing mode amplifies per-step round-off, and
+  a two-limb state drifts by ~1e-7 over a few hundred degrees, against ~1e-13
+  with three limbs.
+* The per-ring data factors (parity-selected ring-FFT combinations) are
+  two-limb (~48-bit); their errors are not amplified by the recurrence.
+* All degree-loop arithmetic is float32 (FMA-based).  Float64 is used only for
+  the per-chunk data and seed setup, the power-of-two scale factor, and the
+  block reduction into the output.
 """
 
 from functools import partial
@@ -32,10 +36,11 @@ from . import sht_pallas as _sht_pallas
 
 
 def _fma(a, b, c):
-    """Native PTX FFMA (f32); this JAX build exposes no jnp.fma/lax.fma.
+    """Fused multiply-add ``a*b + c`` in float32 via PTX ``fma.rn.f32``.
 
-    ``c`` is always the widest operand at the call sites, so broadcast the
-    other two to its shape (inline-asm requires identical shapes).
+    JAX exposes no ``fma`` primitive, so inline assembly is used.  ``c`` is
+    always the widest operand at the call sites; the other two are broadcast to
+    its shape because inline assembly requires identical shapes.
     """
     if a.shape != c.shape:
         a = jnp.broadcast_to(a, c.shape)
@@ -158,8 +163,11 @@ def _dfp32_analysis_kernel(
     block_size,
     m_start,
 ):
-    # Each theta-chunk writes its partial sums to its own output slab
-    # [chunk, m, :]; the wrapper adds the slabs across the chunk axis in f64.
+    """Double-fp32 scalar analysis for one order ``m`` (grid ``(m_count,)``).
+
+    Each theta chunk writes its partial sums to its own output slab
+    ``[chunk, m, :]``; the wrapper sums the slabs over the chunk axis in f64.
+    """
     local_m = pl.program_id(0)
     m = local_m + m_start
     m_float = m.astype(jnp.float64)
@@ -172,7 +180,7 @@ def _dfp32_analysis_kernel(
         south_theta = ntheta - 1 - theta
         has_pair = valid & (south_theta != theta)
 
-        # --- data path (f64), exactly as the fp64 kernel ---
+        # --- data path (f64), as in the float64 kernel of sht_pallas ---
         weight_n = plt.load(weight_ref.at[theta], mask=valid, other=0.0)
         angle_n = m_float * plt.load(phase_ref.at[theta], mask=valid, other=0.0)
         cr_n, ci_n = jnp.cos(angle_n), jnp.sin(angle_n)
@@ -209,7 +217,7 @@ def _dfp32_analysis_kernel(
         m_re_h, m_re_l = _split48(Gm_re)
         m_im_h, m_im_l = _split48(Gm_im)
 
-        # --- seed / scale (f64), as in the fp64 kernel ---
+        # --- seed / scale (f64), as in the float64 kernel ---
         sine_n = plt.load(sine_ref.at[theta], mask=valid, other=1.0)
         diagonal = plt.load(diagonal_ref.at[local_m])
         log2_scale = (
@@ -219,12 +227,11 @@ def _dfp32_analysis_kernel(
         qmm_f64 = jnp.where(
             diagonal < 0, -jnp.ones_like(sine_n), jnp.ones_like(sine_n)
         ) * jnp.exp2(log2_scale - scale_exponent)
-        # Power-of-two scale factor kept in f64.  For high m the true values
-        # shrink like sin(theta)^m * diagonal, so scale_exponent reaches far
-        # below -149 where an f32 exp2 underflows to 0 (silently zeroing the
-        # pole contributions); the f64 kernel carries it down to -1022.  The
-        # state limbs stay in [2^-90, 2^90] via the renorm, so only `fac`
-        # holds the extreme magnitude -- exactly the factor f32 cannot.
+        # Power-of-two scale factor, kept in f64.  For high m the true values
+        # shrink like sin(theta)^m * diagonal, so scale_exponent falls far below
+        # the f32 limit (-149) and an f32 factor would silently zero the polar
+        # contributions.  The state limbs stay within [2^-90, 2^90] through the
+        # renormalisation, so only `fac` carries the extreme magnitude.
         fac = jnp.exp2(scale_exponent)
 
         qmm_h, qmm_m, qmm_l = _split72(qmm_f64)
@@ -235,11 +242,10 @@ def _dfp32_analysis_kernel(
         cos_m = plt.load(cos_mid_ref.at[theta], mask=valid, other=0.0)
         cos_l = plt.load(cos_lo_ref.at[theta], mask=valid, other=0.0)
 
-        # The 48-bit state/data product is computed in f32; the power-of-two
-        # scale `fac` (f64) is applied only at the f64 reduction step, so it
-        # never underflows even for the extreme high-m values.  `fac` is
-        # passed per call because the loop-carried copy is rescaled by the
-        # every-step renormalisation and must not be captured stale.
+        # The 48-bit state x data product is computed in f32; the f64 scale
+        # `fac` is applied only in the f64 reduction, so it never underflows.
+        # `fac` is an argument because the renormalisation changes it every
+        # step; capturing it from the enclosing scope would use a stale value.
         def add_coefficient(ell, vh, vl, fac):
             par_plus = jnp.bitwise_and(ell + m, 1) == 0
             g_re_h = jnp.where(par_plus, p_re_h, m_re_h)
@@ -248,8 +254,8 @@ def _dfp32_analysis_kernel(
             g_im_l = jnp.where(par_plus, p_im_l, m_im_l)
             re_h, re_l = _dd_mul(vh, vl, g_re_h, g_re_l)
             im_h, im_l = _dd_mul(vh, vl, g_im_h, g_im_l)
-            # fold each per-element 48-bit product to f64, apply the scale
-            # factor, then a native f64 Pallas block reduction
+            # Fold each 48-bit product to f64, apply the scale factor, then
+            # reduce over the chunk in f64.
             re_f64 = jnp.sum(
                 (re_h.astype(jnp.float64) + re_l.astype(jnp.float64)) * fac
             )
@@ -285,9 +291,9 @@ def _dfp32_analysis_kernel(
             # fac is applied in f64 inside add_coefficient at the reduction
             add_coefficient(ell, cur_h, cur_m + cur_l, fac)
 
-            # every-step power-of-2 renormalisation (f32-safe window).
-            # Track the magnitude over ALL state limbs: after cancellation
-            # the hi limb can be tiny while the middle limb dominates.
+            # Power-of-two renormalisation at every step to keep the state
+            # inside the f32 range.  Take the magnitude over all limbs: after
+            # cancellation the hi limb can be tiny while the middle one dominates.
             largest = jnp.maximum(
                 jnp.maximum(jnp.abs(qm1_h), jnp.abs(qm1_m)), jnp.abs(qm1_l)
             )
@@ -303,13 +309,11 @@ def _dfp32_analysis_kernel(
             mult = jnp.where(
                 large, 2.0**-100.0, jnp.where(small, 2.0**100.0, 1.0)
             )
-            # values = state * fac must stay invariant: state <- state*mult,
-            # fac <- fac/mult (exact power-of-2 rescale; underflow to 0 is
-            # negligible, matching the oracle's f32 fac semantics)
+            # values = state * fac is invariant: state <- state * mult,
+            # fac <- fac / mult (exact power-of-two rescale; underflow of fac to
+            # 0 only drops negligible values).
             fac = fac / mult
-            # state slots are (qm2, qm1): next qm2 <- old qm1 (q_{ell-1}),
-            # next qm1 <- cur (q_ell).  Mirrors the fp64 kernel's
-            # `return qm1, current` convention.
+            # State slots are (qm2, qm1): next qm2 <- q_{ell-1}, next qm1 <- q_ell.
             return (
                 qm1_h * mult,
                 qm1_m * mult,
@@ -331,6 +335,7 @@ def _dfp32_analysis_kernel(
 
 
 def _split_np4(x):
+    """Host-side split of f64 values into two f32 limbs (``_split48``)."""
     x = np.asarray(x, dtype=np.float64)
     h = x.astype(np.float32)
     l = (x - h.astype(np.float64)).astype(np.float32)
@@ -338,6 +343,7 @@ def _split_np4(x):
 
 
 def _split_np7(x):
+    """Host-side split of f64 values into three f32 limbs (``_split72``)."""
     x = np.asarray(x, dtype=np.float64)
     h = x.astype(np.float32)
     r1 = x - h.astype(np.float64)
@@ -356,6 +362,7 @@ def _dfp32_forward_latitudinal(
     weights, phase, *,
     L, block_size, m_start=0, num_warps=2,
 ):
+    """Launch the double-fp32 analysis kernel; returns ``(L, m_count)`` complex."""
     m_count = ftm_real.shape[0]
     ntheta = ftm_real.shape[1]
     diagonal = jnp.asarray(_sht_pallas._diagonal_normalization(L))
@@ -364,8 +371,7 @@ def _dfp32_forward_latitudinal(
     )
     c1_hi, c1_mid, c1_lo = _split_np7(c1)
     c2_hi, c2_mid, c2_lo = _split_np7(c2)
-    # Each theta-chunk writes its partial sums to its own output slab
-    # [chunk, m, :]; the chunk axis is reduced host-side in f64.
+    # One output slab per theta chunk, [chunk, m, :], summed below in f64.
     north_count = (ntheta + 1) // 2
     n_chunks = (north_count + block_size - 1) // block_size
     shape = jax.ShapeDtypeStruct((n_chunks, m_count, L), jnp.float64)
@@ -403,8 +409,8 @@ def _dfp32_forward_latitudinal(
         real, imag = real[0], imag[0]
     else:
         real, imag = jnp.sum(real, axis=0), jnp.sum(imag, axis=0)
-    # The kernel only writes cells with ell >= m; the out_shape buffer is not
-    # zero-initialised, so explicitly mask the never-written ell < m cells.
+    # The kernel writes only cells with ell >= m and the output buffer is not
+    # zero-initialised, so mask the ell < m cells explicitly.
     m_idx = jnp.arange(m_count) + m_start
     valid_ell = jnp.arange(L)[None, :] >= m_idx[:, None]  # (m_count, L)
     real = jnp.where(valid_ell, real, 0.0)
@@ -416,20 +422,25 @@ def scalar_forward_latitudinal_dfp32(
     positive, theta, weights=None, phase=None, *, L, block_size=256, m_start=0,
     num_warps=2,
 ):
+    """Scalar latitudinal analysis with double-fp32 recurrence arithmetic.
+
+    Same inputs and output as
+    :func:`gmaster._sht.sht_pallas.scalar_forward_latitudinal`: ``positive`` has
+    shape ``(ntheta, m_count)`` and the result is complex128 ``(L, m_count)``,
+    zero for ``ell < m``.  ``num_warps`` sets the warps per Triton program.
+    Kernel inputs are prepared eagerly before the jitted launch (see below).
+    """
     weights = jnp.ones_like(theta) if weights is None else weights
     phase = jnp.zeros_like(theta) if phase is None else phase
-    # All Pallas inputs are computed EAGERLY here on concrete arrays, then
-    # passed to the jitted kernel as direct (root) operands. Two JAX 0.10
-    # Pallas pitfalls are worked around:
-    #   1. pallas_call lowers incorrectly when an input operand is an
-    #      intermediate computed inside the enclosing trace (e.g.
-    #      jnp.real(pos.T), jnp.sin(theta) computed inside the jit) -- it
-    #      must be a direct trace argument. Hence the ftm/sine/cosine are
-    #      built here, outside the jit.
-    #   2. the cos low limbs `(cos - cos_hi.astype(f64)).astype(f32)` are
-    #      off by ~2^-25 when the f32->f64 upcast is traced (corrupting the
-    #      coefficients feeding the recurrence, ~1e-2..1e-7 errors).
-    #      Computing them on the concrete array is exact.
+    # All kernel inputs are computed eagerly here on concrete arrays and passed
+    # to the jitted launcher as direct arguments, working around two Pallas
+    # issues observed with JAX 0.10:
+    #   1. pallas_call lowers incorrectly when an operand is an intermediate
+    #      computed inside the enclosing trace (e.g. jnp.real(positive.T) or
+    #      jnp.sin(theta)); operands must be direct trace arguments.
+    #   2. the cos limbs `(cos - cos_hi.astype(f64)).astype(f32)` come out
+    #      wrong by ~2^-25 when the upcast is traced, corrupting the recurrence
+    #      coefficients.  Computed on concrete arrays they are exact.
     transposed = jnp.asarray(positive).T
     cosine = jnp.cos(theta)
     cos_hi = cosine.astype(jnp.float32)

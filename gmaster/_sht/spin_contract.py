@@ -1,46 +1,29 @@
-"""Fused polar Wigner-d contraction: one read of the slice, four accumulators.
+"""Pallas (Triton) contraction of the spin-weighted Wigner-d slabs.
 
-:func:`gmaster._spin_slice.forward_latitudinal` contracts one table block against
-four *real* right-hand sides (direct re/im and the ``pi - theta`` mirror re/im), and
-that channel split is what makes the XLA form fast -- ``einsum`` on the complex map
-caps at 717 GB/s.  It is also what makes it slow: the four products are four separate
-operands of the tuple ``lax.reduce``, so XLA walks the block set once per channel.
-Here one Triton program owns a tile of outputs and loops the reduction axis, loading
-the table **once** and multiplying it by all four right-hand sides in registers.
+This is the GPU kernel behind the polarised latitudinal step of
+:mod:`gmaster._sht.spin_slice`.  Each ``m`` window of the precomputed Wigner-d
+slab is contracted against four *real* right-hand sides: the direct ``+m``
+columns (real and imaginary parts) and the ``pi - theta`` mirror that serves
+``-m`` (real and imaginary parts).  The XLA form expresses these as four operands
+of one ``lax.reduce`` and so streams the slab once per channel; here each Triton
+program owns a tile of outputs, loops over the reduction axis, loads each table
+tile **once** and multiplies it by all four right-hand sides in registers.  The
+contraction is memory-bound, so reading the table once is the whole gain
+(roughly 4.5x over the XLA form, close to the pure-read floor of the slab).
 
-Three things had to be true for that to pay off, and each one is a measurement:
+Precision rules that keep the kernel near the byte floor:
 
-* **One read, not four.**  The premise of the kernel.
-* **Products in the storage precision.**  Writing the accumulate as
-  ``acc += v.astype(f64) * r.astype(f64)`` -- which is what "careful" suggests --
-  runs the float32 slice at 210 GB/s against a 1361 GB/s control, because
-  ``cvt.f32.f64`` issues at a small fraction of the FMA rate and the right-hand side
-  is loaded four times per table element.  Same kernel, same tile, products in
-  float32 with float64 tile partials: 1065 GB/s (``.qwen/tmp/spin_contract_tune3.log``
-  against `.qwen/tmp/spin_contract_tune5.log`).
-* **The right-hand side never widened in memory.**  In synthesis ``alm`` arrives
-  complex128 because that is how NaMaster keeps ``a_lm``.  Feeding that to a float32
-  slice as float64 leaves the kernel arithmetic-bound: 48.85 ms against 7.49 once the
-  channels are taken at the slice's own width, 6.5x, at the same 7.1e-08 relative
-  difference (`.qwen/tmp/spin_contract_tune5.log` against
-  `.qwen/tmp/spin_contract_tune8.log`).  A float32 table cannot inform a caller past
-  ~7 digits anyway.
+* Products and within-tile sums are taken in the storage precision of the slab;
+  only per-tile partials are accumulated in float64.  Widening every element to
+  float64 (``cvt.f32.f64``) makes a float32 slab arithmetic-bound at a fraction
+  of its bandwidth.
+* The right-hand side is cast to the slab's precision, never widened.  Synthesis
+  receives complex128 ``a_lm`` (NaMaster's storage), but a float32 table cannot
+  inform the result beyond ~7 significant digits anyway, and float64 products
+  would again make the kernel arithmetic-bound.
 
-Net on the block set itself (fp32 tables, control 1359-1377 GB/s,
-`.qwen/tmp/spin_contract_tune9.log`): analysis 31.69 -> 6.97 ms (4.55x, 1444 GB/s
-against a 9.37 GiB layout whose pure-read floor is 6.16 ms -- 88% of the floor) and
-synthesis 33.39 -> 7.26 ms (4.60x) at Nside 512; 3.77x and 4.01x at Nside 256.  In the
-pipeline that flips every spin-2 cell against ducc0 -- Nside 512 ``map2alm`` 34.2 ms
-(0.76x) -> 11.1 ms (**2.53x**), ``alm2map`` 37.6 (0.59x) -> 8.8 (**2.71x**), Nside 256
-0.83x -> **1.64x** and 0.52x -> **1.84x** (`.qwen/tmp/sht_spin2_pallas.log`, with
-``rel alm`` 3.0-3.2e-07, the fp32 route's existing 1.1-1.8e-07 order).
-
-Masking is *not* one of the levers, contrary to the first reading of this kernel: one
-fully masked 1024-element tile beats a decomposition into unmasked 128- and
-16-element tiles by 3x (see :func:`_contract`).
-
-The ``flm`` / ``ftm`` assembly stays in XLA outside the kernel -- ``L x (2L-1)`` is
-37 MB at Nside 512 against the table's 9.37 GiB, so it is not where the time is.
+The ``flm`` / ``ftm`` assembly stays in XLA outside the kernel: it is
+``L x (2L-1)`` complex values, negligible next to the slab.
 """
 
 from functools import partial
@@ -51,18 +34,13 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import triton as plt
 
-# Output elements per program.  Swept over {4,8,16,32}: 8 is best or tied in every
-# cell of both directions at both 256 and 512 (16 and 32 lose 10-40%).
+# Tuning constants, chosen by sweeps at Nside 256 and 512 in both directions.
+# Output elements per program: 8 is best or tied everywhere (16 and 32 lose 10-40%).
 _E_TILE = 8
-# Reduction elements per tile.  Swept over {64,128,256,512,1024,2048}: long wins and
-# 1024 is the plateau.  At Nside 512 the analysis contraction runs 22.79 ms with
-# 64-element tiles, 13.56 at 128, 8.97 at 256, 7.53 at 512, 6.97 at 1024, and 7.21 at
-# 2048 (`.qwen/tmp/spin_contract_tune8.log`, `.qwen/tmp/spin_contract_tune9.log`; the
-# 64/128/256 points are the 4-column series, the rest the 8-column one).  Nothing
-# here is derived from a register budget: the formula this replaced produced 1024 for
-# float32 by accident and 512 for float64, and cost 1.3x on float32.
+# Reduction elements per tile: longer tiles win up to a plateau at 1024 (at Nside
+# 512 analysis, 64-element tiles are ~3x slower; 2048 is slightly worse than 1024).
 _RED_CHUNK = 1024
-# 2 warps beat 4 in every cell of the sweep (6.97 vs 7.50 ms analysis at Nside 512).
+# 2 warps per program beat 4 in every configuration swept (~7% at Nside 512).
 _NUM_WARPS = 2
 
 
@@ -70,18 +48,12 @@ def _reduce_tile(rhs_ref, blk_ref, lane, out_idx, red_idx, accs, *, out_mask,
                  red_mask):
     """One tile of the contraction: load the table once, accumulate four channels.
 
-    The products and the within-tile sum are in the operands' own precision -- in
-    production float32, because both the slice and the ring transform run at
-    ``set_table_precision("fp32")`` -- and only the per-tile partial is converted to
-    float64.  Widening per element is what makes the float64 spelling slow here
-    rather than merely careful: ``cvt.f32.f64`` issues at a small fraction of the
-    FMA rate on this card, the right-hand side is loaded four times per table
-    element, and the tile sweep says the result is a kernel that runs at 211 GB/s
-    against a 1361 GB/s control (``.qwen/tmp/spin_contract_tune3.log``).
-
-    The right-hand side's width is a direct multiplier on traffic because it is
-    re-read once per output tile of its lane, so it is never widened in memory
-    either: it keeps the ring transform's own ``complex64``/``complex128`` real part.
+    Products and the within-tile sum are in the operands' own precision (float32
+    under ``set_table_precision("fp32")``); only the per-tile partial is converted
+    to float64.  Widening per element would make the kernel bound by the
+    ``cvt.f32.f64`` issue rate rather than by memory bandwidth.  The right-hand
+    side is re-read once per output tile, so its width multiplies traffic directly
+    and it is never widened in memory either.
     """
     if out_mask is None:
         v = plt.load(blk_ref.at[lane, out_idx[:, None], red_idx[None, :]])
@@ -102,14 +74,10 @@ def _contract(rhs_ref, blk_ref, acc_ref, *, n_out, n_red, out_tile, red_chunk,
               store_mask):
     """``acc[c, m, o] = sum_r blk[m, o, r] * rhs[c, m, r]`` over a contiguous ``r``.
 
-    Whole tiles first (no predicate at all), then a single masked tail.  Splitting
-    the ragged remainder against progressively smaller tiles -- the "get rid of the
-    mask" instinct -- measures *worse* at every configuration tried: at Nside 256
-    (``n_red = 1023``) one fully masked 1024-element tile does analysis in 1.15 ms,
-    while the same length decomposed into 128- and 16-element unmasked tiles plus a
-    masked tail takes 3.44 ms (`.qwen/tmp/spin_contract_tune5.log` against
-    `.qwen/tmp/spin_contract_tune7.log`, same card, controls 1360 and 1402 GB/s).  A
-    16-wide vector load costs more than a predicate on a 1024-wide one.
+    Whole tiles first (no predicate), then a single masked tail tile.  One masked
+    1024-wide tile is faster than decomposing the remainder into smaller unmasked
+    tiles (about 3x at Nside 256, ``n_red = 1023``): narrow vector loads cost more
+    than a predicate on a wide one.
     """
     lane = pl.program_id(0)
     tile = pl.program_id(1)
@@ -157,9 +125,9 @@ _CALLS = {}
 def _make(kind, mb, ncol, ntheta, store_name, rhs_name, tile, chunk):
     """Cached ``pallas_call`` for one (window shape, storage) pair.
 
-    Keyed and cached like :mod:`gmaster._band_pallas`: one window is one program,
-    and paying Triton compilation on every transform call would put the whole win
-    back into the host.
+    Cached like :mod:`gmaster._sht.band_pallas`: each window shape is one
+    program, and recompiling it with Triton on every transform call would cost
+    far more host time than the kernel saves.
     """
     key = (kind, mb, ncol, ntheta, store_name, rhs_name, tile, chunk)
     call = _CALLS.get(key)
@@ -196,8 +164,8 @@ def forward(slab, ftm, *, L):
     """Analysis contraction over the theta-contiguous block set.
 
     Returns the assembled ``(L, 2L-1)`` array; agrees with
-    :func:`gmaster._spin_slice.forward_latitudinal` to the summation-order floor
-    (6.1e-16 relative at Nside 128 float64, ``.qwen/tmp/spin_contract_gate.log``).
+    :func:`gmaster._sht.spin_slice.forward_latitudinal` to summation-order
+    round-off (~6e-16 relative in float64).
     """
     from gmaster._sht import spin_slice as ss
 
@@ -207,11 +175,10 @@ def forward(slab, ftm, *, L):
     out = jnp.zeros((L, 2 * L - 1), dtype=jnp.result_type(slab[0], ftm))
     for (m0, m1, lo), block in zip(ss._windows(L), slab):
         ncol, ntheta = block.shape[1], block.shape[2]
-        # The right-hand side is taken to the slice's precision.  Under
-        # ``set_table_precision("fp32")`` the ring transform is already complex64 so
-        # this is a no-op; it matters only when a float32 slice meets a float64 map,
-        # where widening the *table* instead (what the XLA form does) makes the
-        # kernel float64-arithmetic-bound at a quarter of its byte rate.
+        # Cast the right-hand side to the slab's precision.  Under
+        # ``set_table_precision("fp32")`` the ring transform is already complex64 and
+        # this is a no-op; for a float32 slab with a float64 map, widening the table
+        # instead would make the kernel float64-arithmetic-bound.
         rhs = _rhs_forward(ftm, m0, m1, L, jnp.dtype(block.dtype))
         acc = _make("f", block.shape[0], ncol, ntheta, str(block.dtype),
                     str(rhs.dtype), _E_TILE, _RED_CHUNK)(rhs, block)
@@ -237,12 +204,9 @@ def inverse(slab, flm, *, L):
         ncol, ntheta = block.shape[2], block.shape[1]
         direct = alm[lo:, off + m0:off + m1]
         mirror = sign[lo:, None] * alm[lo:, off - m1 + 1:off - m0 + 1][:, ::-1]
-        # The contraction takes its precision from the slice, not from the caller's
-        # storage: `alm` arrives complex128 because that is how NaMaster keeps a_lm,
-        # but a float32 slice cannot inform it past ~7 digits, and taking the
-        # products in float64 leaves this kernel arithmetic-bound at ~200 GFMA/s
-        # (48.6 ms against XLA's 32.7 at Nside 512, `.qwen/tmp/spin_contract_tune5.log`)
-        # instead of near the byte floor.
+        # Precision follows the slab, not the caller's storage: ``alm`` is complex128
+        # (NaMaster's convention) but a float32 slab cannot resolve it past ~7
+        # digits, and float64 products would make the kernel arithmetic-bound.
         rhs = jnp.stack([direct.real.T, direct.imag.T,
                          mirror.real.T, mirror.imag.T],
                         axis=0).astype(block.dtype)

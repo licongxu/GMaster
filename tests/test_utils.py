@@ -1,3 +1,5 @@
+"""Utilities: apodization, simulations, alm indexing, global parameters and dispatch helpers."""
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -12,6 +14,7 @@ from gmaster._sht import rings
 
 
 def test_mask_apodization_matches_namaster():
+    """Curved-sky C1, C2 and Smooth apodization match NaMaster."""
     reference = pytest.importorskip("pymaster")
     nside = 8
     mask = np.ones(12 * nside**2)
@@ -25,6 +28,10 @@ def test_mask_apodization_matches_namaster():
 
 
 def test_synfast_spherical_is_reproducible_and_correlated():
+    """synfast_spherical is reproducible for a fixed seed, its Gaussian draws have the requested
+    covariance (to the sampling noise of 10,000 draws), and a non-positive-semidefinite
+    spectrum matrix is rejected.
+    """
     lmax = 5
     spectra = np.zeros((6, lmax + 1))
     spectra[0] = 1
@@ -57,6 +64,7 @@ def test_synfast_spherical_is_reproducible_and_correlated():
 
 
 def test_alm_index_arrays_are_cached_by_lmax():
+    """The (ell, m) index arrays are cached per lmax, follow the healpy layout, and are shared by NmtAlmInfo."""
     lmax = 4
     m = np.arange(lmax + 1)
     first = utils._alm_index_arrays(lmax, m)
@@ -74,6 +82,7 @@ def test_alm_index_arrays_are_cached_by_lmax():
 
 
 def test_alm_index_cache_never_holds_a_tracer():
+    """Building NmtAlmInfo inside jax.jit must not store a tracer in the index cache."""
     from jax.core import Tracer
 
     lmax = 6
@@ -89,12 +98,13 @@ def test_alm_index_cache_never_holds_a_tracer():
         for pair in utils._ALM_INDEX_CACHE.values()
         for array in pair
     )
-    # The traced lmax is still usable outside the trace and caches cleanly there.
+    # Outside the trace the same lmax builds concrete arrays and caches them.
     outside = utils.NmtAlmInfo(lmax)
     assert utils._ALM_INDEX_CACHE[lmax] == (outside._ell, outside._m)
 
 
 def test_default_parameters_control_new_fields():
+    """The global defaults (n_iter, n_iter_mask, tol_pinv, SHT calculator) are applied and validated."""
     original = nmt.get_default_params()
     try:
         nmt.set_n_iter_default(1)
@@ -117,6 +127,9 @@ def test_default_parameters_control_new_fields():
 
 
 def test_latitudinal_method_chooses_march_or_dc():
+    """set_latitudinal_method selects the latitudinal engine: 'march' disables divide-and-conquer,
+    and 'dc'/'auto' still refuse it outside its supported band limits.
+    """
     from gmaster._sht import dc as _dc_lat
 
     original = nmt.latitudinal_method()
@@ -135,7 +148,11 @@ def test_latitudinal_method_chooses_march_or_dc():
 
 
 def test_cuda_gpu_gate_accepts_colab_tesla_t4():
-    """Colab T4 is ``Tesla T4``; requiring ``NVIDIA`` silently skipped the march."""
+    """The CUDA device check accepts NVIDIA cards whose device kind lacks the word "NVIDIA".
+
+    Colab's T4 reports itself as ``Tesla T4``; a check that required ``NVIDIA`` in the name
+    would silently skip the CUDA routes on it.
+    """
     assert is_cuda_device_kind("Tesla T4")
     assert is_cuda_device_kind("Tesla L4")
     assert is_cuda_device_kind("NVIDIA RTX PRO 6000 Blackwell Workstation Edition")
@@ -149,8 +166,9 @@ def test_cuda_gpu_gate_accepts_colab_tesla_t4():
 def test_complex64_chirp_matches_exact_integer_reduction(two_nphi):
     """`_chirp_c64` reduces q^2 mod 2 nphi exactly at every HEALPix ring size up to Nside 16384.
 
-    An int32 square overflowed at Nside 8192 (polar rings reach 2 nphi = 65528), which put O(1)
-    errors into every polar-cap ring transform there.
+    Squaring the index in int32 overflows once 2 nphi reaches 65528 (Nside 8192 rings), which
+    would put O(1) errors into the polar-cap ring transforms.  The 1e-6 tolerance is the
+    complex64 rounding of the chirp itself.
     """
     import jax.numpy as jnp
 

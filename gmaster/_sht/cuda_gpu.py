@@ -1,10 +1,10 @@
-"""CUDA GPU detection that includes Colab's Tesla T4.
+"""CUDA device-kind detection.
 
-JAX on Colab reports ``device_kind`` as ``Tesla T4`` / ``Tesla L4`` with no
-``NVIDIA`` substring. Workstation JAX often reports ``NVIDIA RTX ...``. Requiring
-``NVIDIA`` sent the public Colab demo down the generic s2fft scatter loop
-(minutes at NSIDE 1024) while the v2 march library still loaded and printed
-enabled.
+Decides whether JAX is running on an NVIDIA CUDA GPU, which selects the fused
+GPU transform paths over the generic fallback. ``device_kind`` strings vary by
+platform: workstation drivers report e.g. ``NVIDIA RTX ...``, while Colab reports
+``Tesla T4`` / ``Tesla L4`` with no ``NVIDIA`` substring, so the check matches a
+list of known product tags rather than the vendor name alone.
 """
 
 import jax

@@ -1,7 +1,0 @@
-PARTITION=root
-HOST_DENIED cpu 32
-STAGE field
-STAGE coupling
-STAGE field
-STAGE coupling
-RESULT {"engine": "gmaster", "cores": 8, "nside": 8192, "spin": 2, "seconds": [57.19874241400066], "cl_path": "benchmarks/independent/act_cl_re1_gmaster8_n8192_s2.npy", "nell": 819, "host_peak_gib": 92.62921905517578, "gpu_peak_gib": 79.0414848998189}

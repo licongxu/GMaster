@@ -1,4 +1,4 @@
-"""NaMaster-compatible curved-sky fields."""
+"""Curved-sky fields (`NmtField`), the GPU counterpart of ``pymaster.NmtField``."""
 
 import jax
 import jax.numpy as jnp
@@ -18,7 +18,62 @@ from .utils import (
 
 
 class NmtField:
-    """Masked curved-sky field with device-resident maps and coefficients."""
+    """A masked curved-sky field: mask, maps, contaminant templates and their alms.
+
+    Same interface and conventions as ``pymaster.NmtField``.  Maps, masks and
+    coefficients are stored as JAX arrays on the GPU, and all spherical-harmonic
+    transforms run there.  Supports HEALPix and CAR maps, spin-0 and spin-s fields,
+    linear contaminant deprojection, E/B purification (spin 2) and anisotropic masks.
+
+    Parameters
+    ----------
+    mask : array_like, shape (npix,) or (ny, nx)
+        Mask (weight map), HEALPix in RING ordering or CAR.  With `mask_22` it is the
+        11 component of an anisotropic weight matrix.
+    maps : array_like, shape (nmaps, npix) or (nmaps, ny, nx), or None
+        Observed maps: 1 for spin 0, 2 (e.g. Q/U or gamma_1/gamma_2, HEALPix
+        polarisation convention) for spin s > 0.  If None, the field holds only a mask
+        and can be used to compute coupling matrices but not power spectra.
+    spin : int, optional
+        Spin of the field.  Defaults to 0 for one map and 2 for two maps.
+    templates : array_like, shape (ntemp, nmaps, npix) or (ntemp, nmaps, ny, nx), optional
+        Contaminant templates.  Their best-fit contribution is subtracted from the maps.
+    beam : array_like, shape (>= lmax + 1,), optional
+        Harmonic transform of the (azimuthally symmetric) beam.  No pixel window is
+        applied automatically.
+    purify_e, purify_b : bool, optional
+        Purify E or B modes (spin 2 only).
+    n_iter : int, optional
+        Jacobi iterations for the map transforms.  Defaults to the global setting
+        (`set_n_iter_default`).
+    n_iter_mask : int, optional
+        Jacobi iterations for the mask transform.  Defaults to the global setting.
+    tol_pinv : float, optional
+        Relative eigenvalue threshold when inverting the template covariance; see
+        `moore_penrose_pinvh`.  Defaults to the global setting.
+    wcs : astropy.wcs.WCS, optional
+        WCS of CAR maps.  If None, HEALPix is assumed.
+    lmax : int, optional
+        Maximum multipole of the field's alms.  Defaults to the maximum supported by
+        the pixelization (``3 * nside - 1`` for HEALPix).
+    lmax_mask : int, optional
+        Maximum multipole of the mask's alms.  Same default as `lmax`.
+    masked_on_input : bool, optional
+        True if the maps and templates are already multiplied by the mask (not
+        advisable with purification).
+    lite : bool, optional
+        Keep only what is needed for the power spectrum itself (no maps, templates or
+        cached mask alms), saving memory; deprojection bias cannot then be computed.
+    mask_22, mask_12 : array_like, optional
+        The 22 and 12 components of an anisotropic weight matrix (spin > 0 only).
+        Must be given together.
+
+    Notes
+    -----
+    For scalar HEALPix fields the mask alms are computed together with the map alms
+    (unless ``lite=True``), because the two transforms can share a single latitudinal
+    pass; `get_mask_alms` then returns them without further work.
+    """
 
     def __init__(
         self,
@@ -191,16 +246,15 @@ class NmtField:
                     "i,iap->ap", self.alphas, templates_unmasked
                 )
 
-        # A large field's transforms need tens of GiB of temporaries (a polarised Nside 4096
-        # pass peaks at 40 GiB); evict the stale caches a previous workspace left on the
-        # device before starting (`_config.make_room`).
+        # The transforms of a large field need tens of GiB of temporaries (a polarised
+        # Nside 4096 pass peaks near 40 GiB), so free stale device caches first.
         nside = getattr(self.minfo, "nside", None)
         if nside:
             _config.make_room(6 * (4 * nside - 1) * 2 * (self.ainfo.lmax + 1) * 16)
-        # At Nside 8192 the mask's spin-0 transform (~47 GiB working set) does not fit beside a
-        # polarised field's alms and maps; the workspace asked for it after the field and the
-        # coupling stage ran out of memory.  Taken first, only the maps are resident; it is waited
-        # for, or the asynchronous dispatch overlaps its buffers with the spin-2 transform's.
+        # At Nside >= 8192 the mask transform (~47 GiB working set) does not fit next to a
+        # polarised field's maps and alms, so compute it first, while only the maps are
+        # resident.  Block until it finishes; otherwise asynchronous dispatch would overlap
+        # its buffers with those of the spin-2 transform.
         if (nside and nside >= 8192 and self.spin and not self.lite
                 and self.mask is not None):
             jax.block_until_ready(self.get_mask_alms())
@@ -210,15 +264,11 @@ class NmtField:
                 self.get_mask_alms(), maps_unmasked, task=task
             )
         else:
-            # A scalar field and its mask are two independent spin-0 transforms at
-            # the same order and the same `n_iter`, streaming the same Legendre
-            # band; run together they cost 0.53-0.68x of the price of the two
-            # passes (`utils.map2alm_pair`).  The mask alms land in `alm_mask`,
-            # which is what `get_mask_alms` would have computed later, so the only
-            # behaviour that changes is that they exist now: a field that never
-            # reaches a coupling matrix pays for the second transform at ~10 % of
-            # the first instead of 100 % of it.  `lite` fields keep the lazy route
-            # because they asked not to retain derived state.
+            # A scalar field and its mask are two spin-0 transforms with the same lmax
+            # and n_iter, so they can share one latitudinal pass (`utils.map2alm_pair`),
+            # costing roughly 0.5-0.7 of two separate transforms.  The mask alms are
+            # stored in `alm_mask`, exactly what `get_mask_alms` would compute later.
+            # `lite` fields keep the lazy route, since they retain no derived state.
             fused = None
             if (self.spin == 0 and not self.lite and self.mask is not None
                     and not self.anisotropic_mask
@@ -234,10 +284,8 @@ class NmtField:
                     maps, self.spin, self.minfo, self.ainfo, n_iter=self.n_iter
                 )
             else:
-                # `alm` keeps map2alm's (1, nelem) packing; `alm_mask` keeps
-                # get_mask_alms' unpacked (nelem,) row, which is what the pair's
-                # second element has to be sliced to for the two routes to be
-                # interchangeable.
+                # `alm` has map2alm's (1, nelem) shape; `alm_mask` has the (nelem,)
+                # shape that `get_mask_alms` returns.
                 self.alm, self.alm_mask = fused[0], fused[1][0]
         if not self.lite:
             self.maps = maps
@@ -267,24 +315,50 @@ class NmtField:
                     )
 
     def is_compatible(self, other, strict=True):
+        """Check whether another field is compatible with this one.
+
+        Parameters
+        ----------
+        other : NmtField
+            Field to compare with.
+        strict : bool, optional
+            If True, compare both the pixelization and the harmonic resolution;
+            otherwise only the harmonic resolution (enough for power spectra).
+
+        Returns
+        -------
+        bool
+        """
         if strict and self.minfo != other.minfo:
             return False
         return self.ainfo_mask == other.ainfo_mask and self.ainfo == other.ainfo
 
     def get_mask(self):
+        """Return the field's mask, shape (npix,) (CAR maps flattened)."""
         if self.mask is None:
             raise ValueError("Input mask unavailable for this field")
         return self.mask
 
     def get_anisotropic_mask(self):
+        """Return the anisotropic mask components, shape (2, npix)."""
         if self.mask_a is None:
             raise ValueError("Input anisotropic mask unavailable for this field")
         return self.mask_a
 
     def get_mask_alms(self):
+        """Return the spherical-harmonic coefficients of the mask.
+
+        Computed on first call if not already available, and stored unless the field
+        is `lite`.
+
+        Returns
+        -------
+        jax.Array, shape (nelem_mask,)
+            Healpy-packed mask alms up to `lmax_mask`.
+        """
         if self.alm_mask is None:
-            # Spin maps stay on the first GPU. The scalar mask runs on the
-            # other card, which the spin march has already released.
+            # With several GPUs, run the mask transform on the second one so that it
+            # does not compete for memory with the field's spin transform on the first.
             mask = self.mask[None, :]
             gpus = _healpix._gpu_devices()
             if len(gpus) > 1:
@@ -302,6 +376,12 @@ class NmtField:
         return self.alm_mask
 
     def get_anisotropic_mask_alms(self):
+        """Return the alms of the anisotropic mask components (spin ``2 * spin``).
+
+        Returns
+        -------
+        jax.Array, shape (2, nelem_mask)
+        """
         if self.mask_a is None:
             raise ValueError("This field does not have an anisotropic mask")
         if self.alm_mask_a is None:
@@ -318,16 +398,34 @@ class NmtField:
         return self.alm_mask_a
 
     def get_maps(self):
+        """Return the masked, deprojected (and purified, if requested) maps.
+
+        Returns
+        -------
+        jax.Array, shape (nmaps, npix)
+        """
         if self.maps is None:
             raise ValueError("Input maps unavailable for this field")
         return self.maps
 
     def get_alms(self):
+        """Return the field's alms, including masking, deprojection and purification.
+
+        Returns
+        -------
+        jax.Array, shape (nmaps, nelem)
+        """
         if self.alm is None:
             raise ValueError("Mask-only fields have no alms")
         return self.alm
 
     def get_templates(self):
+        """Return the masked contaminant templates.
+
+        Returns
+        -------
+        jax.Array, shape (ntemp, nmaps, npix)
+        """
         if self.temp is None:
             raise ValueError("Input templates unavailable for this field")
         return self.temp
@@ -335,6 +433,13 @@ class NmtField:
     def _purify(
         self, alm_mask, maps_unmasked, *, task, n_iter=None, return_maps=True
     ):
+        """Pure E/B alms of a spin-2 field (Smith 2006; Alonso et al. 2019, Sec. 2.4).
+
+        Adds to the ordinary masked alms the counter-terms built from the spin-1 and
+        spin-2 derivatives of the mask.  ``task = (purify_e, purify_b)`` selects which
+        component receives them.  Returns the alms, and the corresponding maps if
+        `return_maps`.
+        """
         n_iter = self.n_iter if n_iter is None else int(n_iter)
         ell_mask = self.ainfo_mask._ell
         ell = self.ainfo._ell
@@ -395,12 +500,15 @@ class NmtField:
 
     @property
     def Nw(self):
+        """Shot-noise contribution of the mask for catalog-based fields (0 otherwise)."""
         return self._Nw
 
     @property
     def Nf(self):
+        """Shot-noise contribution to the field power spectrum for catalog-based fields (0 otherwise)."""
         return self._Nf
 
     @property
     def alpha(self):
+        """Ratio of data to random sources for clustering catalogs (None otherwise)."""
         return self._alpha

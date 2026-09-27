@@ -1,27 +1,31 @@
-"""The v2 latitudinal march: a difference-form float32 Wigner-d recurrence behind the JAX FFI.
+"""CUDA float32 difference-form Wigner-d march for the spin-0 and spin-2 latitudinal transforms.
 
-Same contracts as the Pallas march in :mod:`gmaster._spin_march_pallas` (spin-0 folded analysis /
-synthesis of the positive-m block, spin-2 analysis / synthesis of the full ``(L, 2L-1)`` block),
-served by CUDA kernels in ``gmaster/_native/cuda/march_v2.cu`` (``nvcc`` on first GPU use) and the
-OpenMP CPU port in ``gmaster/_native/cpu/march_v2_cpu.cc`` (``g++`` when JAX is on CPU).
+Implements the latitudinal step of the HEALPix SHT (spin-0 folded analysis / synthesis of the
+positive-m block, spin-2 analysis / synthesis of the full ``(L, 2L-1)`` block) with the same
+contracts as the Pallas march in :mod:`gmaster._sht.spin_march`.  The Wigner-d rows are generated
+in registers, never stored.  The CUDA kernels (``gmaster/_native/cuda/march_v2.cu``) are compiled
+with ``nvcc`` on first GPU use and cached by source hash; when JAX runs on CPU the OpenMP port
+(``gmaster/_native/cpu/march_v2_cpu.cc``) is compiled with ``g++`` instead.  Both are reached
+through the JAX FFI.  For ``L`` in the divide-and-conquer range the public entry points delegate
+to :mod:`gmaster._sht.dc`.
 
-The mathematics (docs/march_v2_maths.md): for the Jacobi row ``v_n = (c1 x + c0) v_{n-1} - cb v_{n-2}``
-the kernel marches the pair ``(v, D = v_n - v_{n-1})`` as
+Mathematics (``docs/march_v2_maths.md``): for the Jacobi row
+``v_n = (c1 x + c0) v_{n-1} - cb v_{n-2}`` the kernel marches the pair ``(v, D = v_n - v_{n-1})`` as
 
     C = c1 (x - 1) + (c1 - 1 - cb + c0),    D <- cb D + C v,    v <- v + D
 
 on the northern hemisphere, and the reflected row ``(-1)^n v_n`` (``x -> |x|``, ``c0 -> -c0``) on
-the southern one.  Near the poles and near every turning point the three-term recurrence has a
-near-double characteristic root and a plain float32 march amplifies each rounding by ``1/sin(phase
-step)``; the difference form injects errors at the scale of ``D`` instead of ``v``, and with the
-lane coordinate ``|x| - 1`` and the coefficients carried as (hi, lo) float32 pairs the phase error
-is the random-walk floor ``~sqrt(n) u``.  Measured against the fp64 recurrence: rms relative
-``1-2e-6`` at Nside 1024, ``5e-6`` at 4096, every order.
+the southern one.  Near the poles and turning points the three-term recurrence has a near-double
+characteristic root, so a plain float32 march amplifies each rounding by ``1/sin(phase step)``.
+The difference form injects errors at the scale of ``D`` rather than ``v``; with the lane
+coordinate ``|x| - 1`` and the coefficients carried as (hi, lo) float32 pairs, the phase error is
+the random-walk floor ``~sqrt(n) u``.  Against the fp64 recurrence the rms relative error is
+``1-2e-6`` at Nside 1024 and ``5e-6`` at Nside 4096, for every order.
 
-Every lane keeps an int32 binade ``ex`` (normalised every ``UNR = 8`` degrees) and the kernels emit
-the true-magnitude float32 value ``v * 2^(ex + floor(log2 N(base)) - 127) * u(ell)`` with the uniform
+Each lane keeps an int32 binade ``ex`` (renormalised every ``UNR = 8`` degrees).  The kernels emit
+the true-magnitude float32 value ``v * 2^(ex + floor(log2 N(base)) - 127) * u(ell)``, with
 ``u(ell) = 2^(log2 N(ell) - floor(log2 N(base)))`` folded into the tables, so the tile partials are
-plain float32 numbers and the driver sums them without any exponent bookkeeping.
+plain float32 numbers that the driver sums without exponent bookkeeping.
 """
 from __future__ import annotations
 
@@ -48,14 +52,14 @@ KT = 12
 EX_PAD = -10_000_000
 _M_WINDOW = int(os.environ.get("GMASTER_V2_M_WINDOW", "512"))
 # The analysis partials of one window are ``(mb, ntile, L - m0, nch)`` float32 and XLA materialises
-# them before the tile sum, so the window is narrowed at large geometries to hold that buffer under
-# this budget (Nside 4096 spin 2: 12.6 MB per row, so 128 rows).
+# them before the tile sum, so at large geometries the m-window is narrowed to keep that buffer
+# under this budget (Nside 4096 spin 2: 12.6 MB per row, so 128 rows).
 _PARTS_BUDGET = int(float(os.environ.get("GMASTER_V2_PARTS_GB", "2")) * 1024 ** 3)
-# Window tables depend on the geometry alone, so they stay resident on the device below this
-# budget and are rebuilt per call above it (50-60 ms for a whole Nside 4096 geometry, against a
-# 260-900 ms pass).  The budget holds Nside <= 2048 and refuses Nside 4096 (7.5-8.3 GiB per
-# geometry, and the polarised pipeline needs its pool): pinning those cost the Nside 4096 spin-2
-# pipeline its command buffer.  `_config.make_room` evicts whatever is held.
+# Window tables depend on the geometry alone.  Below this budget they stay resident on the device;
+# above it they are rebuilt inside each call (50-60 ms for a whole Nside 4096 geometry, against a
+# 260-900 ms pass).  The default holds Nside <= 2048 and refuses Nside 4096 (7.5-8.3 GiB per
+# geometry), whose polarised pipeline needs that memory for its own buffers.
+# `_config.make_room` evicts whatever is held.  Default: max(4 GiB, 12% of the device pool).
 _TABLE_CACHE_GB = os.environ.get("GMASTER_V2_TABLE_CACHE_GB")
 
 
@@ -134,11 +138,11 @@ def _retain_pool_memory(ndev):
     """Keep freed device memory in the CUDA memory pool instead of returning it at every sync.
 
     JAX's `cuda_async` allocator draws from each device's current memory pool, whose release
-    threshold defaults to 0: with `XLA_PYTHON_CLIENT_PREALLOCATE=false` (the invocation the README
-    prescribes for large maps) every large temporary was unmapped at the next synchronisation and
-    mapped again on the next call -- 50 ms of the 107 ms Nside 2048 spin-2 coupling stage.  A
-    threshold of UINT64_MAX keeps what the process has touched (its high-water mark), as a caching
-    allocator does.  `GMASTER_RETAIN_POOL=0` leaves the pool alone (e.g. on a shared GPU).
+    threshold defaults to 0.  With `XLA_PYTHON_CLIENT_PREALLOCATE=false` (recommended in the README
+    for large maps) every large temporary would then be unmapped at the next synchronisation and
+    mapped again on the next call, about half the Nside 2048 spin-2 coupling stage.  A threshold of
+    UINT64_MAX keeps the process's high-water mark, as a caching allocator does.
+    `GMASTER_RETAIN_POOL=0` leaves the pool alone (e.g. on a shared GPU).
     """
     if os.environ.get("GMASTER_RETAIN_POOL", "1") == "0":
         return
@@ -153,7 +157,12 @@ def _retain_pool_memory(ndev):
 
 
 def _build():
-    """Compile the CUDA source into a per-source-hash shared library (cached under ~/.cache)."""
+    """Compile the CUDA kernels and register their FFI targets; return the library or None.
+
+    The shared library is keyed by a hash of the source, compute capability, JAX version and
+    `GMASTER_V2_DEFS`, and cached in `GMASTER_CUDA_CACHE` (default ``~/.cache/gmaster``).  Any
+    failure is recorded in `_LIB_ERROR` and makes the route unavailable.
+    """
     global _LIB, _LIB_ERROR
     if _LIB is not None or _LIB_ERROR is not None:
         return _LIB
@@ -202,7 +211,7 @@ def _build():
 
 
 def _build_cpu():
-    """Compile the OpenMP CPU march (same recurrence as the CUDA kernels)."""
+    """Compile the OpenMP CPU march (same recurrence as the CUDA kernels), cached like `_build`."""
     global _CPU_LIB, _CPU_LIB_ERROR
     if _CPU_LIB is not None or _CPU_LIB_ERROR is not None:
         return _CPU_LIB
@@ -243,10 +252,10 @@ def _want_cpu():
         return True
 
 
-# Default 0: the v2 march serves every band limit when the CUDA library builds.
-# `GMASTER_MARCH_V2=0` restores the exact fp64 band / slice routes (the small-geometry tests
-# pin those to 1e-13).  `GMASTER_MARCH_V2_MIN_L` can raise the floor again; below Nside 64 the
-# geometry pads to one 512-lane tile, so small maps spend most of each tile on padding.
+# Lowest band limit served by the v2 march (default 0: every band limit, once the library builds).
+# `GMASTER_MARCH_V2=0` selects the exact fp64 band / slice routes instead (accurate to 1e-13 on
+# small geometries).  Below Nside 64 the geometry pads to one 512-lane tile, so small maps spend
+# most of each tile on padding; raise this floor to route them elsewhere.
 _MIN_L = int(os.environ.get("GMASTER_MARCH_V2_MIN_L", "0"))
 
 
@@ -268,6 +277,7 @@ def enabled(L=None) -> bool:
 
 
 def unavailable_reason():
+    """The exception that made the active (CPU or CUDA) library unavailable, or None."""
     return _CPU_LIB_ERROR if _want_cpu() else _LIB_ERROR
 
 
@@ -279,12 +289,15 @@ def _split64(a):
 
 @lru_cache(maxsize=16)
 def _geometry_numpy(L, nside, spin):
-    """Lane layout for one geometry.  Spin 0: the northern rings (``x >= 0``) in ring order;
-    spin 2: the northern block then the southern block, each padded to whole analysis tiles so
-    that every tile (of either kernel) lies in one hemisphere."""
+    """Lane layout for one geometry (lane = one ring, ``-1`` for padding).
+
+    Spin 0: the northern rings (``x >= 0``) in ring order.  Spin 2: the northern block, then the
+    southern block, each padded to whole analysis tiles so that every tile of either kernel lies
+    in one hemisphere.
+    """
     from s2fft.sampling import s2_samples
 
-    # the grid `healpix._stable_thetas` gives, built on the host so that the geometry is concrete
+    # Same grid as `healpix._stable_thetas`, built on the host so that the geometry is concrete.
     theta = (np.asarray(s2_samples.thetas(L, "healpix", nside), np.float64)
              + 8 * np.finfo(np.float64).eps)
     ntheta = theta.shape[0]
@@ -350,11 +363,16 @@ def _geo_dict(arrays, L, nside, spin):
 
 @lru_cache(maxsize=64)
 def _windows(L, nside=None, spin=None):
+    """The m-windows ``(m0, mb, mbp)``: first order, width, and width padded to a multiple of 4.
+
+    The width is `GMASTER_V2_M_WINDOW`, narrowed to a power of two so that one window's analysis
+    partials fit in `_PARTS_BUDGET`.
+    """
     width = _M_WINDOW
     if nside is not None:
         geo = _geometry_numpy(L, nside, spin)
-        # Spin 0 may be launched paired (two maps, the smaller `TILE_ANA_PAIR` tile and twice the
-        # channels), which is four times this stage's partials, so the window is sized for that.
+        # Spin 0 may be launched paired (two maps: the smaller `TILE_ANA_PAIR` tile and twice the
+        # channels, so four times the partials); the window is sized for that case.
         nch, tile = (4, TILE_ANA_PAIR) if spin == 0 else (4, TILE_ANA)
         per_row = (geo["npad"] // tile) * L * nch * 4
         width = min(width, max(4, _PARTS_BUDGET // max(per_row, 1)))
@@ -369,12 +387,15 @@ def _windows(L, nside=None, spin=None):
 
 @partial(jax.jit, static_argnames=("mbp", "L", "spin"))
 def _window_tables(m0, geo, *, mbp, L, spin):
-    """Kernel tables of one window (rows ``m0 .. m0 + mbp - 1``, rows past ``L`` are dummies):
-    ``man`` / ``ex0`` ``(mbp, npad)`` seeds and ``tab`` ``(mbp, L + UNR, KT)`` float32.
+    """Kernel tables of one window (rows ``m0 .. m0 + mbp - 1``; rows past ``L`` are dummies).
+
+    Returns the seeds ``man`` (float32 mantissa) and ``ex0`` (int32 binade), both ``(mbp, npad)``,
+    and ``tab`` ``(mbp, L + UNR, KT)`` float32 holding the recurrence coefficients as (hi, lo)
+    pairs, the normalisation factor ``u`` and the bit-cast exponent.
 
     ``log2 N(ell, m)`` is one ``gammaln`` per row at ``ell = M`` plus a float64 cumulative sum of
-    ``0.5 log2((ell+m)(ell-m)/((ell-s)(ell+s)))`` along ``ell``: four transcendentals per entry
-    measured 41 ms per window at Nside 4096 on this 1/64-rate float64 card, the cumsum a few ms.
+    ``0.5 log2((ell+m)(ell-m)/((ell-s)(ell+s)))`` along ``ell``, which avoids four transcendentals
+    per entry (costly on GPUs with reduced float64 throughput).
     """
     Lp = L + UNR
     ms = jnp.asarray(m0, jnp.float64) + jnp.arange(mbp, dtype=jnp.float64)
@@ -430,14 +451,14 @@ def _window_tables(m0, geo, *, mbp, L, spin):
 
 
 # The paired analysis kernel holds two maps' right-hand sides in registers, so it runs on the
-# half-size theta tile and writes four times a single launch's tile partials.  Measured against the
-# unpaired analysis with the (bit-identical, always-cheaper) paired synthesis in place, on a
-# `NmtField` that builds a map and its mask together: Nside 2048 spin 0 527 -> 461 ms, Nside 4096
-# 3596 -> 3107 ms.  It wins at every size, so there is no cap; the knob is kept for A/B.
+# half-size theta tile and writes four times a single launch's tile partials.  It is faster than
+# two unpaired launches at every size tested (about 13% on an `NmtField` building a map and its
+# mask at Nside 2048 and 4096), so by default there is no cap.  `GMASTER_V2_PAIR_MAX_L` sets one.
 _PAIR_MAX_L = int(os.environ.get("GMASTER_V2_PAIR_MAX_L", "0")) or (1 << 30)
 
 
 def pair_fits(L, nside):
+    """True when a paired spin-0 analysis is allowed and fits in half the device pool."""
     if int(L) > _PAIR_MAX_L:
         return False
     stats = jax.devices()[0].memory_stats() or {}
@@ -446,9 +467,10 @@ def pair_fits(L, nside):
 
 
 def pair_bytes(L, nside):
-    """Device bytes one paired spin-0 analysis launch asks for (rhs, one window's tile partials,
-    and the two assembled alms).  The v2 march holds no Wigner-d table, so this is the whole
-    demand: at Nside 4096 it is 9.6 GiB against the 43.9 GiB slab the Pallas route needed."""
+    """Device bytes of one paired spin-0 analysis: rhs, one window's tile partials, two alms.
+
+    The march holds no Wigner-d table, so this is the whole demand (9.6 GiB at Nside 4096).
+    """
     geo = _geometry_numpy(L, nside, 0)
     npad = geo["npad"]
     mbp = max(mbp for (_, _, mbp) in _windows(L, nside, 0))
@@ -467,18 +489,16 @@ def _tables_bytes(L, nside, spin):
 def _build_tables(L, nside, spin):
     """Every window's ``(man, ex0, tab)`` as concrete device arrays, built outside any trace.
 
-    They must never be built *inside* the transform's trace: `jax.ensure_compile_time_eval` there
-    turns them into HLO constants of the outer program, which XLA copies to the host at lowering
-    (the trap session 36 hit with the 4 GiB ring table, HANDOFF addendum 32 section 7).  They cross
-    as jit arguments instead.
+    Call this outside the transform's trace: under a trace, `jax.ensure_compile_time_eval` would
+    turn the tables into HLO constants of the outer program, which XLA copies to the host at
+    lowering (gigabytes at large Nside).  The tables are passed to the transform as jit arguments.
     """
     with jax.ensure_compile_time_eval():
         geo = _geometry(L, nside, spin)
         out = []
         for (m0, _mb, mbp) in _windows(L, nside, spin):
-            # `m0` is a traced argument and only `mbp` is static, so the whole geometry compiles
-            # this builder once (a fresh `jax.jit(partial(...))` per window instead recompiled it
-            # every call: 24 windows x ~2 s at Nside 4096, which is the 57 s pass this replaced).
+            # `m0` is traced and only `mbp` is static, so `_window_tables` compiles once per
+            # geometry rather than once per window (about 2 s each at Nside 4096).
             tabs = _window_tables(jnp.int32(m0), geo, mbp=mbp, L=L, spin=spin)
             out.append(tuple(jax.block_until_ready(t) for t in tabs))
     return tuple(out)
@@ -488,10 +508,10 @@ def tables_for(L, nside, spin):
     """Resident window tables for one geometry, or ``None`` when they are too large to hold.
 
     ``None`` means "build each window inside the transform's trace": the tables are then part of
-    the program, XLA frees each window's as it goes, and nothing is pinned between calls.  That is
-    the only workable answer at the mask geometry of an Nside 4096 spin-2 pipeline
-    (``L = 2 lmax + 1 = 24575`` over 192 windows, 30 GiB if materialised at once, which is what
-    exhausted the pool and failed a cuFFT plan there).
+    the program, XLA frees each window's as it goes, and nothing is pinned between calls.  This is
+    required at large geometries, e.g. the mask geometry of an Nside 4096 spin-2 pipeline
+    (``L = 2 lmax + 1 = 24575``, 192 windows, 30 GiB if materialised at once).  Tables are cached
+    only within `GMASTER_V2_TABLE_CACHE_GB` and when `_pool_is_tight` leaves room.
     """
     key = (int(L), int(nside), int(spin))
     hit = _TABLE_CACHE.get(key)
@@ -508,12 +528,11 @@ def tables_for(L, nside, spin):
     return tabs
 
 
-# A geometry may pin its tables only if the pool can also hold this many ring spectra beside
-# them.  The spectrum is the unit the transform allocates in (`ntheta x (2L or L)` complex128) and
-# the pipeline holds several at once, so it is the right yardstick: at Nside 4096 it admits the
-# scalar geometry (7.5 GiB of tables + 6 x 3.0 GiB = 25.5 of 71.2 GiB) and refuses the polarised
-# one (8.25 + 6 x 6.0 = 44.3), whose pipeline peaks above 56 GiB and whose coupling stage is what
-# ran out of memory with the tables held.
+# A geometry may pin its tables only if half the pool can also hold this many ring spectra beside
+# them.  The spectrum (`ntheta x (2L or L)` complex128) is the unit the transform allocates in, and
+# a pipeline holds several at once.  With a 71.2 GiB pool at Nside 4096 this admits the scalar
+# geometry (7.5 GiB of tables + 6 x 3.0 GiB = 25.5 GiB) and refuses the polarised one
+# (8.25 + 6 x 6.0 = 44.3 GiB), whose pipeline peaks above 56 GiB.
 _TABLE_ROOM_SPECTRA = float(os.environ.get("GMASTER_V2_TABLE_ROOM_SPECTRA", "6.0"))
 
 
@@ -637,10 +656,9 @@ def _fold_rhs(positives, weights, phase, geo, L):
         minus = (g_n - g_p)[:, ring]
         chan = jnp.stack([plus.real, plus.imag, minus.real, minus.imag], axis=-1)
         chan = jnp.where(valid[None, :, None], chan, 0.0)
-        # Materialised behind a barrier: each window slices `mb` of these `L` rows, and with the
-        # block left fusable XLA rebuilds the parity combination and the lane gather inside every
-        # window's slice instead of once (the same inlining trap the spin-2 analysis hit, where it
-        # was 73 ms of a 156 ms pass at Nside 2048 -- `.qwen/tmp/s2split_s37.py`).
+        # Materialised behind a barrier: each window slices `mb` of these `L` rows, and if the
+        # block were left fusable XLA would rebuild the parity combination and lane gather inside
+        # every window's slice instead of once (see the note in `_forward_impl`).
         out.append(lax.optimization_barrier(lax.convert_element_type(chan, jnp.float32)))
     return out
 
@@ -653,9 +671,8 @@ def _fold_analyze(positives, weights, phase, garr, tabs, *, L, nside):
     cols = [[] for _ in positives]
     nmaps = len(positives)
     if nmaps == 2:
-        # One march, both maps: the recurrence is a function of (m, ell, theta) alone, so a field
-        # and its mask join the emit as extra channels instead of marching the rows twice (at
-        # Nside 2048 spin 0 the two separate launches were 190 ms of the 559 ms `NmtField`).
+        # One march, both maps: the recurrence depends on (m, ell, theta) alone, so a field and
+        # its mask join the emit as extra channels instead of marching the rows twice.
         rhs_all = [jnp.concatenate(
             [rhs_all[0][:, :, None, :], rhs_all[1][:, :, None, :]], axis=2).reshape(
                 rhs_all[0].shape[:2] + (8,))]
@@ -687,10 +704,10 @@ def _forward_fold_pair_impl(positive_a, positive_b, weights, phase, garr, tabs, 
 
 
 def _dc(L, *arrays):
-    """The sub-cubic divide-and-conquer engine (`_dc_lat`) when it serves this bandlimit.
+    """The divide-and-conquer engine (:mod:`gmaster._sht.dc`) if it serves this band limit, else None.
 
-    Never inside a trace: its plan arrays would be captured as program constants there (the
-    callers that serve it compose their programs eagerly), so a traced call keeps the march.
+    Never used inside a trace, where its plan arrays would be captured as program constants; a
+    traced call keeps the march.
     """
     from . import dc as _dc_lat
 
@@ -700,6 +717,10 @@ def _dc(L, *arrays):
 
 
 def forward_latitudinal_positive(positive, weights, phase, *, L, nside):
+    """Spin-0 folded analysis: ``(ntheta, L)`` positive-order ring spectrum to ``(L, L)`` alm.
+
+    ``weights`` are the ring quadrature weights and ``phase`` the ring phase offsets.
+    """
     dc = _dc(L, positive)
     if dc is not None:
         return dc.forward_latitudinal_positive(positive, weights, phase, L=L, nside=nside)
@@ -708,6 +729,7 @@ def forward_latitudinal_positive(positive, weights, phase, *, L, nside):
 
 
 def forward_latitudinal_positive_pair(positive_a, positive_b, weights, phase, *, L, nside):
+    """Two folded scalar analyses sharing one march; returns a list of two alm blocks."""
     dc = _dc(L, positive_a)
     if dc is not None:
         return dc.forward_latitudinal_positive_pair(positive_a, positive_b, weights, phase,
@@ -732,9 +754,9 @@ def _fold_synthesise(positives, phase, garr, tabs, *, L, nside, cdtype=jnp.compl
 
     ``cdtype`` is the output type; the phased rows are rounded to it where they are formed.
 
-    Like the analysis pair, the recurrence is shared and each extra map costs its own
-    accumulators -- which for spin 0 are the lanes the spin-2 kernel uses for its second
-    helicity and this one leaves idle, so the paired kernel needs no extra registers.
+    The recurrence is shared and each extra map needs only its own accumulators.  For spin 0
+    these occupy the channels the spin-2 kernel uses for its second helicity, so the paired
+    kernel needs no extra registers.
     """
     geo = _geo_dict(garr, L, nside, 0)
     ntheta = geo["ntheta"]
@@ -774,6 +796,7 @@ def _fold_synthesise(positives, phase, garr, tabs, *, L, nside, cdtype=jnp.compl
 
 
 def inverse_latitudinal_positive(positive, phase, *, L, nside, cdtype=jnp.complex128):
+    """Spin-0 folded synthesis: ``(L, L)`` alm to the ``(ntheta, L)`` positive-order spectrum."""
     dc = _dc(L, positive)
     if dc is not None:
         return dc.inverse_latitudinal_positive(positive, phase, L=L, nside=nside)
@@ -796,7 +819,7 @@ def _forward_impl(ftm, garr, tabs, *, L, nside, cdtype=jnp.complex128):
     """``(ntheta, 2L)`` ring spectrum (column ``L + m`` is order ``m``) to ``(L, 2L-1)``.
 
     ``cdtype`` is the output's element type.  The kernel's partials are float32, so complex64
-    holds them exactly; Nside 8192 asks for it (its complex128 block is 18 GiB).
+    holds them exactly; Nside 8192 uses it (its complex128 block would be 18 GiB).
     """
     spin = 2
     geo = _geo_dict(garr, L, nside, spin)
@@ -805,16 +828,14 @@ def _forward_impl(ftm, garr, tabs, *, L, nside, cdtype=jnp.complex128):
     lane_ring = geo["lane_ring"]
     valid = geo["valid"]
     ring = jnp.where(valid, lane_ring, 0)
-    # Transposed once for the whole launch, and with no array-wide reversal: `ftm[::-1]` and the
-    # column flip that used to build the mirror channel lowered to one `loop_reverse_slice_fusion`
-    # of 85 ms per pass at Nside 2048 spin 2 (`.qwen/tmp/nsys_s2.nsys-rep`), against 50 ms for the
-    # march itself.  The ring reversal is folded into the lane gather (`mring`) and the order
-    # reversal into each window's own `mb`-row slice, which costs nothing.
-    # Materialised once, behind a barrier: `_forward_impl` is inlined into the caller's trace (a
-    # `jit` inside a `jit` is not a fusion boundary), and left fusable XLA re-derives these
-    # transposes inside every window's lane gather -- 48 strided passes over the 1.6 GiB ring
-    # spectrum, 73 ms of a 156 ms analysis pass at Nside 2048 spin 2 that does not appear when the
-    # march is timed on its own (`.qwen/tmp/s2split_s37.py`).
+    # The spectrum is transposed once for the whole launch and never reversed array-wide: XLA
+    # lowers a full reversal to a `loop_reverse_slice_fusion` that costs more than the march
+    # itself.  The ring reversal is folded into the lane gather (`mring`) and the order reversal
+    # into each window's own `mb`-row slice, which are free.
+    # The transposes are materialised behind a barrier: `_forward_impl` is inlined into the
+    # caller's trace (a `jit` inside a `jit` is not a fusion boundary), and if left fusable XLA
+    # re-derives them inside every window's lane gather, one strided pass over the whole ring
+    # spectrum per window.
     dirT = lax.optimization_barrier(ftm[:, L:2 * L].T)      # row m is order +m
     negT = lax.optimization_barrier(ftm[:, 1:L + 1].T)      # row k is order -m at k = L-1-m
     mring = jnp.where(valid, ntheta - 1 - lane_ring, 0)
@@ -836,16 +857,12 @@ def _forward_impl(ftm, garr, tabs, *, L, nside, cdtype=jnp.complex128):
                 [jnp.zeros((mb, m0, 4), parts.dtype), parts], axis=1)           # (mb, L, 4)
         parts = parts * rowsign[m0:m0 + mb][:, None, None].astype(jnp.float32)
         rows.append(parts[:, :, :2])
-        # The mirror half is stacked in *descending* order right here, at float32, so that its
-        # transpose lands on the output columns directly.  Reversing the assembled complex128
-        # block instead fused the reversal, the sign and the final concatenate into one
-        # `loop_reverse_slice_fusion` writing the whole 1.2 GiB `(L, 2L-1)` buffer: 85 ms per pass
-        # at Nside 2048 spin 2 against 50 ms for the march (`.qwen/tmp/nsys_s2.nsys-rep`).
+        # The mirror half is stacked in descending order here, at float32, so that its transpose
+        # lands on the output columns directly; reversing the assembled complex128 `(L, 2L-1)`
+        # block instead would cost a full-size reverse fusion.
         mrows.append(parts[::-1, :, 2:])
-    # One pad, one concatenate, one transpose.  Per-window `parts.T` fused into the final
-    # `(L, 2L-1)` concatenate instead lowered to a single 85 ms `loop_reverse_slice_fusion` per
-    # pass at Nside 2048 spin 2 -- 48 small transposes and two reversals writing one 1.2 GiB
-    # complex128 buffer, against 50 ms for the march itself (`.qwen/tmp/nsys_s2.nsys-rep`).
+    # One concatenate and one transpose per half, rather than per-window transposes fused into
+    # the final concatenate (which XLA lowers to one slow reverse-slice fusion over the output).
     dpart = jnp.concatenate(rows, axis=0)                       # (L, L, 2) rows ascending in m
     mpart = jnp.concatenate(mrows[::-1], axis=0)                # (L, L, 2) rows descending in m
     direct = (dpart[..., 0] + 1j * dpart[..., 1]).astype(cdtype).T
@@ -856,6 +873,7 @@ def _forward_impl(ftm, garr, tabs, *, L, nside, cdtype=jnp.complex128):
 
 
 def forward_latitudinal(ftm, *, L, spin, nside, cdtype=jnp.complex128):
+    """Spin-2 analysis: ``(ntheta, 2L)`` ring spectrum to ``(L, 2L-1)`` (see `_forward_impl`)."""
     if int(spin) != 2:
         raise ValueError(f"v2 march implements spin=+2, got spin={spin}")
     dc = _dc(L, ftm)
@@ -905,14 +923,18 @@ def _inverse_impl(flm, garr, tabs, *, L, nside, cdtype=jnp.complex128, group=Non
     return jnp.concatenate([jnp.zeros((ntheta, 1), cdtype), mirror[:, 1:][:, ::-1], direct],
                            axis=1)
 
-# Windows per program when the synthesis runs in complex64 (Nside 8192).  As one program it needed
-# 34.5 GiB beside its input (12 GiB output, 22.5 GiB temporaries) and the second call of an Nside
-# 8192 spin-2 pipeline ran out of memory there.  In groups of 64 (6 programs of 384 windows) it is
-# 24.0 GiB, the blocks plus the output; 4 or 16 per group measured 35.9 (`.qwen/tmp/s39/inv_peak.py`).
+# Windows per program when the synthesis runs in complex64 (Nside 8192).  As a single program it
+# needs 34.5 GiB beside its input (a 12 GiB output plus 22.5 GiB of temporaries), which does not fit
+# alongside an Nside 8192 spin-2 pipeline.  Groups of 64 windows (6 programs for 384 windows) peak
+# at 24.0 GiB, the blocks plus the output; smaller groups (4 or 16) peak higher, at 35.9 GiB.
 _INVERSE_GROUP = int(os.environ.get("GMASTER_V2_INVERSE_GROUP", "64"))
 
 
 def inverse_latitudinal(flm, *, L, spin, nside, cdtype=jnp.complex128):
+    """Spin-2 synthesis: ``(L, 2L-1)`` to the ``(ntheta, 2L)`` ring spectrum (see `_inverse_impl`).
+
+    In complex64 the windows run in groups of `GMASTER_V2_INVERSE_GROUP` to bound peak memory.
+    """
     if int(spin) != 2:
         raise ValueError(f"v2 march implements spin=+2, got spin={spin}")
     dc = _dc(L, flm)

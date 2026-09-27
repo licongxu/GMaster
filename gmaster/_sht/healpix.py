@@ -38,8 +38,6 @@ from . import spin_slice as _spin_slice
 from .cuda_gpu import on_cuda_gpu as _on_cuda_gpu
 from .dfp32 import scalar_forward_latitudinal_dfp32
 from .sht_pallas import (
-    _scalar_spin_synthesis_latitudinal,
-    _spin_forward_latitudinal,
     scalar_forward_latitudinal,
     scalar_inverse_latitudinal,
 )
@@ -66,8 +64,8 @@ from .rings import (
 
 def _stable_thetas(L, nside):
     theta = jnp.asarray(s2_samples.thetas(L, "healpix", nside))
-    # ponytail: remove this perturbation when s2fft's Price-McEwen recurrence
-    # handles exact-zero renormalisation without dropping subsequent modes.
+    # Nudge theta off exact zero: s2fft's Price-McEwen recurrence drops subsequent modes when
+    # its renormalisation hits an exact zero.  Remove once s2fft handles that case.
     return theta + 8 * jnp.finfo(theta.dtype).eps
 
 
@@ -77,9 +75,8 @@ def _forward_s2fft_ftm(maps, tables, *, L, nside, reality):
     if reality:
         ftm = healpix_ffts.healpix_fft(maps, L, nside, "jax", reality)
     else:
-        # One batched transform instead of s2fft's per-ring unroll: the
-        # latter issues one tiny FFT per ring (1023 of them at Nside 256) and
-        # runs launch-bound at ~4 GB/s.  Matches it to 1.6e-15.
+        # One batched ring FFT instead of s2fft's per-ring unroll, which issues one tiny FFT
+        # per ring and is launch-bound.  Agrees with s2fft to ~1e-15.
         centered = _forward_ring_fft_full(maps, tables, L=L, nside=nside)
         ftm = jnp.concatenate(
             (jnp.zeros((centered.shape[0], 1), dtype=centered.dtype), centered),
@@ -99,10 +96,9 @@ def _forward_s2fft_ftm(maps, tables, *, L, nside, reality):
 
 def _forward_latitudinal(ftm, *, L, spin, nside, reality, L_lower):
     if not reality and _spin_march.march_requested(spin, L=L, nside=nside):
-        # March the Wigner-d row inside the kernel instead of building the 73.48 GiB slice that
-        # `slabs_for` declines at Nside 1024, or the 13.2 s generic scatter loop that replaces it.
-        # With a slice resident the table route wins and keeps the call; see
-        # :func:`gmaster._spin_march_pallas.march_requested`.
+        # Generate the Wigner-d rows inside the kernel instead of reading a precomputed slice
+        # (too large above Nside ~512) or falling back to s2fft's slow generic scatter loop.
+        # When a slice is resident the table route keeps the call; see `march_requested`.
         return _spin_march.forward_latitudinal(ftm, L=L, spin=spin, nside=nside)
     return _ftm_flm_primitive.ftm_to_flm(
         ftm,
@@ -120,13 +116,11 @@ def _forward_latitudinal(ftm, *, L, spin, nside, reality, L_lower):
 
 @partial(jax.jit, static_argnames=("L", "spin", "reality"))
 def _finish_forward_s2fft(flm, *, L, spin, reality):
-    """Degree normalisation, the spin sign and the sub-spin zeroing, in one elementwise pass.
+    """Apply the degree normalisation, spin sign and ell < |spin| zeroing in one pass.
 
-    Written as an einsum, a `where` and a multiply this was three separate passes over the
-    `(L, 2L-1)` complex128 block -- 1.2 GiB at Nside 2048 spin 2, measured 72.7 ms of a 155 ms
-    analysis pass, against 58 ms for the march that produced it
-    (`.qwen/tmp/s2split_s37.py`).  The three factors are diagonal in `ell`, so they multiply into
-    one `(L,)` vector and the whole finish is one read and one write.
+    All three factors are diagonal in `ell`, so they combine into one `(L,)` vector and the
+    finish is a single read and write of the `(L, 2L-1)` block (1.2 GiB complex128 at
+    Nside 2048 spin 2), rather than three memory-bound passes.
     """
     m_start = L - 1 if reality else 0
     ell = jnp.arange(L)
@@ -136,8 +130,8 @@ def _finish_forward_s2fft(flm, *, L, spin, reality):
         * (-1.0) ** abs(spin)
     )
     if reality:
-        # The negative-order half is filled from the positive one, so the scaling has to land
-        # before the mirror: keep the two steps, but each is still a single pass.
+        # The negative-m half is mirrored from the positive half, so the degree scaling
+        # must be applied before the mirror.
         flm = flm * jnp.sqrt((2 * ell + 1) / (4 * jnp.pi))[:, None]
         flm = flm.at[:, :m_start].set(
             jnp.flip(
@@ -180,12 +174,10 @@ def _prepare_inverse_s2fft(flm, *, L):
 
 def _inverse_latitudinal(flm, theta, *, L, spin, nside, reality):
     if not reality and _spin_march.synth_requested(spin, L=L, nside=nside):
-        # The same table-free row march as the analysis seam, in the synthesis direction (sum over
-        # ell per theta lane): 122.7 ms at Nside 1024 against the 13.2 s generic loop the declined
-        # slice falls back to.  It takes the same no-slice default as analysis but has its own flag,
-        # `GMASTER_SPIN2_MARCH_SYNTH=0` to restore the exact route, because it is 0.86x against
-        # ducc0 rather than ahead (105.7 ms) and its map is 1.968e-04 max / 6.370e-06 rms off ducc0
-        # where the scatter loop is 1.095e-09 (`.qwen/tmp/synth_vs_ducc_1024.log`).
+        # Table-free row march in the synthesis direction (sum over ell per theta lane), far
+        # faster than the generic scatter loop.  `GMASTER_SPIN2_MARCH_SYNTH=0` restores the
+        # exact s2fft route: this march agrees with ducc0 to ~2e-4 max (~6e-6 rms) at Nside
+        # 1024, against ~1e-9 for the scatter loop.
         return _spin_march.inverse_latitudinal(flm, L=L, spin=spin, nside=nside)
     return _ftm_flm_primitive.flm_to_ftm(
         flm,
@@ -271,23 +263,19 @@ def _use_multi_gpu_sht(L):
 
 _SPIN_PALLAS_MAX_L = 768
 
-# The precomputed Legendre band is O(L^2 * nside) in the *storage* precision:
-# 9.4 GiB at Nside 512 and 73.5 GiB at 1024 in float64, half that with
-# `set_table_precision("fp32")` (36.7 GiB at Nside 1024). Anything above this falls
-# back to the fused kernel rather than trading a faster theta stage for an OOM.
-# Synthesis prefers a second, re-laid-out copy and takes it only while the pool has
-# room (`_theta_matrix._synth_band`); with one resident band it reduces the analysis
-# layout strided, so this single number gates both directions.
-# 40 GiB is what makes the float32 Nside 1024 analysis band engage on this box's
-# 71.2 GiB pool; the float64 Nside 1024 band (73.5 GiB) and both Nside 2048 sizes
-# still decline. This gate only decides whether a build is attempted — the builders
-# also decline on `RESOURCE_EXHAUSTED`, and `_spin_slice` checks live pool headroom.
+# Size cap on the precomputed Legendre band, which is O(L^2 * nside) in the storage
+# precision: 9.4 GiB at Nside 512 and 73.5 GiB at Nside 1024 in float64, half that with
+# `set_table_precision("fp32")`.  Larger bands fall back to the fused kernel.  Synthesis
+# uses a re-laid-out second copy only when the pool has room (`_theta_matrix._synth_band`)
+# and otherwise reads the analysis layout, so this one number gates both directions.
+# 40 GiB admits the float32 Nside 1024 band on an ~80 GB card; float64 Nside 1024 and
+# Nside 2048 decline.  This only decides whether a build is attempted: the builders also
+# decline on `RESOURCE_EXHAUSTED`, and `_spin_slice` checks live pool headroom.
 _MATRIX_BAND_BUDGET = 40 * 1024**3
 
-# Largest Wigner-d slab that may ride a fused analysis boundary.  The fusion is a 7.9x / 2.5x win at
-# Nside 64 / 128 (`.qwen/tmp/slab_fuse2.log`) and 1.05x at 256, where the slab is 2.44 GiB; at Nside
-# 512 it is 18.7 GiB and a boundary carrying both it and the maps is the layout-doubling that
-# `_inverse_latitudinal_slab` exists to avoid, so the split route keeps the call there.
+# Largest Wigner-d slab that may be passed into a fused analysis program.  Fusion pays off
+# at small Nside (the slab is 2.44 GiB at Nside 256); at Nside 512 the slab is 18.7 GiB and a
+# program holding it alongside the maps doubles the layout, so the split route is used.
 _SLAB_FUSE_MAX_BYTES = 4 * 1024**3
 
 
@@ -304,8 +292,8 @@ def _spin_slabs(L_work, spin, *, nside):
     if nmt_params.sht_calculator in ("jax-generic", "jax-mgpu"):
         return None, None
     if _spin_march._march_v2.enabled(L_work):
-        # The v2 CUDA march beats the resident slab and needs none of its memory: at Nside 512
-        # spin 2 the slab route is 41.5 ms per pass with a 43.9 GiB device peak, the march 2.7 ms.
+        # The v2 CUDA march is faster than the resident slab and needs none of its memory
+        # (the slab route peaks at ~44 GiB at Nside 512 spin 2).
         return None, None
     return _spin_slice.slabs_for(
         _stable_thetas(L_work, nside), L=L_work, spin=spin, nside=nside
@@ -317,55 +305,38 @@ def _use_pallas_sht(L, spin):
         "jax", "jax-single", "jax-mgpu", "jax-dfp32", "jax-matrix"
     ):
         return False
-    # No lower bound on L: interleaved against the generic s2fft path with the
-    # clocks forced up, the fused scalar path is 1.8x faster at Nside 16 and
-    # 4.5x at Nside 32, because the generic latitudinal step is a scatter loop
-    # whose cost barely falls with map size. Alms agree to 2.9e-13.
-    # Fused spin-weighted kernels remain experimental: their closed-form
-    # Wigner-d seeds lose relative precision through catastrophic cancellation
-    # once |m| approaches l. Spin transforms use the generic path until the
-    # kernels adopt a renormalized sideways recursion (Turok-Bucher class).
+    # No lower bound on L: the generic s2fft latitudinal step is a scatter loop whose cost
+    # barely falls with map size, so the fused scalar path wins even at Nside 16.
+    # Spin-weighted fused kernels are not used: their closed-form Wigner-d seeds lose
+    # relative precision through cancellation as |m| approaches l.
     if spin != 0:
         return False
     return _on_cuda_gpu()
 
 
 def _pallas_block_size(nside):
-    # 512 lanes per program is the throughput sweet spot: larger tiles
-    # under-utilize the SMs (the synthesis kernel degrades ~1.5-1.6x at
-    # 1024 and cliffs hard at 2048), while smaller tiles add redundant
-    # degree-loop work in analysis. 2*nside keeps the small-Nside case.
+    # 512 lanes per program: larger tiles under-utilise the SMs (synthesis degrades sharply
+    # at 1024-2048), smaller ones repeat degree-loop work in analysis.  2*nside covers small maps.
     return min(512, 2 * nside)
 
 
-# Above this working bandlimit the refinement loop runs op-by-op instead of as
-# one traced program.  768 is Nside 256: with the band hoisted out of the trace by
-# `_trace_route_ready`, one program over the refinement loop is bit-identical
-# (rel 0.000e+00, `.qwen/tmp/traceidentity_s32.py`) and 9.4 % faster end to end at
-# that size -- 13.737 -> 12.442 ms, field 7.243 -> 6.378 ms
-# (`.qwen/tmp/tracepipe_s32.log`).  It does not extend: the same arm at Nside 512
-# (gate 1536) is 17 % *slower*, 68.407 -> 80.283 ms, with a 4.69 GiB band inside the
-# program instead of the 0.61 GiB one it carries here.  Before the hoist the gate
-# could not move at all -- the band build inside an outer trace raised
-# `AttributeError: 'block_until_ready' is not available on traced array
-# float32[160, 64, 512]` (`.qwen/tmp/s24_256_0.log`).
+# Above this working band limit the refinement loop runs op-by-op instead of as one traced
+# program.  Up to 768 (Nside 256) the single program is bit-identical and ~9% faster; at
+# Nside 512 it is slower, because the program then carries a 4.7 GiB band.
 _PALLAS_TRACED_MAX_L = 768
-# Tracing n_iter at L=3072 (Nside 1024) compiled for ~20 min on a Colab T4 and
-# the warmed field was still minutes; the already-jitted per-transform march
-# programs are the T4 route.  768 is Nside 256, where one program over the
-# refinement loop was measured 9.4 % faster.
+# The same limit for the march routes (`GMASTER_MARCH_TRACED_MAX_L`).  Tracing the whole
+# refinement loop at large L compiles for many minutes on small GPUs, so larger sizes run
+# the already-jitted per-transform programs.
 _MARCH_TRACED_MAX_L = int(os.environ.get("GMASTER_MARCH_TRACED_MAX_L", "768"))
 
 
 def _trace_route_ready(nside, L_work):
-    """Whether the single-program refinement route can see its tables at this size.
+    """Whether the refinement loop may run as one traced program at this size.
 
-    The Legendre band is built outside a trace or not at all (`_theta_matrix._band`
-    drains its build caches with `block_until_ready` and declines under one), so a
-    geometry first touched inside a traced program silently takes the fused fp64
-    on-the-fly kernel inside the very program that was traced to be fast.  The band
-    is therefore built here, at top level, before the route is chosen -- so a
-    program never carries a table build, which XLA would then re-run on every call.
+    The Legendre band can only be built outside a trace (`_theta_matrix._band` declines
+    under one), so it is built here, at top level, before the route is chosen.  Otherwise
+    the traced program would silently fall back to the slow on-the-fly kernel, or carry a
+    table build that XLA re-runs on every call.
     """
     if not _prefer_theta_band(nside, L_work, 0):
         return L_work <= _MARCH_TRACED_MAX_L
@@ -384,44 +355,34 @@ def _use_multi_gpu_pallas(L, values):
 
 
 def _prefer_theta_band(nside, L, m_start):
-    """Use the precomputed Legendre band instead of the kernel's recurrence.
+    """Whether to use the precomputed Legendre band instead of the kernel's recurrence.
 
-    The band holds the same fp64 d^l_{m,0}(theta_j) values the fused kernel
-    regenerates on every call, so the latitudinal stage becomes a memory-bound
-    contraction. Measured against the kernel with the two interleaved and the
-    clocks forced up: map2alm + alm2map is 1.12x faster at Nside 64, 1.23x at
-    128, 1.33x at 256, with the alms agreeing to 1.8e-14. It is the default for
-    the scalar transform; `jax` still means "band if it fits", and an
-    insufficient budget or an m-split falls through to the kernel.
+    The band holds the d^l_{m,0}(theta_j) values the fused kernel regenerates on every call,
+    turning the latitudinal stage into a memory-bound contraction (alms agree to ~1e-14).
+    Declined for an m-split, when the v2 CUDA march is enabled, or when the band exceeds
+    `_MATRIX_BAND_BUDGET`.
     """
     if m_start != 0:
         return False
     if nmt_params.sht_calculator not in ("jax", "jax-matrix"):
         return False
     if _spin_march._march_v2.enabled(L):
-        # The v2 CUDA march beats the resident band at every size (2.8x at Nside 1024).
+        # The v2 CUDA march is faster than the resident band at every size.
         return False
     return _theta_band_bytes(nside, L, dtype=table_dtype()) <= _MATRIX_BAND_BUDGET
 
 
 def _fused_forward_sht(positive, theta, weights, phase, *, L, block_size,
                        m_start=0):
-    """Forward latitudinal SHT, dispatched on the configured calculator.
+    """Scalar forward latitudinal stage, dispatched on the configured calculator.
 
-    The double-fp32 (DFP32) kernel is analysis-only and slightly different
-    in precision; every other calculator uses the fp64 Pallas kernel.
-    The scalar path prefers the precomputed Legendre band while it fits (see
-    `_prefer_theta_band`) and falls back to the kernel when it does not or
-    cannot be materialized concretely, which is what happens on `jax.grad`
-    paths.  Where the band is refused for *size* -- Nside 2048 and above at
-    float32 -- the folded spin-0 march serves the call instead of the fp64
-    on-the-fly kernel, because that kernel is the worst cell in the repo
-    (0.33x at 2048, 0.27x at 4096); see
-    :func:`gmaster._spin_march_pallas.fold_requested`.
+    Order of preference: the folded spin-0 march (`fold_requested`), the precomputed
+    Legendre band while it fits (`_prefer_theta_band`; it cannot be built under a trace,
+    e.g. on `jax.grad` paths), then the fp64 Pallas kernel.  The double-fp32 (DFP32) kernel
+    replaces the fp64 one when selected; it is analysis-only and slightly less precise.
     """
     nside = (len(theta) + 1) // 4
-    # The folded march builds phases for m = 0..L-1. An m-split hands it only
-    # one slice (Nside 8192 low half is 7198 columns, not 24576).
+    # The folded march builds phases for all m = 0..L-1, so it cannot serve an m-split slice.
     if (m_start == 0 and positive.shape[-1] == L
             and nmt_params.sht_calculator in ("jax", "jax-matrix")
             and _spin_march.fold_requested(nside, L)):
@@ -448,14 +409,9 @@ def _fused_forward_sht(positive, theta, weights, phase, *, L, block_size,
 def _fused_inverse_sht(positive, theta, phase, *, L, nside, block_size):
     """Scalar synthesis latitudinal stage, dispatched like `_fused_forward_sht`.
 
-    HEALPix synthesis carries no quadrature weight of its own (the ring
-    transform has it), so both routes get a unit weight vector.  The synthesis
-    band prefers a copy re-laid out so the reduction runs over a contiguous axis,
-    and `_theta_matrix._synth_band` makes that copy only while the pool has room
-    for it; with one band resident it reduces the analysis layout strided instead.
-    So the gate here is the same single-band test as the analysis path, and the
-    doubling that used to be written here is what silently handed Nside 1024
-    synthesis back to the fused kernel.
+    HEALPix synthesis carries no quadrature weight (the ring transform has it), so the
+    routes get a unit weight vector.  The band gate is the same single-band test as
+    analysis: `_theta_matrix._synth_band` adds a re-laid-out copy only if the pool has room.
     """
     weights = jnp.ones_like(theta)
     if (nmt_params.sht_calculator in ("jax", "jax-matrix")
@@ -495,8 +451,8 @@ def _pallas_fft_method():
 
 def _forward_healpix_fft(maps, *, L, nside, reality):
     """HEALPix ring FFT in the centred `(4*nside-1, 2L)` layout s2fft's primitive wants."""
-    # Not a jit boundary itself: the ring constants have to be fetched outside the trace
-    # so they cross as arguments instead of being rebuilt (or baked) inside it.
+    # Not a jit boundary: the ring constants are fetched outside the trace and passed as
+    # arguments, so they are not rebuilt or baked in as constants.
     return _forward_ring_fft(
         maps, _ring_analysis_tables(L, nside, getattr(maps, "device", None)),
         L=L, nside=nside,
@@ -504,8 +460,8 @@ def _forward_healpix_fft(maps, *, L, nside, reality):
 
 
 def _finish_inverse_pallas(ftm_positive, *, L, nside):
-    # The full polar-cap kernel at Nside 8192 is (16382, 65536) complex64,
-    # exactly the 8 GiB cuFFT buffer that does not fit beside the spectrum.
+    # At Nside 8192 the full polar-cap kernel is (16382, 65536) complex64 = 8 GiB, which
+    # does not fit beside the spectrum, so the rings are transformed in chunks.
     if nside >= 8192:
         return _inverse_ring_fft_herm_chunked(ftm_positive, L=L, nside=nside)
     return _inverse_ring_fft_herm(
@@ -551,8 +507,8 @@ def _inverse_latitudinal_device(L, spin, nside, reality, half, device_index):
 def _forward_s2fft_multi_gpu(maps, *, L, spin, nside, reality):
     primary, secondary = _gpu_devices()[:2]
     if not reality:
-        # The ring FFT's 16 GiB workspace does not fit on the card that already
-        # holds the map. Build it on the other GPU and march there too.
+        # The ring FFT workspace (~16 GiB) does not fit beside the map, so run the ring
+        # FFT and the march on the second GPU.
         maps = _copy_to_device(maps, secondary)
         ftm = _forward_s2fft_ftm(
             maps,
@@ -563,8 +519,8 @@ def _forward_s2fft_multi_gpu(maps, *, L, spin, nside, reality):
         transform = _forward_latitudinal_device(L, spin, nside, reality, 0, 1)
         flm = _run_blocking(transform, ftm)
         ftm = None
-        # Keep the spectrum on this GPU. Copying it back fills the other card,
-        # and the alm gather then has no room for its 4.5 GiB temporary.
+        # Keep the spectrum on this GPU: copying it back leaves the primary card no room
+        # for the alm gather's temporary.
         flm = _finish_forward_s2fft(flm, L=L, spin=spin, reality=reality)
         flm.block_until_ready()
         return flm
@@ -597,8 +553,8 @@ def _inverse_s2fft_multi_gpu(flm, *, L, spin, nside, reality):
     flm = _copy_to_device(flm, primary)
     flm = _prepare_inverse_s2fft(flm, L=L)
     if not reality:
-        # Spin synthesis ignores the theta half, so the north/south split is
-        # two full marches. Keep the single march on the second GPU.
+        # Spin synthesis ignores the theta half (a north/south split would be two full
+        # marches), so run a single march on the second GPU.
         flm = _copy_to_device(flm, secondary)
         transform = _inverse_latitudinal_device(L, spin, nside, reality, 0, 1)
         ftm = _run_blocking(transform, flm)
@@ -656,16 +612,12 @@ def _unpack_spin(alm, L, L_work):
 
 
 def _polarised_ring_tables(spin, L_work, nside, like, *, synthesis):
-    """The ring chirp-Z constants a polarised core needs, fetched *outside* its trace.
+    """Ring chirp-Z constants for a polarised transform, fetched outside any trace.
 
-    `_map2alm_once`, `_alm2map_core` and `_map2alm_iteration` used to be the jit boundaries
-    themselves and called the non-boundary `_forward_s2fft`/`_inverse_s2fft` inside their trace;
-    those build the tables under `ensure_compile_time_eval`, so the concrete arrays were baked
-    into the outer program as HLO constants -- copied to the host at lowering
-    (`_array_mlir_constant_handler`) and re-embedded per executable.  At Nside 4096 the analysis
-    kernel table alone is `(8190, 65536)` complex64 = 4.00 GiB and the polarised `map2alm` died
-    with `RESOURCE_EXHAUSTED ... 4.00GiB` before any transform ran
-    (`.qwen/tmp/validate_s36c.log`, session 36).  Spin 0 passes `()` and never saw it.
+    They must enter the jitted cores as arguments: built inside a trace they would be baked
+    into the program as HLO constants, copied to the host at lowering and re-embedded per
+    executable.  At Nside 4096 the analysis table alone is `(8190, 65536)` complex64 =
+    4 GiB, enough to exhaust device memory.  Spin 0 needs no tables and gets `()`.
     """
     if spin == 0:
         return ()
@@ -676,10 +628,10 @@ def _polarised_ring_tables(spin, L_work, nside, like, *, synthesis):
 
 
 def _dc_spin(L_work, spin):
-    """The divide-and-conquer engine for a polarised transform at this bandlimit, if it serves it.
+    """The divide-and-conquer engine for a polarised transform at this band limit, or None.
 
-    Its spin-s calls are composed eagerly here (ring FFT, latitudinal step, finish -- each its own
-    program) so that the plan's arrays enter as jit arguments; traced inside the fused programs
+    Its spin-s calls are composed eagerly (ring FFT, latitudinal step, finish, each its own
+    program) so the plan's arrays enter as jit arguments; traced inside the fused programs
     below they would be captured as constants (~20 GiB of HLO at Nside 4096).
     """
     return _spin_march._march_v2._dc(L_work) if spin != 0 else None
@@ -701,10 +653,10 @@ class _MarchStages:
     inverse_latitudinal_spin = staticmethod(_march_inverse_latitudinal_spin)
 
 
-# The staged march at Nside 8192 carries its spectra in complex64 between programs.  The v2
-# kernels read and write float32, so the values the kernel sees and emits are the same; complex128
-# made the synthesis program 18 GiB in + 24 GiB out + 32 GiB temporaries, which with the maps and
-# alms resident was past the 96 GB card at the first refinement iteration.
+# At Nside 8192 the staged march passes its spectra between programs in complex64.  The v2
+# kernels compute in float32, so no precision is lost; in complex128 the synthesis program alone
+# needs ~74 GiB of inputs, outputs and temporaries, which does not fit a 96 GB card beside the
+# resident maps and alms.
 @partial(jax.jit, static_argnums=(1, 2))
 def _prepare_spin_c64(alm, L, L_work):
     return _prepare_inverse_s2fft(_unpack_spin(alm, L, L_work), L=L_work).astype(jnp.complex64)
@@ -718,14 +670,19 @@ def _forward_s2fft_ftm_c64(maps, tables, *, L, nside):
 
 @partial(jax.jit, static_argnames=("L", "nside"))
 def _residual_ftm_c64(synth, maps, tables, *, L, nside):
-    """Ring spectrum of `synth - maps` with the difference formed inside the program: held as
-    its own array it was a third 12 GiB map beside the input and the march's temporaries."""
+    """Ring spectrum of `synth - maps`, with the difference formed inside the program.
+
+    Materialising the difference would add a third full map (12 GiB at Nside 8192).
+    """
     return _forward_s2fft_ftm_c64(synth - maps, tables, L=L, nside=nside)
 
 
 def _march_c64_analysis(ftm_box, ell, order, *, L_work, spin, nside):
-    """March analysis of the complex64 ring spectrum in `ftm_box` (a one-element list, emptied so
-    the spectrum is freed as soon as the march has read it)."""
+    """March analysis of the complex64 ring spectrum held in `ftm_box`.
+
+    `ftm_box` is a one-element list that is emptied here, so the spectrum can be freed as
+    soon as the march has read it.
+    """
     flm = _spin_march._march_v2.forward_latitudinal(ftm_box.pop(), L=L_work, spin=spin,
                                                     nside=nside, cdtype=jnp.complex64)
     return _finish_pack_spin(flm, ell, order, L_work=L_work, spin=spin)
@@ -733,9 +690,9 @@ def _march_c64_analysis(ftm_box, ell, order, *, L_work, spin, nside):
 
 @partial(jax.jit, static_argnames=("L_work", "spin"))
 def _finish_pack_spin(flm, ell, order, *, L_work, spin):
-    """`_spin_pack_plus(_finish_forward_s2fft(flm))` with no `(L, 2L-1)` block between them.
+    """`_spin_pack_plus(_finish_forward_s2fft(flm))` without an intermediate `(L, 2L-1)` block.
 
-    The finish factor is diagonal in `ell`, so it is applied to the gathered entries instead.
+    The finish factor is diagonal in `ell`, so it is applied to the gathered entries.
     """
     factor = (jnp.sqrt((2 * ell + 1) / (4 * jnp.pi)) * jnp.where(ell < abs(spin), 0.0, 1.0)
               * (-1.0) ** abs(spin))
@@ -746,8 +703,7 @@ def _finish_pack_spin(flm, ell, order, *, L_work, spin):
 
 @partial(jax.jit, static_argnames=("L", "spin", "nside"))
 def _finish_inverse_c64(ftm, tables, *, L, spin, nside):
-    """`_finish_inverse_s2fft` on a complex64 march output: the ring phase is applied in complex128
-    as before, and the ring transform takes its complex64 input as it always did."""
+    """`_finish_inverse_s2fft` on a complex64 march output (ring phase applied in complex128)."""
     return _finish_inverse_s2fft(ftm.astype(jnp.complex128), tables, L=L, spin=spin, nside=nside,
                                  reality=False)
 
@@ -758,11 +714,11 @@ def _march_c64_ready(L_work, spin):
 
 
 def _staged_spin(L_work, spin):
-    """The latitudinal engine a polarised transform runs as separate programs, if any.
+    """The latitudinal engine that runs a polarised transform as separate programs, or None.
 
-    The D&C engine where it serves; above `_RING_FACTORS_KEPT_MAX_L` (Nside 8192) also the march,
-    whose fused synthesis program needed one 72 GiB temporary there -- split, each program's
-    working set is one stage's.
+    The D&C engine where it serves; above `_RING_FACTORS_KEPT_MAX_L` (Nside 8192) also the
+    march, whose fused synthesis program would need a ~72 GiB temporary.  Split into stages,
+    each program's working set is that of one stage.
     """
     dc = _dc_spin(L_work, spin)
     if dc is None and spin != 0 and L_work > _RING_FACTORS_KEPT_MAX_L:
@@ -858,10 +814,9 @@ def _map2alm_once_impl(maps, tables, ell, order, *, spin, nside, L, L_work):
     return jnp.stack([-(plus_m + minus_m) / 2, 0.5j * (plus_m - minus_m)])
 
 
-# Above this ring-spectrum size one refinement iteration runs as its two programs (synthesis,
-# then analysis of the residual) instead of one: XLA hands a program a single temporary buffer,
-# and the fused iteration's was 26 GiB at Nside 4096 spin 2 (`MaxAllocSize` in
-# `.qwen/tmp/chain_s36s2.log`), the largest allocation of the whole pipeline.
+# Above this ring-spectrum size one refinement iteration runs as two programs (synthesis, then
+# analysis of the residual) instead of one.  XLA gives each program a single temporary buffer,
+# and for the fused iteration it reaches ~26 GiB at Nside 4096 spin 2.
 _ITERATION_SPLIT_BYTES = 4 * 1024 ** 3
 
 
@@ -903,20 +858,18 @@ def _map2alm_iteration_impl(alm, maps, a_tables, s_tables, ell, order, *, spin, 
 
 @partial(jax.jit, static_argnames=("L",))
 def _forward_latitudinal_slab(ftm, slab, *, L):
-    """The slice contraction on its own: see :func:`_inverse_latitudinal_slab`."""
+    """The slab contraction alone; see :func:`_inverse_latitudinal_slab`."""
     return _spin_slice.forward_latitudinal(ftm, slab, L=L)
 
 
 @partial(jax.jit, static_argnames=("L",))
 def _inverse_latitudinal_slab(flm, slab, *, L):
-    """The slice contraction, and nothing else.
+    """The slab contraction alone, as its own jit.
 
-    A block set is tens of GiB from Nside 512 up, and a ``jax.jit`` boundary whose
-    argument list carries both layouts makes XLA count them twice against the pool
-    (``The byte size of input/output arguments ... exceeds the base limit``) and
-    schedule multi-gibibyte copies of them on every call.  So only the latitudinal
-    step is jitted here; the s2fft stages around it are each already jitted
-    individually and never see the table.
+    A slab is tens of GiB from Nside 512 up.  A jit boundary whose arguments carry both
+    slab layouts makes XLA count them twice against the pool and copy them on every call,
+    so only the latitudinal step is jitted with the slab; the surrounding s2fft stages are
+    jitted separately and never see it.
     """
     return _spin_slice.inverse_latitudinal(flm, slab, L=L)
 
@@ -941,17 +894,12 @@ _map2alm_once_slab_fused = jax.jit(
 
 
 def _map2alm_once_slab(maps, ell, order, *, spin, nside, L, L_work, slab):
-    """Polarised analysis with the latitudinal step replaced by a slab contraction.
+    """Polarised analysis with the latitudinal step done as a slab contraction.
 
-    The ring FFT, the contraction, the epilogue and the E/B combination are one program while the slab
-    is small enough to ride the boundary.  Run as three jits with an eager gather afterwards the call
-    cost 1.700 / 1.944 ms at Nside 64 / 128 whatever the map size, because `plus[ell, L_work-1+order]`
-    and its parity conjugate are dispatched op by op; fused it is 0.215 and 0.765 ms (7.91x, 2.54x)
-    with bit-identical output (`.qwen/tmp/slab_fuse2.log`).  Above the gate fusion is not merely
-    impossible, it is unwanted: forcing it on an 18.74 GiB slab at Nside 512 costs 34.414 -> 38.175 ms
-    per analysis call and 5.075 -> 5.420 ms on the 2.44 GiB slab at Nside 256, with the result unchanged
-    to every printed digit (`.qwen/tmp/s35_slabgate.log`).  The gate therefore keeps the split path for
-    throughput, not because the boundary would refuse.
+    While the slab is at most `_SLAB_FUSE_MAX_BYTES`, the ring FFT, contraction, finish and
+    E/B combination run as one program; at small Nside this removes the per-op dispatch
+    overhead of the E/B gather, which otherwise dominates.  Larger slabs run the stages
+    separately, which is faster there (bit-identical results either way).
     """
     tables = _spin_ring_analysis_tables(
         L_work, nside,
@@ -987,30 +935,19 @@ def _alm2map_core_slab(alm, *, spin, nside, L, L_work, slab):
         spin=spin, nside=nside, L=L, L_work=L_work)
 
 
-# Largest working bandlimit whose whole polarised refinement loop is traced into one program.
-# 1536 is Nside 512, and the slab route does not reach past it anyway (`_spin_slabs` returns no
-# pair at 1024), so the cap is the measured range rather than a boundary the trace would refuse.
-# With the default float64 tables map2alm goes 36.949 -> 34.479 ms at Nside 256 and 239.320 ->
-# 225.025 ms at 512; with `set_table_precision("fp32")` 8.966 -> 7.900 ms at 256 and 60.955 ->
-# 52.372 ms at 512, every arm bit-identical to the eager loop (`max|d|=0.000e+00`).  End to end
-# that is 56 -> 52 ms at Nside 256 and 340 -> 333 ms at 512 spin 2, with `dCl` unchanged to every
-# printed digit and `bytes_in_use` unchanged too (57.5 -> 57.6 GiB, the slabs, not this program).
-# Nside 128 with float64 tables is the one core-call reversal, 5.829/5.830/5.835 ->
-# 5.999/5.996/5.974 ms (1.03x, three repeats), and nine-repeat harness runs put both arms at
-# 10-11 ms, so it is left inside a single upper gate rather than carved out (`.qwen/tmp/
-# s35_b3_fp64.log`, `.qwen/tmp/s35_b3_repeat.log`, `.qwen/tmp/s35_b3_256.log`,
-# `.qwen/tmp/s35_b3_512.log`, `.qwen/tmp/s35_b3_pipe_before.log`, `.qwen/tmp/s35_b3_pipe_after.log`,
-# `.qwen/tmp/s35_b3_n128ab.log`).
+# Largest working band limit whose whole polarised slab refinement loop is traced into one
+# program (1536 is Nside 512; the slab route does not reach Nside 1024).  Tracing is
+# bit-identical to the eager loop, ~6-14% faster on map2alm at Nside 256-512, and adds no
+# device memory beyond the slabs themselves.
 _SPIN_SLAB_TRACED_MAX_L = 1536
 
 
 def _spin_slab_trace_ready(maps, L_work):
-    """Whether the refinement loop may become one program at this size.
+    """Whether the polarised slab refinement loop may run as one program at this size.
 
-    The loop keeps its eager form under an outer trace: one graph over `n_iter` refinement passes
-    keeps every iteration's residual alive for the transpose, which is a memory cost this route has
-    never been measured against, and the repository's AD tests reach only the scalar route.  A
-    gradient of a polarised analysis therefore continues to see the boundaries it had before.
+    Under an outer trace (e.g. `jax.grad`) the loop stays eager: one graph over `n_iter`
+    passes would keep every iteration's residual alive for the transpose, a memory cost
+    not validated for this route.
     """
     if isinstance(maps, jax.core.Tracer):
         return False
@@ -1021,11 +958,10 @@ def _spin_slab_trace_ready(maps, L_work):
 def _map2alm_core_slab_traced(maps, ell, order, analysis_tables, synthesis_tables,
                               analysis_slab, synthesis_slab, *, spin, nside, L,
                               L_work, n_iter):
-    """Polarised analysis with the refinement loop inside one XLA program.
+    """Polarised slab analysis with the refinement loop inside one XLA program.
 
-    The tables ride in as arguments because a traced program may read them but must never build
-    them (`_theta_matrix`'s rule, and the reason `_trace_route_ready` warms the scalar band
-    first): a build inside this program would be re-run by XLA on every call.
+    Ring tables and slabs are passed as arguments: a traced program may read tables but must
+    never build them, since XLA would re-run the build on every call.
     """
     alm = _map2alm_once_slab_body(
         maps, analysis_tables, ell, order, spin=spin, nside=nside, L=L,
@@ -1088,7 +1024,12 @@ def _spin_synthesis_raw(ftm, *, L, nside, spin):
 
 
 def _map2alm_core_dc_spin(maps, ell, order, *, spin, nside, L_work, n_iter, dc):
-    """Spin-s refinement in the D&C engine's node space (see `_dc_lat`): no tree inside the loop."""
+    """Spin-s Jacobi refinement in the D&C engine's node space.
+
+    The engine's tree transforms are orthogonal (V^T V = I), so they cancel between
+    iterations and are applied only once, after the loop.  Residuals are formed in
+    ring-Fourier space by `ring_fold_residual_complex`.
+    """
     tables = _polarised_ring_tables(spin, L_work, nside, maps, synthesis=False)
     fmap = _forward_ring_fft_full(maps[0] + 1j * maps[1], tables, L=L_work, nside=nside)
     fmap = fmap.astype(jnp.complex64)
@@ -1136,45 +1077,8 @@ def _positive_alm(alm, *, L, L_work):
 
 def _alm2map_core_pallas_eager(alm, *, nside, L, L_work, spin=0):
     if spin != 0:
-        # Two-helicity synthesis: a+ = E + iB drives the mp=+s ladder of
-        # f+ = Q - iU; a- = E - iB drives the mp=-s ladder of f- = Q + iU.
-        e_alms, b_alms = jnp.asarray(alm[0]), jnp.asarray(alm[1])
-        ell_idx, m_idx = _ell_order_arrays(L - 1)
-        a_plus = jnp.zeros((L_work, 2 * L_work - 1), dtype=jnp.complex128)
-        a_minus = jnp.zeros((L_work, 2 * L_work - 1), dtype=jnp.complex128)
-        plus_vals = e_alms + 1j * b_alms
-        minus_vals = e_alms - 1j * b_alms
-        parity = (-1.0) ** m_idx
-        a_plus = a_plus.at[ell_idx, L_work - 1 + m_idx].set(plus_vals)
-        a_plus = a_plus.at[ell_idx, L_work - 1 - m_idx].set(parity * jnp.conj(plus_vals))
-        a_minus = a_minus.at[ell_idx, L_work - 1 + m_idx].set(minus_vals)
-        a_minus = a_minus.at[ell_idx, L_work - 1 - m_idx].set(parity * jnp.conj(minus_vals))
-        norm_l = jnp.sqrt((2 * jnp.arange(L) + 1) / (4 * jnp.pi))
-        a_plus = a_plus * norm_l[:, None]
-        a_minus = a_minus * norm_l[:, None]
-        theta = _stable_thetas(L_work, nside)
-        block = min(256, 2 * nside)
-        f_plus = _scalar_spin_synthesis_latitudinal(
-            jnp.asarray(a_plus).T, theta, L=L_work, spin=int(spin), block_size=block
-        )
-        f_minus = _scalar_spin_synthesis_latitudinal(
-            jnp.asarray(a_minus).T, theta, L=L_work, spin=-int(spin), block_size=block
-        )
-        shifts = healpix_ffts.ring_phase_shifts_hp_jax(L_work, nside, False, False)
-        synth_tables = _spin_ring_synthesis_tables(
-            L_work, nside, getattr(f_plus, "device", None))
-
-        def to_map(centered):
-            full = jnp.concatenate(
-                (jnp.zeros((centered.shape[0], 1), dtype=centered.dtype), centered),
-                axis=1,
-            )
-            full = full.at[:, 1:].multiply(shifts)
-            return _inverse_ring_fft_complex(full[:, 1:], synth_tables,
-                                             L=L_work, nside=nside)
-        q_map = 0.5 * (to_map(f_plus) + jnp.conj(to_map(f_minus)))
-        u_map = -0.5j * (to_map(f_plus) - jnp.conj(to_map(f_minus)))
-        return jnp.stack([q_map, u_map])[None, :]
+        # Spin-weighted transforms never take the fused Pallas route (`_use_pallas_sht`).
+        raise NotImplementedError("the fused Pallas synthesis is spin-0 only")
     positive = _positive_alm(alm[0], L=L, L_work=L_work)
     theta = _stable_thetas(L_work, nside)
     phase = healpix_ffts.p2phi_rings_jax(jnp.arange(len(theta)), nside)
@@ -1203,25 +1107,17 @@ def _alm2map_core_pallas(alm, *, nside, L, L_work, spin=0):
 
 
 def _shared_band_route(nside, L_work):
-    """Which stages of two same-geometry spin-0 transforms may share one band.
+    """Which stages of two same-geometry spin-0 transforms may share one Legendre band.
 
-    Returns ``(analysis, synthesis)``.  The MASTER pipeline runs exactly such a
-    pair -- a field's `n_iter` Richardson passes and, inside
-    `compute_coupling_matrix`, its mask's `n_iter_mask` passes, both spin 0 at
-    `lmax_mask == lmax` -- and at Nside 256 that pair is 11.918 ms of a 12.442 ms
-    pipeline (`.qwen/tmp/tracepipe_s32.log`).  Both passes stream the same
-    resident band, so one program can serve both: measured 0.55x/0.56x/0.53x of
-    two separate calls at Nside 256/512/1024 for the analysis and 0.68x/0.63x for
-    the synthesis, outputs bit-identical (`.qwen/tmp/pairsettle_s33.log`,
-    `.qwen/tmp/pairsettle_s33_big.log`).
+    Returns ``(analysis, synthesis)``.  The MASTER pipeline runs such a pair: a field's
+    `n_iter` refinement and, in `compute_coupling_matrix`, its mask's `n_iter_mask`
+    refinement, both spin 0 when `lmax_mask == lmax`.  Both stream the same resident band,
+    so one pass serves both at roughly half the cost of two, bit-identically.
 
-    The gate is the band's own: no march may be serving these geometries (a
-    forced `GMASTER_SPIN0_MARCH=1` would otherwise silently get the band here and
-    the march on the single route), the band must fit, and it must be concrete --
-    so `warm` builds it here, at top level, rather than inside a trace.  The
-    synthesis half answers separately because the contiguous re-layout is what
-    makes a second right-hand side cheap; with the copy refused the pair costs
-    4.19x instead (`_theta_matrix.inverse_latitudinal_pair`).
+    Requires that no march serves these geometries (e.g. forced by
+    `GMASTER_SPIN0_MARCH=1`), that the band fits, and that it is concrete, so `warm`
+    builds it here at top level.  Synthesis is reported separately because pairing only
+    pays with the contiguous re-laid-out band copy (`_theta_matrix.inverse_latitudinal_pair`).
     """
     if not _prefer_theta_band(nside, L_work, 0):
         return (False, False)
@@ -1236,32 +1132,17 @@ def _shared_band_route(nside, L_work):
 
 
 def _march_pair_route(nside, L_work):
-    """True when the folded spin-0 march can serve a pair of same-geometry analyses.
+    """Whether the folded spin-0 march can serve a pair of same-geometry analyses.
 
-    This is the pair route for the sizes where no band exists -- Nside 2048 and above.  A marched
-    row's cost is the Legendre recurrence, which depends on the `(m, theta)` triple alone; the map
-    enters only in the emit, where four channels already fold through one Triton reduction tree.
-    Two maps therefore share the recurrence, though less completely than the band pairing does,
-    because the emit's fp64 partials and rhs also double: measured against two separate calls,
-    one paired latitudinal step costs **0.489** at Nside 512 (13.10 ms against 26.81 ms, where a
-    single march is 13.90 ms), 0.504 at 1024 (55.0 against 109.2 ms) and **0.752** at 2048 (435.0
-    against 578.4 ms), the trend being the store and rhs volume growing into the recurrence
-    (`.qwen/tmp/marchpair_512.log`, `.qwen/tmp/marchpair_1024.log`, `.qwen/tmp/marchpair_2048.log`).
-    The pairing cannot be bit-identical -- widening the emit block from 4 to 8 channels changes the
-    reduction tree, which shows up as 1.2-1.3e-07 relative against the single march -- so it is
-    checked against the fp64 band instead: at Nside 512 `|paired - band| = 2.03e-04` against
-    `|single - band| = 2.03e-04`, max abs 8.406e-08 against 8.405e-08, i.e. the paired route is
-    exactly as close to the accurate contraction as the march it replaces.  The synthesis half is
-    not paired here: the marched synthesis kernel keeps per-lane accumulators and per-degree
-    coefficient loads, both of which scale with the number of maps, so it has no shared reduction
-    tree to widen and a second map would double the part that costs.
+    This is the pair route where no band exists (Nside 2048 and above).  The Legendre
+    recurrence depends only on `(ell, m, theta)`, so two maps share it and only the emit
+    doubles; a paired step costs ~0.5-0.75 of two separate calls.  Widening the emit block
+    changes the reduction order, so results differ from the single march at ~1e-7 relative,
+    with the same accuracy against the fp64 band.  Synthesis is not paired on this route:
+    its per-lane accumulators scale with the number of maps, so nothing is shared.
 
-    The last clause is a memory limit, not a speed one.  At Nside 4096 the paired program dies in
-    the allocator -- `RESOURCE_EXHAUSTED: Out of memory while trying to allocate 8.15GiB` inside the
-    71.2 GiB pool -- where the same geometry run as two separate calls completes in 33.62 s against
-    NaMaster's 74.11 s (`rel dCl` 1.42e-06) with a 16.3 GiB GPU peak
-    (`.qwen/tmp/pairrun_4096_s34.log`).  `fold_pair_fits` refuses it, and the two calls the caller
-    then makes are the arm that works.
+    `fold_pair_fits` is a memory limit: at Nside 4096 the paired program does not fit
+    (~8 GiB allocation fails), and the caller then runs two separate calls.
     """
     return (_spin_march.fold_requested(nside, L_work)
             and _spin_march.fold_pair_fits(nside, L_work))
@@ -1269,11 +1150,11 @@ def _march_pair_route(nside, L_work):
 
 def _map2alm_pair_once_pallas(maps_a, maps_b, ell, order, *, nside, L_work, march_pair,
                               return_ftm=False):
-    """Two scalar analyses, one ring FFT per map and one sweep of the row source.
+    """Two scalar analyses: one ring FFT per map, one shared latitudinal sweep.
 
-    The azimuthal stage is per-map work and is done twice; only the latitudinal contraction is
-    shared, which is where the bytes (band) or the recurrence (march) are.  ``return_ftm`` also
-    hands back the two ring spectra, which the folded refinement loop reuses.
+    Only the latitudinal contraction is shared, since that is where the cost lies (band
+    reads or march recurrence).  With ``return_ftm`` the two ring spectra are also
+    returned, for reuse by the ring-fold refinement loop.
     """
     ftm_a = _forward_ring_fft_positive(
         maps_a[0],
@@ -1302,18 +1183,16 @@ def _pair_latitudinal_analysis(ftm_a, ftm_b, ell, order, *, nside, L_work, march
     weights = quadrature_jax.quad_weights_transform(L_work, "healpix", nside)
     phase = -healpix_ffts.p2phi_rings_jax(jnp.arange(len(theta)), nside)
     if _spin_march._march_v2._dc(L_work, ftm_a) is not None:
-        # The divide-and-conquer engine pairs by sharing its plan traversal; it has no march-style
-        # memory gate, so both maps always go through one call.
+        # The D&C engine pairs by sharing its plan traversal and has no pair memory gate.
         positive_a, positive_b = _spin_march._march_v2.forward_latitudinal_positive_pair(
             ftm_a, ftm_b, weights, phase, L=L_work, nside=nside)
     elif march_pair:
         positive_a, positive_b = _spin_march.forward_latitudinal_positive_pair(
             ftm_a, ftm_b, weights, phase, L=L_work, nside=nside)
     elif _spin_march._march_v2.enabled(L_work) and not _prefer_theta_band(nside, L_work, 0):
-        # The pair route was taken for the *synthesis* alone: above `_march_v2._PAIR_MAX_L` the
-        # paired analysis kernel loses (it needs the half-size theta tile, so it writes four times
-        # a single launch's tile partials), while the paired synthesis is free and bit-identical.
-        # The two analyses then run as two ordinary marched calls.
+        # Pair route taken for the synthesis only: above `_march_v2._PAIR_MAX_L` the paired
+        # analysis kernel is slower (it needs a half-size theta tile and writes 4x the tile
+        # partials), so the two analyses run as separate marched calls.
         positive_a = _spin_march.forward_latitudinal_positive(
             ftm_a, weights, phase, L=L_work, nside=nside)
         positive_b = _spin_march.forward_latitudinal_positive(
@@ -1347,12 +1226,13 @@ def _alm2map_core_pallas_pair_eager(alm_a, alm_b, *, nside, L, L_work):
     )
 
 
-# The Richardson residual `FFT(IFFT(F) - map)` of a HEALPix ring is the n_phi-periodic fold of F
-# minus the map's own spectrum (`_march_v2.ring_fold_residual`), so the refinement loop keeps the
-# spectra from its first analysis and never runs a ring FFT again.  `GMASTER_RING_FOLD=0` restores
-# the synthesise-to-pixels form.
+# The refinement residual `FFT(IFFT(F) - map)` of a HEALPix ring equals the n_phi-periodic fold
+# of F minus the map's own spectrum (`_march_v2.ring_fold_residual`), so the refinement loop keeps
+# the spectra from its first analysis and runs no further ring FFTs.  `GMASTER_RING_FOLD=0`
+# restores synthesis to pixels.
 _RING_FOLD = os.environ.get("GMASTER_RING_FOLD", "1") != "0"
-# Refinement in the D&C engine's node space (V^T V = I: the trees cancel between iterations).
+# Refinement in the D&C engine's node space (V^T V = I, so the trees cancel between iterations).
+# `GMASTER_DC_NODE_SPACE=0` disables it.
 _NODE_SPACE = os.environ.get("GMASTER_DC_NODE_SPACE", "1") != "0"
 
 
@@ -1368,8 +1248,8 @@ def _single_latitudinal_synthesis(alm, *, nside, L, L_work):
     if (nmt_params.sht_calculator in ("jax", "jax-matrix")
             and _spin_march.fold_synth_requested(nside, L_work)
             and _spin_march._march_v2.enabled(L_work)):
-        # Every caller hands this to `ring_fold_residual`, which reads complex64: emitted as such
-        # it is the same numbers without the complex128 copy (12 GiB at Nside 8192).
+        # Every caller passes this to `ring_fold_residual`, which reads complex64; emitting
+        # complex64 directly avoids a complex128 copy (12 GiB at Nside 8192).
         return _spin_march._march_v2.inverse_latitudinal_positive(
             positive, phase, L=L_work, nside=nside, cdtype=jnp.complex64)
     return _fused_inverse_sht(positive, theta, phase,
@@ -1389,19 +1269,16 @@ def _single_latitudinal_analysis(ftm, ell, order, *, nside, L_work):
 def _map2alm_core_pallas_pair_eager(
     maps_a, maps_b, ell, order, *, nside, L, L_work, n_iter, pair_synth, march_pair
 ):
-    """Two Richardson recursions stepping in lockstep over one row source.
+    """Two independent Jacobi refinements stepping in lockstep over one row source.
 
-    The recursions are independent -- each refines its own alms against its own
-    map -- so they can share a pass even though neither can be batched internally.
-    `pair_synth` and `march_pair` are static because which source serves this
-    geometry is decided before any trace, and a traced program must not branch on
-    a table cache; the two also select different kernels, so neither can become a
-    runtime value.
+    Each map refines its own alms; they share only the latitudinal passes.  `pair_synth`
+    and `march_pair` are static: the route is chosen before any trace (a traced program must
+    not branch on a table cache), and they select different kernels.
     """
     dc = _spin_march._march_v2._dc(L_work)
     if n_iter and dc is not None and L == L_work and _ring_fold_ready(L_work):
-        # The divide-and-conquer engine serves both latitudinal stages: the refinement runs in its
-        # packed alm layout (fp64 accumulation) and converts to the output packing once.
+        # The D&C engine serves both latitudinal stages: the refinement runs in its packed alm
+        # layout (fp64 accumulation) and converts to the output packing once at the end.
         ftms = [_forward_ring_fft_positive(
                     m[0],
                     _ring_analysis_tables(
@@ -1411,7 +1288,7 @@ def _map2alm_core_pallas_pair_eager(
         weights = quadrature_jax.quad_weights_transform(L_work, "healpix", nside)
         phi = healpix_ffts.p2phi_rings_jax(jnp.arange(4 * nside - 1), nside)
         if _NODE_SPACE:
-            # Node-space refinement (`_dc_lat` notes): the trees cancel between iterations.
+            # Node-space refinement: the tree transforms cancel between iterations.
             return dc.refine_s0(ftms, weights, phi, ell, order, L=L_work, nside=nside, n_iter=n_iter)
         else:
             acc = dc.forward_packed(ftms, weights, -phi, L=L_work, nside=nside).astype(jnp.complex128)
@@ -1484,12 +1361,10 @@ def _alm2map_core_pallas_pair(alm_a, alm_b, *, nside, L, L_work):
 def _map2alm_core_pallas_pair(
     maps_a, maps_b, ell, order, *, nside, L, L_work, n_iter, pair_synth, march_pair
 ):
-    """Paired analysis, traced whole below `_PALLAS_TRACED_MAX_L`.
+    """Paired analysis, traced as one program on the same condition as the single route.
 
-    Same condition as the single route, for the same reason: tracing removes host
-    dispatch, which pays up to `_PALLAS_TRACED_MAX_L` and costs 17 % above it.
-    The march pairing only ever serves sizes far above that gate, so in practice it
-    runs op-by-op and the flag is there to keep one code path.
+    See `_map2alm_core_pallas`.  The march pairing only serves sizes above
+    `_PALLAS_TRACED_MAX_L`, so in practice it runs op-by-op.
     """
     core = (_map2alm_core_pallas_pair_traced if _trace_route_ready(nside, L_work)
             else _map2alm_core_pallas_pair_eager)
@@ -1507,54 +1382,10 @@ def _ell_order_arrays(lmax):
     return jnp.asarray(ells), jnp.asarray(ms)
 
 
-def _map2alm_once_pallas_spin(maps, ell, order, *, nside, L_work, spin):
-    """Two-helicity spin-2 analysis.
-
-    a+_lm = sum_rings w e^{-im phi} (Q - iU)_ring d^l_{m,+s}
-    a-_lm = sum_rings w e^{-im phi} (Q + iU)_ring d^l_{m,-s}
-    E = (a+ + a-)/2, B = (a+ - a-)/(2i), packed in Healpy ordering with the
-    sqrt((2l+1)/4pi) normalization applied per degree.
-    """
-    theta = _stable_thetas(L_work, nside)
-    weights = quadrature_jax.quad_weights_transform(L_work, "healpix", nside)
-    phase = -healpix_ffts.p2phi_rings_jax(jnp.arange(len(theta)), nside)
-    m_centered = jnp.arange(-(L_work - 1), L_work)
-    window = weights[:, None] * jnp.exp(1j * (phase[:, None] * m_centered[None, :]))
-    block = min(256, 2 * nside)
-
-    signal_plus = maps[0] - 1j * maps[1]   # helicity +s
-    signal_minus = maps[0] + 1j * maps[1]  # helicity -s
-    analysis_tables = _spin_ring_analysis_tables(
-        L_work, nside,
-        getattr(maps, "device", None) or getattr(signal_plus, "device", None))
-    rings_p = _forward_ring_fft_full(signal_plus, analysis_tables,
-                                     L=L_work, nside=nside)
-    rings_m = _forward_ring_fft_full(signal_minus, analysis_tables,
-                                     L=L_work, nside=nside)
-
-    a_plus_grid = _spin_forward_latitudinal(
-        rings_p * window, theta, L=L_work, spin=int(spin), block_size=block
-    )
-    a_minus_grid = _spin_forward_latitudinal(
-        rings_m * window, theta, L=L_work, spin=-int(spin), block_size=block
-    )
-
-    norm_l = jnp.sqrt((2 * jnp.arange(L_work) + 1) / (4 * jnp.pi))
-    a_plus = a_plus_grid.T * norm_l[:, None]
-    a_minus = a_minus_grid.T * norm_l[:, None]
-
-    plus_col = a_plus[ell, L_work - 1 + order]
-    minus_col = a_minus[ell, L_work - 1 + order]
-    e_vals = 0.5 * (plus_col + minus_col)
-    b_vals = (plus_col - minus_col) / (2j)
-    return jnp.stack([e_vals, b_vals])
-
-
 def _map2alm_once_pallas(maps, ell, order, *, nside, L_work, spin=0):
     if spin != 0:
-        return _map2alm_once_pallas_spin(
-            maps, ell, order, nside=nside, L_work=L_work, spin=spin
-        )
+        # Spin-weighted transforms never take the fused Pallas route (`_use_pallas_sht`).
+        raise NotImplementedError("the fused Pallas analysis is spin-0 only")
     ftm = _forward_ring_fft_positive(
         maps[0],
         _ring_analysis_tables(
@@ -1581,16 +1412,12 @@ def _map2alm_once_pallas(maps, ell, order, *, nside, L_work, spin=0):
 def _map2alm_core_pallas(
     maps, ell, order, *, nside, L, L_work, n_iter, spin=0
 ):
-    """Analytic pseudo-Cl analysis, traced whole or run op-by-op.
+    """Pallas-route analysis with refinement, traced as one program or run op-by-op.
 
-    Tracing the refinement loop as one program removes the per-primitive host dispatch, which at small
-    bandlimit is the whole cost: at Nside 128 the op-by-op route takes 1.058 ms for a 196608-pixel map
-    whose device work is 0.333 ms, so one program over the same body is 3.17x faster with bit-identical
-    output -- 1.96x on the inverse, and 2.18x / 1.77x with two refinement iterations
-    (`.qwen/tmp/spin0_traced.log`, `.qwen/tmp/spin0_traced_it2.log`).  The gate used to stop at Nside 128
-    because the Legendre band cannot be built inside a trace; now that `_trace_route_ready` builds it
-    first, Nside 256 takes the single program too (9.4 % on the pipeline, bit-identical alms) and Nside
-    512 is measurably worse without it -- see `_PALLAS_TRACED_MAX_L`.
+    At small band limit the per-primitive host dispatch dominates (at Nside 128 the device
+    work is about a third of the op-by-op wall time), so tracing the refinement loop into one
+    program is 2-3x faster with bit-identical output.  `_trace_route_ready` decides, building
+    the Legendre band first; see `_PALLAS_TRACED_MAX_L` for the size limit.
     """
     core = (_map2alm_core_pallas_traced if _trace_route_ready(nside, L_work)
             else _map2alm_core_pallas_eager)
@@ -1603,7 +1430,7 @@ def _map2alm_core_pallas_eager(
 ):
     dc = _spin_march._march_v2._dc(L_work) if spin == 0 else None
     if dc is not None and n_iter and L == L_work and _NODE_SPACE and _ring_fold_ready(L_work):
-        # One map in the D&C engine's node space (the paired route's loop with one right-hand side).
+        # One map refined in the D&C engine's node space (the paired loop with one right-hand side).
         ftm = _forward_ring_fft_positive(
             maps[0],
             _ring_analysis_tables(
@@ -1671,8 +1498,8 @@ def _pallas_parameters(L, nside):
 
 def _map2alm_once_pallas_multi_gpu(maps, ell, order, *, nside, L_work):
     primary, secondary = _gpu_devices()[:2]
-    # A mask placed on the second GPU stays there. Copying its high-m slice
-    # off the first GPU is an extra 8 GiB while the spin maps are still resident.
+    # A map already on the second GPU stays there: copying its high-m slice from the first
+    # GPU would cost an extra ~8 GiB while the spin maps are still resident.
     home = secondary if getattr(maps, "device", None) == secondary else primary
     maps = _copy_to_device(maps, home)
     ftm = _forward_healpix_fft(maps[0], L=L_work, nside=nside, reality=True)
@@ -1727,7 +1554,7 @@ def _map2alm_once_pallas_multi_gpu(maps, ell, order, *, nside, L_work):
         high = _copy_to_device(high, primary)
     packed = _pack_pallas_parts(low, high, ell, order, split=split)[None, :]
     packed.block_until_ready()
-    # The gather owns its buffer. Drop the ring FFT before the next iteration.
+    # The gather owns its buffer; drop the ring spectra before the next iteration.
     ftm = None
     positive = None
     low = None
@@ -1857,8 +1684,8 @@ def _map2alm_once_multi_gpu(maps, ell, order, *, spin, nside, L, L_work):
     plus_m = plus[ell, L_work - 1 + order]
     minus_m = (-1) ** order * jnp.conj(plus[ell, L_work - 1 - order])
     alm = jnp.stack([-(plus_m + minus_m) / 2, 0.5j * (plus_m - minus_m)])
-    # A slice keeps the full ring spectrum alive. At Nside 8192 that spectrum
-    # plus the next pass's copy is the 16 GiB alloc that does not fit.
+    # A slice would keep the full spectrum alive; at Nside 8192 it and the next pass's copy
+    # (~16 GiB) do not fit together, so copy the packed alms into their own buffer.
     alm.block_until_ready()
     owned = jax.device_put(np.array(alm), alm.device)
     owned.block_until_ready()
@@ -1873,8 +1700,8 @@ def _map2alm_core_multi_gpu(
     alm = _map2alm_once_multi_gpu(
         maps, ell, order, spin=spin, nside=nside, L=L, L_work=L_work
     )
-    # The spin march fills the second GPU. Keep the packed spectrum and the
-    # residual on the first so the next march starts on an empty card.
+    # The spin march fills the second GPU; keep the packed alms and the residual on the
+    # first so the next march starts on an empty card.
     if spin:
         alm = _copy_to_device(alm, primary)
     for _ in range(n_iter):
@@ -1912,13 +1739,26 @@ def _map2alm_core_multi_gpu(
 # hand HEALPix geometries to these, which choose the route for the band limit and spin.
 # ------------------------------------------------------------------------------------------------
 def map2alm(maps, spin, map_info, alm_info, *, n_iter):
-    """HEALPix analysis: `(nmaps, npix)` maps to Healpy-packed `(nmaps, nalm)` alms."""
+    """HEALPix analysis: `(nmaps, npix)` maps to Healpy-packed `(nmaps, nalm)` alms.
+
+    Parameters
+    ----------
+    maps : array, shape (nmaps, npix)
+        One map for spin 0, `(Q, U)` for spin > 0.
+    spin : int
+    map_info, alm_info
+        HEALPix geometry (`nside`) and alm layout (`lmax`, packed `_ell`, `_m` indices).
+    n_iter : int
+        Number of Jacobi refinement iterations, as in NaMaster.
+
+    Returns
+    -------
+    array, shape (nmaps, nalm)
+        Alms (`E, B` for spin > 0) in Healpy (m-major) packing.
+    """
     L = alm_info.lmax + 1
-    # The Pallas latitudinal SHT resolves m up to L-1 from the HEALPix rings
-    # directly and is accurate for L < 2*nside (NaMaster likewise only
-    # integrates m <= lmax), so let the working order track L there.  The
-    # generic s2fft reference ring FFT cannot concatenate its ring regions
-    # when L < 2*nside, so it still needs the working order lifted to 2*nside.
+    # The Pallas route resolves m up to L-1 directly from the rings and is accurate for
+    # L < 2*nside (NaMaster likewise only integrates m <= lmax), so it works at L_work = L.
     L_work = L
     if _use_pallas_sht(L_work, spin):
         if _use_multi_gpu_pallas(L_work, maps) and spin == 0:
@@ -1941,10 +1781,8 @@ def map2alm(maps, spin, map_info, alm_info, *, n_iter):
             n_iter=int(n_iter),
             spin=int(spin),
         )
-    # Non-Pallas paths use the s2fft reference ring FFT, whose JAX kernel
-    # concatenates the polar/equatorial/south ring regions and only works for
-    # L >= 2*nside. Lift the working order so those paths stay valid; the
-    # Pallas path above already returned with L_work == L.
+    # The other routes use s2fft's ring FFT, which concatenates the polar and equatorial ring
+    # regions and requires L >= 2*nside, so lift the working band limit.
     L_work = max(L_work, 2 * map_info.nside)
     if spin != 0:
         analysis_slab, synthesis_slab = _spin_slabs(
@@ -1989,25 +1827,29 @@ def map2alm(maps, spin, map_info, alm_info, *, n_iter):
 def map2alm_pair(maps_a, maps_b, map_info, alm_info, *, n_iter):
     """Two spin-0 analyses that share one latitudinal pass, or None.
 
-    `map_a` and `map_b` are both ``(1, npix)`` and are analysed against the same
-    `alm_info` with the same `n_iter`.  The two transforms are independent; the
-    only reason to run them together is that the latitudinal step dominates either
-    one, so one pass can serve both.  Where a Legendre band exists it is the largest
-    thing either transform touches and pairing it reads it once (0.53-0.68x of two
-    calls, outputs bit-identical, `_shared_band_route`).  Where none exists -- Nside
-    2048 and above -- the folded march generates its row inside the kernel, so the
-    two maps share the recurrence itself: 0.752 of two calls there, 0.489 at
-    Nside 512 (`_march_pair_route`).  Returns `(alm_a, alm_b)`, or None when this
-    geometry cannot share -- the caller then makes two ordinary `map2alm` calls,
-    which is exactly what a None here preserves.
+    The two transforms are independent, but the latitudinal step dominates each, so one
+    pass can serve both: with a Legendre band the band is read once (`_shared_band_route`);
+    without one (Nside 2048 and above) the folded march shares its recurrence
+    (`_march_pair_route`).  A pair costs roughly 0.5-0.75 of two separate calls.
 
-    Both halves come out eagerly, so a caller that needs only one of them pays for
-    both; that second transform costs about a tenth of the first here against the
-    full price of a separate call, and it is the trade `NmtField` makes on behalf
-    of the pipeline that always needs both.  The band route is bit-identical to two
-    separate transforms; the march route is not, because widening the emit block
-    reassociates the theta sum, and its error against the fp64 band is measured
-    unchanged from the shipped march's.
+    The band route is bit-identical to two separate transforms.  The march route is not
+    (the wider emit block reorders the theta sum) but is as accurate against the fp64 band
+    as the single march.
+
+    Parameters
+    ----------
+    maps_a, maps_b : array, shape (1, npix)
+        Two spin-0 maps on the same geometry.
+    map_info, alm_info
+        HEALPix geometry and alm layout shared by both.
+    n_iter : int
+        Number of Jacobi refinement iterations for each map.
+
+    Returns
+    -------
+    tuple of two arrays of shape (1, nalm), or None
+        None when this geometry cannot share a pass; the caller then makes two
+        ordinary `map2alm` calls.
     """
 
     L = alm_info.lmax + 1
@@ -2018,11 +1860,10 @@ def map2alm_pair(maps_a, maps_b, map_info, alm_info, *, n_iter):
     march_pair = False
     if not analysis:
         march_pair = _march_pair_route(map_info.nside, L_work)
-        # The v2 march pairs the synthesis too: its spin-0 kernel leaves the accumulators the
-        # spin-2 kernel uses for its second helicity idle, so the second map is free of registers
-        # and the paired launch is bit-identical to two separate ones (1.25x at Nside 1024).  That
-        # holds at every size, so above the paired *analysis* limit the route is still worth
-        # taking with the analyses unpaired -- a field and its mask then share one refinement.
+        # The v2 march also pairs the synthesis: the second map uses the accumulators the
+        # spin-2 kernel reserves for its second helicity, so it is nearly free and bit-identical
+        # to two launches.  This holds at every size, so the pair route is taken even when the
+        # analyses cannot be paired.
         pair_synth = _spin_march._march_v2.enabled(L_work)
         analysis = march_pair or pair_synth
     if not analysis:
@@ -2035,7 +1876,11 @@ def map2alm_pair(maps_a, maps_b, map_info, alm_info, *, n_iter):
 
 
 def alm2map(alm, spin, map_info, alm_info):
-    """HEALPix synthesis: Healpy-packed `(nmaps, nalm)` alms to `(nmaps, npix)` maps."""
+    """HEALPix synthesis: Healpy-packed `(nmaps, nalm)` alms to `(nmaps, npix)` maps.
+
+    `alm` holds one set of alms for spin 0 or `(E, B)` for spin > 0; the output is one map
+    or `(Q, U)`.  `map_info` and `alm_info` give the HEALPix geometry and alm layout.
+    """
     L = alm_info.lmax + 1
     L_work = L
     if _use_pallas_sht(L_work, spin):
@@ -2046,8 +1891,7 @@ def alm2map(alm, spin, map_info, alm_info):
             L_work=L_work,
             spin=int(spin),
         )
-    # Non-Pallas paths use the s2fft reference ring FFT, which requires
-    # L >= 2*nside; the Pallas path above already returned with L_work == L.
+    # The other routes use s2fft's ring FFT, which requires L >= 2*nside.
     L_work = max(L_work, 2 * map_info.nside)
     if spin != 0:
         _, synthesis_slab = _spin_slabs(L_work, int(spin), nside=map_info.nside)

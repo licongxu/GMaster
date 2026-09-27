@@ -1,3 +1,5 @@
+"""Bandpower binning (NmtBin, NmtBinFlat) against pymaster."""
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -9,6 +11,7 @@ import gmaster as nmt
 
 
 def test_curved_binning_matches_namaster():
+    """Linear D_ell bins give NaMaster's effective ells, binned and unbinned spectra."""
     reference = pytest.importorskip("pymaster")
     rng = np.random.default_rng(1)
     cls = rng.normal(size=(4, 65))
@@ -27,6 +30,7 @@ def test_curved_binning_matches_namaster():
 
 
 def test_curved_custom_bands_and_jit():
+    """Bins built from explicit edges average correctly, report band sizes, unbin, and work under jax.jit."""
     b = nmt.NmtBin.from_edges([0, 4, 9], [4, 9, 16])
     cls = jnp.arange(16.0)
     np.testing.assert_allclose(jax.jit(b.bin_cell)(cls), [1.5, 6.0, 12.0])
@@ -37,6 +41,7 @@ def test_curved_custom_bands_and_jit():
 
 
 def test_curved_rejects_zero_weight_band_and_wrong_shapes():
+    """A band whose weights sum to zero and spectra of the wrong shape are rejected."""
     with pytest.raises(RuntimeError):
         nmt.NmtBin(
             ells=np.arange(4),
@@ -51,6 +56,7 @@ def test_curved_rejects_zero_weight_band_and_wrong_shapes():
 
 
 def test_flat_binning_matches_namaster():
+    """Flat-sky bins give NaMaster's effective ells, binned and unbinned spectra."""
     reference = pytest.importorskip("pymaster")
     l0 = np.arange(2, 42, 5.0)
     lf = l0 + 5

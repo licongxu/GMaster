@@ -1,3 +1,9 @@
+"""Precision controls: table precision, ring (azimuthal) precision and coupling precision.
+
+These tests cover the defaults, the effect of switching, and cache invalidation.  The
+session fixture in ``conftest.py`` always runs this module at fp64.
+"""
+
 import healpy as hp
 import jax
 import jax.numpy as jnp
@@ -18,25 +24,29 @@ _HAS_NVIDIA_GPU = on_cuda_gpu()
 
 @pytest.fixture(autouse=True)
 def _restore_precision():
+    """Restore the default precisions and drop the table caches after each test."""
     yield
     utils.set_table_precision("fp64")
     utils.set_ring_precision("follow")
-    nmt.set_coupling_precision("auto")     # the shipped default: fp32 where the v2 march serves
+    nmt.set_coupling_precision("auto")     # the default: fp32 where the v2 march is used
     _theta_matrix.release()
     _spin_slice.clear_cache()
 
 
 def _clear():
+    """Drop the Legendre-band and Wigner-d table caches."""
     _theta_matrix.release()
     _spin_slice.clear_cache()
 
 
 def test_float64_is_the_default():
+    """Tables are stored in float64 unless the user asks otherwise."""
     assert utils.nmt_params.table_dtype == "fp64"
     assert utils.table_dtype() == jnp.float64
 
 
 def test_unknown_precision_is_rejected():
+    """Every precision setter rejects an unsupported value."""
     with pytest.raises(KeyError):
         utils.set_table_precision("fp16")
     with pytest.raises(KeyError):
@@ -46,13 +56,12 @@ def test_unknown_precision_is_rejected():
 
 
 def test_ring_precision_follows_the_tables_only_while_it_follows():
-    """`follow` is the historical coupling; `fp64`/`fp32` pin it independently.
+    """Under `follow` the ring precision tracks the table precision; `fp64`/`fp32` pin it.
 
-    The coupling is not cosmetic: the analysis chirp-Z casts the map pixels to the
-    chirp's own real dtype, so under `follow` an fp32 session analyzes the map in
-    float32 and the ring sums come out ~1e-7.  Held to `fp64` the same session
-    reproduces the float64 ring sums exactly, which is what makes the float32 table
-    route pass the transform-parity suite.
+    This matters for accuracy: the analysis chirp-Z casts the map pixels to the chirp's
+    real dtype, so under `follow` an fp32 table session analyses the map in float32 and
+    the ring sums are only good to ~1e-7.  With rings pinned to `fp64` the same session
+    reproduces the float64 ring sums exactly.
     """
     assert utils.nmt_params.ring_precision == "follow"
     assert utils.ring_dtype() == jnp.complex128
@@ -69,6 +78,7 @@ def test_ring_precision_follows_the_tables_only_while_it_follows():
 
 
 def test_ring_switch_rebuilds_the_ring_tables():
+    """Changing the ring precision rebuilds the chirp tables in the new dtype, with the same values."""
     nside, L = 32, 96
     fp64 = rings._ring_analysis_tables(L, nside)
     assert fp64[0].dtype == jnp.complex128
@@ -84,6 +94,7 @@ def test_ring_switch_rebuilds_the_ring_tables():
 
 
 def test_band_storage_follows_the_selection():
+    """The Legendre band is stored in the selected table dtype."""
     nside, L = 32, 96
     _clear()
     band = _theta_matrix._band(_theta_matrix.band_geometry(nside, L))
@@ -92,10 +103,9 @@ def test_band_storage_follows_the_selection():
     utils.set_table_precision("fp32")
     band32 = _theta_matrix._band(_theta_matrix.band_geometry(nside, L))
     assert band32[0][0].dtype == jnp.float32
-    # The recurrence stays float64: the single-precision band is the double
-    # precision one rounded.  It is rounded as it is emitted rather than after
-    # the fact (so no float64 twin of a block is ever resident), which leaves the
-    # two differing only in the exp2-underflow tail, around 1e-38.
+    # The recurrence runs in float64 and each value is rounded to float32 as it is
+    # stored (so no float64 copy of a block is kept), so the two bands differ only
+    # in the exp2-underflow tail, around 1e-38.
     for even, odd in zip(band, band32):
         for full, half in zip(even, odd):
             np.testing.assert_allclose(
@@ -104,14 +114,15 @@ def test_band_storage_follows_the_selection():
 
 
 def test_precision_switch_rebuilds_rather_than_reusing():
+    """Switching precision clears the band cache and keys new entries by dtype, so tables are never mixed."""
     nside, L = 32, 96
     _clear()
     fp64_key = _theta_matrix.band_geometry(nside, L)
     assert _theta_matrix._band(fp64_key) is not None
     assert len(_theta_matrix._BAND_CACHE) == 1
     utils.set_table_precision("fp32")
-    # The switch clears the caches, and the new geometry key carries the dtype, so
-    # a caller can never be handed the other precision's bytes.
+    # The switch clears the cache, and the geometry key includes the dtype, so a
+    # caller can never receive tables of the other precision.
     assert len(_theta_matrix._BAND_CACHE) == 0
     fp32_key = _theta_matrix.band_geometry(nside, L)
     assert fp32_key != fp64_key
@@ -123,13 +134,12 @@ def test_precision_switch_rebuilds_rather_than_reusing():
 
 @pytest.mark.parametrize("prec", ["fp64", "fp32"])
 def test_contracts_reduce_in_the_storage_width_without_truncating(prec):
-    """The width cast must be applied part-by-part, never to a complex operand.
+    """Band contractions reduce in the storage precision and return complex128 without truncation.
 
-    Both band contractions reduce in the table's storage precision and widen the
-    partials afterwards.  Casting the *operand* instead is a one-character mistake
-    (`convert_element_type(rhs, slab.dtype)` on a complex128 array truncates it),
-    and it silently zeroes the imaginary half of the synthesis sum: the Nside 512
-    decoupled cell came out wrong by 7.5 relative, in float64 as much as float32.
+    Both contractions reduce in the table's storage precision and widen the partial sums
+    afterwards.  The cast must be applied to the real and imaginary parts separately:
+    casting a complex128 operand to a real table dtype discards its imaginary part, which
+    would silently zero half of the synthesis sum in float64 as well as float32.
     """
     utils.set_table_precision(prec)
     nside, L = 32, 96
@@ -174,6 +184,7 @@ def test_contracts_reduce_in_the_storage_width_without_truncating(prec):
 
 
 def test_byte_estimates_follow_the_storage_precision():
+    """Memory estimates for the band and the Wigner-d triangle halve at float32."""
     fp64 = _theta_matrix.band_bytes(128, 384, dtype=jnp.float64)
     fp32 = _theta_matrix.band_bytes(128, 384, dtype=jnp.float32)
     assert fp32 * 2 == fp64
@@ -185,11 +196,11 @@ def test_byte_estimates_follow_the_storage_precision():
 @pytest.mark.skipif(not _HAS_NVIDIA_GPU, reason="SHT dispatch requires an NVIDIA GPU")
 @pytest.mark.parametrize("spin", [0, 2])
 def test_float32_tables_keep_the_coupling_matrix(spin):
-    """fp32 tables cost representation error and nothing else.
+    """float32 tables change the decoupled Cls only by their representation error.
 
-    Measured on the full pipeline: 5.2e-8 relative on the decoupled Cls against
-    float64 tables, at every size tried.  The bound here is that, plus headroom;
-    float64 stays the default precisely because it is ~1e-12 instead.
+    The full pipeline with float32 tables agrees with the float64 one to ~5e-8 relative on
+    the decoupled Cls; the 1e-6 bound adds headroom.  float64 remains the default because
+    it agrees with pymaster to ~1e-12.
     """
     reference = pytest.importorskip("pymaster")
     nside = 32
@@ -231,16 +242,12 @@ def test_float32_tables_keep_the_coupling_matrix(spin):
 
 
 def test_float32_coupling_quadrature_keeps_the_cells():
-    """The quadrature's operand precision is opt-in and it really does switch.
+    """`set_coupling_precision("fp32")` really switches the polarised coupling quadrature.
 
-    Each of the two contractions in `_general_coupling_matrix_quadrature` is 115.9 GFLOP at
-    lmax 3071 and runs at 1.76 TFLOP/s in float64 -- 94 % of this card's fp64 roofline -- so
-    float32 operands are worth 34.3x there (`.qwen/tmp/coupling_prec_1024c_s29.log`), at a cost
-    of rel 2.1e-06 of the matrix.  On the full pipeline (`.qwen/tmp/coupling_board_s29.log`)
-    that is 335 -> 91 ms of the Nside 1024 spin-2 coupling and the decoupled Cls still agree
-    with pymaster to 3.2e-06, the same as float64, because at fp32 tables the error budget is
-    set by the tables.  Against float64 tables the matrix itself is what moves, so that is
-    what is pinned here.
+    float32 operands in `_general_coupling_matrix_quadrature` move the coupling matrix by
+    ~2e-6 relative to float64 (well inside the 1e-4 bound), which is below the error that
+    float32 tables already contribute to the decoupled Cls.  The difference must also be
+    nonzero, which proves the switch took effect.
     """
     lmax = 95
     rng = np.random.default_rng(7)
@@ -255,8 +262,8 @@ def test_float32_coupling_quadrature_keeps_the_cells():
     fp64 = matrix()
 
     nmt.set_coupling_precision("fp32")
-    # The flag is read while tracing, so a program compiled by an earlier test in this process
-    # would otherwise keep its float64 operands and this would pass without testing anything.
+    # The flag is read at trace time, so without clearing the caches a program compiled
+    # earlier in this process would keep its float64 operands and the test would be vacuous.
     jax.clear_caches()
     fp32 = matrix()
 
@@ -271,17 +278,12 @@ def test_float32_coupling_quadrature_keeps_the_cells():
 
 
 def test_float32_scalar_coupling_keeps_the_matrix():
-    """The same switch covers the scalar build, which has no `dot` in it at all.
+    """`set_coupling_precision("fp32")` also switches the scalar (TT) coupling recurrence.
 
-    `_coupling_matrix_tt` is five table lookups and a few elementwise operations over ~n^3/3
-    elements, so there is no contraction to put on tensor units and operand width is the only
-    lever it has: 9.42x at lmax 1535 (23.48 -> 2.49 ms) and 7.51x at lmax 3071
-    (159.05 -> 21.19 ms) for rel 1.885e-07 (`.qwen/tmp/ttknob_s30.log`).  That is an order of
-    magnitude better than the polarised arm above because the log-cumsum table and the offset
-    accumulator stay float64 and only the per-term products are rounded.
-
-    Above ``_TT_QUADRATURE_LMAX`` the dispatched builder is the fp64 GEMM, so
-    this pins the recurrence's float32 arm below that gate.
+    `_coupling_matrix_tt` keeps its log-cumsum table and offset accumulator in float64 and
+    rounds only the per-term products, so the float32 matrix is within ~2e-7 relative of the
+    float64 one (bound 1e-5).  Above ``_TT_QUADRATURE_LMAX`` the dispatcher uses the fp64
+    quadrature instead, so this test stays below that threshold.
     """
     lmax = 31
     rng = np.random.default_rng(17)

@@ -5,9 +5,9 @@ Geometry
     ``a_lm`` layout).
 
 Transforms
-    `map2alm` / `alm2map` for spin-0 and spin-s fields (HEALPix routes live in
-    `gmaster._sht.healpix`; CAR and arbitrary positions go through the direct
-    `catalog2alm` / `alm2catalog` sums).
+    `map2alm` / `alm2map` for spin-0 and spin-s fields.  HEALPix maps use the GPU
+    transforms in `gmaster._sht`; CAR maps and arbitrary positions use the direct
+    sums `catalog2alm` / `alm2catalog`.
 
 Masks and simulations
     `mask_apodization` (C1, C2, Smooth), `mask_apodization_flat`,
@@ -15,8 +15,8 @@ Masks and simulations
 
 Settings
     Re-exported from `gmaster._config`: `nmt_params`, `set_n_iter_default`,
-    `set_tol_pinv_default`, `set_sht_calculator`, precision knobs and
-    `set_latitudinal_method`.
+    `set_tol_pinv_default`, `set_sht_calculator`, and the GMaster-specific
+    `set_table_precision`, `set_ring_precision` and `set_latitudinal_method`.
 """
 
 from functools import partial
@@ -59,7 +59,35 @@ __all__ = [
 
 
 def mask_apodization(mask_in, aposize, apotype="C1"):
-    """Apodize a HEALPix mask using NaMaster's C1, C2, or Smooth rule."""
+    """Apodize a HEALPix mask.
+
+    A pixel counts as masked where the mask is zero (or negative).  With ``theta`` the
+    angular distance from a pixel to the nearest masked pixel, ``theta_*`` the
+    apodization scale and ``x = sqrt((1 - cos theta) / (1 - cos theta_*))``, each pixel
+    is multiplied by
+
+    - ``"C1"``: ``x - sin(2 pi x) / (2 pi)`` for ``x < 1``, else 1;
+    - ``"C2"``: ``(1 - cos(pi x)) / 2`` for ``x < 1``, else 1;
+    - ``"Smooth"``: all pixels within ``2.5 theta_*`` of a masked pixel are zeroed, the
+      result is smoothed with a Gaussian of standard deviation ``theta_*``, and then
+      multiplied by the original mask.
+
+    As in NaMaster, the "C1"/"C2" names are swapped relative to Grain et al. (2009).
+
+    Parameters
+    ----------
+    mask_in : array_like, shape (npix,)
+        HEALPix mask in RING ordering.
+    aposize : float
+        Apodization scale ``theta_*`` in degrees.
+    apotype : {"C1", "C2", "Smooth"}, optional
+        Apodization type.
+
+    Returns
+    -------
+    ndarray or jax.Array, shape (npix,)
+        Apodized mask (a NumPy array for "C1"/"C2", a JAX array for "Smooth").
+    """
     if apotype not in ("C1", "C2", "Smooth"):
         raise ValueError(
             f"Apodization type {apotype} unknown. Choose from ['C1', 'C2', 'Smooth']"
@@ -120,7 +148,27 @@ def mask_apodization(mask_in, aposize, apotype="C1"):
 
 
 def mask_apodization_flat(mask_in, lx, ly, aposize, apotype="C1"):
-    """Apodize a 2-D flat-sky mask using NaMaster's conventions."""
+    """Apodize a flat-sky (rectangular) mask.
+
+    Same apodization types as `mask_apodization`, with Euclidean distances on the
+    flat patch.
+
+    Parameters
+    ----------
+    mask_in : array_like, shape (ny, nx)
+        Input mask.
+    lx, ly : float
+        Patch size along x and y, in radians.
+    aposize : float
+        Apodization scale in degrees.
+    apotype : {"C1", "C2", "Smooth"}, optional
+        Apodization type.
+
+    Returns
+    -------
+    ndarray or jax.Array, shape (ny, nx)
+        Apodized mask.
+    """
     if apotype not in ("C1", "C2", "Smooth"):
         raise ValueError(
             f'Unknown apodization type {apotype}. Allowed: "Smooth", "C1", "C2"'
@@ -170,6 +218,8 @@ def mask_apodization_flat(mask_in, lx, ly, aposize, apotype="C1"):
 
 
 class _SHTInfo:
+    """HEALPix ring geometry: colatitudes, first-pixel azimuths, pixels per ring, weights."""
+
     def __init__(self, nside):
         self.nside = nside
         self.nring = 4 * nside - 1
@@ -214,6 +264,7 @@ class _SHTInfo:
 
 
 def _clenshaw_curtis_weights(size):
+    """Clenshaw-Curtis quadrature weights for `size` equispaced colatitudes on [0, pi]."""
     intervals = size - 1
     theta = np.pi * np.arange(size) / intervals
     weights = np.zeros(size)
@@ -233,6 +284,8 @@ def _clenshaw_curtis_weights(size):
 
 
 class _CARSHTInfo:
+    """CAR ring geometry, with the pixel positions used by the direct transforms."""
+
     def __init__(self, n_theta, theta_min, d_theta, n_phi, d_phi, phi0):
         self.nring = int(n_theta)
         self.theta = theta_min + np.arange(n_theta) * d_theta
@@ -281,7 +334,19 @@ class _CARSHTInfo:
 
 
 class NmtMapInfo:
-    """Description of a curved-sky map pixelization."""
+    """Description of a curved-sky map pixelization (HEALPix or CAR).
+
+    Instances can be compared with ``==`` to check that two fields share a
+    pixelization.
+
+    Parameters
+    ----------
+    wcs : astropy.wcs.WCS or None
+        WCS of a CAR map.  If None, HEALPix is assumed and `axes` must be a
+        one-element sequence holding the number of pixels.
+    axes : sequence of int
+        Map shape: ``(npix,)`` for HEALPix, ``(ny, nx)`` for CAR.
+    """
 
     def __init__(self, wcs, axes):
         if wcs is not None:
@@ -366,6 +431,11 @@ class NmtMapInfo:
         )
 
     def reform_map(self, maps):
+        """Flatten maps to ``(..., npix)`` in the internal pixel order.
+
+        CAR maps are flipped so that colatitude and azimuth increase along the axes;
+        HEALPix maps are returned unchanged.
+        """
         if not self._map_compatible(maps):
             raise ValueError("Incompatible map!")
         if self.is_healpix:
@@ -382,15 +452,19 @@ class NmtMapInfo:
         return maps.shape[-2:] == (self.ny, self.nx)
 
     def get_lmax(self):
+        """Return the maximum multipole supported by the pixelization.
+
+        ``3 * nside - 1`` for HEALPix, ``pi / min(d_theta, d_phi)`` for CAR.
+        """
         if self.is_healpix:
             return 3 * self.nside - 1
         return int(np.pi / min(self.d_theta, self.d_phi))
 
 
-# `ell`/`m` are a pure function of lmax, but building them costs lmax+1 numpy.arange calls
-# plus a device_put per construction, and `NmtField` builds two per field: 1.15 ms of the
-# 1.66 ms constructor at Nside 64.  The budget is in elements because at Nside 2048 a single
-# pair is 38M of them.
+# Cache of the per-coefficient `ell` / `m` index arrays, keyed by lmax.  They depend only on
+# lmax, but rebuilding them (lmax + 1 numpy.arange calls and a host-to-device copy) dominated
+# the cost of a small `NmtField`.  The budget counts elements because a single pair is ~38M
+# elements at Nside 2048.
 _ALM_INDEX_BUDGET = 64_000_000
 _ALM_INDEX_CACHE: dict = {}
 _ALM_INDEX_ELEMENTS = 0
@@ -405,8 +479,8 @@ def _alm_index_arrays(lmax, m):
     order = np.repeat(m, lmax + 1 - m)
     cached = (jnp.asarray(ell), jnp.asarray(order))
     if isinstance(cached[0], Tracer) or isinstance(cached[1], Tracer):
-        # Several helpers build an `NmtAlmInfo` inside a trace; a tracer in a
-        # module-level cache surfaces later as an UnexpectedTracerError.
+        # Do not cache under a JAX trace: a tracer stored in a module-level cache
+        # would later raise UnexpectedTracerError.
         return cached
     if _ALM_INDEX_ELEMENTS + 2 * len(ell) > _ALM_INDEX_BUDGET:
         _ALM_INDEX_CACHE.clear()
@@ -417,7 +491,26 @@ def _alm_index_arrays(lmax, m):
 
 
 class NmtAlmInfo:
-    """Description of Healpy-packed spherical-harmonic coefficients."""
+    """Layout of healpy-packed spherical-harmonic coefficients.
+
+    Coefficients are stored m-major for ``0 <= m <= l <= lmax`` (``mmax = lmax``),
+    as in healpy.
+
+    Parameters
+    ----------
+    lmax : int
+        Maximum multipole.
+
+    Attributes
+    ----------
+    lmax, mmax : int
+        Maximum multipole and azimuthal order.
+    mstart : ndarray of uint64, shape (mmax + 1,)
+        Offset of the first coefficient of each m, so that ``a_lm`` sits at
+        ``mstart[m] + l``.
+    nelem : int
+        Number of coefficients, ``(lmax + 1) (lmax + 2) / 2``.
+    """
 
     def __init__(self, lmax):
         self.lmax = int(lmax)
@@ -432,7 +525,24 @@ class NmtAlmInfo:
 
 
 def moore_penrose_pinvh(mat, tol_pinv):
-    """Hermitian pseudo-inverse using NaMaster's relative eigenvalue cutoff."""
+    """Moore-Penrose pseudo-inverse of a Hermitian matrix.
+
+    The matrix is diagonalised and the inverse of every eigenvalue smaller than
+    ``tol_pinv`` times the largest one is set to zero.
+
+    Parameters
+    ----------
+    mat : array_like, shape (n, n)
+        Hermitian matrix.
+    tol_pinv : float or None
+        Relative eigenvalue threshold.  If None or ``<= 0``, the ordinary inverse is
+        returned.
+
+    Returns
+    -------
+    jax.Array, shape (n, n)
+        Pseudo-inverse of `mat`.
+    """
     matrix = jnp.asarray(mat)
     if tol_pinv is None or tol_pinv <= 0:
         return jnp.linalg.inv(matrix)
@@ -444,7 +554,30 @@ def moore_penrose_pinvh(mat, tol_pinv):
 
 
 def map2alm(map, spin, map_info, alm_info, *, n_iter):
-    """Transform HEALPix maps to NaMaster/Healpy-packed E/B coefficients."""
+    """Spherical-harmonic analysis of a spin-0 or spin-s map.
+
+    For spin ``s > 0`` the two input components are (Q, U)-like and the output rows are
+    the E and B coefficients, following NaMaster's conventions.
+
+    Parameters
+    ----------
+    map : array_like, shape (nmaps, npix)
+        Input map(s); ``nmaps`` is 1 for spin 0 and 2 otherwise.  CAR maps must already
+        be flattened with `NmtMapInfo.reform_map`.
+    spin : int
+        Spin of the field.
+    map_info : NmtMapInfo
+        Pixelization of the map.
+    alm_info : NmtAlmInfo
+        Layout of the output coefficients.
+    n_iter : int
+        Number of Jacobi iterations used to refine the transform (keyword only).
+
+    Returns
+    -------
+    jax.Array, shape (nmaps, alm_info.nelem)
+        Healpy-packed coefficients.
+    """
     maps = jnp.asarray(map)
     nmaps = 1 if spin == 0 else 2
     if maps.ndim != 2 or maps.shape != (nmaps, map_info.npix):
@@ -452,8 +585,8 @@ def map2alm(map, spin, map_info, alm_info, *, n_iter):
     if spin < 0 or spin > alm_info.lmax:
         raise ValueError("spin must satisfy 0 <= spin <= lmax")
     if not map_info.is_healpix:
-        # ponytail: direct CAR synthesis is O(npix*lmax^2); replace it with a
-        # separable theta/FFT transform when production CAR maps exceed memory.
+        # CAR maps use the direct sum, which costs O(npix lmax^2); adequate for
+        # moderate resolutions.  Large CAR maps would need a separable ring transform.
         weighted = map_info.si.times_weight(maps)
         alm = catalog2alm(
             weighted, map_info.si.positions, spin, alm_info.lmax
@@ -473,27 +606,31 @@ def map2alm(map, spin, map_info, alm_info, *, n_iter):
 
 
 def map2alm_pair(map_a, map_b, map_info, alm_info, *, n_iter):
-    """Two spin-0 analyses that share one latitudinal pass, or None.
+    """Analyse two spin-0 HEALPix maps in one shared latitudinal pass, if possible.
 
-    `map_a` and `map_b` are both ``(1, npix)`` and are analysed against the same
-    `alm_info` with the same `n_iter`.  The two transforms are independent; the
-    only reason to run them together is that the latitudinal step dominates either
-    one, so one pass can serve both.  Where a Legendre band exists it is the largest
-    thing either transform touches and pairing it reads it once (0.53-0.68x of two
-    calls, outputs bit-identical, `_shared_band_route`).  Where none exists -- Nside
-    2048 and above -- the folded march generates its row inside the kernel, so the
-    two maps share the recurrence itself: 0.752 of two calls there, 0.489 at
-    Nside 512 (`_march_pair_route`).  Returns `(alm_a, alm_b)`, or None when this
-    geometry cannot share -- the caller then makes two ordinary `map2alm` calls,
-    which is exactly what a None here preserves.
+    The latitudinal stage dominates the cost of a transform, so two maps on the same
+    grid (for example a field and its mask) can share it: the precomputed Legendre band
+    is read once, or the on-the-fly Wigner-d recurrence is generated once for both.
+    The pair costs roughly 0.5-0.75 of two separate calls.  The band route is
+    bit-identical to two `map2alm` calls; the march route agrees to float32-class
+    accuracy (the summation order changes).
 
-    Both halves come out eagerly, so a caller that needs only one of them pays for
-    both; that second transform costs about a tenth of the first here against the
-    full price of a separate call, and it is the trade `NmtField` makes on behalf
-    of the pipeline that always needs both.  The band route is bit-identical to two
-    separate transforms; the march route is not, because widening the emit block
-    reassociates the theta sum, and its error against the fp64 band is measured
-    unchanged from the shipped march's.
+    Parameters
+    ----------
+    map_a, map_b : array_like, shape (1, npix)
+        Spin-0 HEALPix maps.
+    map_info : NmtMapInfo
+        Pixelization shared by both maps.
+    alm_info : NmtAlmInfo
+        Layout of the output coefficients.
+    n_iter : int
+        Number of Jacobi iterations (keyword only).
+
+    Returns
+    -------
+    tuple of jax.Array or None
+        ``(alm_a, alm_b)``, each of shape ``(1, alm_info.nelem)``, or None when this
+        geometry has no shared route (the caller should then make two `map2alm` calls).
     """
     maps_a = jnp.asarray(map_a)
     maps_b = jnp.asarray(map_b)
@@ -506,7 +643,24 @@ def map2alm_pair(map_a, map_b, map_info, alm_info, *, n_iter):
 
 
 def alm2map(alm, spin, map_info, alm_info):
-    """Transform NaMaster/Healpy-packed E/B coefficients to HEALPix maps."""
+    """Spherical-harmonic synthesis of a spin-0 or spin-s field.
+
+    Parameters
+    ----------
+    alm : array_like, shape (nmaps, alm_info.nelem)
+        Healpy-packed coefficients (E and B for spin ``s > 0``).
+    spin : int
+        Spin of the field.
+    map_info : NmtMapInfo
+        Output pixelization.
+    alm_info : NmtAlmInfo
+        Layout of `alm`.
+
+    Returns
+    -------
+    jax.Array, shape (nmaps, npix)
+        Map(s); CAR maps are returned flattened in the internal pixel order.
+    """
     alm = jnp.asarray(alm)
     nmaps = 1 if spin == 0 else 2
     if alm.ndim != 2 or alm.shape != (nmaps, alm_info.nelem):
@@ -520,13 +674,13 @@ def alm2map(alm, spin, map_info, alm_info):
 
 @partial(jax.jit, static_argnames=("spin", "lmax"))
 def _catalog2alm_core(values, positions, *, spin, lmax):
-    """Adjoint arbitrary-position spin transform in Healpy alm ordering."""
+    """Adjoint spin-s transform from arbitrary positions, in healpy alm ordering."""
     L = lmax + 1
     theta, phi = positions
     signal = values[0] if spin == 0 else values[0] + 1j * values[1]
     full = jnp.zeros((L, 2 * L - 1), dtype=jnp.complex128)
-    # ponytail: O(n_source*lmax^2); block sources or add a catalog NUFFT when
-    # retained catalogs no longer fit device memory at survey scale.
+    # Direct sum, O(n_source lmax^2); `gmaster.nusht` provides fast non-uniform
+    # transforms for large catalogues.
     for ell in range(abs(spin), L):
         d_slice = jax.vmap(
             lambda angle: turok_jax.compute_slice(angle, ell, L, -spin)
@@ -555,7 +709,27 @@ def _catalog2alm_core(values, positions, *, spin, lmax):
 
 
 def catalog2alm(values, positions, spin, lmax):
-    """Transform weighted catalog samples to Healpy-packed E/B coefficients."""
+    """Direct adjoint spherical-harmonic transform of values at arbitrary positions.
+
+    Computes ``a_lm = sum_i v_i Y*_lm(theta_i, phi_i)`` (spin-weighted for ``spin > 0``,
+    returning E/B), with no quadrature weight beyond what `values` already carries.
+
+    Parameters
+    ----------
+    values : array_like, shape (nmaps, n_source)
+        Values (already multiplied by any weights); ``nmaps`` is 1 for spin 0, else 2.
+    positions : array_like, shape (2, n_source)
+        Colatitude ``theta`` and azimuth ``phi`` of each source, in radians.
+    spin : int
+        Spin of the field.
+    lmax : int
+        Maximum multipole.
+
+    Returns
+    -------
+    jax.Array, shape (nmaps, (lmax + 1) (lmax + 2) / 2)
+        Healpy-packed coefficients.
+    """
     positions = jnp.asarray(positions, dtype=jnp.float64)
     values = jnp.atleast_2d(jnp.asarray(values, dtype=jnp.float64))
     nmaps = 1 if spin == 0 else 2
@@ -570,6 +744,7 @@ def catalog2alm(values, positions, spin, lmax):
 
 @partial(jax.jit, static_argnames=("spin", "lmax"))
 def _alm2catalog_core(alms, positions, *, spin, lmax):
+    """Spin-s synthesis at arbitrary positions from healpy-ordered alms."""
     L = lmax + 1
     theta, phi = positions
     full = (
@@ -599,7 +774,24 @@ def _alm2catalog_core(alms, positions, *, spin, lmax):
 
 
 def alm2catalog(alms, positions, spin, lmax):
-    """Evaluate Healpy-packed E/B coefficients at catalog positions."""
+    """Evaluate a spherical-harmonic expansion at arbitrary positions (direct sum).
+
+    Parameters
+    ----------
+    alms : array_like, shape (nmaps, (lmax + 1) (lmax + 2) / 2)
+        Healpy-packed coefficients (E and B for ``spin > 0``).
+    positions : array_like, shape (2, n_source)
+        Colatitude and azimuth of each position, in radians.
+    spin : int
+        Spin of the field.
+    lmax : int
+        Maximum multipole.
+
+    Returns
+    -------
+    jax.Array, shape (nmaps, n_source)
+        Field values at the positions.
+    """
     positions = jnp.asarray(positions, dtype=jnp.float64)
     alms = jnp.asarray(alms)
     nmaps = 1 if spin == 0 else 2
@@ -613,6 +805,7 @@ def alm2catalog(alms, positions, spin, lmax):
 
 @jax.jit
 def _gaussian_alms(key, covariance_root, ell, order):
+    """Draw correlated Gaussian alms given a per-ell square root of the covariance."""
     real_key, imaginary_key = jax.random.split(key)
     shape = (len(ell), covariance_root.shape[-1])
     real = jax.random.normal(real_key, shape, dtype=covariance_root.dtype)
@@ -628,7 +821,38 @@ def _gaussian_alms(key, covariance_root, ell, order):
 
 
 def synfast_spherical(nside, cls, spin_arr, beam=None, seed=-1, wcs=None, lmax=None):
-    """Generate correlated Gaussian HEALPix fields on the active JAX device."""
+    """Generate full-sky correlated Gaussian random fields.
+
+    Produces outputs statistically equivalent to healpy's ``synfast``, generated on the
+    default JAX device.  Random numbers come from JAX, so a given `seed` does not
+    reproduce pymaster's maps.
+
+    Parameters
+    ----------
+    nside : int
+        HEALPix resolution.  Ignored when `wcs` is given.
+    cls : array_like, shape (n_cls, n_ell)
+        Power spectra of all map pairs, ``n_cls = nmaps (nmaps + 1) / 2`` with ``nmaps``
+        counting 1 map per spin-0 field and 2 per spin-s field.  Only the upper triangle
+        of the spectrum matrix is given, in row-major order (for 3 maps:
+        ``[11, 12, 13, 22, 23, 33]``).
+    spin_arr : array_like of int, shape (nfields,)
+        Spin of each field.
+    beam : array_like, shape (nfields, n_ell), optional
+        Beam window function of each field, applied to the harmonic coefficients.
+    seed : int, optional
+        Random seed; a negative value draws a random seed.
+    wcs : astropy.wcs.WCS, optional
+        WCS of a full-sky CAR map, used instead of HEALPix.
+    lmax : int, optional
+        Maximum multipole of the generated coefficients.  Defaults to the maximum
+        supported by the pixelization (and never exceeds ``n_ell - 1``).
+
+    Returns
+    -------
+    jax.Array
+        Maps of shape ``(nmaps, npix)`` for HEALPix or ``(nmaps, ny, nx)`` for CAR.
+    """
     if wcs is None and int(nside) <= 0:
         raise ValueError("nside must be positive")
     spins = np.asarray(spin_arr, dtype=np.int32)
@@ -704,7 +928,29 @@ def synfast_spherical(nside, cls, spin_arr, beam=None, seed=-1, wcs=None, lmax=N
 
 
 def synfast_flat(nx, ny, lx, ly, cls, spin_arr, beam=None, seed=-1):
-    """Generate correlated Gaussian flat-sky fields on the active JAX device."""
+    """Generate correlated Gaussian random fields on a flat rectangular patch.
+
+    Parameters
+    ----------
+    nx, ny : int
+        Number of pixels along x and y.
+    lx, ly : float
+        Patch size along x and y, in radians.
+    cls : array_like, shape (n_cls, n_ell)
+        Power spectra, ordered as in `synfast_spherical`, sampled at integer multipoles
+        ``0 .. n_ell - 1`` and interpolated to the 2-D wavevectors.
+    spin_arr : array_like of int, shape (nfields,)
+        Spin of each field.
+    beam : array_like, shape (nfields, n_ell), optional
+        Beam window function of each field.
+    seed : int, optional
+        Random seed; a negative value draws a random seed.
+
+    Returns
+    -------
+    jax.Array, shape (nmaps, ny, nx)
+        Simulated maps (1 per spin-0 field, 2 per spin-s field).
+    """
     from .field_flat import _flat_alm2map, _wavevectors
 
     spins = np.asarray(spin_arr, dtype=np.int32)

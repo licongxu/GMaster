@@ -1,16 +1,16 @@
-"""CPU OpenMP v2 march: same recurrence as CUDA, served when JAX is on CPU."""
+"""The OpenMP CPU build of the v2 march, which runs the CUDA march's recurrence when JAX is on CPU."""
 from __future__ import annotations
 
 import os
 import subprocess
 import sys
 
-import numpy as np
 import pytest
 
 
 @pytest.mark.march_v2
 def test_cpu_march_library_builds():
+    """The OpenMP CPU build of the v2 march compiles and loads."""
     from gmaster._sht import march_v2 as _march_v2
 
     lib = _march_v2._build_cpu()
@@ -19,6 +19,11 @@ def test_cpu_march_library_builds():
 
 @pytest.mark.march_v2
 def test_cpu_v2_map2alm_agrees_with_namaster():
+    """On a CPU-only JAX backend, map2alm through the CPU v2 march agrees with NaMaster.
+
+    Runs in a subprocess so that JAX initialises on the CPU platform.  The march uses float32
+    arithmetic, hence the 1e-5 relative tolerance.
+    """
     env = os.environ.copy()
     env["JAX_PLATFORMS"] = "cpu"
     env["CUDA_VISIBLE_DEVICES"] = ""

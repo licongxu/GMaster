@@ -1,39 +1,34 @@
-"""Table-free spin-2 latitudinal step: the Wigner-d row is marched, not stored.
+"""Table-free latitudinal step: the Wigner-d row is marched in registers, not stored.
 
-Why this exists.  At Nside 1024 the polar Wigner-d slice is 73.48 GiB (`triangle_bytes`),
-`slabs_for` declines it against the 56 GiB budget, and the pipeline pays a 13.27 s/pass generic
-loop while ducc0 does the *whole* spin-2 forward transform in 115 ms (HANDOFF, session 21).
-Generating the row instead of storing it removes the table: one Pallas program owns one
-(m-window row, theta-tile) pair, marches `ell` in registers, and contracts into the four real
-polarised channels inside the same loop -- so the table route's 1:4 load-to-arithmetic ratio
-becomes 1:4 FMA and the right-hand side is read once per degree instead of once per table entry.
+A Pallas/Triton difference-form march for the latitudinal (theta) step of the spin-2 and folded
+spin-0 transforms.  One program owns one (m-window row, theta tile) pair, marches `ell` in
+registers and contracts each degree into the real channels of the right-hand side inside the same
+loop, so no Wigner-d table is materialised on the host or device.  This is the route for
+geometries whose Wigner-d slice exceeds the memory budget (e.g. 73 GiB for spin 2 at Nside 1024).
+When the CUDA v2 march (:mod:`gmaster._sht.march_v2`) is enabled for `L`, every public entry
+point delegates to it instead.
 
-The closed form (fit against `_spin_slice._build`, which is itself validated end to end against
-pymaster; `.qwen/tmp/spin2_lowrow_fit.py`):
+Closed form marched (validated against `_spin_slice._build`, itself checked against pymaster):
 
     d^l_{m,-s}(theta) = (-1)^m 2^(eps_m LG2N) (sin t/2)^alpha (cos t/2)^beta P^{(a,b)}_n(cos t)
     alpha = m + s,  beta = |m - s|,  n = l - max(m, s),
     LG2N = log2 sqrt((l+m)!(l-m)! / ((l-s)!(l+s)!)),  eps_m = -1 for m < s else +1.
 
-`n` counts from `max(m, s)`, not `m`: a row below the spin starts its polynomial at ell = s.  And
+`n` counts from `max(m, s)`, not `m`: a row below the spin starts its polynomial at ell = s.
 DLMF 14.9.16's `(cos t/2)^(m1+m2)` admits the (m, -s) substitution only for m >= s; below the spin
-the pair-swapped branch inverts the factorial ratio, which is the `eps_m` flip.  Measured against
-the shipped slice, missing them costs rel 1.0 on row m=0 and 2.6e-02 on m=1 (`eps_m` recovers
-5.4e-12 and 5.2e-12), while every row m >= s is unaffected -- so a march that skips this is quietly
-wrong in exactly the two rows nothing else checks.
+the pair-swapped branch inverts the factorial ratio, which is the `eps_m` flip.  Omitting either
+leaves rows m >= s correct but makes rows m = 0 and m = 1 wrong (O(1) and O(1e-2) relative).
 
-Numerics.  The march carries a float32 (value, limb) pair per theta lane and renormalises each lane
-against a 2^+-24 band every degree; the products go through inline PTX because XLA has no float32
-FMA here and `add(neg(mul(a,b)), mul(a,b))` folds to exactly zero residuals inside Pallas.  Both
-compensations are needed -- coefficient limbs alone give 1.04e-05, state limbs alone the same,
-together 5.73e-08 at Nside 256 and 1.21e-07 at 1024 against an fp64 march of the same shape
-(`.qwen/tmp/spin2_lowrow_cert_256.log`, `spin2_lowrow_cert_1024.log`).  Tile partials leave in
-float64 and are summed across tiles, the same discipline as `_spin_slice._reduce_channels`.
+Numerics.  The march carries a float32 (value, limb) pair per theta lane and renormalises each
+lane into a 2^+-24 band every degree.  Products go through inline PTX FMA because XLA offers no
+float32 FMA here and `add(neg(mul(a,b)), mul(a,b))` folds to an exactly zero residual inside
+Pallas.  Both compensations (coefficient limbs and state limbs) are needed: either alone gives
+~1e-5, together ~1e-7 against a float64 march of the same recurrence up to Nside 1024.  Tile
+partials are summed across tiles in float64, as in `_spin_slice._reduce_channels`.
 
-Everything the kernel reads is computed inside the trace from `cos(theta)` and static (L, nside):
-no table is materialised on the host, on the device between calls, or in the module.  Selected by
-`GMASTER_SPIN2_MARCH=1` at the seam in :func:`gmaster._sht.healpix._forward_latitudinal`; off by default,
-and any spin other than +2 (or a non-NVIDIA device) keeps the shipped route.
+Every kernel input is computed inside the trace from `cos(theta)` and static (L, nside).  Route
+selection is by :func:`march_requested`, :func:`synth_requested`, :func:`fold_requested` and
+:func:`fold_synth_requested` (see their docstrings for the `GMASTER_*` flags).
 """
 from __future__ import annotations
 
@@ -60,9 +55,8 @@ _TILE = int(os.environ.get("GMASTER_SPIN2_MARCH_TILE", "256"))
 _WARPS = int(os.environ.get("GMASTER_SPIN2_MARCH_WARPS", "1"))
 # Ceiling on programs per march launch for the wide m-window (see :func:`_march_windows`).
 _MARCH_GRID_CAP = int(os.environ.get("GMASTER_MARCH_GRID_CAP", "2048"))
-# Degrees per loop iteration of the analysis march (see `_kern`): 8 measured best at Nside 1024
-# (K=4 2.18 ms, K=8 1.92, K=16 3.22 -- spills -- against 3.82 for the per-degree loop,
-# `.qwen/tmp/emit_ablate_s36.py`).
+# Degrees per loop iteration of the analysis march (see `_kern`).  8 is fastest at Nside 1024;
+# 16 spills registers and is slower than 4.
 _UNROLL = int(os.environ.get("GMASTER_MARCH_UNROLL", "8"))
 # `GMASTER_MARCH_POLAR_SKIP=0` marches every (m, theta tile) program, including the ones above the
 # ring's `mlim` (see `_polar_skip`); on by default.
@@ -79,10 +73,9 @@ def _on_nvidia() -> bool:
 def slice_declined(L, nside) -> bool:
     """True when no Wigner-d slice can be resident for this geometry, at any storage precision.
 
-    `slabs_for` returns `(None, None)` above `_SLAB_BUDGET` and the caller drops to the generic
-    scatter loop, which for spin 2 at Nside 1024 is a 13.2 s latitudinal step
-    (`.qwen/tmp/score_s2_routes_1024.log`: 13 255 ms against ducc0's 112.9 ms, 0.01x).  fp32 tables
-    are the cheapest the layout can ever be, so testing them is what "cannot exist" means.
+    Mirrors `slabs_for`, which returns `(None, None)` above `_SLAB_BUDGET`; the only alternative
+    route is then the generic scatter loop (~13 s for spin 2 at Nside 1024, ~100x slower than
+    the march).  The size is tested at the configured table dtype, the smallest layout available.
     """
     from gmaster._config import table_dtype
     from gmaster._sht import spin_slice as ss
@@ -93,23 +86,15 @@ def slice_declined(L, nside) -> bool:
 def march_requested(spin, *, L=None, nside=None) -> bool:
     """True when the analysis march should serve this call.
 
-    `GMASTER_SPIN2_MARCH` decides outright if it is set.  Left unset the march takes the call only
-    where there is no alternative -- a geometry too large for any slice (`slice_declined`) -- and
-    the shipped table route keeps everything it can.  That default is the measured one: with a
-    slice resident the fused table route runs Nside 512 spin 2 `map2alm` in 9.1-9.4 ms, while the
-    march at that geometry takes 24.0 ms (`.qwen/tmp/twosum_check.log` section 4 -- measured with the
-    table route declined, so the two numbers are not from one allocator setting; they are not to be
-    read as a ratio, only as "the march is not the route to prefer when a slice exists").  With no
-    slice the march runs 106.6-109.0 ms against the 13.2 s scatter loop, which is the whole 0.01x to
-    parity at Nside 1024 (107.3 ms against ducc0's 105.9, `.qwen/tmp/score_default_pool.log`).  The
-    cost is accuracy -- 3.7e-05 against ducc0 marched, 4.0e-07 on the scatter loop -- so
-    `GMASTER_SPIN2_MARCH=0` keeps the exact route at any size.
+    `GMASTER_SPIN2_MARCH=1` forces the march (on NVIDIA, or wherever the v2 march is enabled);
+    `=0` keeps the table route at any size.  Unset, the march serves the call when the v2 march is
+    enabled for `L`, or on NVIDIA when no Wigner-d slice fits (`slice_declined`).  With a slice
+    resident the table route is faster (e.g. Nside 512: ~9 ms against ~24 ms) and more accurate;
+    without one the march is ~100x faster than the scatter loop.  Accuracy cost of the Pallas
+    march: ~4e-05 relative against ducc0, versus ~4e-07 for the scatter loop.
 
-    The seam only sees a spin-2 call when `_spin_slabs` returns `(None, None)`, which is `slabs_for`
-    declining -- the same test `slice_declined` makes, so "the seam was reached" and "the march is
-    the only route" are the same condition by construction. At Nside 512 the slab route owns the call
-    and neither flag changes anything there: counting calls from the E/B entry points returns zero
-    with `GMASTER_SPIN2_MARCH=1` set (`.qwen/tmp/route_probe_512.log`).
+    The caller only reaches this seam when `_spin_slabs` returns `(None, None)`, which is the same
+    test `slice_declined` makes, so where a slab exists the flag has no effect.
     """
     if int(spin) != SPIN:
         return False
@@ -126,47 +111,22 @@ def march_requested(spin, *, L=None, nside=None) -> bool:
 def synth_requested(spin, *, L=None, nside=None) -> bool:
     """True for the synthesis march: its own flag, otherwise the no-slice rule.
 
-    The flag is separate from `GMASTER_SPIN2_MARCH` because the two directions have different
-    economics -- analysis is ahead of ducc0 without a table while synthesis is behind it -- but the
-    *default* is the same rule: march wherever `slice_declined` says no Wigner-d slice can exist, and
-    keep the exact route everywhere else.  `GMASTER_SPIN2_MARCH_SYNTH=0` restores the exact route at
-    any size; `=1` forces this one.
+    `GMASTER_SPIN2_MARCH_SYNTH` is separate from `GMASTER_SPIN2_MARCH` because the two directions
+    have different cost/accuracy tradeoffs; the default rule is the same (march only where
+    `slice_declined`, or wherever the v2 march is enabled).  `=0` keeps the exact route at any
+    size; `=1` forces the march.
 
-    Measured at Nside 1024 against ducc0's own map, with alms taken from ducc0's analysis (the input
-    a pipeline actually produces): the marched map is **1.968e-04 max / 6.370e-06 rms** off ducc0 with
-    the fitted convention factor `|s| = 1.00`, where the generic scatter loop it replaces scores
-    1.095e-09 (`.qwen/tmp/synth_vs_ducc_1024.log`).  That is roughly the polar-lane row error
-    (2.47e-04 at `ell = 1528`) arriving at one pole-most pixel; the map rms is 6e-06.  The cost side:
-    122.7 ms against ducc0's 105.7 (0.86x) and against **13.2 s** for the scatter loop, i.e. this
-    turns a 0.01x cell into ~0.8x.  It is still behind ducc0, so this is not a win, it is the removal
-    of a two-order-of-magnitude default.
+    Accuracy at Nside 1024 against ducc0, alms from a spin-2 analysis: ~2e-04 max, ~6e-06 rms
+    relative, against ~1e-09 for the scatter loop.  The max error comes from the pole-most rings,
+    where the float32 lane pair delivers ~29 bits at high `ell` (e.g. 2.5e-04 at `ell = 1528`) and
+    the error grows toward the pole; a float64 march of the same recurrence holds ~1e-12, so the
+    loss is float32 arithmetic, not the algorithm.  Cost is ~10x below the scatter loop, still
+    somewhat above ducc0.
 
-    One convention difference to know about.  The march's recurrence starts at `ell = max(m, spin)`,
-    so it contributes nothing from `ell < |spin|`, whereas s2fft's `flm_to_ftm` and ducc0 both do use
-    such terms if handed them (`.qwen/tmp/ducc_ell_below_spin.log`: injecting `|alm| = 1e3` at
-    `ell < 2` moves ducc0's map by 0.14 of its maximum).  Inputs that come out of any spin-2 analysis
-    have essentially nothing there -- ducc0 returns exactly 0.0 at `ell = 0` and noise level at
-    `ell = 1` -- which is why this never shows up in a pipeline, but a hand-built `alm` with
-    sub-spin power will silently lose it.  The number that used to be quoted for this route, rms
-    0.93 (`.qwen/tmp/synth_map_err_1024.log`), was exactly that: a probe feeding a red random `alm`
-    whose largest coefficients sit at `ell = 0, 1`, so only m = -1, 0, +1 columns disagreed
-    (`.qwen/tmp/synth_which_columns_512.log`) while every `ell >= 2` term matched to 1.75e-06
-    (`.qwen/tmp/synth_per_m_ell_256.log`).
-
-    What is not settled is why the synthesis lane pair delivers roughly 29 bits at the extreme rows
-    instead of the ~48 it costs.  A float64 march of the same recurrence holds 7.5e-13 at
-    ell = 1526 (`.qwen/tmp/march_fp64_scan.log`), so it is arithmetic and not the algorithm.  Three
-    suspects have been measured and eliminated: the seed (a float32-rounded seed is amplified by
-    only 0.1-0.4 ulp across the whole band, `.qwen/tmp/seed_amp_probe.log`, which is why pairing it
-    was inert); the primitives (`_two_prod`, `_fma` and `_two_sum` are each bit-exact on this stack,
-    `.qwen/tmp/twoprod_probe.log`, `twosum_probe.log`); and the fast-form TwoSum residual, which
-    *is* inexact here (~1 ulp, rms 8.2e-09 with |uh| < |th| and 2.0e-08 with |uh| > |th| against
-    0.000e+00 for the branch-free 2Sum, `.qwen/tmp/twosum_order_probe.log`) but replacing it changes
-    the row error by nothing -- 28 of 30 (m, ring, ell) cells of `.qwen/tmp/polar_lane_dump.py` are
-    bit-identical before and after, and `ell=1528` in the pole lane is 2.47e-04 either way
-    (`.qwen/tmp/polar_lane_256_fast2sum.log`, `polar_lane_256_2sum.log`).  That dump also shows the
-    defect is a lane-growth law rather than a single bad ring: 1.3e-07 at the equator against 6.5e-05
-    at the pole for m=0 at `ell=760`, north and south agreeing to the digit.
+    Convention: the recurrence starts at `ell = max(m, spin)`, so coefficients with
+    `ell < |spin|` contribute nothing.  s2fft's `flm_to_ftm` and ducc0 do use such terms if given
+    them.  Alms from any spin-2 analysis are (numerically) zero there, but a hand-built `alm` with
+    sub-spin power will silently lose it.
     """
     if int(spin) != SPIN:
         return False
@@ -182,7 +142,7 @@ def synth_requested(spin, *, L=None, nside=None) -> bool:
 
 # --------------------------------------------------------------------------------------- kernel
 def _two_prod(a, b):
-    """(a*b, exact residual): the only exact-FMA pair available under this XLA/Pallas stack."""
+    """(a*b, exact residual) via PTX `mul`/`fma`; XLA exposes no float32 FMA inside Pallas."""
     return plt.elementwise_inline_asm(
         "mul.rn.f32 $0, $2, $3; neg.f32 $1, $0; fma.rn.f32 $1, $2, $3, $1;",
         args=[a, b], constraints="=r,=r,r,r", pack=1,
@@ -191,7 +151,7 @@ def _two_prod(a, b):
 
 
 def _fma(a, b, c):
-    # One output + three inputs = operands $0..$3 (numbering covers outputs; $4 does not exist).
+    # Single-rounded float32 a*b + c.  Operands $0..$3 are one output then three inputs.
     return plt.elementwise_inline_asm("fma.rn.f32 $0, $1, $2, $3;", args=[a, b, c],
                                       constraints="=r,r,r,r", pack=1,
                                       result_shape_dtypes=[
@@ -205,8 +165,9 @@ def _two_sum(a, b):
 
 
 def _pow2(d):
-    """2**d for an integer block, assembled from the exponent field; `lax.exp2` is inexact on
-    integer exponents (measured 1.3e-07) and this rescale has to be exact."""
+    """Exact float32 2**d for integer `d`, assembled from the exponent field (0 below 2**-126).
+
+    `lax.exp2` is not exact on integer exponents (~1e-7 relative) and the rescale must be."""
     biased = jnp.clip(d + 127, 1, 254)
     return jnp.where(d >= -126, jax.lax.bitcast_convert_type(biased << 23, jnp.float32),
                      jnp.float32(0.0))
@@ -227,9 +188,9 @@ def _polar_skip(m, xv, valid, *, L, spin):
     that order every `d^ell_{m,-s}(theta)` with `ell <= lmax` sits in its forbidden region by at
     least `ofs` in `m`, where the WKB action `(2 sqrt 2 / 3) ofs^1.5 / sqrt(lmax sin theta) / cos theta`
     puts it below ~1e-8 (docs/latitudinal_march_maths.md §8).  The tile is skipped when its
-    largest `mlim` is below `m`; the work that removes is 14 / 17 / 19 % of the analysis march at
-    Nside 1024 / 2048 / 4096 (`.qwen/tmp/mlim_count_s36.py`).  `xv` is the float32 cosine; the
-    half-precision of `1 - x^2` at the pole moves `mlim` by ~1 order against a margin of 100.
+    largest `mlim` is below `m`, which removes 14-19 % of the analysis march at Nside 1024-4096.
+    `xv` is the float32 cosine; its rounding in `1 - x^2` at the pole moves `mlim` by ~1 order,
+    well inside the margin of 100.  Disabled by `GMASTER_MARCH_POLAR_SKIP=0`.
     """
     if not _POLAR_SKIP:
         return jnp.zeros((), jnp.bool_)
@@ -244,20 +205,18 @@ def _kern(manr, ex0r, xr, xlr, c1r, c0r, cbr, c1lr, c0lr, cblr, mantr, lexr, sgn
           out_ref, oex_ref, *, L, ntheta, chunk, unroll, spin=SPIN, nc=NC):
     """One (m-window row, theta tile) of the analysis march; see the module docstring.
 
-    The emit is float32 end to end and the fp64 lives outside the kernel.  Each degree stores its
-    four channel partials as float32 scaled by the normalisation's *fractional* binade
-    (`mantr`, in [1, 2)) and, in `oex_ref`, the integer binade the partial is missing: the tile's
-    exponent `emax` plus `lexr = floor(log2 N(ell, m))`.  The driver applies `2**oex` in float64
-    and sums the tiles.  The shipped form computed `exp2(emax + log2 N)` in float64 in the kernel
-    and stored `float64` partials -- a warp-wide fp64 exp2, four fp64 converts and four fp64
-    multiplies per degree on a card that issues fp64 at 1/64 rate, which session 21's ablations
-    booked under "the emit" without splitting it out.  Measured on the first 128-order window,
-    `.qwen/tmp/emit_ablate_s36.py` (medians, GPU1): Nside 1024 3.74 -> 2.26 ms from the fp32 emit
-    alone, and 1.92 ms with `unroll` degrees per loop iteration (the independent per-degree
-    reduction trees then overlap the next degrees' recurrence); Nside 4096 43.2 -> 22.5 ms.  The
-    recurrence-only floor is 1.23 / 13.7 ms at those sizes.  The change is a rounding-order change
-    (one float32 multiply by the fractional binade per partial): 7.5e-08 relative to the fp64-emit
-    kernel over every lane at Nside 1024, windows m0 = 0 / 1024 / 2560.
+    The emit is float32 end to end; float64 is applied only outside the kernel, because the GPU
+    issues float64 at a small fraction of the float32 rate.  Each degree stores its four channel
+    partials as float32 scaled by the normalisation's *fractional* binade (`mantr`, in [1, 2)),
+    and in `oex_ref` the integer binade the partial is missing: the tile exponent `emax` plus
+    `lexr = floor(log2 N(ell, m))`.  The driver applies `2**oex` in float64 and sums the tiles
+    (`_sum_tiles`).  This matches a float64 emit to ~1e-7 relative.
+
+    `unroll` degrees are marched per loop iteration so that the independent per-degree reduction
+    trees overlap the following degrees' recurrence.
+
+    Output layout: `out_ref` is `(mb, ntile, Lm, nc)` float32 and `oex_ref` `(mb, ntile, Lm)`
+    int32, indexed by `ell - m0`.
     """
     row = pl.program_id(0)
     tile = pl.program_id(1)
@@ -330,12 +289,8 @@ def _kern(manr, ex0r, xr, xlr, c1r, c0r, cbr, c1lr, c0lr, cblr, mantr, lexr, sgn
         uh, ul = _two_prod(cb, ph)
         ul = _fma(cb, pl_, ul)
         ul = _fma(jnp.broadcast_to(plt.load(cblr.at[row, ell]), xv.shape), ph, ul)
-        # The residual of `th - uh` comes from the branch-free 2Sum, never the fast form
-        # `(th - nxt) - uh`: on this stack the fast form is off by ~1 ulp of `nxt` (rms 8.2e-09 when
-        # |uh| < |th|, 2.0e-08 when |uh| > |th|) against 0.000e+00 for `_two_sum` in both orderings
-        # (`.qwen/tmp/twosum_order_probe.log`).  It fixes the lane state, not the polar defect --
-        # the row error at ell=1528 is 2.47e-04 either way (`.qwen/tmp/polar_lane_256_fast2sum.log`
-        # against `.qwen/tmp/polar_lane_256_2sum.log`).
+        # The residual of `th - uh` uses the branch-free 2Sum, not the fast form
+        # `(th - nxt) - uh`, which is off by ~1 ulp on this stack in either magnitude ordering.
         nxt, e3 = _two_sum(th, -uh)
         nxtl = (tl - ul) + e3
         hh = nxt + nxtl                       # keep |nxtl| < |nxt| so the limb stays a limb
@@ -486,49 +441,15 @@ def _march_windows(L, ntile, spin):
     """The m-windows of one march launch of *ntile* theta tiles at *spin*.
 
     One program covers one ``(m, theta tile)`` pair, so the window width changes neither the total
-    work nor the total program count -- only how it is split: ``L/mb`` launches of ``mb*ntile``
-    programs.  With no slab to skip bytes in (the whole point of the marched routes) nothing argues
-    against a wide window, so 128 is taken -- until a launch passes ``_MARCH_GRID_CAP`` programs,
-    where it starts to lose.  Measured 128 over 64, arms alternating in one process
-    (`.qwen/tmp/march_mblock_ab.log`) and one size per process for the rest:
+    work nor the total program count, only how it is split: ``L/mb`` launches of ``mb*ntile``
+    programs.  Wider windows (``_MARCH_M_BLOCK``, 128) mean fewer launches and are 1.1-1.4x faster
+    as long as a launch stays at or below ``_MARCH_GRID_CAP`` (2048) programs; at 4096 programs per
+    launch they are ~5 % slower, so the narrower ``_M_BLOCK`` is used there.  The width only
+    regroups independent m-rows, so results agree to the last bit.
 
-    | cell | programs per launch, 64 -> 128 | 64 | 128 |
-    |---|---|---|---|
-    | spin 2 analysis, nside 1024 | 1024 -> 2048 | 107.14 ms | **78.57** (**1.36x**) |
-    | spin-0 fold analysis, nside 2048 | 2048 -> 2048 | 419.42 ms | **312.04** (**1.34x**) |
-    | spin 2 synthesis, nside 2048 | 1024 -> 2048 | 525.70 ms | **473.49** (**1.11x**) |
-    | spin-0 fold synthesis, nside 2048 | 1024 -> 2048 | 325.03 ms | **303.59** (**1.07x**) |
-    | spin 0, nside 1024, both directions | <= 1024 | 28.14 / 31.14 ms | 28.13 / 30.54 (parity) |
-    | spin 2 analysis, nside 2048 | 2048 -> **4096** | **610.69 ms** | 634.22 (**0.96x**) |
-    | spin-0 fold analysis, nside 4096 | 2048 -> **4096** | **2253.8 ms** | 2386.7 (**0.94x**) |
-
-    Every win is at a launch of 2048 programs or fewer and both losses at 4096.  The alms are
-    bit-identical except at nside 1024 spin 2, where they move by 4.3e-19 against
-    ``|alm|max 2.7e-03`` -- different summation grouping, last-bit.  Against ducc0 the two flips
-    that matter are spin-0 2048 ``map2alm`` 0.75x -> **1.01x** and spin-2 1024 ``map2alm``
-    1.04x -> **1.45x** (`.qwen/tmp/score_s28.log`; cross-process repetitions of the two losses are
-    588.5 -> 611.9 ms in `.qwen/tmp/score_mb_ab.log`).
-
-    **Session 28 withheld it from spin 0 only.**  With the polarised routes wide, one build in about
-    twenty-four returned an alm that was entirely NaN (9,440,250 of 9,440,256 entries) and took the
-    coupled cell with it, while ~60 builds at 64 never did and 24 builds with `jax_debug_nans`
-    enabled never fired.  It was always the first build of the process and only the first, it happened
-    with the analysis wide and the synthesis narrow as well as the reverse, the two widths' results
-    agreed to 4.3e-19 when both completed, and no read of the drivers found a slot the kernel leaves
-    unwritten -- the analysis masks its `ell < max(m, spin)` wedge and both synthesis kernels store
-    every ``(row, tile, lane)`` once.  That combination is uninitialized device memory, not the
-    arithmetic, so the width was withheld from spin 2 until it was root-caught; the spin-0 folded
-    routes, where no such event has been seen, kept the win.  Reproducers:
-    `.qwen/tmp/nan_where.py`, `.qwen/tmp/nan_dir.py`, `.qwen/tmp/nan_debug.py`; details in HANDOFF
-    session 28.
-
-    **The wedge is root-caught and spin 2 takes the width.**  Session 28's pre-registered experiment
-    was "make the kernel write the wedge and see whether the poisoned wide build stops NaNing"; it did.
-    The analysis slab is now the window's own range (`L - m0`), each row stores at `ell - m0`, and the
-    program zeroes its own `<= mb - 1` lane head instead of leaving allocator bytes there, so every
-    lane the reduce reads is written.  With that, `GMASTER_M_BLOCK=128` gave `max|dCl| = 4.17e-12`,
-    `rel = 3.69e-06` -- digit-for-digit the narrow value -- in every pipeline process tried, against
-    2/2 `nan` at the same cell before the fix (`.qwen/tmp/pipe_trim_wide.log`, HANDOFF session 29).
+    The analysis kernel writes every lane of its slab, including the ``ell < max(m, spin)`` head it
+    does not march (see `_kern`).  This matters for wide windows: an unwritten head left
+    uninitialised device memory in the slab, which occasionally surfaced as an all-NaN alm.
     """
     from gmaster._sht import spin_slice as ss
 
@@ -541,22 +462,14 @@ def _march_windows(L, ntile, spin):
 def _synth_windows(L, ntile, spin):
     """The m-windows of one synthesis launch: as wide as the program ceiling still allows.
 
-    The law measured for `_march_windows` is about programs per launch, not about the window itself
-    (every win was at <= 2048 programs, every loss at 4096), and this route is the one marched route
-    with room: `_ST0` leaves it 4 theta tiles at nside 2048 and 8 at 4096, where the analysis has 16
-    and 32.  So the window is grown to fill the ceiling (`cap // ntile`, rounded down to a power of
-    two, capped at `_MARCH_M_SYNTH0_MAX`) instead of stopping at 128.  Measured against ducc0, spin-0
-    `alm2map`, fp32, 5 reps, one geometry per process (`.qwen/tmp/swinf_s29.log`, against the
-    pre-change `BOARD` stage of `.qwen/tmp/s29z.log`): **2048 215.6 ms / 1.40x against 246.3 ms /
-    1.24x** and **4096 1649.2 ms / 1.19x against 1740.0 ms / 1.14x**, with `rel alm` digit-for-digit
-    unchanged (6.9e-05 / 2.1e-04) because the window only groups independent m-lanes into one launch.
-    Reproduced in the width sweep of `.qwen/tmp/swin_s29.log` (2048: 217.2 ms with the ceiling at 512,
-    249.6 ms with it at 256; 4096: 1670.6 ms) and at 4096 again in `.qwen/tmp/s29y.log` (1650.3 ms).
-    Nside 1024 does not move (30.2 ms either way, 24 launches of 128 orders against 6 of 512), and the
-    four-tile gate exists because Nside 512 -- two theta tiles, so the rule would pick 256 or 512 there
-    -- measured 4.9 and 5.0 ms against the shipped 4.4 ms in that same pair of arms.  The analysis
-    route keeps `_march_windows`: growing its window past the ceiling does not widen anything, it
-    trips the fallback to `_M_BLOCK` and costs 1.37x at 2048.
+    The rule in `_march_windows` concerns programs per launch, not the window itself.  The spin-0
+    synthesis route uses a wider theta tile (`_ST0`), so it has few tiles (4 at Nside 2048, 8 at
+    4096) and room under ``_MARCH_GRID_CAP``: the window is grown to ``cap // ntile``, rounded down
+    to a power of two and capped at ``_MARCH_M_SYNTH0_MAX``.  This is 1.05-1.15x faster at Nside
+    2048-4096 with identical results.  Below four theta tiles (Nside <= 512) a wide window is
+    slightly slower, so those geometries and all spin-2 calls keep `_march_windows`.  The analysis
+    route cannot do the same: its window is already at the cap, and growing it would trip the
+    fallback to ``_M_BLOCK``.
     """
     from gmaster._sht import spin_slice as ss
 
@@ -583,10 +496,9 @@ def _forward_impl(ftm, *, L, spin, nside):
     sh, ch = jnp.sin(theta / 2.0), jnp.cos(theta / 2.0)
     rev = ftm[::-1]                                  # ring i of rev is the ring at pi - theta_i
     sign = ss._sign(L, SPIN)
-    # Assembled by one concatenation of per-window column blocks, like `_inverse_impl`: the
-    # per-window `out.at[...].set` form holds a full (L, 2L-1) complex128 buffer -- 4.8 GiB at
-    # Nside 4096 -- across an unrolled loop of up to 192 windows, and XLA's buffer assignment for
-    # that program is what pushed the spin-2 pass past the pool there (session 36).
+    # Assembled by one concatenation of per-window column blocks, like `_inverse_impl`.  A
+    # per-window `out.at[...].set` keeps a full (L, 2L-1) complex128 buffer (4.8 GiB at Nside 4096)
+    # live across the unrolled window loop, which exhausts the device pool at that size.
     dirs, mirs = [], []
     for (m0, m1, lo) in _march_windows(L, ntile, SPIN):
         mb = m1 - m0
@@ -637,21 +549,16 @@ def forward_latitudinal(ftm, *, L, spin, nside):
 def fold_requested(nside, L) -> bool:
     """True when the folded spin-0 march should serve a latitudinal call.
 
-    Left unset the march takes the call only where the Legendre band is refused for *size*, because
-    a resident table beats it: Nside 1024 reads its 36.75 GiB band in 26.83 ms at 1471 GB/s, which
-    is the card's streaming rate and about half what a march over the same folded lane count costs
-    (`.qwen/tmp/spin0_stage_split.log`).  Where the band cannot exist the alternative is the fp64
-    on-the-fly scalar kernel, and that is the worst cell in the repo: Nside 2048 `map2alm` 949.2 ms
-    (0.33x) and Nside 4096 7516.9 ms (0.27x) against ducc0's 315.6 and 2014.4
-    (`.qwen/tmp/score_n2048_spin0_s26.log`, `.qwen/tmp/score_n4096_spin0.log`).  The fold halves the
-    lane count relative to the spin-2 march, and theta tiles are the kernel's second program axis,
-    so the program count halves with it rather than just the work per program.
+    Unset, the march serves the call when the v2 march is enabled for `L`, or on NVIDIA where the
+    Legendre band is refused for size (`healpix._prefer_theta_band`).  A resident band is faster:
+    it is read at streaming bandwidth, about twice as fast as marching it.  Without a band the
+    alternative is the float64 on-the-fly scalar kernel, which is 3-4x slower than ducc0 at
+    Nside 2048-4096.  Folding north/south halves the theta lanes, and hence the program count.
 
     `GMASTER_SPIN0_MARCH=1` serves every scalar call, including the geometries where a band exists,
     which is how the two routes are compared against each other; `=0` restores the fp64 kernel
-    everywhere.  The accuracy cost is the march's own -- float32 lanes and a 2^+-24 renormalisation
-    band, measured against ducc0 in the scoring runs below, against 3.4e-07 for the kernel it
-    replaces.
+    everywhere.  The accuracy cost is the march's own (float32 lanes, 2^+-24 renormalisation
+    band); the float64 kernel it replaces is accurate to ~3e-07 against ducc0.
     """
     from gmaster._sht import healpix
 
@@ -664,11 +571,9 @@ def fold_requested(nside, L) -> bool:
     return on_gpu and not healpix._prefer_theta_band(nside, L, 0)
 
 
-# Demand the paired fold may put on the allocator, judged against the device pool.  The two
-# measured points are Nside 2048, which runs (`.qwen/tmp/pairrun_s34.log`: 4558 -> 3961 ms, GPU
-# peak 4.3 GiB), and Nside 4096, which does not (`.qwen/tmp/pairrun_4096_s34.log`:
-# `RESOURCE_EXHAUSTED: Out of memory while trying to allocate 8.15GiB` inside a 71.2 GiB pool,
-# while the same geometry run as two separate calls completes with a 16.3 GiB peak).
+# Safety factor on `fold_pair_bytes` against the device pool (see `fold_pair_fits`).  Calibrated so
+# that Nside 2048 pairs and Nside 4096 does not on a ~71 GiB pool: the paired fold runs at 2048
+# but ran out of memory at 4096, where two separate calls still fit.
 _PAIR_POOL_FACTOR = 4
 
 
@@ -681,9 +586,8 @@ def fold_pair_bytes(nside, L) -> int:
     one), the fp64 per-window partials the assembly consumes, and the two assembled alms.
     It is a scale estimate for a gate, not a scheduler's answer -- see `fold_pair_fits`.
     The fold planes are counted at 16 bytes even under `set_ring_precision("fp32")`, because
-    the crash this gate is calibrated against (`.qwen/tmp/pairrun_4096_s34.log`) was measured
-    with the azimuthal stage in float64 and that is the only footprint on record; a float32-ring
-    session therefore declines the pair one size earlier than it strictly needs to.
+    the gate was calibrated with the azimuthal stage in float64; with float32 rings it is
+    therefore conservative.
     """
     ntheta = 4 * nside - 2
     north = (ntheta + 1) // 2
@@ -702,12 +606,10 @@ def fold_pair_fits(nside, L) -> bool:
     """True when this device's pool can be asked to hold the paired fold.
 
     Pairing puts both maps' azimuthal stages, both rhs blocks and one unrolled window loop
-    into a single XLA program, so the allocator's peak is well above the analytic live set --
-    at Nside 4096 the estimate is 33.0 GiB and the run still died on an 8.15 GiB request with
-    the rest of the pipeline resident, i.e. the peak ran at more than twice the estimate.
-    Demanding `4x` free is what makes the two measured points come out right, and it leaves a
-    larger pool able to take the size back rather than hard-coding a Nside.  A device with no
-    pool accounting (`memory_stats()` returns None, which is what CPU does) is unlimited.
+    into a single XLA program, so the allocator's peak is well above the analytic live set
+    (more than twice it at Nside 4096).  Requiring `_PAIR_POOL_FACTOR` times the estimate
+    scales with the pool instead of hard-coding an Nside.  A device with no pool accounting
+    (`memory_stats()` returns None, as on CPU) is treated as unlimited.
     """
     stats = jax.devices()[0].memory_stats()
     limit = stats.get("bytes_limit") if stats else None
@@ -723,11 +625,10 @@ def fold_pair_fits(nside, L) -> bool:
 def fold_synth_requested(nside, L) -> bool:
     """True when the folded spin-0 march should serve a synthesis latitudinal call.
 
-    Mirrors `fold_requested` for the inverse direction -- the synthesis band is refused by the same
-    size test plus its own 16 GiB reserve, so Nside 2048/4096 fall all the way to the fp64 on-the-fly
-    kernel, which is the worst cell on the board (`2048 0 alm2map 305.8 1267.1 0.24x`,
-    `4096 0 alm2map 2022.3 10050.4 0.20x`).  Its own flag so the two directions can be A/B'd apart;
-    unset falls back to `GMASTER_SPIN0_MARCH` so one switch still flips the whole spin-0 route.
+    Mirrors `fold_requested` for the inverse direction.  Without the march, Nside 2048/4096 fall
+    back to the float64 on-the-fly kernel (4-5x slower than ducc0).  `GMASTER_SPIN0_MARCH_SYNTH`
+    controls this direction alone; unset, it falls back to `GMASTER_SPIN0_MARCH`, so one switch
+    flips the whole spin-0 route.
     """
     from gmaster._sht import healpix
 
@@ -777,11 +678,9 @@ def _fold_analyze(positives, weights, phase, *, L, nside):
     jn = jnp.arange(north)
     partner = ntheta - 1 - jn
 
-    # The four channels of the rhs are interleaved on the last axis, so building them per window is
-    # a strided store per window: measured 126.9 ms of the 442 ms Nside 2048 `map2alm`, against
-    # ~2 ms for the same bytes streamed once (`.qwen/tmp/spin0_fold_rhs_cost_2048b.log` -- neither
-    # bandwidth nor the `zeros().at[].set` form is the cost, a concatenate is 1.04x).  So the whole
-    # (L, npad, nc) block is built once and each window slices its own rows out of it.
+    # The rhs channels are interleaved on the last axis, so building them per window would be a
+    # strided store per window (a large share of the Nside 2048 runtime).  The whole
+    # (L, npad, nc) block is built once and each window slices its own rows.
     chans = []
     for positive in positives:
         folded = positive.T * weights[None, :] * p2phi
@@ -815,13 +714,10 @@ def _fold_analyze(positives, weights, phase, *, L, nside):
         for k in range(len(positives)):
             c = 4 * k
             p = jnp.where(keep, parts[..., c:c + NC], 0.0)
-            # The scalar route's rows are `sqrt((2l+1)/4pi) * d^l_{m0}`, not the bare Wigner row:
-            # the band's `_diagonal_normalization` seed carries the degree factor (measured as a
-            # constant ratio of exactly that over every row and lane, 5.2e-08 at Nside 32), and so
-            # does the fused kernel that shares the seed.  The march closes the form on the bare
-            # row, so the degree factor is applied here rather than inside the kernel, where it
-            # would also land on the spin-2 route -- whose contract deliberately leaves it to
-            # `_finish_forward_s2fft`.
+            # The scalar route's rows are `sqrt((2l+1)/4pi) * d^l_{m0}` (the band's
+            # `_diagonal_normalization` seed carries the degree factor), while the march produces
+            # the bare row.  The factor is applied here, not in the shared kernel, because the
+            # spin-2 contract leaves it to `_finish_forward_s2fft`.
             block = ((p[..., 0] + 1j * p[..., 1])
                      + sgn * (p[..., 2] + 1j * p[..., 3])) * norm[m0:][None, :]
             cols[k].append(jnp.zeros((L, mb), dtype=block.dtype).at[m0:, :].set(block.T))
@@ -869,28 +765,18 @@ def forward_latitudinal_positive_pair(positive_a, positive_b, weights, phase, *,
 
 # ------------------------------------------------------------------- synthesis: the same row, summed
 _ST = int(os.environ.get("GMASTER_SPIN2_MARCH_SYNTH_TILE", "512"))
-# Spin 0's synthesis march wants a wider theta tile than spin 2's, and the fold is why: it hands the
-# kernel `north = (ntheta+1)//2` rows instead of `ntheta`, so at the spin-2 width a 2048-grid launch
-# is 8 tiles of 512 northern rows and each block re-does its per-window prologue 8 times over half
-# the rows.  Measured against ducc0 in one geometry per process, `GM_PREC=fp32`, 5 reps
-# (`.qwen/tmp/st2048_s29.log`, `.qwen/tmp/st_spin0_s29.log`, `.qwen/tmp/default_s29.log`), spin-0
-# `alm2map`:
-#   Nside 2048  512 (shipped) 287.4 ms 0.99x | 256 270.0 ms 1.04x | 1024 243.7 ms 1.17x | 2048 401.2 0.71x
-#   Nside 4096  512          1885.1 ms 1.02x | 1024 1745.8 ms 1.10x | 2048 3186.5 ms 0.61x
-#   Nside 1024  512            31.0 ms 1.73x | 1024  30.7 ms 1.70x | 2048  30.7 ms 1.59x  (flat)
-# Spin 2 at the same geometry goes the other way -- 453.7 ms 1.25x at 512, 508.1 at 256, 524.6 at
-# 1024 -- so the width is per-spin, not global.  Applied only where `north` can still fill four
-# tiles at the wide width, which is exactly the regime measured above; below it (Nside <= 1024,
-# where the widths are indistinguishable) the shipped geometry stands.
+# Spin 0's synthesis march uses a wider theta tile than spin 2's.  The fold hands the kernel
+# `north = (ntheta+1)//2` rows, so at the spin-2 width each program repeats its per-window prologue
+# over half as many rows.  1024 is 1.07-1.17x faster than 512 at Nside 2048-4096; 2048 is much
+# slower, and at Nside 1024 the widths are indistinguishable.  Spin 2 prefers 512, so the width is
+# per-spin.  `_synth_tile` applies `_ST0` only where `north` fills at least four wide tiles.
 _ST0 = int(os.environ.get("GMASTER_SPIN0_SYNTH_TILE", "1024"))
-# Warps per synthesis block.  Re-measured at the shipped tile widths, Nside 2048 `alm2map`
-# (`.qwen/tmp/s29z.log` stage `SW`; the 4-warp row is the default arm of stage `BOARD`): spin 0 gives
-# 1522.1 ms (1 warp), 383.0 (2), **246.3 (4)**, 254.2 (8); spin 2 gives 526.2 (2), **457.7 (4)**.
-# The one-warp arm is 6x the four-warp one -- a 1024-lane tile over 32 lanes is an occupancy cliff,
-# not a slope -- so this knob and `_ST`/`_ST0` are one decision and must be swept together.
+# Warps per synthesis block; 4 is fastest for both spins at the default tile widths.  Too few warps
+# for a wide tile is an occupancy cliff (1 warp on a 1024-lane tile is ~6x slower), so this knob and
+# `_ST`/`_ST0` must be tuned together.
 _SW = int(os.environ.get("GMASTER_SPIN2_MARCH_SYNTH_WARPS", "4"))
 # `fast` accumulates the contraction in plain float32, `comp` in (value, limb) float32 pairs; see
-# `_accumulate_fast` for the measured cost and error of the difference.
+# `_accumulate_fast` for the cost/accuracy tradeoff.
 _ACC = os.environ.get("GMASTER_SPIN2_MARCH_SYNTH_ACC", "fast")
 _ACC_FAST = _ACC != "comp"
 
@@ -920,11 +806,9 @@ def _accumulate(nd, ndl, tex, aex, at0, rh, rl, ih, il, a_r, a_l, b_r, b_l):
     The invariant is `value * 2**aex`, so a block that moves has to carry the stored value with it.
     A term that dwarfs the accumulator lifts the block and flushes the residue; a term it dwarfs
     simply underflows in -- the block never moves down, because that would grow the stored value
-    toward overflow.  Clamping the drift in both directions without rescaling, as the first version
-    did, silently multiplies whatever had accumulated by `2**drift`.  That is what put the synthesis
-    step at 7.08e-04 against the shipped route at Nside 1024 while the identical march gives
-    1.46e-07 in analysis (`.qwen/tmp/march_knob_1024.log`): analysis reduces over theta, so a lane
-    whose residue got relabelled is diluted, while synthesis emits that lane as a pixel.
+    toward overflow.  Moving the block without rescaling the stored value would silently multiply
+    the accumulated sum by `2**drift`; synthesis is sensitive to this because each lane is emitted
+    as a pixel rather than reduced over theta.
     """
     aex = jnp.where(at0, tex, aex)
     lift = jnp.maximum(tex - aex - 90, 0).astype(jnp.int32)
@@ -956,11 +840,9 @@ def _accumulate_fixed(nd, tex, rh, ih, mrh, mih, a_r, b_r, c_r, d_r):
     The coefficients arrive prescaled to `[1, 2)` at their maximum (`_window_prescale`) and the
     term `nd * 2**tex` is the bare `|d| / 2**frac <= 1`, so the accumulators stay below
     `2**(2 + log2 L)` and need no block exponent: the alignment is one exact power of two shared by
-    the direct and mirror sums (their `lex` are the same array), then four FMAs.  Against
-    `_accumulate_fast`, which re-derived a per-lane block exponent, a lift, a residue rescale and
-    a 2^+-24 guard for each of the two sums every degree, this is the same arithmetic with the
-    range bookkeeping removed: bit-identical except for terms below `2**-126` of the window's
-    scale, which are flushed.
+    the direct and mirror sums (their `lex` are the same array), then four FMAs.  Compared with
+    `_accumulate_fast` this drops the per-lane range bookkeeping and is bit-identical except for
+    terms below `2**-126` of the window's scale, which are flushed.
     """
     nd = nd * _pow2(tex)
     return a_r + nd * rh, b_r + nd * ih, c_r + nd * mrh, d_r + nd * mih
@@ -973,11 +855,9 @@ def _accumulate_fast(nd, tex, aex, at0, rh, ih, a_r, b_r):
     what keeps a 6000-term sum inside float32's exponent range and is kept verbatim.  What is
     dropped is the *precision* half: the limb operands (neither the marched limb nor the
     coefficient limbs are read at all, so the kernel does not even load them) and the
-    accumulator limb.  At 4 elements/thread that is 61 of the step's ~165 vector operations, and the
-    step is warp-issue-bound at ~100% of the machine's issue rate, so the saving is the op count
-    itself: 83.41 -> 51.96 ms over all 48 windows at Nside 1024 (1.605x), with max|diff| 1.260e-07
-    against the compensated arm and 2.15e-06 relative to the window's own maximum
-    (`.qwen/tmp/synth_acc_cost_1024.log`).
+    accumulator limb.  The step is instruction-issue bound, so removing ~40 % of its vector
+    operations makes it ~1.6x faster, at ~2e-06 error relative to the window's maximum against the
+    compensated form (Nside 1024).
     """
     aex = jnp.where(at0, tex, aex)
     lift = jnp.maximum(tex - aex - 90, 0).astype(jnp.int32)
@@ -1007,14 +887,12 @@ def _kern_synth(manr, ex0r, xr, xlr, c1r, c0r, cbr, c1lr, c0lr, cblr,
     orders need the *same* row: the negative side is ``R_m(pi - theta)``, and because the HEALPix
     theta grid is symmetric (``theta[ntheta-1-i] == pi - theta[i]``) that is the same marched lane
     read at the mirrored ring.  So one march feeds both accumulators and only the store index
-    differs -- before this the negative orders ran a second, identical march on a `-cos` geometry,
-    which is why synthesis cost 197.7 ms against analysis' 111.6 at Nside 1024.
+    differs.
 
-    The accumulation is plain float32 by default; `GMASTER_SPIN2_MARCH_SYNTH_ACC=comp` restores the
-    (value, limb) pairs and `_accumulate_fast` records what the two cost.  Float64 accumulators are
-    not an option on this GPU, which runs float64 at 1/64 rate -- an fp64 accumulator alone cost
-    793.9 ms for this step (`.qwen/tmp/sht_vs_ducc_s29_ab2_1024_2.log`).  Output channel 0/1 is the
-    direct (positive m) sum, 2/3 the mirror (negative m) sum, which the caller stores at the
+    The accumulation is plain float32 by default; `GMASTER_SPIN2_MARCH_SYNTH_ACC=comp` selects
+    (value, limb) pairs (see `_accumulate_fast`).  Float64 accumulators are avoided because
+    many GPUs issue float64 at a small fraction (e.g. 1/64) of the float32 rate.  Output
+    channel 0/1 is the direct (positive m) sum, 2/3 the mirror (negative m) sum, which the caller stores at the
     reversed theta axis.
     """
     row = pl.program_id(0)
@@ -1056,12 +934,8 @@ def _kern_synth(manr, ex0r, xr, xlr, c1r, c0r, cbr, c1lr, c0lr, cblr,
         uh, ul = _two_prod(cb, ph)
         ul = _fma(cb, pl_, ul)
         ul = _fma(jnp.broadcast_to(plt.load(cblr.at[row, ell]), xv.shape), ph, ul)
-        # The residual of `th - uh` comes from the branch-free 2Sum, never the fast form
-        # `(th - nxt) - uh`: on this stack the fast form is off by ~1 ulp of `nxt` (rms 8.2e-09 when
-        # |uh| < |th|, 2.0e-08 when |uh| > |th|) against 0.000e+00 for `_two_sum` in both orderings
-        # (`.qwen/tmp/twosum_order_probe.log`).  It fixes the lane state, not the polar defect --
-        # the row error at ell=1528 is 2.47e-04 either way (`.qwen/tmp/polar_lane_256_fast2sum.log`
-        # against `.qwen/tmp/polar_lane_256_2sum.log`).
+        # The residual of `th - uh` uses the branch-free 2Sum, not the fast form
+        # `(th - nxt) - uh`, which is off by ~1 ulp on this stack in either magnitude ordering.
         nxt, e3 = _two_sum(th, -uh)
         nxtl = (tl - ul) + e3
         hh = nxt + nxtl
@@ -1183,14 +1057,13 @@ def _synth_coeff(flm, m0, mb, L, *, mirror):
 
     ``lgs`` is split into ``lex`` (integer, folded into the term exponent) and a ``[1, 2)`` factor
     that rides in the float32 coefficient together with the closed form's ``(-1)**m``; the mirror
-    half carries the slice's own ``(-1)**(ell + |spin|)``, which the delta probe
-    (``.qwen/tmp/spin2_synth_negm_64.log``) shows is exactly the ``theta -> pi - theta`` factor the
-    shipped synthesis applies to negative orders.
+    half carries the slice's own ``(-1)**(ell + |spin|)``, the ``theta -> pi - theta`` factor the
+    table-based synthesis applies to negative orders.
 
     Split into a float32 high part plus limb: the contraction inside the kernel is float32
     (float64 is 1/64-rate here), so the coefficient keeps its precision only as a pair -- a
     float32 coefficient alone is re-spent at every degree of the same lane and its error grows
-    like L * 2**-24 (measured 5.9e-06 at Nside 32).
+    like L * 2**-24.
     """
     from gmaster._sht import spin_slice as ss
 
@@ -1258,14 +1131,8 @@ def _inverse_impl(flm, *, L, spin, nside):
     sh, ch = jnp.sin(theta / 2.0), jnp.cos(theta / 2.0)
     # The window column ranges are disjoint and tile the result, so the result is assembled by one
     # concatenation instead of `out.at[...].set` per window.  XLA scatter is out-of-place, so the
-    # per-window form copied the whole (ntheta, 2L) complex128 buffer 48 times at Nside 1024 and 96
-    # times at 2048 -- 1.50 GiB per copy at the latter.  Re-measured end to end in one process with
-    # both arms on identical inputs: 114.36 -> 64.35 ms (**1.78x**) at 1024 and 1611.28 -> 482.72 ms
-    # (**3.34x**) at 2048, `max|diff| 0.000e+00` (bit-identical), `.qwen/tmp/synth_assembly_ab2.log`.
-    # The numbers this comment used to quote (2.93x / 5.20x) came from the same A/B under different
-    # conditions and the log it cited had since been overwritten by an unrelated probe; the direction
-    # was right, the magnitudes were not.  Analysis assembly does *not* benefit (0.98-0.99x,
-    # `.qwen/tmp/analysis_assembly_ab.log`) -- do not port this back and forth.
+    # per-window form would copy the whole (ntheta, 2L) complex128 buffer once per window (1.5 GiB
+    # per copy at Nside 2048); the concatenation is 1.8-3.3x faster and bit-identical.
     dirs, mirs = [], []
     for (m0, m1, lo) in _march_windows(L, ntile, SPIN):
         mb = m1 - m0
@@ -1359,9 +1226,8 @@ def inverse_latitudinal(flm, *, L, spin, nside):
     """Synthesis latitudinal step with no Wigner-d table.
 
     ``(L, 2L-1)`` complex in (``flm[ell, L-1+m]``) to ``(4*nside-1, 2L)`` complex, the contract
-    `healpix._inverse_latitudinal` has today; the kernel is the same certified ``d^l_(m,-2)`` the
-    analysis march uses, measured against the shipped route at rel 1e-14 with unit scalar
-    (``.qwen/tmp/spin2_synth_row2_64.log``).
+    `healpix._inverse_latitudinal` expects.  The kernel marches the same ``d^l_(m,-2)`` rows as the
+    analysis; see :func:`synth_requested` for accuracy.
     """
     if int(spin) != SPIN:
         raise ValueError(f"march route implements spin=+{SPIN}, got spin={spin}")

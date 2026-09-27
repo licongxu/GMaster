@@ -1,27 +1,29 @@
-"""Precomputed-Legendre-matrix analysis theta stage.
+"""Spin-0 latitudinal transform as a contraction with a precomputed Legendre band.
 
-The fused Pallas kernel regenerates every d^l_{m,0}(theta_j) inside each analysis
-call, which makes the theta stage recurrence-bound. These numbers are a fixed
-function of (nside, L), so generating them once turns the transform into a pure
-multiply-reduce that is memory-bound instead.
+The fused Pallas kernel (`gmaster._sht.sht_pallas`) regenerates every
+d^l_{m,0}(theta_j) inside each call, so its latitudinal stage is bound by the
+recurrence.  These values depend only on (nside, L), so this module builds them
+once, keeps them on the device while they fit, and turns the transform into a
+memory-bound multiply-reduce.  When the band cannot be built or cached (not
+enough device memory, or inside a `jax.grad` / transpose trace) the public
+functions return None and the caller uses the fused kernel.
 
-Layout: the m-banded row set (only ell >= m, so there is no 2x padding waste)
-split into m-blocks of BLOCK. Block b covers m in [m0, m0+mb) and holds a slab of
-shape (L - m0, mb, north) with `j` contiguous — the natural lax.scan output order,
-so building the band never needs a transpose copy. Each block's result is a
-rectangular region at (m0, m0) of the (ell, m) output, so the blocks are
-assembled with pad-and-concatenate. That matters more than it sounds: the
-equivalent scatter with 2-D index arrays measures ~1500x slower in XLA.
+Layout: only the rows with ell >= m are stored, split into m-blocks of width
+`BLOCK`.  Block b covers m in [m0, m0 + mb) and is a slab of shape
+(L - m0, mb, north), indexed slab[ell - m0, m_local, j], with the ring index `j`
+contiguous (the natural `lax.scan` output order, so no transpose copy is
+needed).  Each block's output is the rectangle at (m0, m0) of the (ell, m)
+array, so blocks are assembled with pad-and-concatenate; the equivalent scatter
+with 2-D index arrays is about three orders of magnitude slower in XLA.
 
-The north/south fold `alm = A_north + (-1)^(ell+m) * A_south` distributes over the
-j-reduction, so it can be applied after the contraction instead of inside it. That
-needs (-1)^(ell+m) to be constant across each reduction, which it is once rows are
-split by parity of i = ell - m0: each half then contracts with a single complex RHS
-instead of four real columns, halving the arithmetic at identical bytes.
+North/south fold: alm = A_north + (-1)^(ell+m) A_south distributes over the ring
+sum, so it is applied after the contraction.  Splitting each block's rows by the
+parity of i = ell - m0 makes (-1)^(ell+m) a per-column constant within each half,
+so each half contracts with a single complex right-hand side.
 
-Row values are identical to `_sht_pallas._analysis_kernel`'s: same normalised
-3-term recurrence, same seed log2|diag[m]| + m*log2(sin), same
-exp2-rescale-every-16 schedule (value-preserving), same equator-counted-once rule.
+Row values match `sht_pallas._analysis_kernel`: same normalised three-term
+recurrence, same seed log2|diag[m]| + m*log2(sin theta), same value-preserving
+exp2 rescale every 16 degrees, and the equator ring counted once.
 """
 
 import contextlib
@@ -43,9 +45,9 @@ from gmaster._sht.sht_pallas import (
 
 BLOCK = 64
 
-# Which builder fills the band.  The scan is the reference and stays the default in tests;
-# the Pallas emitter is the same march with one Triton program per m-block, which is what
-# makes a large band cheap to produce (see `gmaster/_band_pallas.py`).
+# Band builder, from GMASTER_BAND_BUILDER: "pallas" (default; one Triton program per
+# m-block, see `gmaster._sht.band_pallas`) or "scan" (the XLA reference, also the
+# fallback off NVIDIA GPUs).  Both produce the same values.
 _BAND_BUILDER = os.environ.get("GMASTER_BAND_BUILDER", "pallas").strip().lower()
 
 
@@ -59,34 +61,27 @@ def set_band_builder(name):
 
 
 def band_builder():
+    """The configured band builder name."""
     return _BAND_BUILDER
 
 
 @lru_cache(maxsize=1)
 def _has_nvidia_gpu():
-    """True on a CUDA GPU. Colab reports ``Tesla T4`` without ``NVIDIA``."""
+    """True on a CUDA GPU (some devices, e.g. ``Tesla T4``, omit ``NVIDIA``)."""
     return on_cuda_gpu()
 
 
 def _build_slab(theta, L, diag, c1, c2, m0, mb, store_name="float64"):
-    """(L - m0, mb, north) slab, slab[ell - m0, m_local, j].
+    """Build one m-block with `lax.scan`: shape (L - m0, mb, north), slab[ell - m0, m_local, j].
 
-    `store_name` rounds the *emitted* values only.  The recurrence carries on in
-    float64 and never sees them, so a float32 slab here is bit-for-bit the
-    float64 slab cast afterwards -- and it is what lets the largest geometries be
-    built at all: the scan's output is the band's dominant allocation, so emitting
-    it in float32 halves the peak instead of leaving a full-precision twin next
-    to the storage copy.
+    The recurrence always runs in float64; `store_name` only rounds the emitted
+    values, so a float32 slab is bit-for-bit the float64 slab cast afterwards.
+    Emitting in the storage dtype keeps the scan output (the dominant allocation)
+    from coexisting with a float64 copy.
 
-    The recurrence coefficients are passed to the scan as rows, not gathered out
-    of `c1`/`c2` by `ell` inside the body.  With those tables shaped (m, ell),
-    `c1[m0:m0+mb, ell]` is a column gather -- `mb` strided loads, once per degree,
-    3071 times for a single slab at Nside 1024 -- and it is the only access in the
-    body that is neither contiguous nor loop invariant.  They do not depend on the
-    recurrence state, so slicing and transposing once outside the scan hands each
-    step the same (mb,) vector the gather produced: bit-for-bit the same slab
-    (checked at Nside 512 and 1024, both storages, `.qwen/tmp/builder_nogather.py`)
-    for 1.09-1.20x at 512 and parity at 1024.
+    The recurrence coefficients are sliced and transposed once outside the scan
+    so each step receives a contiguous (mb,) row instead of gathering a strided
+    column of `c1`/`c2` per degree; the result is identical.
     """
     north = (len(theta) + 1) // 2
     store = jnp.dtype(store_name)
@@ -98,7 +93,7 @@ def _build_slab(theta, L, diag, c1, c2, m0, mb, store_name="float64"):
     log2_scale = jnp.log2(jnp.abs(d))[:, None] + mf * jnp.log2(sine)[None, :]
     exponent = jnp.floor(log2_scale).astype(jnp.int32)
     seed = jnp.where(d < 0, -1.0, 1.0)[:, None] * jnp.exp2(log2_scale - exponent)
-    # (rows, mb): step i is the vector the gather at `ell = m0 + i` produced.
+    # (rows, mb): row i holds the coefficients for ell = m0 + i.
     k1 = c1[m0:m0 + mb, m0:L].T
     k2 = c2[m0:m0 + mb, m0:L].T
 
@@ -130,42 +125,38 @@ def _build_slab(theta, L, diag, c1, c2, m0, mb, store_name="float64"):
 
 
 def _build_pair(theta, L, diag, c1, c2, m0, mb, store_name):
-    """One m-block's two parity halves, in the storage precision.
+    """One m-block split into its (even, odd) ell - m0 parity halves, in storage precision.
 
-    The slab is emitted in that precision (`_build_slab`), so no float64 copy of
-    a block is ever resident alongside it, and the split is inside the jit so the
-    unsplit slab dies with the call too.  At Nside 1024 that is the difference
-    between a float32 band that builds and one that runs the pool out of memory
-    next to a 73.5 GiB float64 twin.
+    The split happens inside the jit so the unsplit slab is freed with the call
+    and no float64 copy of the block stays resident.
     """
     vals = _build_slab(theta, L, diag, c1, c2, m0, mb, store_name)
     return vals[0::2], vals[1::2]
 
 
 _BAND_CACHE = {}
-# Geometries whose build ran the pool out of memory.  Cleared by `release()`,
-# because that is exactly the call that reclaims the room they needed.
+# Geometries whose build ran out of device memory; cleared by `release()`, which
+# is the call that frees room for them.
 _BAND_FAILED = set()
-# Each band is gigabytes, so this is a bound on device memory, not on keys.
+# Each band is gigabytes, so this bounds device memory rather than key count.
 _BAND_MAX_GEOMETRIES = 4
-# m-blocks built before the compilation caches are dropped mid-build, so that the
-# executables of blocks already stored stop pinning their outputs (see `_band`).
+# Number of m-blocks built between `jax.clear_caches()` calls during a build, so
+# that executables of finished blocks stop pinning their outputs (see `_band`).
 _BUILD_CLEAR_EVERY = 8
 
 
 def _band(geometry):
-    """Parity-split m-banded slabs for (nside, L, block), or None if unavailable.
+    """Parity-split m-banded slabs ``(even_blocks, odd_blocks)`` for a geometry, or None.
 
-    Rows of each block are split by parity of i = ell - m0 so that each half can
-    be contracted with a single complex RHS (see `_transform`).
+    `geometry` is ``(nside, L, block, store_dtype)`` from `band_geometry`.  Rows
+    of each block are split by parity of i = ell - m0 (see `_transform`).
 
-    The band is only usable as a device buffer, so it must be built outside a
-    trace; `lru_cache` would happily cache tracers (the `UnexpectedTracerError`
-    trap of HANDOFF Session 5j), hence the explicit dict, which stores a
-    geometry only once its slabs are concrete. Under `jax.grad` /
-    `jax.linear_transpose` the builder returns tracers even inside
-    `ensure_compile_time_eval`, so this returns None and the caller falls back
-    to the fused kernel: gradients keep flowing, they just take the kernel.
+    The band is only useful as concrete device buffers, so it must be built
+    outside a trace.  `lru_cache` would cache tracers (`UnexpectedTracerError`);
+    the explicit dict stores a geometry only once its slabs are concrete.  Under
+    `jax.grad` / `jax.linear_transpose` the builders return tracers, so this
+    returns None and the caller uses the fused kernel, which keeps gradients
+    working.  Also returns None if the build runs out of device memory.
     """
     from gmaster._sht import healpix
 
@@ -183,49 +174,41 @@ def _band(geometry):
     c1_np, c2_np = _normalized_coefficients_numpy(L, 0, L)
 
     def scan_builder():
-        # Built on demand: the coefficient tables ride the jit as constants, and
-        # the emitter route should not pay to stage them.
+        # Created lazily so the emitter route does not stage the coefficient
+        # tables as jit constants.
         return jax.jit(partial(_build_pair, theta, L, diag,
                                jnp.asarray(c1_np), jnp.asarray(c2_np)),
                        static_argnames=("m0", "mb", "store_name"))
 
     emitter = _BAND_BUILDER == "pallas" and _has_nvidia_gpu()
     if emitter:
-        # One Triton program per m-block: the march in registers, storing straight
-        # into the parity halves.  Chosen because the scan route pays an XLA
-        # compile per block, which is 99% of a build (340 s for 36.73 GiB at
-        # Nside 1024, against 5.14 s for the same band here).
+        # One Triton program per m-block, writing straight into the parity halves.
+        # The scan route pays an XLA compile per block, which dominates its build
+        # time (minutes vs seconds at Nside 1024).
         from gmaster._sht import band_pallas as _band_pallas
 
         builder = partial(_band_pallas.build_pair, theta, L, diag, c1_np, c2_np)
     else:
         builder = scan_builder()
-    # `ensure_compile_time_eval` is what lets the scan fold into the caller as a
-    # compile-time constant.  It works by making `jax.jit` evaluate eagerly, and a
-    # `pallas_call` has no eager rule -- `pl.program_id` raises
-    # `NotImplementedError: Evaluation rule for 'program_id' not implemented`,
-    # which is exactly what the emitter did the first time it was wired in here.
-    # So the emitter route skips the fold and relies on the concrete-buffer check
-    # below to reject a build performed inside a trace, which is the same
-    # outcome the fold produced for gradients: the caller takes the fused kernel.
+    # `ensure_compile_time_eval` makes the scan build eagerly even when called from
+    # inside a trace.  `pallas_call` has no eager rule (`pl.program_id` raises
+    # NotImplementedError), so the emitter route skips it and instead relies on
+    # the concrete-buffer checks below to decline a build inside a trace.
     fold = contextlib.nullcontext() if emitter else jax.ensure_compile_time_eval()
     even, odd = [], []
     try:
         with fold:
             for i, m0 in enumerate(range(0, L, block)):
-                # The recurrence is fp64 and stays fp64; only the *storage* may be
-                # fp32, and the cast is part of the block's kernel so the fp64
-                # original is dead before the next block is built.  Casting the
-                # finished band would need both precisions resident at once, which
-                # is exactly the budget the fp32 option exists to avoid.
+                # The recurrence is float64; only storage may be float32, and the
+                # cast happens inside the block's program so both precisions are
+                # never resident for the whole band.
                 mb = min(block, L - m0)
                 try:
                     pair = builder(m0, mb, store.name)
                 except Exception as exc:
-                    # RESOURCE_EXHAUSTED is the pool's verdict on the geometry and
-                    # belongs to the handler below.  Anything else is the emitter
-                    # declining a shape it cannot compile, which is worth one
-                    # rebuilt block rather than losing the band's transform.
+                    # RESOURCE_EXHAUSTED goes to the outer handler.  Any other
+                    # emitter failure means it cannot compile this shape: switch
+                    # to the scan builder for the rest of the band.
                     if not emitter or isinstance(exc, jax.errors.JaxRuntimeError):
                         raise
                     emitter = False
@@ -236,24 +219,14 @@ def _band(geometry):
                         "being built with the scan builder instead", stacklevel=2)
                     pair = builder(m0, mb, store.name)
                 if not hasattr(pair[0], "block_until_ready"):
-                    # The emitter route builds without `ensure_compile_time_eval`, so
-                    # inside an outer trace its blocks come back as tracers.  Decline
-                    # here rather than at the drain below, which raises
-                    # `AttributeError: 'block_until_ready' is not available on traced
-                    # array` and takes the whole call down instead of falling back to
-                    # the fused kernel the way a gradient path does.
+                    # Emitter blocks built inside an outer trace are tracers;
+                    # decline now so the caller falls back to the fused kernel.
                     return None
                 even.append(pair[0])
                 odd.append(pair[1])
-                # A cached executable pins a copy of the buffers it produced, so a
-                # band built as L/BLOCK separate programs costs twice its table:
-                # measured at Nside 256, 1.22 GiB of band holding 2.5 GiB of pool,
-                # and the excess vanished from `jax.clear_caches()` while the band
-                # stayed (`.qwen/tmp/band_build_memory.py`).  Each program here is
-                # used exactly once, so dropping it as soon as its block lands costs
-                # nothing and keeps the peak at one table plus one block -- which is
-                # what makes the Nside 1024 float32 band (36.8 GiB) reachable on a
-                # 71 GiB pool instead of needing 73.6.
+                # A cached executable pins a copy of its outputs, which would double
+                # the band's footprint.  Each program is used once, so clearing the
+                # caches periodically keeps the peak near one band plus one block.
                 if (i + 1) % _BUILD_CLEAR_EVERY == 0:
                     for slab in pair:
                         slab.block_until_ready()
@@ -263,23 +236,20 @@ def _band(geometry):
         if not all(hasattr(slab, "block_until_ready") for group in groups
                    for slab in group):
             return None
-        # Dispatch is asynchronous, so a pool that ran out during the loop is
-        # only reported here -- at Nside 1024 this is the call that raised.
+        # Dispatch is asynchronous, so an out-of-memory error during the loop
+        # surfaces here.
         for group in groups:
             for slab in group:
                 slab.block_until_ready()
-        # Release the executables of the final, un-cleared partial batch too.
+        # Release the executables of the final partial batch as well.
         jax.clear_caches()
     except jax.errors.JaxRuntimeError as exc:
-        # The byte gate is a static estimate; the pool gets the final say.  A band
-        # that does not fit must hand the caller None so it can take the fused
-        # kernel — letting the OOM escape kills the run at the next allocation
-        # instead, which is what happened at Nside 1024 with a float64 band.
+        # The byte estimate is static; the allocator decides.  A band that does not
+        # fit returns None so the caller takes the fused kernel instead of failing.
         if "RESOURCE_EXHAUSTED" not in str(exc):
             raise
         gc.collect()
-        # Negative cache: without it every one of the ~7 latitudinal passes in a
-        # field build retries a multi-gigabyte build that just failed.
+        # Negative cache so later latitudinal passes do not retry the failed build.
         _BAND_FAILED.add(geometry)
         return None
     _BAND_CACHE[geometry] = groups
@@ -289,10 +259,9 @@ def _band(geometry):
 def release():
     """Drop the cached Legendre bands; they rebuild on the next scalar transform.
 
-    The polar Wigner-d block sets and these bands are the two large resident
-    tables in GMaster, and at Nside 512 they do not both fit.  The caller that
-    needs room calls this rather than failing, because the transform each one
-    enables differs by an order of magnitude in cost.
+    The polar Wigner-d block sets (`spin_slice`) and these bands are the two large
+    resident tables in GMaster and may not both fit; `spin_slice` calls this to
+    reclaim room rather than fail.
     """
     _BAND_CACHE.clear()
     _SYNTH_CACHE.clear()
@@ -309,11 +278,11 @@ def band_bytes(nside, L, block=BLOCK, dtype=jnp.float64):
 
 
 def band_geometry(nside, L):
-    """Cache key for the band: the shape *and* the storage precision.
+    """Cache key for the band: ``(nside, L, BLOCK, table_dtype)``.
 
-    ``nmt_params.table_dtype`` is user-selectable (`set_table_precision`), and a
-    cached fp64 band must not be handed to a caller that asked for fp32 or vice
-    versa, so the dtype is part of the key rather than an implicit input.
+    The storage precision is user-selectable (`set_table_precision`), so it is
+    part of the key: a float64 band is never served to a float32 request or
+    vice versa.
     """
     from gmaster._config import table_dtype
 
@@ -323,26 +292,16 @@ def band_geometry(nside, L):
 def _contract_theta(slab, chan):
     """``acc[e, m, c] = sum_j slab[e, m, j] * chan[m, j, c]`` in one sweep.
 
-    Both channels must be reduced together.  Spelling it
-    ``sum(slab[..., None] * chan[None], axis=2)`` leaves the two channels in a
-    trailing dimension *after* the reduction axis, and XLA then materialises the
-    (rows, mb, north, 2) product rather than folding it into the reduce: 12.16 ms
-    for the Nside 512 band against 8.14 ms here (823 vs 1238 GB/s of slab read,
-    control 1400 GB/s, three interleaved rounds, values agree to 2.5e-16).  A
-    tuple reduce carries both accumulators in a single pass.
+    `chan` holds the real and imaginary parts as its last axis (c = 0, 1).  Both
+    channels are reduced together in one tuple `lax.reduce`: the broadcast
+    spelling ``sum(slab[..., None] * chan[None], axis=2)`` makes XLA
+    materialise the (rows, mb, north, 2) product, and an `einsum` is slower
+    inside the whole-band program, so this form is markedly faster.
 
-    A dot is not the answer either: ``einsum("emj,mjc->emc")`` measures 4x
-    *slower* inside this program (203 GB/s) while measuring 4x faster when each
-    block is compiled on its own.  Only the whole-band program is what ships.
-
-    The reduce runs in the *storage* width and only the block partials are
-    widened.  Widening the slab first is the natural thing to write and it is
-    numerically the better estimator, but it hands XLA a float64 temporary the
-    size of the band: at Nside 512 with `set_table_precision("fp32")` that costs
-    9.37 ms against 3.87 ms here, control 1339 GB/s (the float64 band is
-    identical either way, rel 0.00e+00).  The precision bought back is worth
-    less than the time: the difference between the two is 1.28e-07 on the alms,
-    while the float32 table itself is already good to ~1e-7.
+    The reduction runs in the storage dtype and only the block partials are
+    widened to float64.  Widening the slab first would create a float64
+    temporary the size of the band; with float32 tables the resulting difference
+    (~1e-7 relative) is at the level of the table precision itself.
     """
     chan = lax.convert_element_type(chan, slab.dtype)
     zero = jnp.zeros((), slab.dtype)
@@ -368,6 +327,7 @@ def _assemble_blocks(even_accs, odd_accs, widths, L):
 
 @partial(jax.jit, static_argnames=("L", "widths"))
 def _transform(slabs_even, slabs_odd, ftm_pos, weights, phase, *, L, widths):
+    """Analysis contraction over the whole band; returns the (L, L) complex (ell, m) alms."""
     ntheta = weights.shape[0]
     north = (ntheta + 1) // 2
     m = jnp.arange(L, dtype=jnp.float64)[:, None]
@@ -375,7 +335,7 @@ def _transform(slabs_even, slabs_odd, ftm_pos, weights, phase, *, L, widths):
     jn = jnp.arange(north)
     partner = ntheta - 1 - jn
     # The equator ring is its own partner and is counted once, matching
-    # `_sht_pallas._analysis_kernel`, which skips the south half there.
+    # `sht_pallas._analysis_kernel`, which skips the south half there.
     north_rhs = folded[:, jn]
     south_rhs = jnp.where(partner == jn, 0.0, folded[:, partner])
     # p = (-1)^(ell+m) is a per-column sign once rows are split by parity of
@@ -392,14 +352,21 @@ def _transform(slabs_even, slabs_odd, ftm_pos, weights, phase, *, L, widths):
 
 
 def positive_latitudinal(positive, *, L, nside, weights, phase):
-    """Positive-m analysis theta transform from the cached band.
+    """Positive-m analysis latitudinal transform using the cached band.
 
-    `positive` is the positive-m block of the azimuthal-FFT map, the same slice
-    `_fused_forward_sht` hands to `scalar_forward_latitudinal`; the result is the
-    (ell, m) complex array that kernel returns. `theta` is not needed — the band
-    was built for these rings already, which is exactly the work being removed.
-    Returns None when the band cannot be materialized as device buffers, i.e. on
-    gradient paths, so the caller can fall back to the fused kernel.
+    Parameters
+    ----------
+    positive : (ntheta, L) complex array
+        Positive-m block of the azimuthal-FFT map (the slice
+        `healpix._fused_forward_sht` passes to `scalar_forward_latitudinal`).
+    weights, phase : (ntheta,) arrays
+        Per-ring quadrature weights and azimuthal phase offsets.
+
+    Returns
+    -------
+    (L, L) complex array indexed (ell, m), as returned by the fused kernel, or
+    None if the band is unavailable (gradient trace, or insufficient memory),
+    in which case the caller should use the fused kernel.
     """
     assert BLOCK % 2 == 0, "the parity split assumes an even m-block"
     band = _band(band_geometry(nside, L))
@@ -411,7 +378,7 @@ def positive_latitudinal(positive, *, L, nside, weights, phase):
 
 
 def forward_latitudinal(ftm, *, L, nside, theta, weights, phase):
-    """`positive_latitudinal` taking the full FFT map, for the existing probes."""
+    """`positive_latitudinal` taking the full (ntheta, 2L) FFT map; `theta` is unused."""
     return positive_latitudinal(ftm[:, L:], L=L, nside=nside, weights=weights,
                                 phase=phase)
 
@@ -419,17 +386,10 @@ def forward_latitudinal(ftm, *, L, nside, theta, weights, phase):
 def _contract_theta_pair(slab, chan_a, chan_b):
     """`_contract_theta` for two right-hand sides over one read of `slab`.
 
-    Four accumulators instead of two, in the same tuple reduce, for the same
-    reason and with the same caveat about spelling.  Measured against two
-    separate `_transform` calls on the resident band
-    (`.qwen/tmp/pairsettle_s33.log`, fp32 tables, outputs bit-identical to the
-    separate calls, rel 0.00e+00): two maps cost 0.55x/0.56x/0.53x of what two
-    calls cost at Nside 256/512/1024 (1.217 -> 0.673, 7.450 -> 4.136,
-    52.954 -> 28.144 ms) and 0.86x at Nside 128, where the stage is too small
-    to be bandwidth-bound.  The slab is the traffic and the second map is
-    arithmetic the card already has spare -- the same balance the isolated
-    m-block probe found (`.qwen/tmp/multi_rhs_contract.log`: 4 right-hand sides
-    cost +5 %).
+    Four accumulators in one tuple reduce.  The stage is bandwidth-bound, so the
+    second map adds arithmetic but no slab traffic: two maps cost roughly 0.55x
+    of two separate calls at Nside >= 256 (less gain at small Nside, where the
+    stage is not bandwidth-bound).  Outputs are bit-identical to separate calls.
     """
     chan_a = lax.convert_element_type(chan_a, slab.dtype)
     chan_b = lax.convert_element_type(chan_b, slab.dtype)
@@ -448,12 +408,11 @@ def _contract_theta_pair(slab, chan_a, chan_b):
 @partial(jax.jit, static_argnames=("L", "widths"))
 def _transform_pair(slabs_even, slabs_odd, ftm_a, ftm_b, weights, phase, *,
                     L, widths):
-    """`_transform` for two maps: one sweep of the band serves both.
+    """`_transform` for two maps sharing one sweep of the band.
 
-    Everything that depends on the map (the ring fold, the parity combination,
-    the interleaved assembly) is still done twice; only the slab read is shared,
-    which is the whole point -- this is a bandwidth program, not a work-sharing
-    one.
+    Per-map work (ring fold, parity combination, assembly) is still done twice;
+    only the slab read is shared, which is what matters for a bandwidth-bound
+    stage.
     """
     ntheta = weights.shape[0]
     north = (ntheta + 1) // 2
@@ -482,11 +441,11 @@ def _transform_pair(slabs_even, slabs_odd, ftm_a, ftm_b, weights, phase, *,
 
 
 def positive_latitudinal_pair(positive_a, positive_b, *, L, nside, weights, phase):
-    """Two positive-m analysis theta transforms from one pass over the band.
+    """Two positive-m analysis latitudinal transforms from one pass over the band.
 
-    Returns `(alm_a, alm_b)`, or None if the band is not resident as concrete
-    device buffers -- the same decline and for the same reasons as
-    `positive_latitudinal`, so a caller can fall back to two separate calls.
+    Arguments are as in `positive_latitudinal`.  Returns ``(alm_a, alm_b)``, or
+    None under the same conditions as `positive_latitudinal`, so the caller can
+    fall back to two separate calls.
     """
     assert BLOCK % 2 == 0, "the parity split assumes an even m-block"
     band = _band(band_geometry(nside, L))
@@ -499,10 +458,10 @@ def positive_latitudinal_pair(positive_a, positive_b, *, L, nside, weights, phas
 
 
 _SYNTH_CACHE = {}
-# Room left in the pool for the pipeline itself (map blocks, the (L, ntheta) FFT
-# buffer, the coupling matrix) when deciding whether a second copy of the band
-# fits.  4 GiB was tried and was not enough: at Nside 1024 float32 the copy was
-# allowed, the process reached 96.9 GiB of a 97.9 GiB card, and it stalled.
+# Device memory reserved for the rest of the pipeline (map blocks, the (L, ntheta)
+# FFT buffer, the coupling matrix) when deciding whether a second, synthesis-layout
+# copy of the band fits.  4 GiB proved too small at Nside 1024 float32 (the process
+# filled the card and stalled).
 _SYNTH_RESERVE = 16 * 1024 ** 3
 ELL_CONTIG = "ell_contig"        # (m, j, ell) -- synthesis reduces a contiguous axis
 THETA_CONTIG = "theta_contig"    # (ell, m, j) -- the analysis layout, reduced strided
@@ -511,13 +470,13 @@ THETA_CONTIG = "theta_contig"    # (ell, m, j) -- the analysis layout, reduced s
 def _pool_bytes():
     """Total bytes the device will give this process, or +inf when it won't say.
 
-    With a preallocated pool `pool_bytes` is that number; with
-    `XLA_PYTHON_CLIENT_PREALLOCATE=false` — the invocation this repo's README
-    prescribes for the large geometries — it is reported as 0 while the pool is
-    growable up to `bytes_limit`, which is the number the fit test actually wants.
+    With a preallocated pool this is `pool_bytes`; with
+    `XLA_PYTHON_CLIENT_PREALLOCATE=false` (recommended for large geometries)
+    `pool_bytes` is 0 and the pool can grow up to `bytes_limit`, which is then
+    the relevant limit.
     """
     try:
-        # CPU returns None rather than raising (same trap as `_spin_slice._pool_headroom`).
+        # The CPU backend returns None rather than raising.
         stats = jax.local_devices()[0].memory_stats() or {}
     except Exception:  # pragma: no cover - backend without statistics
         return float("inf")
@@ -529,23 +488,18 @@ def _pool_bytes():
 
 
 def _synth_band(geometry):
-    """The band laid out for synthesis: ``(blocks, layout)``.
+    """The band laid out for synthesis: ``(blocks, layout)``, or None without a band.
 
-    With room to spare the blocks are the band re-laid out as
-    ``(m_local, j, ell_row)``, which is what `_contract_ell` wants; a transposed
-    *view* is what the theta stage punishes, so each block is materialised and the
-    `+ 0.0` is what forces the copy.
+    If memory allows, each block is copied to ``(m_local, j, ell_row)`` layout
+    (`ELL_CONTIG`), so `_contract_ell` reduces a contiguous axis.  The ``+ 0.0``
+    forces a materialised copy; a transposed view would be reduced strided.
 
-    That copy is exactly another band, and both of them have to live alongside the
-    pipeline's own working set for the whole synthesis stage.  Asking only whether
-    the copy fits *right now* is wrong: measured at Nside 1024 with float32 tables,
-    the pool had room for the second 36.8 GiB when the question was asked and the
-    process still ended up holding 96.9 GiB of the card's 97.9 and stalling.  So
-    the test bounds the whole table footprint against the pool and leaves
-    `_SYNTH_RESERVE` for the pipeline.  When it does not fit, the analysis layout is
-    handed to the strided contraction — `_spin_slice` measures that at 2.1x the cost
-    of the contiguous one, against the fused fp64 kernel, which is the alternative
-    to declining.
+    That copy is a second band, and both must coexist with the pipeline's working
+    set for the whole synthesis stage.  The test therefore bounds the total table
+    footprint (two bands plus `_SYNTH_RESERVE`) against the pool size, not the
+    currently free memory.  If it does not fit, the analysis layout is returned
+    (`THETA_CONTIG`) and reduced strided, which is about 2x slower but still far
+    cheaper than the fused float64 kernel.
     """
     cached = _SYNTH_CACHE.get(geometry)
     if cached is not None:
@@ -554,21 +508,19 @@ def _synth_band(geometry):
     if band is None:
         return None
     if geometry not in _SYNTH_CACHE and len(_SYNTH_CACHE) >= _BAND_MAX_GEOMETRIES:
-        # Same bound as the analysis band's, or the two caches together would
-        # hold twice as many geometries as either alone allows.
+        # Same bound as the analysis cache.
         _SYNTH_CACHE.clear()
     nbytes = sum(slab.nbytes for group in band for slab in group)
     if 2 * nbytes + _SYNTH_RESERVE > _pool_bytes():
-        # Two copies do not fit with the pipeline: synthesis reduces the band
-        # where it lies.
+        # Two copies do not fit alongside the pipeline: reduce the band in place.
         _SYNTH_CACHE[geometry] = (band, THETA_CONTIG)
         return band, THETA_CONTIG
     try:
         groups = tuple(
             tuple((slab.transpose(1, 2, 0) + 0.0) for slab in group) for group in band)
     except jax.errors.JaxRuntimeError as exc:
-        # The headroom check is a snapshot and the transpose is asynchronous, so
-        # the pool can still have the last word.  Decline the *copy*, not the route.
+        # The size check is an estimate and the copy is asynchronous, so the
+        # allocator may still refuse it.  Decline the copy, not the route.
         if "RESOURCE_EXHAUSTED" not in str(exc):
             raise
         gc.collect()
@@ -576,10 +528,8 @@ def _synth_band(geometry):
         return band, THETA_CONTIG
     if not all(hasattr(slab, "block_until_ready") for group in groups
                for slab in group):
-        # Same concrete-buffer test as `_band`: under a trace the transpose is a
-        # tracer, so hand back the analysis layout and cache nothing.  Caching a
-        # tracer here is the `UnexpectedTracerError` that Session 5j recorded, and
-        # the drain below would raise `AttributeError` before it got that far.
+        # Under a trace the copy is a tracer: return the analysis layout and cache
+        # nothing (caching a tracer raises `UnexpectedTracerError` later).
         return band, THETA_CONTIG
     for group in groups:
         for slab in group:
@@ -589,19 +539,16 @@ def _synth_band(geometry):
 
 
 def warm(nside, L):
-    """Build the band and its synthesis layout now, and say whether they are concrete.
+    """Build the band and its synthesis layout now; return whether they are resident.
 
-    A traced program can *read* the band but cannot *build* it: both builders drain
-    their caches with `block_until_ready` and decline under a trace, so a geometry
-    first touched inside one silently takes the fused fp64 kernel -- the worst cell
-    in the repo -- inside a program that was traced precisely to be fast.  Callers
-    that are about to trace therefore ask this first; the build happens here, at top
-    level, exactly as it would have happened on the op-by-op route.
+    A traced program can read the band but cannot build it (the builders decline
+    under a trace), so a geometry first touched inside a trace would silently use
+    the slow fused float64 kernel.  Callers about to trace call this first, at
+    top level.
 
-    The answer is residency, not intent: each builder caches a geometry only once its
-    slabs are concrete, so after the calls below `geometry in _SYNTH_CACHE` is exactly
-    "a program may read these buffers".  Called inside a trace the builders decline,
-    nothing is cached, and this returns False -- which is the correct answer there.
+    The return value reflects residency: builders cache a geometry only once its
+    slabs are concrete, so True means a traced program may read these buffers.
+    Called inside a trace, nothing is cached and this returns False.
     """
     geometry = band_geometry(nside, L)
     if _band(geometry) is None:
@@ -613,34 +560,27 @@ def warm(nside, L):
 
 
 def synth_pair_ready(nside, L):
-    """Whether two syntheses can share this geometry's band, after `warm`.
+    """Whether two syntheses can share this geometry's band (call after `warm`).
 
-    Sharing needs the contiguous re-layout: with the copy refused and the reduce
-    strided, a second right-hand side costs 4.19x rather than saving anything
-    (`inverse_latitudinal_pair`).  Asking after `warm` keeps the answer about
-    residency rather than intent, and a cache miss here means the caller should
-    pair the analysis and run the two syntheses apart.
+    Sharing requires the contiguous `ELL_CONTIG` layout; on the strided layout a
+    second right-hand side is slower than two separate calls (see
+    `inverse_latitudinal_pair`).  If this returns False, the caller should run the
+    two syntheses separately.
     """
     cached = _SYNTH_CACHE.get(band_geometry(nside, L))
     return cached is not None and cached[1] == ELL_CONTIG
 
 
 def _contract_ell(slab, rhs):
-    """``acc[m, j] = sum_e slab[m, j, e] * rhs[m, e]``, reducing the ell axis.
+    """``acc[m, j] = sum_e slab[m, j, e] * rhs[m, e]``, reducing the contiguous ell axis.
 
-    The synthesis twin of `_contract_theta`.  Spelled as a single complex product,
-    ``sum(slab * rhs[:, None, :], axis=-1)``, the operand that has to be
-    materialised before the reduce is complex — twice the slab — and the reduce
-    sits behind that materialisation instead of absorbing it: 22.55 ms for the
-    Nside 512 synth band against 16.78 ms here (446 vs 600 GB/s of slab read,
-    control 1420 GB/s, three interleaved rounds, values agree to 3.1e-16).
+    The synthesis counterpart of `_contract_theta`.  The complex `rhs` is split
+    into real and imaginary parts reduced as a tuple: a single complex product
+    would materialise a complex operand twice the slab's size before the reduce.
 
-    Like `_contract_theta` this reduces in the storage width and widens the
-    partials, for the same reason and the same measured size of effect on a
-    float32 table.  The width cast has to be applied to the real and imaginary
-    parts separately: casting a complex operand to a real dtype truncates it, and
-    the imaginary half of the synthesis sum silently becomes zero (Nside 512,
-    decoupled cell wrong by 7.5 relative).
+    As in `_contract_theta`, the reduction runs in the storage dtype and only the
+    partials are widened.  The cast must be applied to real and imaginary parts
+    separately: casting a complex array to a real dtype drops the imaginary part.
     """
     re_rhs = lax.convert_element_type(rhs.real, slab.dtype)
     im_rhs = lax.convert_element_type(rhs.imag, slab.dtype)
@@ -652,13 +592,10 @@ def _contract_ell(slab, rhs):
 
 
 def _contract_ell_leading(slab, rhs):
-    """`_contract_ell` on a band that stayed in its analysis (ell, m, j) layout.
+    """`_contract_ell` on a band still in its analysis (ell, m, j) layout.
 
-    The same sum with the reduced axis leading rather than trailing: XLA gathers
-    it with a stride instead of streaming it, which `_spin_slice` measures at ~2x
-    on the contraction.  That is the price of not holding a second copy of a table
-    that is already tens of gigabytes (see `_synth_band`), and it is paid against
-    the fused fp64 kernel, which is the alternative.
+    The reduced axis is leading, so XLA reads it strided (about 2x slower).  This
+    is the cost of not holding a second copy of the band (see `_synth_band`).
     """
     re_rhs = lax.convert_element_type(rhs.T.real, slab.dtype)
     im_rhs = lax.convert_element_type(rhs.T.imag, slab.dtype)
@@ -671,14 +608,14 @@ def _contract_ell_leading(slab, rhs):
 
 @partial(jax.jit, static_argnames=("L", "widths", "strided"))
 def _inverse(slabs_even, slabs_odd, alm, weights, phase, *, L, widths, strided):
+    """Synthesis contraction over the whole band; returns the (ntheta, L) positive-m block."""
     # In the analysis layout the ring axis is last instead of second.
     north = slabs_even[0].shape[2 if strided else 1]
     contract = _contract_ell_leading if strided else _contract_ell
     m = jnp.arange(L, dtype=jnp.float64)[:, None]
     sign = 1.0 - 2.0 * jnp.bitwise_and(jnp.arange(L), 1).astype(jnp.float64)
-    # The fused kernel applies each ring's quadrature weight and phi phase to
-    # its own half, so the band has to as well -- the south half with the
-    # *partner* ring's weight and phase, in descending theta.
+    # Each ring gets its own quadrature weight and phi phase, as in the fused
+    # kernel: the south half uses the partner ring's, in descending theta.
     north_factor = weights[:north] * jnp.exp(1j * (m * phase[:north]))
     south_factor = (
         jnp.flip(weights)[: north - 1]
@@ -711,13 +648,21 @@ def _inverse(slabs_even, slabs_odd, alm, weights, phase, *, L, widths, strided):
 
 
 def inverse_latitudinal(positive_alm, *, L, nside, weights, phase):
-    """Positive-m synthesis theta transform from the cached band.
+    """Positive-m synthesis latitudinal transform using the cached band.
 
-    `positive_alm` is the (ell, m) positive-m block, the same array
-    `_alm2map_core_pallas` hands to `scalar_inverse_latitudinal`; the result is
-    the centred (ntheta, L) positive-m block that kernel returns, quadrature
-    weight and phi phase included.  Returns None when the band is unavailable so
-    the caller can fall back to the fused kernel.
+    Parameters
+    ----------
+    positive_alm : (L, L) complex array
+        Positive-m alms indexed (ell, m), as passed by
+        `healpix._alm2map_core_pallas` to `scalar_inverse_latitudinal`.
+    weights, phase : (ntheta,) arrays
+        Per-ring quadrature weights and azimuthal phase offsets.
+
+    Returns
+    -------
+    (ntheta, L) complex array, the positive-m block of the ring FFT with
+    weights and phases applied (as the fused kernel returns), or None if the
+    band is unavailable, in which case the caller should use the fused kernel.
     """
     assert BLOCK % 2 == 0, "the parity split assumes an even m-block"
     geometry = band_geometry(nside, L)
@@ -734,8 +679,8 @@ def inverse_latitudinal(positive_alm, *, L, nside, weights, phase):
 def _contract_ell_pair(slab, rhs_a, rhs_b):
     """`_contract_ell` for two right-hand sides over one read of `slab`.
 
-    Contiguous-`ell` layout only; see `inverse_latitudinal_pair` for why the
-    strided twin is not offered.
+    Contiguous-ell layout only; see `inverse_latitudinal_pair` for why there is
+    no strided variant.
     """
     re_a = lax.convert_element_type(rhs_a.real, slab.dtype)
     im_a = lax.convert_element_type(rhs_a.imag, slab.dtype)
@@ -788,16 +733,14 @@ def _inverse_pair(slabs_even, slabs_odd, alm_a, alm_b, weights, phase, *, L,
 
 def inverse_latitudinal_pair(positive_alm_a, positive_alm_b, *, L, nside,
                              weights, phase):
-    """Two positive-m synthesis theta transforms from one pass over the band.
+    """Two positive-m synthesis latitudinal transforms from one pass over the band.
 
-    Returns `(ftm_a, ftm_b)`, or None when the pair cannot be served: the band
-    being absent, or its synthesis copy having been refused.  The refusal on the
-    strided layout is a measurement, not a convenience -- with the reduced axis
-    leading, four accumulators cost 4.19x what two separate strided calls cost
-    at Nside 1024 (58.285 -> 244.251 ms, `.qwen/tmp/pairsettle_s33_big.log`),
-    where with the contiguous layout the same pair costs 0.63x of them at
-    Nside 512 (8.483 -> 5.321 ms).  A strided gather has no spare bandwidth to
-    lend, so the second map is pure overhead.
+    Arguments are as in `inverse_latitudinal`.  Returns ``(ftm_a, ftm_b)``, or
+    None if the band is unavailable or only the strided analysis layout is
+    resident.  On the strided layout a shared pass is several times slower than
+    two separate calls (the strided read has no spare bandwidth for a second
+    right-hand side), whereas on the contiguous layout it costs about 0.6x of
+    two calls.
     """
     assert BLOCK % 2 == 0, "the parity split assumes an even m-block"
     geometry = band_geometry(nside, L)

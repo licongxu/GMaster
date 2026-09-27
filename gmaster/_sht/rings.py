@@ -1,11 +1,11 @@
 """Azimuthal (ring) stage of the HEALPix transforms.
 
-A HEALPix ring with `nphi` pixels is Fourier-transformed in longitude.  Equatorial-belt rings
-all have `nphi = 4 nside >= L` and take one batched FFT.  Polar-cap rings are shorter than
-the band limit, so their order-`m` coefficients alias; those rows use a chirp-Z (Bluestein)
+Each HEALPix ring with `nphi` pixels is Fourier-transformed in longitude.  Equatorial-belt rings
+all have `nphi = 4 nside >= L` and take one batched FFT.  Polar-cap rings are shorter than the
+band limit, so their order-`m` coefficients alias; those rows use a chirp-Z (Bluestein)
 transform, whose three constant factors depend on the geometry only and are cached here
 (`_ring_analysis_tables`, `_spin_ring_*_tables`).  Above `_RING_FACTORS_KEPT_MAX_L`
-(Nside 8192) only the ring lengths are kept and each row block builds its own factors.
+(i.e. at Nside 8192) only the ring lengths are kept and each row block builds its own factors.
 
 Everything here is private to `gmaster._sht.healpix`.
 """
@@ -50,8 +50,8 @@ def _ring_czt_constants(L, nside):
     """`(nphi, start, None, None, width)`: the per-ring vectors only.
 
     The `(4 nside - 1, 4 nside)` gather / valid grids are not uploaded: at Nside 4096 the int64
-    gather alone is 2.1 GB, and it was copied to the device by every table build and embedded as a
-    constant in every jitted forward ring transform.  `_cap_pixels` forms the cap rows' pixel
+    gather alone is 2.1 GB, and it would be copied to the device by every table build and embedded
+    as a constant in every jitted forward ring transform.  `_cap_pixels` forms the cap rows' pixel
     indices from `start + j, j < nphi` instead.
     """
     nphi, start, _, _, width = _ring_czt_constants_numpy(L, nside)
@@ -72,10 +72,9 @@ def _cap_pixels(pixels, caps, L, nside):
 def _ring_inverse_layout_numpy(L, nside):
     """Per-pixel source slot of the (4*nside-1, 4*nside) ring grid, on the host.
 
-    The inverse ring transform used to write the map with an index-add scatter,
-    which needs atomics: the padded slots of every short ring all point at
-    pixel 0. The HEALPix rings partition the map, so the same write is a pure
-    gather of exactly one slot per pixel.
+    The HEALPix rings partition the map, so the inverse ring transform writes the map as a
+    pure gather of exactly one slot per pixel, rather than an index-add scatter (which would
+    need atomics, since the padded slots of every short ring point at pixel 0).
     """
     ntheta = 4 * nside - 1
     npix = 12 * nside**2
@@ -96,8 +95,9 @@ def _ring_inverse_layout(L, nside):
     return jnp.asarray(source), jnp.asarray(used)
 
 
-# Ring chirp-Z tables are rebuilt when large instead of kept: in the node-space refinement the ring
-# FFT runs once per map, and at Nside 4096 the kept tables were 6.5 GiB (spin) + 3.75 GiB (scalar).
+# Ring chirp-Z tables larger than this are rebuilt per call instead of kept: in the node-space
+# refinement the ring FFT runs once per map, and at Nside 4096 the tables would pin 6.5 GiB (spin)
+# + 3.75 GiB (scalar) of device memory.
 _RING_TABLE_CACHE_BYTES = int(float(os.environ.get("GMASTER_RING_TABLE_CACHE_BYTES", str(2 ** 30))))
 
 
@@ -133,13 +133,11 @@ def _size_cached(fn):
 def _chirp(index, two_nphi, sign, L, wide=None):
     """exp(sign i pi q^2 / nphi) in the ring stage's dtype.
 
-    The angle is reduced exactly in integers as in `_chirp_angle`; for a complex64 ring stage the
-    reduction runs as ((q mod m)^2) mod m (m = 2 nphi) in uint32 while m <= 65536 -- the square of a
-    residue then fits -- and in int64 above (Nside > 8192); the angle is scaled in float64 and
-    evaluated with float32 sincos, all in one fused program.  (An int32 square overflowed at Nside
-    8192, where polar rings reach m = 65528: O(1) errors in every polar-cap ring transform.)  Built
-    in complex128 (int64 squares, float64 sincos at 1/64 rate, complex128 kernel FFTs) these tables
-    took 287 ms at Nside 4096 spin 2 -- too slow to rebuild per field, so 6.5 GiB stayed resident.
+    The angle is reduced exactly in integers as in `_chirp_angle`.  For a complex64 ring stage the
+    reduction is ((q mod m)^2) mod m (m = 2 nphi) in uint32 while m <= 65536, where the square of a
+    residue fits, and in int64 above (Nside > 8192); int32 would overflow at Nside 8192, where
+    polar rings reach m = 65528.  The angle is scaled in float64 and evaluated with float32 sincos
+    in one fused program, which is cheap enough to rebuild the tables per field.
     """
     if jnp.dtype(ring_dtype(L)) == jnp.complex64:
         two_nphi = jnp.asarray(two_nphi)
@@ -183,10 +181,9 @@ def _ring_split_numpy(L, nside):
     `4*nside-1` rings and 0.667 of the pixels (checked for 64/256/1024).
 
     The shortcut needs `L <= 4*nside`, because a length-`4*nside` transform returns exactly
-    the band `m < 4*nside`. Beyond that the ring sums repeat with period `nphi` (measured
-    3.5e-16, `.qwen/tmp/ring_alias_check.py`), so an overset band would have to be tiled
-    back in; rather than pay a tile/alias pass for a band limit nobody fits anyway, `L >
-    4*nside` puts every ring back in the chirp-Z and returns an empty belt.
+    the band `m < 4*nside`. Beyond that the ring sums repeat with period `nphi`, so an overset
+    band would have to be tiled back in; since such band limits are not used in practice,
+    `L > 4*nside` simply puts every ring in the chirp-Z and returns an empty belt.
     """
     ntheta = 4 * nside - 1
     if L > 4 * nside:
@@ -202,15 +199,12 @@ def _ring_split_numpy(L, nside):
 def _ring_analysis_tables(L, nside, device=None):
     """The constant factors of the analysis ring chirp-Z, built once per geometry.
 
-    The convolution kernel and both chirp ramps depend only on (L, nside), but spelled
-    inline they are recomputed *inside* the jitted transform on every call, and XLA does
-    not fold them: a jitted program containing nothing but `fft(kernel)` measures **2.03 ms
-    at Nside 1024** (5.02 ms with its own `exp`), against a 13.57 ms ring stage, and the
-    chirp exponentials cost another 1.65 + 1.26 ms at 163/213 GB/s because `exp(i*angle)`
-    over a (4n-1, N) array is transcendental-bound, not bandwidth-bound. A pipeline
-    evaluation runs the ring stage 4-8 times, so this is paid repeatedly for values that
-    never change. Returned as device arrays to be passed as jit *arguments* — closing over
-    them would just move them into the jaxpr as literals.
+    The convolution kernel and both chirp ramps depend only on (L, nside).  Written inline
+    they would be recomputed inside the jitted transform on every call (XLA does not fold
+    them), and the kernel FFT plus the transcendental-bound chirp exponentials are a large
+    fraction of the ring stage, which a pipeline runs several times.  They are returned as
+    device arrays to be passed as jit *arguments*; closing over them would embed them in the
+    jaxpr as literals.
 
     They cover the polar rings only (`_ring_split_numpy`): the equatorial belt needs no
     chirp-Z, so shipping belt rows here would be 2/3 of the table bytes for nothing.
@@ -258,12 +252,9 @@ def _scalar_czt_factors(two_nphi, L, nside):
 def _forward_ring_fft_positive(map_flat, tables, *, L, nside):
     """Every ring's `m in [0, L)` block: plain FFT on the belt, chirp-Z on the caps.
 
-    `_forward_healpix_fft` additionally fills the Hermitian mirror into a
-    `(4*nside-1, 2L)` window because s2fft's latitudinal primitive takes that layout. The
-    HEALPix pipeline asks for it and then slices it straight back off again
-    (`ftm[:, L_work:]`), so a zeroed 2L-wide buffer, two update-slices and a flip/conj
-    gather — 100 MB-scale at Nside 512, 400 MB-scale at 1024 — buy nothing there. Same
-    numbers, fewer passes: `_forward_ring_fft` is this plus the fill.
+    Returns `(4*nside-1, L)`.  `_forward_ring_fft` is this plus the Hermitian mirror fill into
+    the `(4*nside-1, 2L)` window that s2fft's latitudinal primitive takes; callers that only
+    need `m >= 0` use this form and skip the extra buffer and passes.
 
     `tables` is `_ring_analysis_tables(L, nside)` (polar rows only). The belt is
     `pixels[belt_start : belt_start + (2*nside+1)*4*nside]` reshaped to
@@ -322,8 +313,8 @@ def _forward_ring_fft(map_flat, tables, *, L, nside):
 def _inverse_ring_fft(ftm_positive, *, L, nside):
     """Exact HEALPix ring inverse FFT as one batched chirp-Z transform.
 
-    Kept as the baseline `_inverse_ring_fft_herm` is checked against (identical to
-    1.3e-15 at Nside 512, 2.07x slower); nothing in the shipped path calls it.
+    Reference implementation for testing `_inverse_ring_fft_herm` (agreement 1.3e-15 at
+    Nside 512); not used by the transforms.
     """
     nphi, _, _, _, width = _ring_czt_constants(L, nside)
     ntheta = 4 * nside - 1
@@ -487,18 +478,16 @@ def _inverse_ring_fft_herm_chunked(ftm_positive, *, L, nside):
 def _inverse_ring_fft_herm(ftm_positive, tables, *, L, nside):
     """Real HEALPix synthesis ring transform, from the positive-m half only.
 
-    `_inverse_ring_fft` mirrors the block into a centred window of 2L coefficients and
-    chirp-Z transforms all of it, so the convolution length bound (`2L - 1 + width`)
-    forces a transform of 8192 at Nside 512 and 16384 at 1024.  The mirror is exact by
-    construction — `full[L - m] == conj(full[L + m])` — so the ring sum collapses to
+    The centred window of 2L coefficients (as in `_inverse_ring_fft`) would need a
+    convolution of length bound `2L - 1 + width`.  Its mirror is exact by construction,
+    `full[L - m] == conj(full[L + m])`, so the ring sum collapses to
 
         sum_{m=-L+1}^{L-1} F_m e^{2i pi p m / nphi} = 2 P(p) - F_0,
         P(p) = sum_{m=0}^{L-1} F_m e^{2i pi p m / nphi},
 
-    which needs only L coefficients and a bound of `L + width - 1`: 4096 at Nside 512,
-    8192 at 1024.  Same numbers, N log N cheaper.  The centred form's `wrap_phase`
-    correction is the bookkeeping for the L-sample shift of the coefficient index and
-    disappears here, because this form never shifts it.
+    which needs only L coefficients and a bound of `L + width - 1` (half the transform
+    length).  No `wrap_phase` correction is needed, because the coefficient index is
+    never shifted.
 
     `tables` is `_ring_synthesis_tables(L, nside)` (polar rows only). On the equatorial
     belt `nphi = 4*nside > L`, so `P` is just `width * ifft(zero-pad(F))`: one transform,
@@ -535,11 +524,11 @@ def _inverse_ring_fft_herm(ftm_positive, tables, *, L, nside):
     return jnp.where(used, slots[source], 0.0)
 
 
-# Largest bandlimit whose polar-cap chirp-Z factors are kept as tables.  Above it (Nside 8192) the
+# Largest band limit whose polar-cap chirp-Z factors are kept as tables.  Above it (Nside 8192) the
 # analysis kernel spectrum alone is (16382, 131072) complex64 = 16 GiB and the three synthesis
-# factors 28 GiB, which with the fused transform's working set does not fit the card
-# (`Failed to create cuFFT batched plan`); there the tables are each row's `2 nphi` and every
-# row block builds its own factors -- elementwise chirps and one extra FFT per block.
+# factors 28 GiB, which together with the transform's working set do not fit on the device.  There
+# the "table" is each row's `2 nphi` and every row block builds its own factors (elementwise
+# chirps and one extra FFT per block).
 _RING_FACTORS_KEPT_MAX_L = int(os.environ.get("GMASTER_RING_FACTORS_KEPT_MAX_L", "12288"))
 
 
@@ -590,13 +579,10 @@ def _spin_ring_analysis_tables(L, nside, device=None):
     )
 
 
-# Polar-cap rows per chirp-Z batch in the polarised ring stages.  All cap rows at once is
+# Polar-cap rows per chirp-Z batch in the ring stages.  All cap rows at once would be
 # `2*(nside-1)` rows of a `next_pow2(width + 2L)`-point transform: at Nside 4096 that is
-# `(8190, 65536)` complex128 = 8.6 GiB *per intermediate* (pad, FFT, product, inverse FFT), which
-# with the 14 GiB of resident tables is what exhausted the 71 GiB pool for a single spin-2 pass
-# (`.qwen/tmp/chain_s36e.log`, session 36).  Rows are independent, so the stage runs in
-# `fori_loop` chunks and the peak is one chunk's intermediates.  Chunks past the end are clamped
-# to the last full window and rewrite identical rows.
+# `(8190, 65536)` complex128 = 8.6 GiB per intermediate (pad, FFT, product, inverse FFT).  Rows
+# are independent, so the stage runs in chunks and the peak is one chunk's intermediates.
 _CAP_CHUNK_ROWS = int(os.environ.get("GMASTER_CAP_CHUNK_ROWS", "1024"))
 
 
@@ -615,9 +601,9 @@ def _chunked_rows(nrows, chunk, body):
 def _chunked_rows_seq(chunk, body, *rows):
     """`body(*blocks)` once per `chunk` rows, so only one block's FFT is live.
 
-    Used when the chirp-Z factors are built inside the block (Nside 8192). Unrolling those
-    blocks makes one program of every FFT at once: 64 GiB, then a 30 GiB allocation on a
-    pool that has already reserved the whole 96 GB card.
+    Used when the chirp-Z factors are built inside the block (Nside 8192).  A `lax.map` keeps
+    the blocks sequential; unrolled static slices would let XLA schedule every block's FFT at
+    once (tens of GiB at Nside 8192).  The rows are zero-padded to a whole number of chunks.
     """
     nrows = rows[0].shape[0]
     if nrows <= chunk:
@@ -650,7 +636,7 @@ def _forward_ring_fft_full(signal, tables, *, L, nside):
     `m >= 0`.  That replaces a `next_pow2(width + 2L)` transform pair (8192 at Nside 512,
     16384 at 1024) with one length-`4*nside` transform on `2*nside+1` of the `4*nside-1`
     rings, with no chirp, pad or kernel multiply there at all.  It agrees with the chirp-Z
-    form to 4e-16 relative for `L` up to the `4*nside` gate (`.qwen/tmp/spin2_ring_ab.py`).
+    form to 4e-16 relative for `L` up to the `4*nside` gate.
 
     The polar rows keep the chirp-Z; `tables` is `_spin_ring_analysis_tables(L, nside)` so
     its ramps and kernel are built once per geometry instead of inside every trace.

@@ -1,3 +1,11 @@
+"""Spherical harmonic transforms: agreement with NaMaster and equivalence of GMaster's internal routes.
+
+Unless marked ``march_v2``, tests run on the exact fp64 routes (see ``conftest.py``) and are held
+to NaMaster at ~1e-13.  Tests marked ``march_v2`` exercise the default float32 CUDA march, which
+agrees with NaMaster to ~1e-6.  Tests that compare two routes performing the same arithmetic in
+a different program structure assert bit-for-bit equality; the others state their tolerance.
+"""
+
 import gc
 
 import healpy as hp
@@ -21,6 +29,7 @@ _HAS_NVIDIA_GPU = on_cuda_gpu()
 
 
 def _random_alms(rng, nmaps, ainfo, spin):
+    """Random healpy-ordered alms: real at m = 0 and zero below ell = spin."""
     alms = rng.normal(size=(nmaps, ainfo.nelem)) + 1j * rng.normal(
         size=(nmaps, ainfo.nelem)
     )
@@ -36,6 +45,7 @@ def _random_alms(rng, nmaps, ainfo, spin):
 
 @pytest.mark.parametrize("spin", [0, 2])
 def test_healpix_transforms_match_namaster(spin):
+    """HEALPix alm2map and map2alm (with and without iterations) match NaMaster for spin 0 and 2."""
     reference = pytest.importorskip("pymaster")
     nside = 8
     lmax = 10
@@ -59,6 +69,7 @@ def test_healpix_transforms_match_namaster(spin):
 
 
 def test_map_and_alm_metadata_match_namaster():
+    """NmtMapInfo/NmtAlmInfo report NaMaster's lmax, sizes and offsets and compare by value."""
     reference = pytest.importorskip("pymaster")
     minfo = nmt.NmtMapInfo(None, (12 * 16**2,))
     ainfo = nmt.NmtAlmInfo(47)
@@ -73,6 +84,7 @@ def test_map_and_alm_metadata_match_namaster():
 
 
 def test_transform_keyword_names_match_namaster():
+    """The transform and pseudo-inverse functions accept NaMaster's keyword names."""
     minfo = nmt.NmtMapInfo(None, (48,))
     ainfo = nmt.NmtAlmInfo(1)
     result = nmt.map2alm(
@@ -89,6 +101,7 @@ def test_transform_keyword_names_match_namaster():
 
 
 def test_spin_transform_at_default_healpix_bandlimit():
+    """Spin-2 transforms at the default band limit lmax = 3 Nside - 1 match NaMaster."""
     reference = pytest.importorskip("pymaster")
     nside = 4
     lmax = 3 * nside - 1
@@ -113,6 +126,7 @@ def test_spin_transform_at_default_healpix_bandlimit():
 
 
 def test_transform_shape_validation():
+    """Maps or alms with the wrong number of components for the spin are rejected."""
     minfo = nmt.NmtMapInfo(None, (12 * 4**2,))
     ainfo = nmt.NmtAlmInfo(7)
     with pytest.raises(ValueError, match="wrong shape"):
@@ -123,6 +137,9 @@ def test_transform_shape_validation():
 
 @pytest.mark.parametrize("L,L_work", [(1, 1), (4, 4), (4, 7)])
 def test_gathered_alm_unpack_matches_healpy_layout(L, L_work):
+    """Unpacking healpy-ordered alms into the (ell, m) grid fills negative m by the reality
+    condition, including padding to a larger working band.
+    """
     ainfo = nmt.NmtAlmInfo(L - 1)
     rng = np.random.default_rng(L_work)
     alm = rng.normal(size=ainfo.nelem) + 1j * rng.normal(size=ainfo.nelem)
@@ -146,6 +163,9 @@ def test_gathered_alm_unpack_matches_healpy_layout(L, L_work):
 
 @pytest.mark.skipif(not _HAS_NVIDIA_GPU, reason="requires an NVIDIA GPU")
 def test_fused_scalar_transforms_match_namaster_and_generic_jax():
+    """The fused Pallas spin-0 transforms ('jax') match NaMaster and the generic s2fft route
+    ('jax-generic') at Nside 64.
+    """
     reference = pytest.importorskip("pymaster")
     nside = 64
     lmax = 95
@@ -192,10 +212,12 @@ def test_fused_scalar_transforms_match_namaster_and_generic_jax():
 
 @pytest.mark.skipif(not _HAS_NVIDIA_GPU, reason="requires an NVIDIA GPU")
 def test_dfp32_scalar_analysis_matches_namaster():
-    # jax-dfp32 runs the double-fp32 latitudinal SHT (analysis only; the
-    # iterative-refinement residual synthesis stays fp64). The Pallas path is
-    # active at L >= 128; double-fp32 retains the 3e-11 gate up to L ~ 192
-    # at nside 64, so test at L = 160 with a large margin.
+    """The double-fp32 analysis ('jax-dfp32') matches the fp64 route and NaMaster to 3e-11.
+
+    Only the analysis uses double-fp32; the synthesis (including the residual synthesis of
+    the iterations) stays fp64.  The Pallas path is used from L = 128, and double-fp32 holds
+    3e-11 up to L ~ 192 at Nside 64, so L = 160 is tested.
+    """
     reference = pytest.importorskip("pymaster")
     nside = 64
     lmax = 159
@@ -232,7 +254,7 @@ def test_dfp32_scalar_analysis_matches_namaster():
                 ),
                 atol=3e-11,
             )
-        # the synthesis direction is unaffected by the calculator choice
+        # The synthesis does not depend on this calculator choice.
         dfp32_map = nmt.alm2map(alms, 0, minfo, ainfo)
         np.testing.assert_allclose(dfp32_map, reference_map, atol=3e-11)
     finally:
@@ -241,6 +263,7 @@ def test_dfp32_scalar_analysis_matches_namaster():
 
 @pytest.mark.skipif(not _HAS_NVIDIA_GPU, reason="requires an NVIDIA GPU")
 def test_fused_scalar_transform_gradients_match_generic_jax():
+    """Gradients through the fused spin-0 transforms match those through the generic s2fft route."""
     nside = 16
     L = 3 * nside
     minfo = nmt.NmtMapInfo(None, (12 * nside**2,))
@@ -307,6 +330,7 @@ def test_fused_scalar_transform_gradients_match_generic_jax():
 )
 @pytest.mark.parametrize("spin", [0, 2])
 def test_multi_gpu_transforms_match_single_gpu(spin):
+    """The multi-GPU calculator gives the single-GPU transforms."""
     nside = 4
     ainfo = nmt.NmtAlmInfo(3 * nside - 1)
     minfo = nmt.NmtMapInfo(None, (12 * nside**2,))
@@ -331,6 +355,7 @@ def test_multi_gpu_transforms_match_single_gpu(spin):
     reason="requires two GPUs",
 )
 def test_fused_multi_gpu_scalar_transforms_match_single_gpu():
+    """The multi-GPU calculator gives the single-GPU fused spin-0 transforms at Nside 64."""
     nside = 64
     ainfo = nmt.NmtAlmInfo(3 * nside - 1)
     minfo = nmt.NmtMapInfo(None, (12 * nside**2,))
@@ -353,12 +378,14 @@ def test_fused_multi_gpu_scalar_transforms_match_single_gpu():
 
 @pytest.mark.skipif(not _HAS_NVIDIA_GPU, reason="requires an NVIDIA GPU")
 def test_matrix_theta_stage_matches_fused_kernel(monkeypatch):
-    # The v2 CUDA march serves this geometry by default; this test is about the exact band /
-    # Pallas route it replaced, so pin that route.
+    """The 'jax-matrix' analysis matches the fused kernel and NaMaster, and has ell >= m support.
+
+    'jax-matrix' replaces the in-kernel Legendre recurrence with a cached m-banded matrix
+    generated by the same recurrence, so it must agree with the fused kernel to fp64 rounding.
+    """
+    # The v2 CUDA march is the default at this size; this test covers the exact band /
+    # Pallas route, so select that route.
     monkeypatch.setenv("GMASTER_MARCH_V2", "0")
-    # jax-matrix swaps the in-kernel Legendre recurrence for a cached m-banded
-    # matrix. The values are generated by the same recurrence, so the analysis
-    # result must match the fused kernel, NaMaster, and the ell >= m support.
     reference = pytest.importorskip("pymaster")
     nside = 64
     lmax = 3 * nside - 1
@@ -390,7 +417,7 @@ def test_matrix_theta_stage_matches_fused_kernel(monkeypatch):
                 ),
                 atol=1e-13,
             )
-        # synthesis is untouched by the analysis calculator
+        # The synthesis does not depend on the analysis calculator.
         matrix_map = nmt.alm2map(alms, 0, minfo, ainfo)
         np.testing.assert_allclose(matrix_map, reference_map, atol=1e-12)
         np.testing.assert_allclose(matrix_map, fused_map, atol=1e-14)
@@ -413,15 +440,14 @@ def test_matrix_theta_stage_matches_fused_kernel(monkeypatch):
 
 @pytest.mark.parametrize("nside, L", [(32, 95), (64, 191), (32, 40), (16, 71)])
 def test_ring_synthesis_from_positive_half_matches_centred_window(nside, L):
-    """The positive-m ring synthesis equals the mirrored-window one it replaces.
+    """The positive-m ring synthesis equals the mirrored-window synthesis.
 
-    `_inverse_ring_fft` mirrors the block into 2L coefficients and chirp-Z transforms
-    all of it; `_inverse_ring_fft_herm` spends the exact mirror as `2 Re P - Re F_0` and
-    needs the CZT bound `L + width - 1` instead of `2L - 1 + width`: half the transform
-    size for the same ring values, measured 2.07x on the stage at Nside 512. The polar
-    rows are read out of a concatenated slot buffer, the belt of one plain inverse FFT.
-    `L = 40` at Nside 32 is a band wider than the polar rings' own `nphi`, so the cap
-    chirp-Z has to alias there; `L = 71 > 4*nside` declines the belt and must still match.
+    `_inverse_ring_fft` mirrors the block into 2L coefficients and chirp-Z transforms all
+    of it; `_inverse_ring_fft_herm` uses the Hermitian identity `2 Re P - Re F_0` and a
+    chirp-Z of length `L + width - 1` instead of `2L - 1 + width`.  Polar rows are read from
+    a concatenated slot buffer and the equatorial belt uses one plain inverse FFT.
+    `L = 40` at Nside 32 is wider than the polar rings' `nphi`, so the cap chirp-Z must
+    alias; `L = 71 > 4*nside` disables the belt shortcut and must still match.
     """
     positive = (
         jax.random.normal(jax.random.PRNGKey(11), (4 * nside - 1, L))
@@ -438,14 +464,12 @@ def test_ring_synthesis_from_positive_half_matches_centred_window(nside, L):
 def test_ring_analysis_matches_direct_dft_ring_by_ring(nside, L):
     """Every ring's m block equals an explicit `sum_p x_p exp(-2i pi p m / nphi)`.
 
-    The azimuthal stage now takes two routes: the equatorial belt (`nphi = 4*nside`, a
-    power of two wider than the band) is one plain FFT of a contiguous reshape, the polar
-    rings keep the Bluestein chirp-Z at the map-wide width. Both routes are checked here
-    against the definition, on cap rings, on the two boundary rings and on belt rings.
-    `L = 64` is the gate boundary `L == 4*nside`; `L = 71 > 4*nside` is an overset band,
-    for which the belt shortcut is declined and every ring goes back through the
-    single-width chirp-Z. `L = 40` at Nside 32 is wider than the polar rings' own `nphi`,
-    so their chirp-Z has to alias.
+    The azimuthal stage has two routes: the equatorial belt (`nphi = 4*nside`) is one plain
+    FFT of a contiguous reshape, while the polar rings use a Bluestein chirp-Z at the
+    map-wide width.  Both are checked against the definition on cap, boundary and belt
+    rings.  `L = 64` is the boundary `L == 4*nside`; at `L = 71 > 4*nside` the belt shortcut
+    is disabled and every ring goes through the chirp-Z.  `L = 40` at Nside 32 is wider than
+    the polar rings' `nphi`, so their chirp-Z must alias.
     """
     nphi, start, _, _, _ = rings._ring_czt_constants_numpy(L, nside)
     map_flat = jnp.asarray(
@@ -520,21 +544,16 @@ def test_spin_ring_window_matches_direct_dft_both_ways(nside, L):
 @pytest.mark.skipif(not _HAS_NVIDIA_GPU, reason="requires an NVIDIA GPU")
 @pytest.mark.parametrize("nside", [16, 48, 64])
 def test_spin2_march_synthesis_matches_the_route_it_replaces(nside):
-    """The table-free synthesis march against the exact `flm_to_ftm` it replaces.
+    """The table-free spin-2 synthesis march matches the exact `flm_to_ftm` route.
 
-    The march is the default only where no Wigner-d slice can exist (`slice_declined`), which is far
-    above every size a test runs at, so the seam is called directly here. Nside 48 is the interesting
-    case: L = 144 makes `_spin_slice._windows` widths 64/64/16, and `_inverse_impl` assembles its
-    result by concatenating the per-window blocks -- valid only because the windows tile orders
-    0..L-1 with `lo == m0`, so a ragged final window is what would break silently.
+    The march is only the default at sizes where no Wigner-d slice fits (`slice_declined`),
+    far above test sizes, so it is called directly.  Nside 48 (L = 144) splits the orders
+    into windows of 64/64/16, which checks that a ragged final window is assembled correctly.
 
-    `ell < |spin|` is zeroed because the march's recurrence starts at `ell = max(m, spin)` and
-    contributes nothing below the spin while the exact route does use those terms; every analysis
-    output already satisfies that, which is why the convention difference never reaches a pipeline.
-    Measured here with the default (plain-float32) accumulation and, in brackets, the compensated
-    one: max rel 2.54e-06 [2.42e-06] at nside 16, 4.90e-06 [4.93e-06] at 48, 8.52e-06 [8.47e-06] at
-    64, and 1.01e-05 for both at 128 (`.qwen/tmp/synth_march_rel.log`) — dropping the accumulation
-    limb is not what limits this step.
+    Rows `ell < |spin|` are zeroed because the march's recurrence starts at
+    `ell = max(m, spin)`, while the exact route uses those terms; analysis outputs never
+    contain them.  The march is float32: the measured relative error is 2.5e-6 to 1e-5 for
+    Nside 16-128, so 1e-4 of scale is a safe tolerance.
     """
     from gmaster._sht import spin_march as march
 
@@ -560,41 +579,28 @@ def test_spin2_march_synthesis_matches_the_route_it_replaces(nside):
 @pytest.mark.skipif(not _HAS_NVIDIA_GPU, reason="requires an NVIDIA GPU")
 @pytest.mark.parametrize("nside", [16, 32, 48, 160, 256, 512])
 def test_spin2_march_analysis_writes_every_lane_it_returns(nside):
-    """The marched analysis output is finite and equals the exact route lane for lane.
+    """The spin-2 analysis march writes every output lane and matches the exact route.
 
-    `pl.pallas_call`'s `out_shape` buffer arrives with whatever the caching allocator left behind.
-    The analysis march stores one row per order at `ell - m0`, so the `nstart - m0` lanes below
-    `max(m, spin)` belong to no `ell` at all and nothing writes them unless the kernel zeroes them
-    itself.  A driver-side mask over the whole slab is not a substitute: the masked-out orders feed
-    nothing downstream, so the GPU is free to drop the select, and that is how a first-execution-only
-    NaN reached a pipeline at nside 1024 spin 2 with the wide m-window (9,440,250 of 9,440,256 alm
-    entries, `.qwen/tmp/nan_where.log`).
+    The Pallas output buffer is uninitialised, and the march stores one row per order at
+    `ell - m0`, so the `nstart - m0` lanes below `max(m, spin)` must be zeroed by the kernel
+    itself; otherwise stale memory (e.g. NaN) can leak into the alms.  Masking the slab after
+    the kernel is not a substitute: those orders feed nothing downstream, so the compiler may
+    eliminate the mask.
 
-    What this test pins down, demonstrated in both directions:
+    The test checks two things:
 
-    * The ragged geometries compile.  A window is ragged when `L = 3*nside` is not a multiple of the
-      128-row m-window, and a head-zeroing block of `(mb, NC)` on a ragged `mb` of 48, 80, 96 or 112
-      is not a power of two, which the Triton lowering rejects outright.  `c095321` shipped exactly
-      that masked block, and walking the shipped `_march_windows` decomposition over the lattice
-      (`.qwen/tmp/lattice_s29.py`) shows it could not compile the spin-2 analysis march at nside
-      **16, 32, 80, 112, 160, 416 or 928** — while every power of two from 64 to 4096 decomposes into
-      128-row windows and was clean.  That is why the 146-test suite never saw it, and why nside 160
-      is in this list alongside the tiny cases: it is a production-sized odd footprint, not a unit-test
-      size.
-    * Every lane the routine returns is finite and matches the exact route, including the sub-spin
-      wedge, so a nonzero leak into those lanes fails here.
+    * Ragged geometries compile.  A window is ragged when `L = 3*nside` is not a multiple of
+      the 128-row m-window, and a zeroing block whose row count is not a power of two is
+      rejected by the Triton lowering.  Nside 16, 32 and 160 give ragged windows whose row
+      counts are not powers of two (160 is a realistic production size); the other sizes
+      give power-of-two windows.
+    * Every returned lane is finite and matches the exact route, including the sub-spin
+      wedge, so a nonzero leak into those lanes fails.
 
-    What it does *not* do, and was written believing it did: the poisoning does not reproduce in
-    process.  On `96fcbd1`, which has no in-kernel zeroing at all, all five cases pass — and priming
-    the pool with 24 buffers of the slab's own byte count does not change that, every wedge lane still
-    arrives exactly zero at nside 256 and 512 (3070/3070 and 6142/6142,
-    `.qwen/tmp/poison_prime_s29.log`).  The fault that motivated this test needs the pipeline's cold
-    pool at nside 1024, and it stays evidenced by that log and the trial counts, not by this test.
-    The dirt-freeing below is kept because a nonzero leak is still caught, not because it is known to
-    provoke one.
-
-    The `ftm` comes from the pipeline's own ring step rather than a random array because its column
-    layout is `L + m` over `2L` columns, which is what makes the window slices line up.
+    The pool is first filled with freed NaN buffers so that an unwritten lane is likely to
+    read NaN, but this is not guaranteed to reproduce the failure.  The `ftm` comes from the
+    real ring step because its column layout (`L + m` over `2L` columns) is what the window
+    slices assume.
     """
     from gmaster._sht import spin_march as march
 
@@ -615,18 +621,16 @@ def test_spin2_march_analysis_writes_every_lane_it_returns(nside):
     got = np.asarray(march.forward_latitudinal(ftm, L=L, spin=2, nside=nside))
     assert np.all(np.isfinite(got)), "marched analysis read unwritten slab lanes"
 
-    # Explicit copy: `np.asarray` hands back a read-once view of the JAX buffer, and the zeroing
-    # below would raise `ValueError: assignment destination is read-only`.
+    # Explicit copy: `np.asarray` returns a read-only view of the JAX buffer, which the
+    # zeroing below would otherwise fail to write.
     ref = np.array(healpix._forward_latitudinal(ftm, L=L, spin=2, nside=nside,
                                               reality=False, L_lower=0), copy=True)
-    # Rows `ell < spin` are where an uninitialized lane would land, so they stay in the comparison.
-    # They are also the one place the two routes differ by convention: the march's recurrence starts
-    # at `max(m, spin)` and stores zeros below it, while the table route keeps its sub-spin terms.
-    # The pipeline applies the march's convention to both routes in `_finish_forward_s2fft`, so the
-    # reference is zeroed here rather than the tolerance being loosened.  Measured residual on the
-    # fixed kernel over rows `ell >= 2`: max abs 9.07e-08 / 5.92e-08 / 4.53e-08 / 2.43e-08 at nside
-    # 16 / 32 / 48 / 256 against scales of 2.00e-01 / 1.15e-01 / 6.81e-02 / 1.39e-02
-    # (`.qwen/tmp/resid_s29.log`), so the tolerance below holds by more than an order of magnitude.
+    # Rows `ell < spin` are where an unwritten lane would appear, so they stay in the comparison.
+    # They are also where the two routes differ by convention: the march stores zeros below
+    # `max(m, spin)`, while the table route keeps sub-spin terms.  The pipeline applies the
+    # march's convention to both routes (`_finish_forward_s2fft`), so the reference is zeroed
+    # here.  Over rows `ell >= 2` the residual is ~5e-7 of scale at Nside 16 and ~2e-6 at
+    # Nside 256, more than an order of magnitude inside the 1e-4 tolerance.
     ref[:2] = 0.0
     np.testing.assert_allclose(got, ref, rtol=0.0, atol=1e-4 * float(np.max(np.abs(ref))))
 
@@ -634,13 +638,12 @@ def test_spin2_march_analysis_writes_every_lane_it_returns(nside):
 @pytest.mark.skipif(not _HAS_NVIDIA_GPU, reason="requires an NVIDIA GPU")
 @pytest.mark.parametrize("nside", [32, 48])
 def test_fused_slab_route_is_bit_identical_to_the_split_route(nside):
-    """Fusing the polarised slab transform may change the dispatch count and nothing else.
+    """The fused spin-2 slab transform is bit-identical to the unfused one.
 
-    The win is 2.5-7.9x at Nside 64-256 (`.qwen/tmp/slab_fuse2.log`, `.qwen/tmp/slab_fuse_synth.log`)
-    and the two routes differ only in how many jit boundaries the same body is cut at, so equality here
-    is exact rather than tolerance-based.  Asserting the slab is under `_SLAB_FUSE_MAX_BYTES` pins the
-    gate: moving a geometry onto a boundary the fusion was measured and rejected on would otherwise
-    happen silently.
+    Both routes run the same operations and differ only in how many jit boundaries they
+    are split into, so equality is exact.  The slab must be below `_SLAB_FUSE_MAX_BYTES`
+    for fusion to be used; asserting it guards against the tested sizes silently leaving
+    the fused route.
     """
     lmax = 3 * nside - 1
     L = lmax + 1
@@ -672,15 +675,11 @@ def test_fused_slab_route_is_bit_identical_to_the_split_route(nside):
 @pytest.mark.skipif(not _HAS_NVIDIA_GPU, reason="requires an NVIDIA GPU")
 @pytest.mark.parametrize("nside", [128, 256])
 def test_traced_refinement_route_is_bit_identical_to_op_by_op(nside):
-    """Tracing the scalar refinement loop may change the dispatch count and nothing else.
+    """The traced spin-0 refinement loop is bit-identical to the op-by-op loop.
 
-    The two cores are the same seven passes cut at a different number of jit
-    boundaries, so equality is exact rather than tolerance-based: measured
-    `rel = 0.000e+00` at Nside 256 (`.qwen/tmp/traceidentity_s32.py`) for a 9.4 %
-    end-to-end win (`.qwen/tmp/tracepipe_s32.log`).  Asserting `L <= _PALLAS_TRACED_MAX_L`
-    pins the gate from both sides -- Nside 512 was measured 17 % *slower* on the traced
-    route and must not be moved onto it, and Nside 256 must not quietly fall back to
-    op-by-op because the Legendre band stopped being hoistable.
+    Both run the same passes, split at a different number of jit boundaries, so equality is
+    exact.  The traced route is used for `L <= _PALLAS_TRACED_MAX_L` (up to Nside 256; it is
+    slower at Nside 512), and requires the Legendre band to be already built on the device.
     """
     lmax = 3 * nside - 1
     L = lmax + 1
@@ -703,17 +702,14 @@ def test_traced_refinement_route_is_bit_identical_to_op_by_op(nside):
 
 @pytest.mark.skipif(not _HAS_NVIDIA_GPU, reason="requires an NVIDIA GPU")
 def test_band_build_declines_inside_a_trace_instead_of_raising(monkeypatch):
-    """A geometry first touched under `jax.grad` must transform, not die on `block_until_ready`.
+    """A geometry first used under `jax.grad` must still transform, with a finite gradient.
 
-    `_theta_matrix._band` drains its build caches with `slab.block_until_ready()` so
-    that a cached executable cannot pin the block it produced; under a trace that
-    raises `AttributeError: 'block_until_ready' is not available on traced array` and
-    takes the whole call down (`.qwen/tmp/s24_256_0.log`, the reason the traced gate sat
-    at Nside 128 for five sessions).  The builders now decline, the transform takes the
-    fused kernel, and the gradient still comes back finite.
+    `_theta_matrix._band` calls `block_until_ready()` on the tables it builds, which is not
+    available on traced arrays.  Under a trace the band builders must decline, so that the
+    transform falls back to the fused kernel instead of raising.
     """
-    # The v2 CUDA march serves this geometry by default; this test is about the exact band /
-    # Pallas route it replaced, so pin that route.
+    # The v2 CUDA march is the default at this size; this test covers the exact band /
+    # Pallas route, so select that route.
     monkeypatch.setenv("GMASTER_MARCH_V2", "0")
     nside = 64
     lmax = 3 * nside - 1
@@ -735,15 +731,12 @@ def test_band_build_declines_inside_a_trace_instead_of_raising(monkeypatch):
 
 @pytest.mark.skipif(not _HAS_NVIDIA_GPU, reason="requires an NVIDIA GPU")
 def test_no_tracer_can_enter_the_table_caches():
-    """Tracing the route dispatcher must neither raise nor leave a tracer in a cache.
+    """Calling the route dispatcher under a trace must not raise or cache a tracer.
 
-    `_trace_route_ready` builds the Legendre band and its synthesis layout at top
-    level, so it is also reachable *during* somebody else's trace (`jax.jit`,
-    `jax.eval_shape`, `jax.grad`).  Both builders then have to decline: a cached
-    tracer is the `UnexpectedTracerError` of Session 5j, and an uncached one means
-    the concrete-buffer drain raises `AttributeError` inside the caller's trace --
-    which is exactly how a first version of the hoist failed, on a path the pipeline
-    itself never walks.
+    `_trace_route_ready` builds the Legendre band and its synthesis layout, so it can be
+    reached during a user's `jax.jit`, `jax.eval_shape` or `jax.grad`.  Both builders must
+    then decline: caching a tracer would cause an `UnexpectedTracerError` later, and
+    calling `block_until_ready` on one raises `AttributeError` inside the caller's trace.
     """
     nside = 64
     L = 3 * nside
@@ -753,8 +746,8 @@ def test_no_tracer_can_enter_the_table_caches():
         jnp.ones(4))
     np.testing.assert_allclose(np.asarray(out), 2.0)
 
-    # Whatever the trace did, the same geometry must still build cleanly at top
-    # level -- a decline that leaves the caches unusable is as bad as a crash.
+    # After the trace, the same geometry must still build cleanly at top level;
+    # a decline that leaves the caches unusable is as bad as a crash.
     assert _theta_matrix.warm(nside, L)
     cached = [slab for groups in _theta_matrix._BAND_CACHE.values()
               for group in groups for slab in group]
@@ -768,19 +761,16 @@ def test_no_tracer_can_enter_the_table_caches():
 @pytest.mark.skipif(not _HAS_NVIDIA_GPU, reason="requires an NVIDIA GPU")
 @pytest.mark.parametrize("nside", [64, 128])
 def test_shared_band_pair_is_bit_identical_to_two_transforms(monkeypatch, nside):
-    """Two spin-0 analyses over one band must be the two analyses, exactly.
+    """Two spin-0 analyses sharing one Legendre band are bit-identical to two separate analyses.
 
-    The pair runs both Richardson recursions in lockstep so each latitudinal
-    contraction serves two maps for one read of the Legendre band.  Every operand
-    of either transform is unchanged -- same ring FFT per map, same band, same
-    accumulation order per channel -- so the assertion is equality, not tolerance,
-    and it is the same equality measured on the isolated programs at Nside
-    128-1024 (`.qwen/tmp/pairsettle_s33.log`, rel 0.00e+00) and end to end through
-    a field and a coupling matrix (`.qwen/tmp/pairverify_s33.log`).  Asserting the
-    route is engaged first keeps a silent decline from making the test vacuous.
+    The pair runs both iterative refinements in lockstep so that each latitudinal
+    contraction serves two maps for one read of the band.  Every operation on either map
+    is unchanged (same ring FFT, same band, same accumulation order), so the assertion is
+    equality.  The test first asserts that the paired route is used, so that a silent
+    fallback cannot make it vacuous.
     """
-    # This is the *band* pair route; the v2 CUDA march has its own pairing (tested below) and
-    # takes these geometries by default, which would otherwise make the assertion below fail.
+    # This tests the *band* pair route.  The v2 CUDA march has its own pairing (tested below)
+    # and is the default at these sizes, so it is disabled here.
     monkeypatch.setenv("GMASTER_MARCH_V2", "0")
     lmax = 3 * nside - 1
     L = lmax + 1
@@ -801,17 +791,14 @@ def test_shared_band_pair_is_bit_identical_to_two_transforms(monkeypatch, nside)
 
 @pytest.mark.skipif(not _HAS_NVIDIA_GPU, reason="requires an NVIDIA GPU")
 def test_shared_band_pair_declines_when_no_route_serves(monkeypatch):
-    """The pair follows the route that serves a single transform, and declines with it.
+    """Paired analysis is refused, returning None, only when neither pairing route is available.
 
-    With no band the pair rides the marched row (`_march_pair_route`) rather than
-    giving up -- that is the whole point of pairing on the band-refused sizes -- so
-    refusing the budget alone no longer refuses the pair.  Both routes have to be
-    shut off for `map2alm_pair` to return None, which is the fallback contract: the
-    field constructor treats None as "do what you did before" and makes two
-    `map2alm` calls.
+    Without a band the pair uses the marched Legendre row (`_march_pair_route`), so refusing
+    the band budget alone does not refuse the pair; both routes must be disabled.  None
+    tells the field constructor to fall back to two separate `map2alm` calls.
     """
-    # The v2 CUDA march serves this geometry by default; this test is about the exact band /
-    # Pallas route it replaced, so pin that route.
+    # The v2 CUDA march is the default at this size; this test covers the exact band /
+    # Pallas route, so select that route.
     monkeypatch.setenv("GMASTER_MARCH_V2", "0")
     nside = 64
     L = 3 * nside
@@ -830,17 +817,13 @@ def test_shared_band_pair_declines_when_no_route_serves(monkeypatch):
 @pytest.mark.skipif(not _HAS_NVIDIA_GPU, reason="requires an NVIDIA GPU")
 @pytest.mark.parametrize("nside", [64, 128])
 def test_marched_pair_shares_one_recurrence(monkeypatch, nside):
-    """Where there is no band, two maps share the marched Legendre row.
+    """Without a band, two maps share one marched Legendre row, to float32 accuracy.
 
-    The march generates its row inside the kernel, so a second right-hand side adds
-    an emit contraction to a row that is being computed anyway -- measured 0.752 of
-    two calls at Nside 2048, where this is the live route, and 0.489 at Nside 512
-    with the march forced (`.qwen/tmp/marchpair_2048.log`, `.qwen/tmp/marchpair_512.log`).
-    Unlike the band pairing this cannot be bit-identical: widening the emit block from
-    4 to 8 channels reassociates the theta reduction.  The bar below is that
-    reassociation, measured at 3.9e-07 on this geometry at Nside 64 and 4.4e-06 at 256
-    (`.qwen/tmp/marchpairwire_s34.log`), and the paired route's error against the fp64
-    band is the shipped march's own error to the fifth digit.
+    The march computes its Legendre row inside the kernel, so a second map only adds an
+    extra contraction.  Unlike the band pairing this is not bit-identical: widening the
+    output block from 4 to 8 channels changes the order of the theta reduction.  The
+    measured difference is 4e-7 of scale at Nside 64 and 4e-6 at Nside 256, inside the
+    1e-4 tolerance.
     """
     monkeypatch.setenv("GMASTER_SPIN0_MARCH", "1")
     lmax = 3 * nside - 1
@@ -863,10 +846,10 @@ def test_marched_pair_shares_one_recurrence(monkeypatch, nside):
 
 
 def test_paired_fold_footprint_grows_with_the_geometry():
-    """The pair gate's byte estimate is monotone, so it can only refuse the large sizes.
+    """The pairing memory estimates increase with Nside, so the gate can only refuse large sizes.
 
-    The estimate is a sum of `L * ntheta`-scale terms, and a formula slip that made it fall
-    with Nside would refuse the small geometries that the pairing actually wins on.
+    A formula error that made the estimate decrease with Nside would refuse the small sizes
+    where pairing is most useful.
     """
     sizes = [healpix._spin_march.fold_pair_bytes(n, 3 * n)
              for n in (256, 512, 1024, 2048, 3072, 4096)]
@@ -882,23 +865,15 @@ def test_paired_fold_footprint_grows_with_the_geometry():
 @pytest.mark.parametrize("nside, fits", [(512, True), (1024, True), (2048, True),
                                          (3072, False), (4096, False)])
 def test_paired_fold_gate_sides_at_the_measured_sizes(monkeypatch, nside, fits):
-    # The verdicts below belong to the Pallas march, whose pair carries a Wigner-d slab; the v2
-    # CUDA march has none and its own estimate (`_march_v2.pair_bytes`, 9.0 GiB at Nside 4096)
-    # lets the pairing run at every size on this card.  Pin the route this test is about.
-    monkeypatch.setenv("GMASTER_MARCH_V2", "0")
-    """The pairing is offered where it has been measured to run and withheld where it has not.
+    """The paired spin-0 fold is offered where it fits and refused where it does not.
 
-    Nside 2048 is the end-to-end win (4558 -> 3961 ms, GPU peak 4.3 GiB,
-    `.qwen/tmp/pairrun_s34.log`); Nside 4096 is a measured crash --
-    `RESOURCE_EXHAUSTED: Out of memory while trying to allocate 8.15GiB` inside this box's
-    71.2 GiB pool, while the same geometry as two separate calls runs in 33.62 s at a
-    16.3 GiB peak (`.qwen/tmp/pairrun_4096_s34.log`).  A refusal returns the caller to those
-    two calls, so the gate costs nothing but the pairing.
-
-    Both measurements were made with the azimuthal stage in float64, which is the shipped
-    coupling, and the estimate is that footprint regardless of `set_ring_precision`, so these
-    verdicts are the same in an fp32-ring session (where they are conservative).
+    Pairing a field with its mask on the Pallas march is allowed up to Nside 2048 and refused
+    from Nside 3072, where the paired footprint (measured to exhaust a ~71 GiB pool at Nside
+    4096) no longer fits; a refusal falls back to two separate calls.  The gate reads the pool
+    limit, so it is meaningful with the default (preallocated) allocator.  The v2 CUDA march has
+    its own, smaller estimate (`march_v2.pair_bytes`), so it is disabled here.
     """
+    monkeypatch.setenv("GMASTER_MARCH_V2", "0")
     monkeypatch.setenv("GMASTER_SPIN0_MARCH", "1")
     assert healpix._spin_march.fold_pair_fits(nside, 3 * nside) is fits
     assert healpix._march_pair_route(nside, 3 * nside) is fits
@@ -906,15 +881,12 @@ def test_paired_fold_gate_sides_at_the_measured_sizes(monkeypatch, nside, fits):
 
 @pytest.mark.skipif(not _HAS_NVIDIA_GPU, reason="requires an NVIDIA GPU")
 def test_latitudinal_adjoint_hands_back_the_operand_dtype():
-    """The analysis VJP's cotangent has the operand's element type, not the kernel's.
+    """The analysis VJP returns a cotangent with the input's dtype, not the kernel's.
 
-    The latitudinal kernel accumulates in float64 whatever it is handed and its transpose
-    runs the float64 synthesis kernel, so without a cast at the adjoint boundary a
-    `set_ring_precision("fp32")` session hands the azimuthal stage a complex128 cotangent
-    for a complex64 primal and reverse mode dies inside the chirp-Z multiply
-    (`lax.mul requires arguments to have the same dtypes`).  That is what
-    `test_fused_scalar_transform_gradients_match_generic_jax` hits under
-    `--gm-ring-precision fp32`; this pins the boundary itself.
+    The latitudinal kernel accumulates in float64 and its transpose runs the float64
+    synthesis kernel.  Without a cast at the adjoint boundary, an fp32-ring session would
+    pass a complex128 cotangent to the complex64 azimuthal stage and reverse mode would
+    fail with a dtype mismatch.
     """
     original = utils.nmt_params.ring_precision
     try:
@@ -939,9 +911,9 @@ def test_latitudinal_adjoint_hands_back_the_operand_dtype():
 
 @pytest.mark.skipif(not _HAS_NVIDIA_GPU, reason="requires an NVIDIA GPU")
 def test_paired_fold_declines_when_the_gate_refuses(monkeypatch):
-    """A refused pair leaves the caller the two-call path rather than an allocation failure."""
-    # The v2 CUDA march serves this geometry by default; this test is about the exact band /
-    # Pallas route it replaced, so pin that route.
+    """When the memory gate refuses pairing, `map2alm_pair` returns None instead of failing to allocate."""
+    # The v2 CUDA march is the default at this size; this test covers the exact band /
+    # Pallas route, so select that route.
     monkeypatch.setenv("GMASTER_MARCH_V2", "0")
     monkeypatch.setattr(healpix._spin_march, "_PAIR_POOL_FACTOR", 10 ** 9)
     monkeypatch.setenv("GMASTER_SPIN0_MARCH", "1")
@@ -958,20 +930,17 @@ def test_paired_fold_declines_when_the_gate_refuses(monkeypatch):
 
 @pytest.mark.parametrize("nside", [512, 1024, 2048, 4096, 8192])
 def test_synthesis_tile_is_per_spin_and_still_powers_of_two(nside):
-    """The synthesis launch geometry agrees with the chunk the kernel is compiled against.
+    """The spin-0 synthesis theta tile gives a power-of-two tile count covering every ring.
 
-    `_inverse_fold_impl` derives `ntile` and `npad` from the tile width and `_call_synth` derives
-    the kernel's `chunk` and its `out_shape` from the same helper, so a divergence between the two
-    would show up as an out-of-bounds or a dropped theta row at a size no in-repo test can reach
-    (the fold only serves Nside >= 2048, where a GPU run costs minutes).  The power-of-two assertion
-    is the Triton lowering rule: every op's array must be a power of two, and the synthesis
-    `out_shape` is `(mb, ntile, chunk, 4)`, so `ntile` has to stay one -- the bug class that shipped
-    once as `Encountered an array of shape (96, 4)` from a ragged m-window.
+    `_inverse_fold_impl` and `_call_synth` both derive their launch shapes from
+    `_synth_tile`, so these properties must hold at every size, including those (Nside >=
+    2048) that are too expensive to run in the test suite.  The Triton lowering requires
+    power-of-two array shapes, and the synthesis `out_shape` is `(mb, ntile, chunk, 4)`, so
+    `ntile` must be a power of two.
 
-    The width itself is measured, not guessed: spin 0's synthesis wants 1024 at Nside >= 2048
-    (287.4 -> 243.7 ms at 2048, 1885.1 -> 1745.8 ms at 4096, bit-identical maps) while spin 2 wants
-    512 (453.7 ms at 2048 against 508.1 at 256 and 524.6 at 1024).  See the `_ST0` note in
-    `gmaster/_spin_march_pallas.py`.
+    Spin 0 uses the wider tile `_ST0` once there are at least four tiles of it (it was
+    measured faster from Nside 2048); spin 2 always uses `_ST`.  See `_ST0` in
+    `gmaster/_sht/spin_march.py`.
     """
     from gmaster._sht import spin_march as smp
 
@@ -982,27 +951,21 @@ def test_synthesis_tile_is_per_spin_and_still_powers_of_two(nside):
     assert st * ntile >= north > st * (ntile - 1)
     assert ntile & (ntile - 1) == 0, f"ntile={ntile} is not a power of two"
     assert st == (smp._ST0 if north >= 4 * smp._ST0 else smp._ST)
-    # Spin 2's generic route takes the shipped width at every size, including the ones where the
-    # spin-0 fold has moved.
+    # Spin 2 uses the standard width at every size.
     assert smp._synth_tile(2, ntheta) == smp._ST
 
 
 @pytest.mark.parametrize("nside", [512, 1024, 2048, 4096, 8192])
 def test_synth_order_window_fills_the_launch_ceiling(nside):
-    """The synthesis order window is grown toward `_MARCH_GRID_CAP` and never past it.
+    """The spin-0 synthesis order window grows toward `_MARCH_GRID_CAP` without exceeding it.
 
-    Every win and loss of the marched routes' order window turned out to be about programs per
-    launch, not about the width (`_march_windows`: wins at <= 2048 programs, losses at 4096).  The
-    folded spin-0 synthesis is the one route with room to fill the ceiling -- `_ST0` leaves it 4
-    theta tiles at Nside 2048 and 8 at 4096 while the analysis has 16 and 32 -- and doing so is worth
-    5% on the largest cell (spin-0 `alm2map` at 4096: 1740.0 ms / 1.14x -> 1650.3 ms / 1.20x,
-    `.qwen/tmp/s29y.log`, `.qwen/tmp/swin_s29.log`).
+    Performance of the marched routes depends on the number of programs per launch rather
+    than on the window width, so the spin-0 synthesis, which has fewer theta tiles than the
+    analysis, widens its order window to fill the launch limit.
 
-    The second half is the trap this guard exists for: raising the *global* `GMASTER_MARCH_M_BLOCK`
-    does not widen the analysis, it pushes `mb * ntile` over the ceiling, which silently drops the
-    route to `_M_BLOCK` = 64 and costs 1.37x there (the 256 arm at Nside 2048 read 405.3 ms, the
-    64-window value, not a 256-window one).  So the synthesis width must be independent of the
-    analysis windows, and this asserts that at every size.
+    The synthesis window must be chosen independently of the analysis windows: raising the
+    global analysis window instead would push `mb * ntile` over the limit and silently
+    fall back to the narrow default.  The test checks this at every size.
     """
     from gmaster._sht import spin_march as smp
     from gmaster._sht import spin_slice as ss
@@ -1012,8 +975,7 @@ def test_synth_order_window_fills_the_launch_ceiling(nside):
     ntile = -(-north // smp._synth_tile(0, north))
     win = smp._synth_windows(L, ntile, 0)
     if ntile < 4:
-        # Below four theta tiles the wider window loses (Nside 512: 4.6 -> 4.9 ms), so the route
-        # falls back to the shipped analysis rule verbatim rather than filling the ceiling.
+        # Below four theta tiles a wider window is slower, so the analysis rule is used as is.
         assert win == smp._march_windows(L, ntile, 0)
         return
     widths = {m1 - m0 for m0, m1, _ in win}
@@ -1022,7 +984,7 @@ def test_synth_order_window_fills_the_launch_ceiling(nside):
     assert mb & (mb - 1) == 0, f"mb={mb} is not a power of two (Triton lowering)"
     assert mb >= ss._MARCH_M_BLOCK
     assert mb * ntile <= smp._MARCH_GRID_CAP
-    # As close to the ceiling as a power of two gets, unless the cap on the width itself binds.
+    # As close to the limit as a power of two allows, unless the maximum width is reached.
     assert mb == ss._MARCH_M_SYNTH0_MAX or 2 * mb * ntile > smp._MARCH_GRID_CAP
     # Coverage: every order 0..L-1 in exactly one window.
     assert [m0 for m0, _, _ in win] == list(range(0, L, mb))
@@ -1031,8 +993,7 @@ def test_synth_order_window_fills_the_launch_ceiling(nside):
     # Spin 2 synthesis is the analysis rule verbatim, at every size.
     assert smp._synth_windows(L, ntile, 2) == smp._march_windows(L, ntile, 2)
 
-    # The analysis windows do not move when the synthesis ceiling moves -- the failure mode that made
-    # an earlier "256 is worse" measurement actually measure 64.
+    # The analysis windows must not change when the synthesis width limit changes.
     before = smp._march_windows(L, ntile, 0)
     orig = ss._MARCH_M_SYNTH0_MAX
     try:
@@ -1043,12 +1004,10 @@ def test_synth_order_window_fills_the_launch_ceiling(nside):
 
 
 def test_pool_headroom_survives_a_backend_without_allocator_stats(monkeypatch):
-    """A backend that returns `None` from `memory_stats()` must mean "unbounded", not crash.
+    """`_pool_headroom` treats a backend without memory statistics as unbounded.
 
-    `_pool_headroom` guards the Wigner-d layout build and documents "+inf when the device won't
-    say", but it only caught a *raising* backend.  `jax.local_devices()[0].memory_stats()` returns
-    `None` on the CPU backend instead of raising, so the very next line (`stats.get("pool_bytes")`)
-    raised `AttributeError: 'NoneType' object has no attribute 'get'` out of `slabs_for`.
+    The CPU backend returns `None` from `memory_stats()` rather than raising; both cases
+    must give +inf instead of an exception.
     """
     from gmaster._sht import spin_slice as ss
 
@@ -1069,15 +1028,11 @@ def test_pool_headroom_survives_a_backend_without_allocator_stats(monkeypatch):
 @pytest.mark.parametrize("nside, traced", [(64, True), (128, True), (256, True),
                                            (512, True), (1024, False), (2048, False)])
 def test_polar_refinement_trace_gate_sides_at_the_measured_sizes(nside, traced):
-    """One program over the refinement loop is offered only inside the measured range.
+    """The traced spin-2 refinement loop is used only up to Nside 512.
 
-    The cap is Nside 512 (`L_work = 3*nside = 1536`), where the polarised analysis is
-    36.949 -> 34.479 ms at 256 and 239.320 -> 225.025 ms at 512 with float64 tables and
-    8.966 -> 7.900 / 60.955 -> 52.372 ms with float32 ones, end to end 56 -> 52 and
-    340 -> 333 ms at spin 2 (`.qwen/tmp/s35_b3_fp64.log`, `.qwen/tmp/s35_b3_pipe_after.log`).
-    Above it `_spin_slabs` hands back no slab pair at all, so the traced route would be
-    measuring a geometry that does not exist; the cap records the range rather than a limit
-    the trace would refuse.
+    Up to Nside 512 (`L_work = 1536`) tracing the loop into one program was measured
+    faster, with both fp64 and fp32 tables.  Above that `_spin_slabs` provides no slab pair,
+    so the traced route does not apply.
     """
     L_work = 3 * nside
     maps = jnp.zeros((2, 12 * nside ** 2), dtype=jnp.float64)
@@ -1107,11 +1062,10 @@ def test_polar_refinement_stays_eager_under_a_trace():
 @pytest.mark.skipif(not _HAS_NVIDIA_GPU, reason="requires an NVIDIA GPU")
 @pytest.mark.parametrize("nside", [32, 48])
 def test_traced_refinement_loop_matches_the_eager_loop(nside):
-    """Tracing `1+2*n_iter` polarised passes into one program changes the dispatch, not the answer.
+    """Tracing the `1+2*n_iter` spin-2 passes into one program does not change the result.
 
-    Both arms call the same `_map2alm_once_slab_body`/`_alm2map_core_slab_body` bodies, so the
-    comparison is exact.  This is the correctness half of the 1.07-1.32x measured at Nside
-    64-512; the shipped gate is what keeps it inside that range.
+    Both arms call the same `_map2alm_once_slab_body`/`_alm2map_core_slab_body` functions,
+    so the comparison is exact.
     """
     lmax = 3 * nside - 1
     L = lmax + 1
@@ -1142,12 +1096,12 @@ def test_chunked_rows_concatenates_static_slices():
 
 
 def test_polar_cap_chunking_matches_the_unchunked_ring_stage():
-    """Forcing `_CAP_CHUNK_ROWS` below the cap count is bit-identical to one batch.
+    """Processing polar-cap rings in chunks is bit-identical to processing them in one batch.
 
-    At Nside 4096 the polarised chirp-Z used to run all 8190 cap rows at once
-    (8.6 GiB per intermediate).  The shipped helper splits that batch; this
-    drives `_forward_ring_fft_full` and `_inverse_ring_fft_complex` at nside=16
-    (30 cap rows) with a 4-row chunk against the default unchunked path.
+    At large Nside the spin-2 chirp-Z over all cap rows at once would need very large
+    intermediates (8.6 GiB each at Nside 4096), so the rows are split into chunks of
+    `_CAP_CHUNK_ROWS`.  Here Nside 16 (30 cap rows) is run with 4-row chunks and compared
+    with the unchunked result, forward and inverse.
     """
     nside, L = 16, 47
     npix = 12 * nside ** 2
@@ -1178,7 +1132,7 @@ def test_polar_cap_chunking_matches_the_unchunked_ring_stage():
 
 
 def test_iteration_split_engages_at_nside_4096_and_not_at_nside_8():
-    """XLA's one-temp fused iteration is 26 GiB at Nside 4096; the gate is that footprint."""
+    """The refinement iteration is split into two programs at Nside 4096 but not at Nside 8."""
     nside, L_work = 4096, 3 * 4096
     assert (4 * nside - 1) * 2 * L_work * 16 > healpix._ITERATION_SPLIT_BYTES
     nside_s, L_s = 8, 24
@@ -1186,11 +1140,12 @@ def test_iteration_split_engages_at_nside_4096_and_not_at_nside_8():
 
 
 def test_split_refinement_iteration_matches_fused_program(monkeypatch):
-    """Splitting `_map2alm_iteration` into two programs does not change the alms.
+    """Splitting the refinement iteration into two programs does not change the alms.
 
-    Above `_ITERATION_SPLIT_BYTES` the fused refinement is two shipped calls
-    (`_alm2map_core_impl` then `_map2alm_once_impl`) instead of one jit.  Zeroing
-    the gate at nside=8 takes that path through `map2alm` with `n_iter=1`.
+    Above `_ITERATION_SPLIT_BYTES` the iteration runs as two calls
+    (`_alm2map_core_impl` then `_map2alm_once_impl`) instead of one jit.  Setting the
+    threshold to zero forces that path at Nside 8, which is then compared with the fused
+    path and with NaMaster.
     """
     reference = pytest.importorskip("pymaster")
     nside, lmax = 8, 10
@@ -1210,10 +1165,10 @@ def test_split_refinement_iteration_matches_fused_program(monkeypatch):
 
 
 def test_make_room_drops_ring_tables_only_when_the_pool_is_short(monkeypatch):
-    """`make_room` is the Nside-4096 coupling eviction; the tables rebuild on the next call.
+    """`make_room` drops the ring tables only when device memory is short.
 
-    Wrap the live device rather than replacing it: `Device.memory_stats` is read-only,
-    and a dummy device object is what segfaulted later tests in this process.
+    The live device is wrapped rather than replaced, because `Device.memory_stats` is
+    read-only and a fake device object can break later tests in the same process.
     """
     nside, L = 8, 16
     rings.drop_ring_tables()
@@ -1241,11 +1196,10 @@ def test_make_room_drops_ring_tables_only_when_the_pool_is_short(monkeypatch):
 
 
 def test_legendre_pool_bytes_is_unbounded_when_the_backend_is_silent(monkeypatch):
-    """`_theta_matrix._pool_bytes` must match `_pool_headroom`: None means +inf, not crash.
+    """`_theta_matrix._pool_bytes` treats a backend without memory statistics as unbounded.
 
-    The CPU backend returns None from `memory_stats()`.  The synth-band fit test used
-    to raise `AttributeError: 'NoneType' object has no attribute 'get'` out of
-    `_synth_band`, which is the first thing `test_contracts_reduce_*` calls.
+    As for `_pool_headroom`, a `None` from `memory_stats()` (the CPU backend) or an
+    exception must give +inf rather than raising.
     """
     from gmaster._sht import theta_matrix as _theta_matrix
 
@@ -1306,7 +1260,7 @@ def test_v2_march_pair_matches_two_transforms(nside):
 @pytest.mark.skipif(not _HAS_NVIDIA_GPU, reason="requires an NVIDIA GPU")
 @pytest.mark.parametrize("nside, spin", [(32, 0), (32, 2), (64, 0), (64, 2), (128, 0), (128, 2)])
 def test_default_route_agrees_with_namaster_at_small_geometries(nside, spin):
-    """The shipped (v2 march) route has to stay a 1e-5-class transform at every size.
+    """The default (v2 march) route agrees with NaMaster to 1e-5 of scale at every size tested.
 
     The exact fp64 band agrees with NaMaster to 1e-13; the march is float32 and agrees to ~1e-6.
     The exact routes are still there and are still pinned to 1e-13 by the tests above
@@ -1361,7 +1315,6 @@ def test_dc_latitudinal_matches_march(nside):
     """
     from gmaster._sht import dc as _dc_lat
     from gmaster._sht import march_v2 as _march_v2
-    from gmaster._sht.healpix import _stable_thetas
     from s2fft.utils import healpix_ffts, quadrature_jax
 
     L = 3 * nside

@@ -48,13 +48,11 @@ def _block(result):
     sample measures only the host-side enqueue. Walking the pytree container is
     what makes the stage numbers add up to the end-to-end total.
 
-    Neither ``NmtField`` nor ``NmtWorkspace`` is a registered pytree, so the walk
-    above hands them back as a single childless leaf and their stages silently
-    measured enqueue only: Nside 2048 spin 0 reported ``coupling 5525->2ms
-    (2350x)`` while the same work inside the blocked ``TOTAL`` was ~3.4 s
-    (``.qwen/tmp/board_2048_rings_fp32_s29b.log``). Their arrays are reached
-    through ``__dict__`` instead, one level of dict/tuple/list included. The
-    reference objects hold numpy arrays, for which this is a no-op.
+    Neither ``NmtField`` nor ``NmtWorkspace`` is a registered pytree, so a plain
+    ``block_until_ready`` would hand them back as one leaf and time only the
+    enqueue.  Their arrays are reached through ``__dict__`` instead, one level of
+    dict/tuple/list included.  The reference objects hold numpy arrays, for which
+    this is a no-op.
     """
     jax.tree.map(
         lambda leaf: leaf.block_until_ready()
@@ -152,14 +150,10 @@ def _run_pipeline(
         repeats,
     )[1]
 
-    # A field's mask alms are lazy in both codes (NaMaster's own `get_mask_alms` docstring says
-    # "in most cases ... are not computed when generating the field ... which may be a slow
-    # operation"). `lmax_mask` defaults to `minfo.get_lmax()` in both libraries and the workspace
-    # does not enlarge it (`.qwen/tmp/lmaxmask_s31.log`), so this is a second spin-0 transform at
-    # the same order and the same `n_iter` as the science stage -- which is why it costs 1.00x of
-    # it. Timing a fresh field and subtracting the construction measures its marginal cost; on a
-    # shared field it is cached and every column would report zero. At Nside 2048 spin 0 this
-    # marginal is 1855 ms against a 4210 ms TOTAL (`.qwen/tmp/maskstage_s30.log`).
+    # A field's mask alms are lazy in both codes, and `lmax_mask` defaults to the map's lmax, so
+    # the mask stage is a second spin-0 transform at the same order and `n_iter` as the science
+    # stage.  Timing a fresh field and subtracting the construction measures its marginal cost;
+    # on a shared field it is cached and every column would report zero.
     t_mask = _timed(
         lambda: _make_field(
             module, mask, maps_t, maps_q, maps_u, spin

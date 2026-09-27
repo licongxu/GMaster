@@ -1,3 +1,10 @@
+"""Catalogue-based fields (NmtFieldCatalog, ...Clustering, ...Momentum) against pymaster.
+
+pymaster evaluates catalogue transforms with ducc0's non-uniform SHT at epsilon = 1e-5, so
+quantities that pass through that transform (alms, coupled Cls, coupling matrices) are compared
+at the ~1e-6 level, while purely algebraic ones (alpha, noise terms) agree to fp64 rounding.
+"""
+
 import jax
 import numpy as np
 import pytest
@@ -10,6 +17,7 @@ from gmaster.utils import alm2catalog, catalog2alm
 
 @pytest.mark.parametrize("spin", [0, 1, 2, 3])
 def test_catalog_transforms_match_namaster(spin):
+    """catalog2alm / alm2catalog match pymaster's ducc0-based catalogue transforms for spins 0-3."""
     reference = pytest.importorskip("pymaster")
     rng = np.random.default_rng(51 + spin)
     positions = np.array(
@@ -28,6 +36,9 @@ def test_catalog_transforms_match_namaster(spin):
 
 @pytest.mark.parametrize("spin", [0, 2])
 def test_catalog_field_deprojection_and_workspace_match_namaster(spin):
+    """A catalogue field with templates and noise variance matches NaMaster: mask and field
+    alms, deprojection coefficients, noise terms, coupled Cl, deprojection bias and coupling matrix.
+    """
     reference = pytest.importorskip("pymaster")
     rng = np.random.default_rng(60 + spin)
     nsource = 80
@@ -79,6 +90,9 @@ def test_catalog_field_deprojection_and_workspace_match_namaster(spin):
 
 
 def test_catalog_retained_helpers_and_validation():
+    """The retained-catalogue helpers (cloud kernel, variance alms, mask map) match NaMaster,
+    and a mask-only catalogue field without a spin, or asked for alms, is rejected.
+    """
     reference = pytest.importorskip("pymaster")
     rng = np.random.default_rng(70)
     positions = np.array(
@@ -114,6 +128,7 @@ def test_catalog_retained_helpers_and_validation():
 
 @pytest.mark.parametrize("clustering", [False, True])
 def test_momentum_and_clustering_random_catalogs_match_namaster(clustering):
+    """Clustering and momentum fields defined by a random catalogue match NaMaster."""
     reference = pytest.importorskip("pymaster")
     rng = np.random.default_rng(80 + clustering)
     ndata, nrandom = 50, 150
@@ -153,6 +168,9 @@ def test_momentum_and_clustering_random_catalogs_match_namaster(clustering):
 
 @pytest.mark.parametrize("clustering", [False, True])
 def test_momentum_and_clustering_map_templates_match_namaster(clustering):
+    """Clustering and momentum fields defined by a mask map with map templates match NaMaster,
+    including the deprojection coefficients and the noise deprojection bias.
+    """
     reference = pytest.importorskip("pymaster")
     rng = np.random.default_rng(90 + clustering)
     nsource = 80

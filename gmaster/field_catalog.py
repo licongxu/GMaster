@@ -1,4 +1,10 @@
-"""JAX-backed fields sampled at arbitrary catalog positions."""
+"""Fields sampled at the discrete positions of a source catalog.
+
+GPU counterparts of ``pymaster.NmtFieldCatalog``, ``NmtFieldCatalogMomentum`` and
+``NmtFieldCatalogClustering`` (Baleato & White 2024; Wolz et al. 2024).  The mask and
+field alms are direct sums over sources (`utils.catalog2alm`), so no pixelisation of
+the catalog is involved.
+"""
 
 import jax.numpy as jnp
 import numpy as np
@@ -17,6 +23,7 @@ from .workspaces import _compute_coupled_cell
 
 
 def _process_positions(positions, weights, lonlat, kind):
+    """Validate positions and convert them to (colatitude, longitude) in radians."""
     positions = np.asarray(positions, dtype=np.float64)
     weights = np.asarray(weights, dtype=np.float64)
     if positions.shape != (2, len(weights)):
@@ -32,7 +39,48 @@ def _process_positions(positions, weights, lonlat, kind):
 
 
 class NmtFieldCatalog(NmtField):
-    """Field sampled at discrete spherical positions."""
+    """A field sampled at the positions of a catalog of sources.
+
+    The field's mask is the weighted sum of delta functions at the source positions.
+    For galaxy clustering use `NmtFieldCatalogClustering` instead.
+
+    Parameters
+    ----------
+    positions : array_like, shape (2, nsrc)
+        Source positions: colatitude and longitude in radians, or, if `lonlat` is
+        True, longitude and latitude in degrees (e.g. RA, Dec).
+    weights : array_like, shape (nsrc,)
+        Weight of each source.
+    field : array_like, shape (nmaps, nsrc), or None
+        Field values at the sources (1 array for spin 0, 2 for spin s).  If None, the
+        field holds only the mask and `spin` must be given.
+    lmax : int
+        Maximum multipole of the field's alms.
+    lmax_mask : int, optional
+        Maximum multipole of the mask's alms; defaults to `lmax`.  Check the
+        sensitivity of the result to this choice.
+    spin : int, optional
+        Spin of the field.  Defaults to 0 for one array and 2 for two.
+    field_is_weighted : bool, optional
+        True if `field` (and `templates`) are already multiplied by the weights.
+    lonlat : bool, optional
+        Interpretation of `positions` (see above).
+    templates : array_like, shape (ntemp, nmaps, nsrc), optional
+        Contaminant templates sampled at the sources; their best fit is subtracted.
+    tol_pinv : float, optional
+        Relative eigenvalue threshold for the template covariance pseudo-inverse.
+    noise_variance : array_like, shape (nsrc,), optional
+        Noise variance per source, used for the deprojection noise bias.
+    retain_catalog : bool, optional
+        Keep positions, weights and values, needed for covariances and deprojection
+        bias.  If False the field is `lite`.
+    n_iter_mask : int, optional
+        Stored as the field's `n_iter_mask`; the catalog mask transform itself is an
+        exact sum and needs no iterations.
+    nside_ipd : int, optional
+        Stored for pymaster compatibility.  `get_theta_cloud` chooses its own
+        resolution from the number of sources.
+    """
 
     def __init__(
         self,
@@ -131,6 +179,17 @@ class NmtFieldCatalog(NmtField):
                 self.temp = templates
 
     def get_theta_cloud(self):
+        """Return the size of the Gaussian "cloud" that replaces each source in covariances.
+
+        A compromise between the median inter-particle distance (of the randoms, if
+        available) and the scale ``pi / lmax_mask``, added in quadrature.  Requires
+        ``retain_catalog=True``.
+
+        Returns
+        -------
+        float
+            Cloud size in radians.
+        """
         if self.lite:
             raise ValueError(
                 "Cannot compute inter-particle distance for fields generated "
@@ -157,10 +216,31 @@ class NmtFieldCatalog(NmtField):
         return self.theta_cloud
 
     def get_cloud_kernel(self, lmax):
+        """Return the harmonic Gaussian kernel of the source cloud.
+
+        Parameters
+        ----------
+        lmax : int
+            Maximum multipole.
+
+        Returns
+        -------
+        ndarray, shape (lmax + 1,)
+            ``exp(-theta_cloud^2 ell (ell + 1) / 2)``.
+        """
         multipoles = np.arange(lmax + 1)
         return np.exp(-0.5 * self.get_theta_cloud() ** 2 * multipoles * (multipoles + 1))
 
     def get_catalog_variance_alm(self):
+        """Return the alms of the local field variance built from the catalog.
+
+        For clustering fields without a mask map, the randoms' squared weights are
+        added.  Requires ``retain_catalog=True``.
+
+        Returns
+        -------
+        jax.Array, shape (nelem_mask,)
+        """
         if self.lite:
             raise ValueError("Cannot compute variance map for lightweight fields")
         alms = catalog2alm(
@@ -176,6 +256,14 @@ class NmtFieldCatalog(NmtField):
         return alms
 
     def get_catalog_mask_map(self):
+        """Return a HEALPix map of the catalog mask, smoothed by the source cloud.
+
+        Returns
+        -------
+        tuple (jax.Array, int) or None
+            The map and its Nside (the smallest power of two with ``3 Nside >=
+            lmax_mask``), or None if the field has a mask map.
+        """
         if self.mask is not None:
             return None
         lmax = self.ainfo_mask.lmax
@@ -186,6 +274,16 @@ class NmtFieldCatalog(NmtField):
         return alm2map(smoothed[None], 0, map_info, self.ainfo_mask)[0], nside
 
     def get_catalog_mask_squared_map(self):
+        """Return the self-pair contribution to the squared catalog mask as a HEALPix map.
+
+        Each random is treated as the square of a Gaussian blob of size
+        `get_theta_cloud`.
+
+        Returns
+        -------
+        tuple (jax.Array, int) or None
+            The map and its Nside, or None if the field has a mask map.
+        """
         if self.mask is not None:
             return None
         lmax = self.ainfo_mask.lmax
@@ -203,6 +301,16 @@ class NmtFieldCatalog(NmtField):
         return alm2map(alms[None], 0, map_info, self.ainfo_mask)[0], nside
 
     def get_noise_deprojection_bias(self):
+        """Return the noise bias induced by template deprojection.
+
+        Zero if there are no templates or no `noise_variance`.  Requires
+        ``retain_catalog=True``.  The result is cached.
+
+        Returns
+        -------
+        jax.Array, shape (nmaps * nmaps, lmax + 1)
+            Coupled (pseudo-C_ell) bias, to be added to the noise bias.
+        """
         if self.lite:
             raise ValueError(
                 "Cannot compute noise deprojection bias for lightweight field"
@@ -271,6 +379,7 @@ class NmtFieldCatalog(NmtField):
 
 
 def _summed_component_cell(alms1, alms2, alm_info, lmax):
+    """Pseudo-C_ell between two alm sets, summed over matching components (trace)."""
     spectra = _compute_coupled_cell(
         alms1, alms2, alm_info._ell, alm_info._m, lmax=lmax
     ).reshape((len(alms1), len(alms2), -1))
@@ -278,7 +387,61 @@ def _summed_component_cell(alms1, alms2, alm_info, lmax):
 
 
 class NmtFieldCatalogMomentum(NmtFieldCatalog):
-    """Density-weighted catalog field using randoms or a map mask."""
+    """A catalog field weighted by the local source density (e.g. galaxy momentum for kSZ).
+
+    The mean source density is described by a random catalog or by a mask map
+    (Harscouet et al. 2025).  The field values are divided by ``alpha``, the ratio of
+    the summed data weights to the summed random weights (or to the mask integral).
+
+    Parameters
+    ----------
+    positions : array_like, shape (2, nsrc)
+        Source positions: colatitude and longitude in radians, or, if `lonlat` is
+        True, longitude and latitude in degrees (e.g. RA, Dec).
+    weights : array_like, shape (nsrc,)
+        Weight of each source.
+    field : array_like, shape (nmaps, nsrc), or None
+        Field values at the sources (e.g. reconstructed radial velocities).  None
+        builds the clustering (overdensity) field; see `NmtFieldCatalogClustering`.
+    positions_rand, weights_rand : array_like
+        As `positions` and `weights`, for the random catalog.  Ignored if `mask`
+        is given.
+    lmax : int
+        Maximum multipole of the field's alms.
+    lmax_mask : int, optional
+        Maximum multipole of the mask's alms.  Defaults to `lmax` with randoms, or to
+        the maximum supported by the mask's pixelization.
+    spin : int, optional
+        Spin of the field.  Defaults to 0 for one array and 2 for two.
+    field_is_weighted : bool, optional
+        True if `field` is already multiplied by the weights.
+    lonlat : bool, optional
+        Interpretation of `positions` (see above).
+    mask : array_like, shape (npix,) or (ny, nx), optional
+        Mask map (HEALPix or CAR) used instead of randoms.
+    n_iter_mask : int, optional
+        Jacobi iterations for the mask transform (mask maps only).
+    wcs : astropy.wcs.WCS, optional
+        WCS of a CAR mask.
+    templates : array_like, optional
+        Contaminant templates, shape ``(ntemp, nmaps, nrand)`` sampled at the randoms,
+        or ``(ntemp, nmaps, npix)`` maps if `mask` is given.
+    tol_pinv : float, optional
+        Relative eigenvalue threshold for the template covariance pseudo-inverse.
+    lmax_deproj : int, optional
+        Maximum multipole used to fit the templates; defaults to `lmax`.
+    n_iter_temp : int, optional
+        Jacobi iterations for template maps (mask maps only).
+    masked_on_input : bool, optional
+        True if the templates are already multiplied by the random weights (or the
+        mask).
+    noise_variance : array_like, shape (nsrc,), optional
+        Noise variance per source, used for the deprojection noise bias.
+    retain_catalog : bool, optional
+        Keep the catalogs, needed for covariances and deprojection bias.
+    nside_ipd : int, optional
+        Stored for pymaster compatibility.
+    """
 
     def __init__(
         self,
@@ -468,6 +631,15 @@ class NmtFieldCatalogMomentum(NmtFieldCatalog):
                 self.temp, self.alm_temp = templates, template_alms
 
     def get_noise_deprojection_bias(self):
+        """Return the noise bias induced by template deprojection.
+
+        For clustering fields the noise is the Poisson term of both data and randoms.
+        Requires ``retain_catalog=True``.  The result is cached.
+
+        Returns
+        -------
+        jax.Array, shape (nmaps * nmaps, lmax + 1)
+        """
         if self.lite:
             raise ValueError("Cannot compute noise deprojection bias for lightweight field")
         shape = (self.nmaps * self.nmaps, self.ainfo.lmax + 1)
@@ -528,7 +700,14 @@ class NmtFieldCatalogMomentum(NmtFieldCatalog):
 
 
 class NmtFieldCatalogClustering(NmtFieldCatalogMomentum):
-    """Catalog overdensity field normalized by randoms or a map mask."""
+    """The overdensity field of a catalog of discrete sources (galaxy clustering).
+
+    The survey footprint is described by a random catalog or by a mask map.  The
+    field's alms are those of the weighted sources divided by ``alpha`` minus those of
+    the footprint, and the shot noise is available as `Nf`.  All parameters are as
+    in `NmtFieldCatalogMomentum`, without `field`, `spin`, `field_is_weighted` and
+    `noise_variance` (the noise is Poisson).
+    """
 
     def __init__(
         self, positions, weights, positions_rand, weights_rand, lmax,

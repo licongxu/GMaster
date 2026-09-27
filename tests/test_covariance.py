@@ -1,3 +1,5 @@
+"""Gaussian covariance workspaces (curved, flat, catalogue, Toeplitz) against pymaster."""
+
 import os
 import tempfile
 
@@ -18,6 +20,7 @@ def _nmaps(spin):
     "spins", [(0, 0, 0, 0), (0, 2, 0, 2), (0, 0, 2, 2), (2, 2, 2, 2)]
 )
 def test_curved_covariance_matches_namaster(spins):
+    """Coupled and decoupled Gaussian covariances match NaMaster for every spin-0/spin-2 combination."""
     reference = pytest.importorskip("pymaster")
     rng = np.random.default_rng(70)
     lmax = 7
@@ -64,6 +67,7 @@ def test_curved_covariance_matches_namaster(spins):
     "spins", [(0, 0, 0, 0), (0, 2, 0, 2), (0, 0, 2, 2), (2, 2, 2, 2)]
 )
 def test_flat_covariance_matches_namaster(spins):
+    """Flat-sky Gaussian covariances match NaMaster for every spin-0/spin-2 combination."""
     reference = pytest.importorskip("pymaster")
     rng = np.random.default_rng(71)
     ny, nx = 8, 10
@@ -104,6 +108,10 @@ def test_flat_covariance_matches_namaster(spins):
 
 
 def test_catalog_covariance_and_inka_match_namaster():
+    """The improved NKA spectrum estimate and the Gaussian covariance of a catalogue field match
+    NaMaster.  The loose tolerance reflects pymaster's catalogue transforms, which run at ducc0
+    epsilon = 1e-5.
+    """
     reference = pytest.importorskip("pymaster")
     rng = np.random.default_rng(72)
     lmax = 6
@@ -136,6 +144,9 @@ def test_catalog_covariance_and_inka_match_namaster():
 
 
 def test_covariance_io_and_deprecated_wrappers():
+    """A covariance workspace survives a FITS round trip, the file is readable by pymaster, and the
+    deprecated module-level `gaussian_covariance` wrapper gives the same answer.
+    """
     reference = pytest.importorskip("pymaster")
     rng = np.random.default_rng(73)
     lmax = 7
@@ -172,6 +183,7 @@ def test_covariance_io_and_deprecated_wrappers():
 
 
 def test_covariance_validation():
+    """Fields other than spin 0/2, and a Toeplitz request without positive `l_exact`/`dl_band`, are rejected."""
     mask = np.ones(12 * 4**2)
     field = nmt.NmtField(mask, None, spin=0, lmax=7, lmax_mask=7)
     spin3 = nmt.NmtField(mask, None, spin=3, lmax=7, lmax_mask=7)
@@ -183,6 +195,7 @@ def test_covariance_validation():
 
 @pytest.mark.parametrize("spin", [0, 2])
 def test_toeplitz_covariance_matches_namaster(spin):
+    """The Toeplitz-approximated covariance coupling coefficients match NaMaster."""
     reference = pytest.importorskip("pymaster")
     rng = np.random.default_rng(74)
     lmax = 12

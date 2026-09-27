@@ -18,20 +18,38 @@ import jax.numpy as jnp
 
 
 class NmtParams:
+    """Process-wide default settings (the object behind `nmt_params`).
+
+    Attributes
+    ----------
+    sht_calculator : str
+        Backend selector for spherical-harmonic transforms (see `set_sht_calculator`).
+    n_iter_default, n_iter_mask_default : int
+        Default number of Jacobi iterations in `map2alm` for maps and for masks.
+    tol_pinv_default : float
+        Default relative eigenvalue threshold for pseudo-inverses.
+    table_dtype : str
+        Storage precision of precomputed transform tables (see `set_table_precision`).
+    ring_precision : str
+        Precision of the azimuthal ring FFTs (see `set_ring_precision`).
+    latitudinal_method : str
+        Latitudinal transform engine (see `set_latitudinal_method`).
+    """
+
     def __init__(self):
         self.sht_calculator = "jax"
         self.n_iter_default = 3
         self.n_iter_mask_default = 3
         self.tol_pinv_default = 1e-10
-        # Storage precision of the precomputed transform tables.  Every
-        # contraction accumulates in float64 whatever this is.
+        # Storage precision of the precomputed transform tables.  Contractions
+        # accumulate in float64 regardless.
         self.table_dtype = "fp64"
-        # Element type of the azimuthal transforms.  "auto" is complex64 where the v2
-        # march serves the latitudinal stage and complex128 below it; "follow" keeps the
-        # historical coupling to the table precision; "fp64"/"fp32" pin it independently.
+        # Element type of the azimuthal transforms.  "auto": complex64 wherever the CUDA
+        # float32 march runs the latitudinal stage, complex128 otherwise; "follow": match
+        # the table precision; "fp64"/"fp32": fixed.
         self.ring_precision = "auto"
-        # "auto": divide-and-conquer where its plan exists, fp32 v2 march elsewhere.
-        # "march": always the fp32 difference-form march. "dc": divide-and-conquer.
+        # "auto": divide-and-conquer inside its band-limit window, float32 march elsewhere.
+        # "march": always the float32 difference-form march.  "dc": divide-and-conquer.
         self.latitudinal_method = "auto"
 
 
@@ -43,34 +61,48 @@ _RING_DTYPES = {"follow": None, "auto": None, "fp64": jnp.complex128,
 
 
 def table_dtype():
-    """jnp dtype the precomputed transform tables are stored in."""
+    """Return the JAX dtype in which precomputed transform tables are stored.
+
+    Returns
+    -------
+    dtype
+        ``jnp.float64`` (default) or ``jnp.float32``, as set by `set_table_precision`.
+    """
     return _TABLE_DTYPES[nmt_params.table_dtype]
 
 
 def ring_dtype(L=None):
-    """Element type of the azimuthal (ring) transforms.
+    """Return the element type of the azimuthal (ring) FFTs.
 
-    The ring stage is a batched FFT, and on this card a double-precision FFT is
-    compute-bound at roughly the fp64 FMA rate while the fp32 one runs on the tensor-core
-    path: the same length transform is ~4.5x cheaper in `complex64` (`.qwen/tmp/ring_fp32_ab.py`:
-    0.91 -> 0.21 ms at Nside 512, 4.08 -> 0.83 ms at 1024).
+    The ring stage is a batched FFT.  On data-centre GPUs a double-precision FFT is limited
+    by the fp64 arithmetic rate, so the same transform is roughly 4-5x cheaper in
+    ``complex64``.
 
-    The shipped default is ``"auto"``: complex64 exactly where the v2 march serves the
-    latitudinal stage, complex128 below it.  ``"follow"`` tracks `set_table_precision`, which
-    is what every pre-v2 published number used.  The cast is not
-    confined to the chirp tables: `_forward_ring_fft_positive` casts the *pixels* to the
-    chirp's real dtype too, so ``"follow"`` with fp32 tables analyzes the map itself in
-    float32.  ``set_ring_precision("fp64")`` keeps the azimuthal stage exact under fp32
-    tables; ``"fp32"`` buys the ~4.5x regardless of the table choice.
+    With the default ``"auto"`` setting the ring stage runs in complex64 wherever the CUDA
+    float32 march serves the latitudinal stage (whose accuracy is already float32-class,
+    ~1e-6), and in complex128 otherwise.  ``"follow"`` matches `set_table_precision`.  Note
+    that the pixels themselves are cast to the ring dtype, so ``"follow"`` with fp32 tables
+    analyses the map in float32; ``set_ring_precision("fp64")`` keeps the azimuthal stage
+    exact in that case.
+
+    Parameters
+    ----------
+    L : int, optional
+        Band limit ``lmax + 1`` of the transform.  Needed by the ``"auto"`` setting.
+
+    Returns
+    -------
+    dtype
+        ``jnp.complex64`` or ``jnp.complex128``.
     """
     forced = _RING_DTYPES[nmt_params.ring_precision]
     if forced is not None:
         return forced
     if nmt_params.ring_precision == "auto" and L is not None:
-        # The shipped default: complex64 exactly where the v2 march serves the latitudinal stage
-        # (every band limit with a CUDA build).  There the pass already carries the march's
-        # float32-class 1e-6, the ring stage is 55 % of it (10.4 of 18.7 ms at Nside 1024 spin 2)
-        # and complex64 halves that; `GMASTER_MARCH_V2=0` keeps the exact transform.
+        # complex64 wherever the float32 march serves the latitudinal stage (every band
+        # limit once the CUDA library is built).  The transform is then already accurate to
+        # ~1e-6 and the ring FFT is about half its cost, so complex64 loses nothing
+        # measurable.  `GMASTER_MARCH_V2=0` disables the march and keeps complex128.
         from ._sht import march_v2 as _march_v2
 
         if _march_v2.enabled(L):
@@ -79,14 +111,22 @@ def ring_dtype(L=None):
 
 
 def set_ring_precision(name):
-    """Choose the element type of the azimuthal transforms independently of the tables.
+    """Choose the precision of the azimuthal (ring) FFTs.
 
-    The two precisions are bought for different reasons: halved *table* bytes change which
-    theta route a geometry dispatches to, while the *ring* precision changes the FFT that
-    the map pixels run in.  Following the tables couples them; this breaks the coupling so
-    an fp32 table route can keep an exact azimuthal transform.
+    GMaster-specific setting with no pymaster equivalent.  The ring precision sets the
+    FFT the map pixels run through, independently of the table storage precision chosen
+    with `set_table_precision` (which mainly decides which tables fit in memory).
 
-    Clears the ring table caches for the same reason `set_table_precision` does.
+    Parameters
+    ----------
+    name : {"auto", "follow", "fp64", "fp32"}
+        ``"auto"`` (default): complex64 where the float32 latitudinal march is used,
+        complex128 otherwise.  ``"follow"``: match the table precision.  ``"fp64"`` /
+        ``"fp32"``: always complex128 / complex64.
+
+    Notes
+    -----
+    Changing the setting clears the cached ring tables, which are keyed by dtype.
     """
     if name not in _RING_DTYPES:
         raise KeyError(
@@ -98,32 +138,41 @@ def set_ring_precision(name):
 
 
 def drop_ring_tables():
-    """Evict the cached ring chirp-Z tables (they are rebuilt on the next transform)."""
+    """Free the cached ring chirp-Z tables; they are rebuilt on the next transform."""
     from ._sht import rings
 
     rings.drop_ring_tables()
 
 
-_ROOM_HOOKS = []       # extra callables that free device caches (registered by workspaces)
-_ROOM_HOOKS_LAST = []  # freed only when the steps above did not make room (v2 march tables)
+_ROOM_HOOKS = []       # callables that free device caches; run first by `make_room`
+_ROOM_HOOKS_LAST = []  # run only if everything else was not enough (march window tables)
 
 
 def make_room(nbytes):
-    """Drop the ring-table caches when the device pool cannot hold `nbytes` more.
+    """Free cached device tables until `nbytes` more bytes can be allocated.
 
-    The polarised ring tables are 30 GiB of complex128 at Nside 4096 and live in `lru_cache`s
-    for the process; the coupling matrix never uses them, and at Nside 4096 spin 2 its assembly
-    (two `(ncls (lmax+1))^2` float64 copies, 18 GiB each) failed with them resident at 50.6 GiB
-    in use (`.qwen/tmp/chain_s36j.log`, session 36).  A device without allocator statistics
-    reports nothing and nothing is dropped.
+    Transform tables are cached for the lifetime of the process and can be large (the
+    polarised ring tables alone are ~30 GiB at Nside 4096).  Large later allocations, such
+    as the Nside 4096 spin-2 coupling matrix, may not fit while they are resident.  Caches
+    are released in order of increasing rebuild cost, stopping as soon as there is room.
+
+    Parameters
+    ----------
+    nbytes : int
+        Number of bytes the caller is about to allocate.
+
+    Notes
+    -----
+    If the device reports neither allocator statistics nor driver memory information,
+    nothing is freed.
     """
     def short():
         stats = jax.devices()[0].memory_stats() or {}
         limit, in_use = stats.get("bytes_limit"), stats.get("bytes_in_use")
         if limit and in_use is not None:
             return limit - in_use < nbytes
-        # PREALLOCATE=false reports bytes_limit 0, which used to skip eviction entirely.
-        # Same driver fallback as workspaces._pool_limit_and_free.
+        # With XLA_PYTHON_CLIENT_PREALLOCATE=false the pool reports bytes_limit 0, so ask
+        # the driver instead (same fallback as workspaces._pool_limit_and_free).
         from ._sht import march_v2 as _march_v2
         info = _march_v2.device_memory_info()
         if info is None:
@@ -135,12 +184,10 @@ def make_room(nbytes):
 
     if not short():
         return
-    # Cheapest first: the Wigner-d quadrature cache (9 GiB at Nside 4096, seconds to rebuild),
-    # then the ring tables (30 GiB, which the next transform rebuilds), and only then the v2
-    # march's window tables.  Those are last because dropping them costs the most: the Nside 4096
-    # spin-0 `NmtField` is 2.00 s with them resident and 3.26 s without
-    # (`.qwen/tmp/field_s37.py`), and the benchmark's repeated field builds were freeing them on
-    # every call, which is the whole difference between that stage measuring 2.0 s and 2.6 s.
+    # Cheapest to rebuild first: registered caches such as the Wigner-d quadrature tables
+    # (~9 GiB at Nside 4096, seconds to rebuild), then the ring tables (~30 GiB), and only
+    # then the march window tables, whose rebuild is the most expensive (at Nside 4096 a
+    # spin-0 `NmtField` takes about 1.6x longer without them).
     for hook in _ROOM_HOOKS:
         hook()
     if not short():
@@ -153,23 +200,24 @@ def make_room(nbytes):
 
 
 def set_table_precision(name):
-    """Choose the device storage precision of the precomputed tables.
+    """Choose the device storage precision of the precomputed transform tables.
 
-    `"fp64"` (default) is what every published GMaster number used: the tables
-    hold exactly the values the fused kernel recomputes, so a table transform and
-    a kernel transform agree to ~1e-16.
+    GMaster-specific setting with no pymaster equivalent.
 
-    `"fp32"` halves the device bytes of those tables.  The largest geometries are
-    dispatched by a fit test, not by speed, so what this buys is *engagement*:
-    a geometry that declined the tables and took the recurrence-bound fused
-    kernel can take the memory-bound contraction instead.  The recurrence that
-    generates the values stays float64 and every contraction still accumulates in
-    float64; the price is the table's own representation error (~1e-7 relative on
-    the coupling matrix), which is why it is opt-in and never inferred.
+    Parameters
+    ----------
+    name : {"fp64", "fp32"}
+        ``"fp64"`` (default): tables hold exactly the values an on-the-fly kernel would
+        compute, so table and kernel transforms agree to ~1e-16.
+        ``"fp32"``: halves the table memory, so larger geometries can use the fast
+        table contraction instead of the slower on-the-fly recurrence.  The values are
+        still generated in float64 and contractions accumulate in float64; the cost is
+        the float32 representation error (~1e-7 relative on the coupling matrix), which
+        is why this is opt-in.
 
-    Cached tables are keyed by dtype, and the caches are process-global, so
-    switching clears them rather than handing a caller the other precision's
-    bytes.
+    Notes
+    -----
+    Cached tables are process-global and keyed by dtype, so switching clears them.
     """
     if name not in _TABLE_DTYPES:
         raise KeyError("GMaster table precision must be 'fp64' or 'fp32'")
@@ -187,19 +235,31 @@ _LATITUDINAL_METHODS = ("auto", "march", "dc")
 
 
 def latitudinal_method():
-    """``"march"`` (fp32 v2 difference form), ``"dc"`` (divide-and-conquer), or ``"auto"``."""
+    """Return the current latitudinal transform engine setting.
+
+    Returns
+    -------
+    str
+        ``"auto"``, ``"march"`` or ``"dc"``; see `set_latitudinal_method`.
+    """
     return nmt_params.latitudinal_method
 
 
 def set_latitudinal_method(name):
-    """Choose the latitudinal transform.
+    """Choose the engine for the latitudinal (theta) stage of the spherical-harmonic transforms.
 
-    ``"march"`` is the fp32 difference-form v2 march at every size.
-    ``"dc"`` is the divide-and-conquer engine wherever its plan can be built
-    (bandlimit up to ``GMASTER_DC_MAX_L``, default 12288, i.e. ``Nside`` 4096).
-    Above that the march is used, because the plan is not built.
-    ``"auto"`` uses the divide-and-conquer engine between ``GMASTER_DC_MIN_L`` and
-    ``GMASTER_DC_MAX_L`` and the march outside that window.
+    GMaster-specific setting with no pymaster equivalent.  Every transform is split into
+    an azimuthal FFT per ring and a latitudinal Wigner-d stage; this selects the latter.
+
+    Parameters
+    ----------
+    name : {"auto", "march", "dc"}
+        ``"march"``: the float32 difference-form Wigner-d march at every size.
+        ``"dc"``: the divide-and-conquer engine wherever its plan can be built (band
+        limit up to ``GMASTER_DC_MAX_L``, default 12288, i.e. Nside 4096); the march is
+        used above that.
+        ``"auto"`` (default): divide-and-conquer for band limits between
+        ``GMASTER_DC_MIN_L`` and ``GMASTER_DC_MAX_L``, the march outside that window.
     """
     if name not in _LATITUDINAL_METHODS:
         raise KeyError(
@@ -210,6 +270,22 @@ def set_latitudinal_method(name):
 
 
 def set_sht_calculator(calc_name):
+    """Select the spherical-harmonic transform backend.
+
+    Plays the role of ``pymaster.set_sht_calculator`` (which chooses between ``"ducc"``
+    and ``"healpy"``); in GMaster every option is a JAX backend.
+
+    Parameters
+    ----------
+    calc_name : str
+        ``"jax"`` (default): automatic choice of the fastest available route, including
+        multi-GPU transforms when several GPUs are visible.  ``"jax-single"``: never split
+        across GPUs.  ``"jax-mgpu"``: always split across GPUs when more than one is
+        available.  ``"jax-generic"``: portable s2fft-style latitudinal loop, without
+        precomputed tables.  ``"jax-dfp32"``: double-float32 kernel for scalar analysis.
+        ``"jax-matrix"``: the same routes as ``"jax"``, except that the scalar
+        on-the-fly kernel is never split across GPUs.
+    """
     if calc_name not in (
         "jax",
         "jax-single",
@@ -226,6 +302,16 @@ def set_sht_calculator(calc_name):
 
 
 def set_n_iter_default(n_iter, mask=False):
+    """Set the default number of Jacobi iterations used in `map2alm`.
+
+    Parameters
+    ----------
+    n_iter : int
+        Number of iterations (non-negative).
+    mask : bool, optional
+        If True, set the default used for mask transforms; otherwise the default used
+        for all other transforms.
+    """
     if n_iter < 0:
         raise ValueError("n_iter must be positive")
     attribute = "n_iter_mask_default" if mask else "n_iter_default"
@@ -233,12 +319,27 @@ def set_n_iter_default(n_iter, mask=False):
 
 
 def set_tol_pinv_default(tol_pinv):
+    """Set the default relative eigenvalue threshold for pseudo-inverses.
+
+    Parameters
+    ----------
+    tol_pinv : float
+        Threshold in [0, 1]; see `moore_penrose_pinvh`.
+    """
     if not 0 <= tol_pinv <= 1:
         raise ValueError("tol_pinv must be between 0 and 1")
     nmt_params.tol_pinv_default = float(tol_pinv)
 
 
 def get_default_params():
+    """Return the current default settings.
+
+    Returns
+    -------
+    dict
+        Keys ``"sht_calculator"``, ``"n_iter_default"``, ``"n_iter_mask_default"``,
+        ``"tol_pinv_default"`` and ``"latitudinal_method"``.
+    """
     return {
         name: getattr(nmt_params, name)
         for name in (

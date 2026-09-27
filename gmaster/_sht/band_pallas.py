@@ -1,39 +1,27 @@
-"""Pallas emitter for the Legendre band slabs.
+"""Pallas emitter for the Legendre band tables.
 
-`_theta_matrix._build_slab` produces the band with a `lax.scan` over the degree, and the
-shipped build at Nside 1024 costs 340 s for 36.73 GiB of output (`.qwen/tmp/block_band_check.log`).
-The device work inside that is small: the same scan warm is 26 ms for the leading block, and the
-whole band's worth of XLA kernel time is under a second (`.qwen/tmp/pallas_band_fullbuild.log`).
-What costs 340 s is that `block` m-blocks means `block` distinct XLA programs -- a static
-`m0`/`mb` per block -- so the build pays a full compile per block, and each of those programs
-also pins a copy of what it produced until the caches are dropped.
+Builds one m-block of the parity-split Legendre band (the ``(even, odd)`` halves returned by
+`_theta_matrix._build_pair`) with a single Triton program.  Each program lane owns one order
+`m`, runs the degree recurrence in registers and stores every degree straight into its parity
+half.  The XLA builder (`_theta_matrix._build_slab`) needs one compiled program per m-block,
+because `m0`/`mb` are static there; this kernel compiles once per block geometry, which turns a
+build dominated by compilation into one dominated by the device stores.
 
-This module emits one m-block with a single Triton program instead: the recurrence runs in
-registers, one lane per `m`, storing each degree straight into the parity-split halves that
-`_build_pair` returns.  Measured on the whole band at Nside 1024, float32 storage, 48 blocks
-warm: **0.08 s** against the 340 s shipped build (`.qwen/tmp/pallas_band_fullbuild2.log`), and
-the block compiles cost 5.14 s cold instead of minutes.  Parity splitting is free -- two masked
-stores per degree measured 37.4 G values/s against 37.8 for one unmasked store
-(`.qwen/tmp/fullbuild_probe.log`), so there is no separate `vals[0::2]` pass.
+Row values match `_build_slab`: the same normalised three-term recurrence, the same seed
+`sign(diag[m]) * 2**(log2|diag[m]| + m*log2(sin theta) - exponent)`, the same rescale every 16
+degrees and the same bit-assembled power of two from `_initial_factor`.  The march carries in
+float64 and only the store is rounded, so `float32` storage is the float64 band cast.  The two
+builders agree to the storage quantum (last-bit differences between a Triton and an XLA
+program, e.g. 6e-08 absolute at Nside 1024 in float32 storage).
 
-Row values match `_build_slab`: same normalised 3-term recurrence, same seed
-`sign(diag[m]) * 2**(log2|diag[m]| + m*log2(sin theta) - exponent)`, same rescale-every-16
-schedule, same `_initial_factor` bit-assembled power of two.  The march carries in float64 and
-only the store is rounded, so `float32` storage is the float64 band cast, exactly as in the
-scan builder.  The two differ in the last bits the way any Triton program differs from an XLA
-one -- max absolute difference 5.96e-08 at Nside 1024 on values up to 1.9e-01, which is float32
-storage quantum, not a recurrence difference.
-
-Two lowering facts this kernel exists to respect, both from
-`.qwen/tmp/emitter_bisect2.log`:
+Two lowering constraints the kernel respects:
 
 * a `jnp.where(scalar_pred, scalar, scalar)` whose result feeds a vector multiply does not
-  lower (`AssertionError: ('tensor<128xi1>', 'tensor<128xf64>')`).  The sign of the seed is
-  therefore written `-jnp.ones_like(cosine)` / `jnp.ones_like(cosine)`, matching
-  `_sht_pallas._analysis_kernel`.
-* the `lax.cond` that carries the 16-degree guard must advance the recurrence in BOTH arms.
-  Returning the incoming carry from the non-firing arm freezes the march on 15 degrees of
-  every 16 and produces garbage that still looks plausible (~2e+00 relative).
+  lower, so the sign of the seed is written with vector arms
+  (`-jnp.ones_like(cosine)` / `jnp.ones_like(cosine)`), as in `_sht_pallas._analysis_kernel`.
+* the `lax.cond` that applies the 16-degree rescale must advance the recurrence in BOTH arms.
+  Returning the incoming carry from the non-rescaling arm freezes the march on 15 of every 16
+  degrees and yields plausible-looking garbage.
 """
 
 from functools import partial
@@ -47,8 +35,7 @@ import numpy as np
 
 from gmaster._sht.sht_pallas import _initial_factor
 
-# Theta lanes per program.  The store-only probe on this layout peaked here and regressed at
-# 512 (`.qwen/tmp/pallas_band_emitter.log`: 127.8 / 123.3 / 89.5 G values/s for 128 / 256 / 512).
+# Theta lanes per program: store throughput on this layout peaks at 128 and drops at 512.
 _CHUNK = 128
 _NUM_WARPS = 2
 
@@ -135,8 +122,7 @@ def _call(m0, mb, L, north, store_name, chunk):
     """Cached `pallas_call` for one block geometry.
 
     Keyed on the geometry because the block's row count is baked into the output shapes; the
-    cache is what keeps a build from paying Triton compilation on every call, which is the
-    same trap the XLA route is in.
+    cache avoids paying Triton compilation on every call.
     """
     key = (m0, mb, L, north, store_name, chunk)
     call = _CALLS.get(key)
@@ -163,11 +149,12 @@ def build_pair(theta, L, diag, c1, c2, m0, mb, store_name="float64"):
     `theta` is the full north+south colatitude array; only the north half enters the band, the
     south being recovered by the `(-1)**(ell+m)` fold in the contraction.
 
-    Not buildable inside `jax.ensure_compile_time_eval()`: that context exists to make `jit`
-    evaluate eagerly, and a `pallas_call` has no eager rule, so it raises
-    `NotImplementedError: Evaluation rule for 'program_id' not implemented`.  Neither
-    `jax.disable_jit(False)` nor a nested `jit` undoes it -- the fold is a trace-time flag, not
-    the jit setting -- which is why `_band` leaves the fold out when it picks this builder.
+    Stores are masked by parity, so no separate `vals[0::2]` pass is needed.
+
+    Not callable inside `jax.ensure_compile_time_eval()`: a `pallas_call` has no eager
+    evaluation rule (`NotImplementedError: Evaluation rule for 'program_id' not implemented`),
+    and neither `jax.disable_jit(False)` nor a nested `jit` lifts that trace-time flag.  This is
+    why `_band` does not use compile-time evaluation when it picks this builder.
     """
     north = (len(theta) + 1) // 2
     chunk = _CHUNK if north >= _CHUNK else max(32, 1 << (int(north).bit_length() - 1))

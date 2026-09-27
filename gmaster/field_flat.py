@@ -1,4 +1,9 @@
-"""JAX-backed flat-sky fields and Fourier transforms."""
+"""Flat-sky fields (`NmtFieldFlat`) and the flat-sky Fourier transforms they use.
+
+The counterpart of ``pymaster.NmtFieldFlat``.  Fourier modes follow NaMaster's
+normalisation, so that power spectra computed from them are directly comparable with
+curved-sky C_ell.
+"""
 
 import jax
 import jax.numpy as jnp
@@ -9,6 +14,7 @@ from .utils import moore_penrose_pinvh, nmt_params
 
 
 def _wavevectors(nx, ny, lx, ly):
+    """Wavevector components (kx, ky) of the rfft2 grid, broadcastable to (ny, nx // 2 + 1)."""
     kx = 2 * jnp.pi * jnp.arange(nx // 2 + 1) / lx
     iy = jnp.arange(ny)
     ky = 2 * jnp.pi * jnp.where(2 * iy <= ny, iy, iy - ny) / ly
@@ -16,6 +22,7 @@ def _wavevectors(nx, ny, lx, ly):
 
 
 def _rotation(nx, ny, lx, ly, spin, inverse=False):
+    """Phase and cos/sin(spin * phi_k) that rotate Fourier (Q, U) into (E, B) or back."""
     kx, ky = _wavevectors(nx, ny, lx, ly)
     phi = jnp.arctan2(ky, kx)
     angle = spin * phi
@@ -25,7 +32,20 @@ def _rotation(nx, ny, lx, ly, spin, inverse=False):
 
 @partial(jax.jit, static_argnames="spin")
 def _flat_map2alm(maps, spin, lx, ly):
-    """Transform maps using NaMaster's flat-sky Fourier normalization."""
+    """Fourier transform of flat-sky maps, with E/B rotation for spin > 0.
+
+    Parameters
+    ----------
+    maps : array_like, shape (nmaps, ny, nx)
+    spin : int
+    lx, ly : float
+        Patch size in radians.
+
+    Returns
+    -------
+    jax.Array, shape (nmaps, ny, nx // 2 + 1)
+        Fourier coefficients, normalised as ``lx ly / (2 pi nx ny)`` times the DFT.
+    """
     maps = jnp.asarray(maps)
     ny, nx = maps.shape[-2:]
     alms = jnp.fft.rfft2(maps) * (lx * ly / (2 * jnp.pi * nx * ny))
@@ -55,7 +75,34 @@ def _flat_alm2map(alms, spin, lx, ly, nx):
 
 
 class NmtFieldFlat:
-    """Masked flat-sky field compatible with NaMaster's public API."""
+    """A masked field on a flat rectangular patch.
+
+    Same interface as ``pymaster.NmtFieldFlat``; arrays are JAX arrays on the device.
+
+    Parameters
+    ----------
+    lx, ly : float
+        Patch size along x and y, in radians.
+    mask : array_like, shape (ny, nx)
+        Mask.
+    maps : array_like, shape (nmaps, ny, nx), or None
+        Observed maps (1 for spin 0, 2 for spin > 0).  If None, the field holds only a
+        mask (used for coupling matrices).
+    spin : int, optional
+        Spin of the field.  Defaults to 0 for one map and 2 for two maps.
+    templates : array_like, shape (ntemp, nmaps, ny, nx), optional
+        Contaminant templates to deproject.
+    beam : array_like, shape (2, n_ell), optional
+        Beam as ``[ells, beam(ells)]``.  If None, no beam is applied.
+    purify_e, purify_b : bool, optional
+        Purify E or B modes (spin 2 only).
+    tol_pinv : float, optional
+        Relative eigenvalue threshold for the template covariance pseudo-inverse.
+    masked_on_input : bool, optional
+        True if the maps and templates are already multiplied by the mask.
+    lite : bool, optional
+        Do not keep maps and templates, only what the power spectrum needs.
+    """
 
     def __init__(
         self,
@@ -184,6 +231,7 @@ class NmtFieldFlat:
                     )(templates)
 
     def _set_beam(self, beam):
+        """Validate and store the beam as a (2, n_ell) array, or None."""
         if beam is None:
             self.beam = None
             return
@@ -195,6 +243,7 @@ class NmtFieldFlat:
         self.beam = beam
 
     def _purify(self, maps_unmasked):
+        """Pure E/B Fourier modes and maps, using the flat-sky mask-derivative counter-terms."""
         mask_alm = self.alm_mask
         ix = jnp.arange(self.nx // 2 + 1)
         iy = jnp.arange(self.ny)
@@ -237,6 +286,7 @@ class NmtFieldFlat:
         return alms, _flat_alm2map(alms, 2, self.lx, self.ly, self.nx)
 
     def is_compatible(self, other):
+        """Return True if `other` has the same pixel grid and patch size."""
         return (
             self.nx == other.nx
             and self.ny == other.ny
@@ -245,9 +295,11 @@ class NmtFieldFlat:
         )
 
     def get_mask(self):
+        """Return the mask, shape (ny, nx)."""
         return self.mask
 
     def get_maps(self):
+        """Return the masked, deprojected (and purified) maps, shape (nmaps, ny, nx)."""
         if self.maps is None:
             raise ValueError(
                 "Input maps unavailable for lightweight fields. To use this function, "
@@ -256,11 +308,13 @@ class NmtFieldFlat:
         return self.maps
 
     def get_alms(self):
+        """Return the Fourier coefficients, shape (nmaps, ny, nx // 2 + 1)."""
         if self.alm is None:
             raise ValueError("Mask-only fields have no alms")
         return self.alm
 
     def get_templates(self):
+        """Return the masked templates, shape (ntemp, nmaps, ny, nx)."""
         if self.temp is None:
             raise ValueError(
                 "Input maps unavailable for lightweight fields. To use this function, "
@@ -269,6 +323,15 @@ class NmtFieldFlat:
         return self.temp
 
     def get_ell_sampling(self):
+        """Return a regular multipole grid for this patch.
+
+        Spacing is the fundamental mode ``min(2 pi / lx, 2 pi / ly)``, up to the
+        Nyquist wavenumber; values are bin centres.
+
+        Returns
+        -------
+        ndarray
+        """
         dk = min(2 * np.pi / self.lx, 2 * np.pi / self.ly)
         kmax = np.hypot(2 * np.pi / self.lx * (self.nx // 2),
                         2 * np.pi / self.ly * (self.ny // 2))

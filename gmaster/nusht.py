@@ -1,26 +1,28 @@
-"""GPU general (non-uniform) spherical harmonic transform.
+"""General (non-uniform) spherical-harmonic transforms on the GPU.
 
-The pipeline is the one ``cunuSHT`` and ``ducc0``'s ``synthesis_general`` use, with GMaster's
-float32 CUDA march in the latitudinal slot:
+`synthesis_general` evaluates a spin-weighted spherical-harmonic expansion at arbitrary
+points on the sphere, and `adjoint_synthesis_general` is its adjoint; they have the
+signatures and conventions of ``ducc0.sht.experimental.synthesis_general`` /
+``adjoint_synthesis_general``.  Requires ``cufinufft`` and ``cupy``.
 
-    a_lm --(v2 march on a Fejer-1 ring grid)--> F(theta, m)
+The method is the double-Fourier-sphere approach of cunuSHT (Belkner et al. 2024) and
+ducc0, with GMaster's float32 CUDA Wigner-d march as the latitudinal stage:
+
+    a_lm --(march on a Fejer-1 ring grid)--> F(theta, m)
          --(doubling in theta)--> F on the full circle
          --(FFT in theta)--> c_{k,m}, a 2-D Fourier series on the torus
          --(cufinufft type 2)--> f(theta_n, phi_n) at arbitrary points.
 
-The Fejer-1 grid ``theta_j = (2j+1) pi / (2 ntheta)`` is equidistant, symmetric about pi/2 and
-excludes the poles, so (i) the march's north/south folding is exactly the ring reversal and
-(ii) the doubled ring stack ``F(2pi - theta, m) = (-1)^(m+s) F(theta, m)`` is again equidistant,
-which is what makes the theta direction a plain FFT.  Both stages are verified in
-``tests/test_nusht.py`` against ``ducc0.sht.experimental``.
+The Fejer-1 grid ``theta_j = (2j+1) pi / (2 ntheta)`` is equidistant, symmetric about
+pi/2 and excludes the poles.  Hence (i) the march's north/south folding is exactly the
+ring reversal and (ii) the doubled ring stack ``F(2pi - theta, m) = (-1)^(m+s) F(theta, m)``
+is again equidistant, so the theta direction is a plain FFT.
 
-``adjoint_synthesis_general`` runs the pipeline backwards -- type-1 NUFFT, inverse latitude FFT,
-undoubling, and the march's analysis kernel, which is the transpose of its synthesis kernel
-(checked by a bilinear-form test in the test module; the mirror channel needs an explicit
-``(-1)^(ell + s)``).  It reproduces ducc0's ``adjoint_synthesis_general``, which is the
-*analysis-shaped* adjoint ``abar_lm = sum_p map_p conj(Y_lm(p))`` and so is not quite the
-transpose of ducc0's own synthesis: the m < 0 half of the hermitian alm is not folded back onto
-m > 0, which would double it.  See the comment in ``_torus_to_alm``.
+The adjoint runs the pipeline backwards: type-1 NUFFT, inverse latitude FFT, undoubling,
+and the march's analysis kernel (the transpose of its synthesis kernel, up to an explicit
+``(-1)^(ell + s)`` on the mirror channel).  Like ducc0's, it is the analysis-shaped
+adjoint ``abar_lm = sum_p map_p conj(Y_lm(p))``: the m < 0 half of the Hermitian alm is not
+folded back onto m > 0 (see `_torus_to_alm`).  Accuracy is float32-class (~1e-6 relative).
 """
 
 from __future__ import annotations
@@ -55,8 +57,8 @@ _NU_PATH = os.environ.get("GMASTER_CUFINUFFT_PATH")
 def _cufinufft():
     """Import ``cufinufft``, preloading the CUDA runtime libraries it links against.
 
-    The wheel here is built against the pip CUDA 12 runtime; those ``.so``s live inside the
-    ``nvidia`` wheels and are not on the loader path, so they are dlopen'd RTLD_GLOBAL first.
+    The pip ``cufinufft`` wheel links against the CUDA 12 runtime shipped in the ``nvidia``
+    pip wheels, which are not on the loader path; they are loaded with RTLD_GLOBAL first.
     """
     try:
         import nvidia
@@ -79,6 +81,7 @@ def _cufinufft():
 
 @lru_cache(maxsize=1)
 def _cupy():
+    """Import ``cupy`` lazily (only needed for the NUFFT)."""
     import cupy
 
     return cupy
@@ -90,6 +93,7 @@ def _to_cupy(x):
 
 
 def _to_jax(x):
+    """Zero-copy cupy array -> jax device array."""
     return jax.dlpack.from_dlpack(x)
 
 
@@ -113,17 +117,27 @@ def _good_size(n):
 
 
 def grid_for(lmax, ntheta=None, nphi=None):
-    """Ring grid for a band limit.
+    """Return the intermediate Fejer-1 ring grid used for a band limit.
 
-    ``ntheta >= lmax + 1``: ``F(theta, m)`` is a trigonometric polynomial of degree ``lmax`` in
-    theta, so the doubled ring stack carries the ``2 lmax + 1`` modes ``|k| <= lmax`` and
-    ``2 ntheta >= 2 lmax + 2`` equispaced samples resolve them with one slot to spare.  Taking
-    the bound at equality is what makes the sizes powers of two at ``lmax = 2^k - 1`` (4096, not
-    4320, at lmax 4095), which is worth ~20% of the theta FFT and ~10% of the NUFFT; the extra
-    ring costs accuracy nothing (6.29e-06 against 6.15e-06 at lmax 4095, both float32 march
-    noise -- ``.qwen/tmp/nu_grid_s37.py``).
-    ``nphi >= 2 lmax + 1``: the phi direction carries orders ``-lmax .. lmax``.  Both are rounded
-    up to even 2-3-5-smooth sizes because the theta FFT and the NUFFT fine grid are sized on them.
+    ``ntheta >= lmax + 1``: ``F(theta, m)`` is a trigonometric polynomial of degree ``lmax``
+    in theta, so the doubled ring stack carries the ``2 lmax + 1`` modes ``|k| <= lmax`` and
+    ``2 ntheta >= 2 lmax + 2`` equispaced samples resolve them.  Taking the bound at
+    equality makes the sizes powers of two for ``lmax = 2^k - 1`` (e.g. 4096 rings at
+    lmax 4095), which speeds up both the theta FFT and the NUFFT at no cost in accuracy.
+    ``nphi >= 2 lmax + 1``: the phi direction carries orders ``-lmax .. lmax``.  Both are
+    rounded up to even 2-3-5-smooth sizes for the FFTs.
+
+    Parameters
+    ----------
+    lmax : int
+        Band limit.
+    ntheta, nphi : int, optional
+        Override the automatic sizes (must satisfy the bounds above).
+
+    Returns
+    -------
+    tuple of int
+        ``(ntheta, nphi)``.
     """
     ntheta = _good_size(lmax + 1) if ntheta is None else int(ntheta)
     nphi = _good_size(2 * lmax + 1) if nphi is None else int(nphi)
@@ -133,6 +147,7 @@ def grid_for(lmax, ntheta=None, nphi=None):
 
 
 def _thetas(ntheta):
+    """Fejer-1 colatitudes ``(2j + 1) pi / (2 ntheta)``."""
     return (2 * np.arange(ntheta) + 1) * np.pi / (2 * ntheta)
 
 
@@ -141,10 +156,10 @@ _GEO_KEYS = ("lane_ring", "valid", "lane_of_ring", "xs_hi", "xs_lo", "mlim", "he
 
 @lru_cache(maxsize=16)
 def _geometry(ntheta, L, spin):
-    """The lane layout ``_march_v2`` builds for HEALPix, for the Fejer-1 grid.
+    """March lane layout for the Fejer-1 grid (the same layout `march_v2` uses for HEALPix).
 
-    Returns ``(arrays, npad)``; ``arrays`` is a tuple in ``_GEO_KEYS`` order so it can cross a
-    ``jit`` boundary as a pytree of device arrays.
+    Returns ``(arrays, npad)``; ``arrays`` is a tuple in ``_GEO_KEYS`` order so it can cross
+    a ``jit`` boundary as a pytree of device arrays.
     """
     theta = _thetas(ntheta)
     nt = theta.shape[0]
@@ -185,6 +200,7 @@ def _geometry(ntheta, L, spin):
 
 
 def _geo(garr, npad, ntheta):
+    """Rebuild the geometry dictionary the march kernels expect."""
     g = dict(zip(_GEO_KEYS, garr))
     g["npad"] = npad
     g["ntheta"] = ntheta
@@ -193,12 +209,12 @@ def _geo(garr, npad, ntheta):
 
 @lru_cache(maxsize=8)
 def _tables(ntheta, L, spin):
-    """Every window's ``(man, ex0, tab)`` for this geometry, as resident device arrays.
+    """Every m-window's march starting tables ``(man, ex0, tab)``, cached on the device.
 
-    Same reason as ``_march_v2._build_tables``: built inside the transform's trace they are a few
-    hundred ms of ``gammaln`` and float64 cumsum *per call* on this 1/64-rate card, and under
-    ``ensure_compile_time_eval`` inside a trace they would become HLO constants.  They cross as
-    jit arguments instead (0.95 GiB at lmax 4095 spin 2).
+    Built once outside the transform and passed in as jit arguments (about 1 GiB at lmax
+    4095 spin 2).  Inside the trace they would be recomputed on every call (float64
+    ``gammaln`` and cumulative sums, slow on GPUs with reduced fp64 throughput), or be
+    embedded as compile-time constants.
     """
     garr, npad = _geometry(ntheta, L, spin)
     with jax.ensure_compile_time_eval():
@@ -211,15 +227,18 @@ def _tables(ntheta, L, spin):
 
 
 def drop_tables():
+    """Free the cached geometry and march tables."""
     _tables.cache_clear()
     _geometry.cache_clear()
 
 
 # --------------------------------------------------------------------------------------- march
 def _scale(L, spin):
-    """``sqrt((2l+1)/4pi) (-1)^m``: the closed form the march kernel expects (see
-    ``_march_v2._fold_synthesise`` / ``_inverse_impl``), times the ``(-1)^s`` of the s2fft
-    spin-harmonic convention (``healpix._finish_inverse_s2fft``)."""
+    """Per-(ell, m) factor ``(-1)^s sqrt((2l+1)/4pi) (-1)^m``.
+
+    The normalisation the march kernel expects, times the ``(-1)^s`` of the s2fft
+    spin-harmonic convention used throughout GMaster.
+    """
     norm = jnp.sqrt((2.0 * jnp.arange(L, dtype=jnp.float64) + 1.0) / (4.0 * jnp.pi))
     rowsign = 1.0 - 2.0 * (jnp.arange(L) % 2).astype(jnp.float64)
     return ((-1.0) ** abs(spin)) * norm[:, None] * rowsign[None, :]
@@ -332,22 +351,23 @@ def _march_ana_spin(Gp, Gm, garr, tabs, *, L, npad, ntheta, spin):
         cp.append(p)
         cm.append(q)
     sc = _scale(L, spin)
-    # The kernel's mirror accumulator is the transpose of its mirror synthesis channel only up to
-    # `(-1)^(ell + s)`: the synthesis writes `f_{-m}(pi - theta)` and the analysis reads the same
-    # ring back, and `d^l_{m,-s}(pi - theta) = (-1)^(l + s) d^l_{-m,-s}(theta)` sits between them
-    # (the same factor `_march_v2._forward_impl` applies).  Measured, not assumed -- see
-    # `test_march_is_transpose`.
+    # The kernel's mirror accumulator is the transpose of its mirror synthesis channel only
+    # up to `(-1)^(ell + s)`: synthesis writes `f_{-m}(pi - theta)`, analysis reads the same
+    # ring back, and `d^l_{m,-s}(pi - theta) = (-1)^(l + s) d^l_{-m,-s}(theta)` relates them.
+    # Verified by `test_march_is_transpose` in tests/test_nusht.py.
     esign = 1.0 - 2.0 * ((jnp.arange(L) + abs(spin)) % 2).astype(jnp.float64)
     return jnp.concatenate(cp, axis=1) * sc, jnp.concatenate(cm, axis=1) * sc * esign[:, None]
 
 
 # --------------------------------------------------------------- doubling + latitude FFT
 def _mode_signs(nphi, spin):
+    """``(-1)^(|m| + s)`` for the FFT-ordered azimuthal orders (parity of the doubling)."""
     m = np.fft.fftfreq(nphi, d=1.0 / nphi).astype(int)
     return jnp.asarray((-1.0) ** (np.abs(m) + abs(spin)))
 
 
 def _theta_phase(ntheta, conj=False):
+    """Half-cell phase shift: the Fejer-1 grid starts at theta = pi / (2 ntheta), not 0."""
     k = np.fft.fftfreq(2 * ntheta, d=1.0 / (2 * ntheta)).astype(int)
     h = np.pi / ntheta
     s = 1.0 if conj else -1.0
@@ -358,9 +378,9 @@ def _theta_phase(ntheta, conj=False):
 def _double_and_fft(F, *, ntheta, nphi, spin, cdtype, wdtype):
     """``(nphi, ntheta)`` ring spectrum -> ``(2 ntheta, nphi)`` torus Fourier coefficients.
 
-    ``wdtype`` is the working precision of the doubled stack, which is the largest array in the
-    transform (1.07 GiB at lmax 4095 in complex128).  complex64 there costs 3e-07 relative --
-    a decade under the march's own float32 noise -- and is 2.7x faster (2.7 ms against 7.1).
+    ``wdtype`` is the working precision of the doubled stack, the largest array in the
+    transform (~1 GiB at lmax 4095 in complex128).  complex64 adds ~3e-7 relative error,
+    ten times below the march's own float32 error, and is ~2.7x faster.
     """
     sgn = _mode_signs(nphi, spin)[:, None].astype(wdtype)
     F = F.astype(wdtype)
@@ -382,6 +402,20 @@ def _undouble_and_ifft(C, *, ntheta, nphi, spin, wdtype):
 
 # ---------------------------------------------------------------------------- alm packing
 def default_mstart(lmax, mmax=None):
+    """Offsets of each m in the standard (healpy) triangular alm packing.
+
+    Parameters
+    ----------
+    lmax : int
+        Maximum multipole.
+    mmax : int, optional
+        Maximum order; defaults to `lmax`.
+
+    Returns
+    -------
+    ndarray of uint64, shape (mmax + 1,)
+        ``mstart[m]`` such that ``a_lm`` is stored at ``mstart[m] + l``.
+    """
     mmax = lmax if mmax is None else mmax
     m = np.arange(mmax + 1)
     return (m * (2 * lmax + 1 - m) // 2).astype(np.uint64)
@@ -391,11 +425,11 @@ def default_mstart(lmax, mmax=None):
 def _alm_index(lmax, mmax, mstart_key, lstride, spin, nalm=0):
     """Index pair for the two directions of the ``mstart`` packing.
 
-    ``idx``/``ok`` are the ``(L, L)`` gather into the packed alm (unpacking).  ``back``/``bok``
-    are its *inverse* gather, ``(nalm,)`` into the flattened ``(L, L)`` block, used for packing.
-    Packing was a ``.at[idx].add`` scatter, which is the wrong shape entirely: the ``ell < m``
-    half of the block is masked to index 0, so half of ``L**2`` complex128 atomics land on one
-    address -- 26.8 ms of the 45 ms adjoint tail at lmax 4095, against 0.9 ms for this gather.
+    ``idx``/``ok`` are the ``(L, L)`` gather from the packed alm (unpacking).
+    ``back``/``bok`` are the inverse gather, ``(nalm,)`` into the flattened ``(L, L)`` block,
+    used for packing.  Packing is done as a gather rather than a scatter because a scatter
+    would send the masked ``ell < m`` half of the block to a single index, serialising
+    ~L^2 / 2 atomic additions on one address.
     """
     L = lmax + 1
     mstart = np.asarray(mstart_key, np.int64)
@@ -413,11 +447,13 @@ def _alm_index(lmax, mmax, mstart_key, lstride, spin, nalm=0):
 
 @partial(jax.jit, static_argnames=("L",))
 def _unpack(alm, idx, ok, *, L):
+    """Packed alm -> dense ``(L, L)`` block indexed ``[ell, m]``."""
     return jnp.where(ok, jnp.take(alm, idx, axis=0), 0.0 + 0.0j)
 
 
 @jax.jit
 def _pack(a2d, back, bok):
+    """Dense ``(L, L)`` block -> packed alm."""
     return jnp.where(bok, jnp.take(a2d.ravel(), back, axis=0), 0.0 + 0.0j)
 
 
@@ -442,6 +478,7 @@ class _NufftPlan:
                          cp.asarray(loc[:, 1].astype(rdtype)))
 
     def __call__(self, data):
+        """Execute the plan on `data` and return a JAX array."""
         # cufinufft runs on the CUDA default stream and jax on its own, and dlpack does not
         # insert the cross-stream event, so each hand-off is bracketed by an explicit sync.
         cp = _cupy()
@@ -454,6 +491,7 @@ class _NufftPlan:
 
 # --------------------------------------------------------------------------------- drivers
 def _prep(alm, spin, lmax, mmax, mstart, lstride):
+    """Validate the alm shape and build the packing indices."""
     alm = jnp.asarray(alm)
     if alm.ndim == 1:
         alm = alm[None, :]
@@ -472,22 +510,48 @@ def _prep(alm, spin, lmax, mmax, mstart, lstride):
 def synthesis_general(alm, *, spin, lmax, loc, epsilon=1e-6, mmax=None, mstart=None,
                       lstride=1, nthreads=None, upsampfac=1.25, single=False, fft_single=True,
                       ntheta=None, nphi=None, plan=None):
-    """Spin-weighted synthesis at arbitrary points on the sphere, on the GPU.
+    """Spin-weighted spherical-harmonic synthesis at arbitrary points on the sphere (GPU).
 
-    Signature and conventions follow ``ducc0.sht.experimental.synthesis_general``: ``alm`` is
-    ``(ncomp, nalm)`` in the ``mstart`` packing (``ncomp`` 1 for spin 0, 2 for spin != 0),
-    ``loc`` is ``(npoint, 2)`` with ``loc[:, 0] = theta``, ``loc[:, 1] = phi``, and the result is
-    ``(ncomp, npoint)`` real.  ``nthreads`` is accepted and ignored (GPU).
+    Signature and conventions follow ``ducc0.sht.experimental.synthesis_general``.
+    Accuracy is limited to ~1e-6 relative by the float32 latitudinal march.
 
-    ``upsampfac`` is the cufinufft upsampling factor (1.25 is both faster and, measured, as
-    accurate as 2.0 here).  ``epsilon`` 1e-6 is the knee: 1e-7 and 1e-8 buy no accuracy (the
-    march's float32 error is the binding constraint) and cost 20-30% of the NUFFT, while 1e-5
-    saves only ~6% -- the cost at upsampfac 1.25 is the spread/interp over the points, not the
-    kernel width -- and is already visible in eps_eff at lmax 1023 (6.2e-06 against 4.6e-06).
-    ``single=True`` runs the NUFFT itself in complex64, which is *not* recommended: it floors
-    eps_eff at ~1.5e-04.  ``fft_single`` sets the latitude FFT's working precision; complex64 is
-    the default because it is 2.5x faster there and measurably free (6.400e-06 against 6.392e-06
-    at lmax 4095).
+    Parameters
+    ----------
+    alm : array_like, shape (ncomp, nalm) or (nalm,)
+        Coefficients in the `mstart` packing; ``ncomp`` is 1 for spin 0 and 2 (E/B-like
+        gradient and curl components) otherwise.
+    spin : int
+        Spin of the field.
+    lmax : int
+        Band limit.
+    loc : array_like, shape (npoint, 2)
+        Colatitude ``loc[:, 0]`` and longitude ``loc[:, 1]`` of each point, in radians.
+    epsilon : float, optional
+        Requested NUFFT accuracy.  The default 1e-6 matches the march's accuracy;
+        smaller values cost 20-30% more NUFFT time without improving the result.
+    mmax : int, optional
+        Maximum order; defaults to `lmax`.
+    mstart : array_like, optional
+        Offset of each m in `alm`; defaults to `default_mstart`.
+    lstride : int, optional
+        Stride between consecutive ell in `alm`.
+    nthreads : int, optional
+        Accepted for ducc0 compatibility and ignored.
+    upsampfac : float, optional
+        cufinufft upsampling factor; 1.25 is faster than 2.0 and as accurate here.
+    single : bool, optional
+        Run the NUFFT in complex64.  Not recommended: it limits accuracy to ~1e-4.
+    fft_single : bool, optional
+        Run the latitude FFT in complex64 (default; ~2.5x faster at no measurable cost).
+    ntheta, nphi : int, optional
+        Override the intermediate grid (see `grid_for`).
+    plan : optional
+        A prebuilt type-2 NUFFT plan for the same points, to reuse across calls.
+
+    Returns
+    -------
+    jax.Array, shape (ncomp, npoint)
+        Real field values at the points.
     """
     L = int(lmax) + 1
     spin = int(spin)
@@ -512,6 +576,7 @@ def synthesis_general(alm, *, spin, lmax, loc, epsilon=1e-6, mmax=None, mstart=N
                                    "wdtype"))
 def _ftm_to_torus(alm, idx, ok, garr, tabs, *, npad, L, spin, ntheta, nphi, cdtype,
                   wdtype):
+    """alm -> ring spectrum F(m, theta) via the march -> torus Fourier coefficients."""
     if spin == 0:
         a = _unpack(alm[0], idx, ok, L=L)
         Fp = _march_syn_s0(a, garr, tabs, L=L, npad=npad, ntheta=ntheta)
@@ -533,8 +598,25 @@ def _ftm_to_torus(alm, idx, ok, garr, tabs, *, npad, L, spin, ntheta, nphi, cdty
 def adjoint_synthesis_general(map, *, spin, lmax, loc, epsilon=1e-6, mmax=None,
                               mstart=None, lstride=1, nthreads=None, upsampfac=1.25,
                               single=False, fft_single=True, ntheta=None, nphi=None, plan=None):
-    """Transpose of :func:`synthesis_general`; matches
-    ``ducc0.sht.experimental.adjoint_synthesis_general``."""
+    """Adjoint of `synthesis_general`: values at arbitrary points to alm (GPU).
+
+    Matches ``ducc0.sht.experimental.adjoint_synthesis_general``, i.e. computes
+    ``abar_lm = sum_p map_p conj(sY_lm(p))`` (no quadrature weights).
+
+    Parameters
+    ----------
+    map : array_like, shape (ncomp, npoint) or (npoint,)
+        Real values at the points (``ncomp`` 1 for spin 0, 2 otherwise).
+    spin, lmax, loc, epsilon, mmax, mstart, lstride, nthreads, upsampfac, single, fft_single, ntheta, nphi
+        As in `synthesis_general`.
+    plan : optional
+        A prebuilt type-1 NUFFT plan for the same points.
+
+    Returns
+    -------
+    jax.Array, shape (ncomp, nalm)
+        Coefficients in the `mstart` packing.
+    """
     L = int(lmax) + 1
     spin = int(spin)
     mp = jnp.asarray(map)
@@ -565,12 +647,13 @@ def adjoint_synthesis_general(map, *, spin, lmax, loc, epsilon=1e-6, mmax=None,
 
 @partial(jax.jit, static_argnames=("L", "spin", "ntheta", "nphi", "npad", "wdtype"))
 def _torus_to_alm(C, back, bok, garr, tabs, *, npad, L, spin, ntheta, nphi, wdtype):
+    """Torus Fourier coefficients -> ring spectrum -> alm via the march analysis kernel."""
     F = _undouble_and_ifft(C, ntheta=ntheta, nphi=nphi, spin=spin, wdtype=wdtype)
     rs = (1.0 - 2.0 * (jnp.arange(L) % 2))[None, :]
-    # ducc0's adjoint is the *analysis-shaped* adjoint -- `abar_lm = sum_p map_p conj(Y_lm)`, with
-    # the m < 0 half of the (hermitian) alm not counted a second time.  So only the m >= 0 rows of
-    # the ring spectrum feed the march for spin 0; for spin != 0 both helicities are needed,
-    # because `conj((-s)Y_lm) = (-1)^(s+m) (+s)Y_{l,-m}` ties the second component to the -m rows.
+    # The analysis-shaped adjoint `abar_lm = sum_p map_p conj(Y_lm)` does not count the m < 0
+    # half of the (Hermitian) alm a second time, so for spin 0 only the m >= 0 rows of the
+    # ring spectrum feed the march.  For spin != 0 both helicities are needed, because
+    # `conj((-s)Y_lm) = (-1)^(s+m) (+s)Y_{l,-m}` ties the second component to the -m rows.
     if spin == 0:
         a = _march_ana_s0(F[:L], garr, tabs, L=L, npad=npad, ntheta=ntheta)
         return _pack(a, back, bok)[None, :]

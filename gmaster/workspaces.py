@@ -1,4 +1,21 @@
-"""Pseudo-spectrum operations."""
+"""Curved-sky and flat-sky MASTER pseudo-C_ell machinery.
+
+This module mirrors ``pymaster.workspaces``. It provides
+
+* coupled pseudo-spectra of two fields (:func:`compute_coupled_cell`,
+  :func:`compute_coupled_cell_flat`);
+* mode-coupling matrices (MCMs) for any spin pair, including pure-E/B fields
+  (:class:`NmtWorkspace`, :func:`get_general_coupling_matrix`), built either by
+  the Wigner-3j recurrence or by Gauss-Legendre quadrature of Wigner-d
+  products, optionally with the Toeplitz approximation;
+* binning and decoupling of pseudo-spectra, and bandpower window functions;
+* full-estimator helpers (:func:`compute_full_master`,
+  :func:`deprojection_bias`).
+
+Spectra are ordered as in NaMaster: for fields of spins ``(s1, s2)`` there are
+``ncls = n1 * n2`` spectra (1, 2 or 4), and an unbinned MCM has shape
+``(ncls * (lmax+1), ncls * (lmax+1))`` with index ``l * ncls + c``.
+"""
 
 import os
 from functools import lru_cache, partial
@@ -14,20 +31,16 @@ from . import _config
 from . import _coupling_tt_cuda
 from .utils import alm2map, map2alm
 
-# Operand precision of the coupling-matrix builders.  The polarised quadrature is two
-# contractions of 115.9 GFLOP each at lmax 3071, and the float64 form runs at 1.76 TFLOP/s, i.e.
-# 94 % of this card's fp64 roofline, so float32 operands are 34.3x there
-# (`.qwen/tmp/coupling_prec_1024c_s29.log`) at a cost of rel 2.1e-06 of the matrix.  The scalar
-# builder `_coupling_matrix_tt` has no dot at all -- five table lookups and a few elementwise ops
-# over ~n^3/3 elements -- and is worth 7.5-9.4x for rel 1.9e-07
-# (`.qwen/tmp/ttknob_s30.log`), since only its per-term products are rounded.
-#
-# The default is "auto": float32 operands exactly where the v2 march serves the transforms
-# (the shipped default: every band limit with a CUDA build).  There the pipeline's own
-# accuracy is the march's float32-class 1e-6 and the coupling matrix's 2e-06 is inside it.
-# `GMASTER_MARCH_V2=0` keeps the exact transforms and this builder in float64, which is what
-# `tests/test_workspaces.py` pins to `atol=2e-14`.  `GMASTER_COUPLING_PRECISION=fp64|fp32`
-# (or :func:`set_coupling_precision`) forces one width at every size.
+# Operand precision of the coupling-matrix builders ("fp64", "fp32" or "auto").
+# The polarised quadrature is dominated by two large GEMMs that are fp64-bound on
+# the GPU; float32 operands make them ~30x faster at a relative matrix error of
+# ~2e-6. The scalar recurrence has no GEMM, and float32 per-term products give
+# ~8x at ~2e-7. "auto" (default) uses float32 exactly where the float32 transform
+# engine (`gmaster._sht.march_v2`, every band limit with a CUDA build) is active;
+# its own accuracy is ~1e-6, so the matrix error stays within the pipeline's.
+# With GMASTER_MARCH_V2=0 the transforms and this builder stay float64 (tested
+# to atol 2e-14). GMASTER_COUPLING_PRECISION or set_coupling_precision() forces a
+# single width at every size.
 _COUPLING_PRECISION = os.environ.get("GMASTER_COUPLING_PRECISION", "auto")
 
 
@@ -43,14 +56,21 @@ def _coupling_f32(lmax):
 def set_coupling_precision(name):
     """Choose the operand precision of the coupling-matrix builders.
 
-    Covers both the polarised quadrature (`_general_coupling_matrix_quadrature`, which sets the
-    operand width of its two large contractions) and the scalar build (`_coupling_matrix_tt`,
-    which rounds its lookup tables and per-term products while keeping the log-cumsum table and
-    the offset accumulator in float64).
+    Applies to the polarised quadrature (operand width of its two large
+    contractions) and to the scalar build (lookup tables and per-term products;
+    the log-cumsum table and the offset accumulator stay float64).
 
-    Must be called before the first coupling build: the flag is consulted while tracing, so an
-    already-compiled program keeps the precision it was traced with (``jax.clear_caches()`` after
-    the call if any coupling matrix has already been built in this process).
+    Parameters
+    ----------
+    name : {"fp64", "fp32", "auto"}
+        ``"auto"`` uses float32 where the float32 transform engine is active
+        and float64 otherwise.
+
+    Notes
+    -----
+    The flag is read at trace time, so already-compiled programs keep their
+    precision. Call this before the first coupling build, or call
+    ``jax.clear_caches()`` afterwards.
     """
     global _COUPLING_PRECISION
     if name not in ("fp64", "fp32", "auto"):
@@ -59,11 +79,13 @@ def set_coupling_precision(name):
 
 
 def coupling_precision():
+    """Return the current coupling-precision setting ("fp64", "fp32" or "auto")."""
     return _COUPLING_PRECISION
 
 
 @partial(jax.jit, static_argnames="lmax")
 def _compute_coupled_cell(alm1, alm2, ell, order, *, lmax):
+    """Cross-spectra of all component pairs from ``m >= 0`` alms (m > 0 counted twice)."""
     products = jnp.real(alm1[:, None, :] * jnp.conj(alm2[None, :, :]))
     products *= jnp.where(order == 0, 1, 2)
     products = products.reshape((-1, products.shape[-1]))
@@ -74,7 +96,21 @@ def _compute_coupled_cell(alm1, alm2, ell, order, *, lmax):
 
 
 def compute_coupled_cell(f1, f2):
-    """Compute coupled pseudo-C_ell spectra from two masked fields."""
+    """Compute the coupled pseudo-C_ell of two masked fields.
+
+    Parameters
+    ----------
+    f1, f2 : NmtField
+        Fields to correlate; they must share pixelization and alm layout.
+
+    Returns
+    -------
+    jax.Array
+        ``(n1 * n2, lmax + 1)`` array of coupled spectra, where ``n1, n2`` are
+        the numbers of field components and ``lmax`` the smaller of the two
+        fields' band limits. For an auto-correlation the field's noise-bias
+        offset ``Nf`` is subtracted from the diagonal spectra.
+    """
     if not f1.is_compatible(f2, strict=False):
         raise ValueError("You're trying to correlate incompatible fields")
     alm1 = f1.get_alms()
@@ -93,6 +129,7 @@ def compute_coupled_cell(f1, f2):
 def _compute_coupled_cell_flat(
     alm1, alm2, l0, lf, lx, ly, cuts, *, nx, ny
 ):
+    """Band-averaged flat-sky cross-power of all component pairs, with ell cuts."""
     ix = jnp.arange(nx)
     iy = jnp.arange(ny)
     kx = 2 * jnp.pi * jnp.where(2 * ix <= nx, ix, ix - nx) / lx
@@ -120,7 +157,23 @@ def _compute_coupled_cell_flat(
 def compute_coupled_cell_flat(
     f1, f2, b, ell_cut_x=(1.0, -1.0), ell_cut_y=(1.0, -1.0)
 ):
-    """Compute binned flat-sky pseudo-C_ell spectra."""
+    """Compute the binned coupled pseudo-C_ell of two flat-sky fields.
+
+    Parameters
+    ----------
+    f1, f2 : NmtFieldFlat
+        Fields to correlate; they must share resolution.
+    b : NmtBinFlat
+        Bandpowers to average into.
+    ell_cut_x, ell_cut_y : tuple of float, optional
+        ``(min, max)`` ranges of ``l_x`` and ``l_y`` to remove (no cut when
+        ``min > max``).
+
+    Returns
+    -------
+    jax.Array
+        ``(n1 * n2, n_bands)`` binned coupled spectra.
+    """
     if not isinstance(b, NmtBinFlat):
         raise TypeError("b must be an NmtBinFlat")
     if not f1.is_compatible(f2):
@@ -139,7 +192,7 @@ def compute_coupled_cell_flat(
     )
 
 
-# Offsets per block in the scalar MASTER matrix build; see `_coupling_matrix_tt`.
+# Offsets per scan step in the scalar recurrence; see `_coupling_matrix_tt_recurrence`.
 _OFFSET_CHUNK = 16
 
 
@@ -151,17 +204,12 @@ _BLOCK_MCM = os.environ.get("GMASTER_BLOCK_MCM", "1") != "0"
 
 @partial(jax.jit, static_argnames=("dtype", "lmax", "ncls", "slots", "signs"))
 def _assemble_mcm_program(blocks, *, dtype, lmax, ncls, slots, signs):
-    """Place the coupling blocks into the mode-coupling matrix in one program.
+    """Place the ``(lmax+1, lmax+1)`` blocks into the dense MCM in one program.
 
-    The chain of ``matrix.at[:, i, :, j].set(...)`` this replaces was up to eight host
-    dispatches, each copying the whole ``(lmax + 1, ncls, lmax + 1, ncls)`` array.  Traced
-    inside one program the same unrolled chain lowers to a single pass over the output,
-    which takes the `coupling` stage of the pipeline from 6 ms to 3 ms at Nside 32 spin 2
-    (``.qwen/tmp/pipe4_s29.log`` against ``.qwen/tmp/pipe_fix32_s29.log``) and from 2674 ms
-    to 2578 ms at Nside 2048 spin 2 (``.qwen/tmp/pipe2_s29.log`` against
-    ``.qwen/tmp/pipe_fix2048_s29.log``), where each update was copying a 9.7 GB matrix.
-    Values are bit-identical because every sign here is exactly ``+-1``: the agreement with
-    the reference is unchanged (rel ``dCl`` 1.09e-05 at 2048 spin 2 in both logs).
+    Tracing the chain of ``.at[:, i, :, j].set`` updates inside a single jit
+    lets XLA write the ``(lmax+1, ncls, lmax+1, ncls)`` output in one pass
+    instead of copying the whole matrix once per block. Signs are exactly
+    ``+-1``, so values are bit-identical to the unfused form.
     """
     matrix = jnp.zeros((lmax + 1, ncls, lmax + 1, ncls), dtype=dtype)
     for block, (row, column), sign in zip(blocks, slots, signs):
@@ -171,7 +219,7 @@ def _assemble_mcm_program(blocks, *, dtype, lmax, ncls, slots, signs):
 
 @partial(jax.jit, static_argnames=("signs",))
 def _mcm_row(pieces, *, signs):
-    """One row channel of the matrix: `(l1, l2, c2)` with the channel axis innermost."""
+    """One row channel of the MCM, shape ``(l1, l2, c2)`` with the channel axis innermost."""
     return jnp.stack([p * s for p, s in zip(pieces, signs)], axis=-1)
 
 
@@ -186,14 +234,15 @@ def _place_blocks(parts, *, ncls, slots, signs, index):
 
 
 class _BlockMCM:
-    """A polarised mode-coupling matrix held as its distinct `(lmax+1, lmax+1)` blocks.
+    """A polarised MCM held as its distinct ``(lmax+1, lmax+1)`` blocks.
 
-    For spin-2 fields the `(ncls (lmax+1))^2` matrix repeats two blocks (`M+`, `M-`, NaMaster
-    eq. 19-20; more with purification) in `ncls^2` slots with signs +-1.  The consumers need
-    three things -- the binned contraction `W @ M`, a matvec and the dense matrix on request --
-    and each is cheaper from the blocks: `W @ M` is one `(nbpw, L) @ (L, L)` GEMM per distinct
-    block instead of the `(ncls nbpw, ncls L) @ (ncls L, ncls L)` one (2.0 TFLOP at Nside 2048
-    spin 2, and an 18 GiB operand at 4096), and the dense matrix is never built on the device.
+    For spin-2 fields the ``(ncls (lmax+1))^2`` matrix repeats a few blocks
+    (``M+`` and ``M-``, Alonso et al. 2019 eqs. 19-20; more with purification)
+    in ``ncls^2`` slots with signs ``+-1``. Binning (``W @ M``), matvecs and
+    host export all work per distinct block, so the dense matrix (18 GiB at
+    Nside 4096 spin 2) is never built on the device, and ``W @ M`` costs one
+    ``(nbpw, L) @ (L, L)`` GEMM per block instead of one ``ncls^2`` times
+    larger.
     """
 
     def __init__(self, blocks, slots, signs, ncls):
@@ -211,6 +260,7 @@ class _BlockMCM:
         self.shape = (self.n, self.n)
 
     def _place(self, parts):
+        """Scatter per-block ``parts`` into a ``(rows, ncls, cols, ncls)`` array."""
         return _place_blocks(tuple(parts), ncls=self.ncls, slots=self.slots, signs=self.signs,
                              index=self.index)
 
@@ -227,10 +277,11 @@ class _BlockMCM:
         return out if dtype is None else out.astype(dtype)
 
     def dense_device(self):
+        """The ``(n, n)`` matrix on the device."""
         return self._place(self.blocks).reshape(self.shape)
 
     def matvec(self, v):
-        """`M @ v` for a flat `(n,)` vector in the `l * ncls + c` ordering."""
+        """``M @ v`` for a flat ``(n,)`` vector in ``l * ncls + c`` ordering."""
         v2 = v.reshape((self.lmax1, self.ncls))
         out = [jnp.zeros(self.lmax1, dtype=jnp.result_type(v.dtype, self.blocks[0].dtype))
                for _ in range(self.ncls)]
@@ -239,12 +290,12 @@ class _BlockMCM:
         return jnp.stack(out, axis=1).reshape(-1)
 
     def banded(self, weights, theory, beam, *, f32):
-        """`(one_sided, binned)` for `output = kron(weights, eye)`, `theory = kron(theory, eye)`.
+        """Binned products with ``kron(weights, I)`` on the left and ``kron(theory, I)`` on the right.
 
-        `one_sided = output @ M diag(beam)` and `binned = one_sided @ theory`, both per distinct
-        block: `(W M_u) diag(beam)` and then `@ T`, `(nbpw, L)` and `(nbpw, nbpw)` pieces placed
-        into the channel grid.  The dense `binned` product was 66 GFLOP of float64 at Nside 2048
-        spin 2 (`(1636, 24576) @ (24576, 1636)`); per block it is two 2-GFLOP ones.
+        Returns ``(one_sided, binned)`` with ``one_sided = W M diag(beam)``
+        (shape ``(nbpw ncls, n)``) and ``binned = one_sided T`` (shape
+        ``(nbpw ncls, nbpw ncls)``), computed per distinct block and then
+        placed into the channel grid. ``f32`` selects float32 GEMM operands.
         """
         if f32:
             parts = [jnp.matmul(weights.astype(jnp.float32), b.astype(jnp.float32),
@@ -260,24 +311,23 @@ class _BlockMCM:
 
 
 def _assemble_mcm(dtype, blocks, *, lmax, ncls, slots, signs):
-    """The dense mode-coupling matrix from its `(lmax+1, lmax+1)` blocks.
+    """Build the MCM from its ``(lmax+1, lmax+1)`` blocks.
 
-    Below `_MCM_PIECED_BYTES` this is the single program above.  Above it the one-program
-    form is a single XLA transpose fusion the size of the matrix, and at Nside 4096 spin 2
-    (`ncls = 4`, 18 GiB) that fusion could not be autotuned inside the pool even with the
-    ring tables evicted and 22.6 GiB in use (`.qwen/tmp/chain_s36l.log`: the autotuner
-    wants the output plus reference copies).  So the matrix is built one row channel at a
-    time -- each `(l1, l2, ncls)` piece is a transpose of `ncls` blocks, a quarter of the
-    matrix -- and the pieces are joined along the row-channel axis, whose innermost axis
-    already matches the output: a plain concatenate, not a transpose.  Values are unchanged.
+    Polarised matrices are returned as a :class:`_BlockMCM` unless
+    ``GMASTER_BLOCK_MCM=0``. Dense matrices up to ``_MCM_PIECED_BYTES`` are
+    built by one program. Larger ones are kept as row-channel pieces
+    (:class:`_RowPieces`): a single matrix-sized transpose fusion cannot be
+    autotuned within the GPU memory pool at Nside 4096 spin 2 (18 GiB), since
+    the autotuner needs extra copies of the output. Each ``(l1, l2, ncls)``
+    piece already has the output's innermost layout, so joining them is a
+    concatenation, not a transpose.
     """
     if ncls > 1 and _BLOCK_MCM:
         return _BlockMCM(tuple(b.astype(dtype) for b in blocks), slots, signs, ncls)
     n = ncls * (lmax + 1)
     if n * n * jnp.dtype(dtype).itemsize <= _MCM_PIECED_BYTES:
-        # `dtype` is passed by keyword: a static argument given *positionally* drops jax's C++
-        # fast path, and this call then costs 1.54 ms of host dispatch at Nside 128 spin 0 --
-        # a third of that pipeline's whole 4.09 ms enqueue (`.qwen/tmp/jitcount_s37.py`).
+        # Pass static arguments by keyword: a positional static argument drops
+        # JAX's C++ dispatch fast path and costs ~1.5 ms of host time per call.
         return _assemble_mcm_program(blocks, dtype=dtype, lmax=lmax, ncls=ncls, slots=slots,
                                      signs=signs)
     placed = {slot: (block, sign) for block, slot, sign in zip(blocks, slots, signs)}
@@ -292,15 +342,19 @@ def _assemble_mcm(dtype, blocks, *, lmax, ncls, slots, signs):
     return _RowPieces(rows)
 
 
-# Below this lmax the threej recurrence is cheap and the workspace tests pin it
-# to 2e-14.  At T4-sized maps the recurrence (CUDA or XLA scan) is ~n^3/3 serial
-# offset work and stayed at ~390 s warmed; Gauss-Legendre d^l_00 is P_l(x) and
-# the same GEMM the polarised path already uses.
+# Scalar MCMs with lmax below this use the exact Wigner-3j recurrence (tested to
+# 2e-14); at and above it, Gauss-Legendre quadrature of Legendre products
+# (d^l_00 = P_l), which reuses the GEMM form of the polarised path and avoids
+# the recurrence's O(n^3) serial offset work.
 _TT_QUADRATURE_LMAX = int(os.environ.get("GMASTER_TT_QUADRATURE_LMAX", "48"))
 
 
 def _coupling_matrix_tt(window_cls, *, lmax):
-    """Scalar MASTER matrix: threej recurrence at small lmax, quadrature above."""
+    """Scalar MCM: Wigner-3j recurrence below ``_TT_QUADRATURE_LMAX``, quadrature above.
+
+    ``window_cls`` is the mask power spectrum up to at least ``2 * lmax``; the
+    result is the ``(lmax+1, lmax+1)`` matrix ``M[l1, l2]``.
+    """
     lmax = int(lmax)
     if lmax >= _TT_QUADRATURE_LMAX:
         return _coupling_matrix_tt_quadrature(window_cls, lmax=lmax)
@@ -309,16 +363,16 @@ def _coupling_matrix_tt(window_cls, *, lmax):
 
 @partial(jax.jit, static_argnames=("lmax", "lmax_mask"))
 def _tt_quadrature_kernel(window_cls, weights, table, *, lmax, lmax_mask):
-    """MASTER TT matrix from the ``x >= 0`` half of the Gauss-Legendre nodes.
+    """Scalar MCM from the ``x >= 0`` half of the Gauss-Legendre nodes.
 
-    ``table`` holds ``P_l(x_i)``, ``l <= lmax_mask``, on the non-negative nodes.  Since
-    ``P_l(-x) = (-1)^l P_l(x)`` and the nodes are symmetric, the full-node sum
-    ``sum_i w_i P_l1 P_l2 C(x_i)`` equals ``sum_{x_i >= 0} w_i P_l1 P_l2 [C(x_i) + (-1)^(l1+l2) C(-x_i)]``
-    (the caller halves the ``x = 0`` weight), so even ``l1 + l2`` pairs contract against
-    ``C+ = C(x) + C(-x)`` and odd pairs against ``C-``, each over same-parity columns only:
-    three quarter-size GEMMs over half the nodes.  The previous form ran two full-node GEMMs
-    whose second (the ``(-1)^L``-signed window) is identical to the first for symmetric nodes.
-    Operand width follows :func:`set_coupling_precision`, like the polarised quadrature.
+    ``table`` holds ``P_l(x_i)`` for ``l <= lmax_mask`` on the non-negative
+    nodes. With ``C(x)`` the mask correlation function, the quadrature
+    ``sum_i w_i P_l1(x_i) P_l2(x_i) C(x_i)`` over symmetric nodes equals
+    ``sum_{x_i >= 0} w_i P_l1 P_l2 [C(x_i) + (-1)^(l1+l2) C(-x_i)]``, because
+    ``P_l(-x) = (-1)^l P_l(x)`` (the caller halves the ``x = 0`` weight). So
+    even-``l1 + l2`` pairs contract against ``C(x) + C(-x)`` and odd pairs
+    against ``C(x) - C(-x)``: three quarter-size GEMMs over half the nodes.
+    Operand width follows :func:`set_coupling_precision`.
     """
     mask_ell = jnp.arange(lmax_mask + 1)
     coefficients = (2 * mask_ell + 1) * window_cls[: lmax_mask + 1] / (4 * jnp.pi)
@@ -334,7 +388,7 @@ def _tt_quadrature_kernel(window_cls, weights, table, *, lmax, lmax_mask):
     def gram(left, weight, right):
         left = (left * weight[:, None]).T
         if use_f32:
-            # `HIGHEST` keeps the products off the tf32 units, as in the polarised quadrature.
+            # HIGHEST keeps float32 products off the TF32 tensor-core path.
             return jnp.matmul(
                 left.astype(jnp.float32), right.astype(jnp.float32),
                 precision=jax.lax.Precision.HIGHEST,
@@ -356,7 +410,11 @@ def _tt_quadrature_kernel(window_cls, weights, table, *, lmax, lmax_mask):
 
 
 def _coupling_matrix_tt_quadrature(window_cls, *, lmax):
-    """Gauss-Legendre TT matrix; matches the threej recurrence to ~1e-11 at lmax 31."""
+    """Scalar MCM by Gauss-Legendre quadrature (agrees with the recurrence to ~1e-11).
+
+    Uses enough nodes to integrate the product of two ``P_l`` (``l <= lmax``)
+    and the mask correlation function (``l <= 2 lmax``) exactly.
+    """
     lmax = int(lmax)
     lmax_mask = 2 * lmax
     order = (2 * lmax + lmax_mask) // 2 + 1
@@ -368,7 +426,7 @@ def _coupling_matrix_tt_quadrature(window_cls, *, lmax):
     window = jnp.asarray(window_cls, dtype=jnp.float64)
     window = jnp.pad(window, (0, max(0, lmax_mask + 1 - int(window.shape[0]))))
     window = window[: lmax_mask + 1]
-    # d^l_00 = P_l; the table is geometry only, so it shares the polarised tables' cache.
+    # d^l_00 = P_l. The table depends only on the nodes, so it shares the polarised tables' cache.
     table = _wigner_d_shared(jnp.arccos(jnp.asarray(nodes)), 0, 0, lmax_mask)
     return _tt_quadrature_kernel(
         window,
@@ -381,40 +439,26 @@ def _coupling_matrix_tt_quadrature(window_cls, *, lmax):
 
 @partial(jax.jit, static_argnames="lmax")
 def _coupling_matrix_tt_recurrence(window_cls, *, lmax):
-    """Exact scalar MASTER matrix using the threej_cosmo recurrence.
+    """Exact scalar MCM from the closed-form Wigner-3j sum (threej_cosmo).
 
-    Offsets are accumulated in blocks rather than one at a time.  A term with a
-    given offset vanishes unless ``offset <= min(l1, l2)``, so a shrinking
-    ``[o0:, o0:]`` slice visits ~n^3/3 elements.  That form is a Python loop of
-    distinct shapes, which XLA unrolls into one kernel per chunk: at lmax 3071
-    that is 192 compiles, and on a Colab T4 with ~12 GB host RAM the unrolled
-    graph thrashes (first call ~30 min, warmed ~13 min vs NaMaster ~3 min).
-    The body keeps a uniform ``(chunk, n, n)`` shape and a ``fori_loop``, so one
-    compile serves every chunk.  Invalid lanes (offset past ``lmax``, or
-    ``offset > min(l1, l2)``) are masked; kept entries match the shrinking form.
-    On a GPU the float32 arm is the CUDA kernel in ``_native/cuda/coupling_tt.cu``:
-    one launch, no ``(chunk, n, n)`` temps (those were ~576 MiB at lmax 3071
-    and minutes on a Colab T4).  The scan remains the CPU / no-nvcc fallback.
+    ``M[l1, l2]`` is a sum over an offset ``o`` of products of the tabulated
+    ratio ``g(p) = Gamma(p + 1/2) / (sqrt(pi) Gamma(p + 1))`` and the mask
+    power; a term contributes only when ``o <= min(l1, l2)``. Offsets are
+    processed ``_OFFSET_CHUNK`` at a time in a ``lax.scan`` with a uniform
+    ``(chunk, n, n)`` body, so a single compilation serves every step;
+    out-of-range lanes are masked. This costs O(n^3) elementwise work and no
+    GEMM, so the only speed lever is operand width: in the float32 arm the
+    lookup tables and terms are float32 (relative matrix error ~2e-7) while
+    the log-cumsum table and the accumulator stay float64.
 
-    Chunking was 3.0-3.6x over the per-offset loop at lmax 383/767/1535
-    (10.05 -> 3.23 ms at lmax 767), values agreeing to 1e-16.
-
-    The block body is five table lookups and a few elementwise ops over the
-    chunk, so it has no `dot` to move onto tensor units; its cost is the
-    elementwise pass itself, and the only lever on that is the operand width.
-    Under :func:`set_coupling_precision` ("fp32") the lookup tables and the term
-    are float32 while the log-cumsum table and the offset accumulator stay
-    float64, which is worth 9.42x at lmax 1535 (23.48 -> 2.49 ms) and 7.51x at
-    lmax 3071 (159.05 -> 21.19 ms) for rel 1.885e-07 of the matrix
-    (`.qwen/tmp/ttknob_s30.log`).  Chunk width is not a lever: 8 and 32 both
-    measured slower than the shipped 16 at lmax 1535 (27.03/27.42 ms,
-    `.qwen/tmp/tt1535_s30.log`).
+    On a GPU the float32 arm runs the CUDA kernel in
+    :mod:`gmaster._coupling_tt_cuda`, which avoids the ``(chunk, n, n)``
+    temporaries; the scan is the CPU / no-nvcc fallback.
     """
     use_f32 = _coupling_f32(lmax)
     element_dtype = jnp.float32 if use_f32 else window_cls.dtype
-    # The accumulator keeps float64 even in the float32 arm: a row of a block sums
-    # up to `lmax` terms, and rounding that partial in float32 would put the error
-    # in the sum rather than in the products.
+    # The accumulator stays float64 even in the float32 arm: each entry sums up to
+    # lmax terms, and float32 partial sums would add error beyond the per-term rounding.
     accumulator_dtype = jnp.float64 if use_f32 else window_cls.dtype
     table_dtype = jnp.float64 if use_f32 else window_cls.dtype
 
@@ -441,21 +485,16 @@ def _coupling_matrix_tt_recurrence(window_cls, *, lmax):
     row = multipoles[:, None]
     column = multipoles[None, :]
 
-    # The summand is symmetric in `(l1, l2)` and depends on them only through `min`, `max` and the
-    # difference, so an upper-triangle-only form exists in which three of the four per-element
-    # gathers become row/column broadcasts.  It was written and measured and is NOT shipped: at
-    # lmax 6143 it is 223 ms against 200 ms here and at lmax 12287 1895 ms against 1761 ms.  The
-    # pass is not gather-issue bound the way the operand count suggests -- `lower`/`upper` are
-    # hoisted out of the offset loop and XLA fuses the four lookups into one pass -- and the
-    # triangular form pays a transpose and a diagonal without removing any elements, because the
-    # discarded half is still inside the rectangle XLA evaluates.
+    # The summand depends on (l1, l2) only through min, max and their difference.
+    # An upper-triangle-only variant is not faster: XLA fuses the lookups into
+    # one pass over the full rectangle anyway, and the triangle adds a transpose.
     lower = jnp.minimum(row, column)
     upper = jnp.maximum(row, column)
     lane = jnp.arange(_OFFSET_CHUNK)[:, None, None]
 
     def add_chunk(matrix, chunk):
-        # Pad the last chunk to width 16 so every iteration has the same gather
-        # shape; indices past lmax are clamped for the lookup and then masked.
+        # The last chunk is padded to full width so every step has the same shape;
+        # offsets past lmax are clamped for the lookup and then masked out.
         offs = chunk * _OFFSET_CHUNK + lane
         in_range = offs <= last_offset
         offs_g = jnp.minimum(offs, last_offset)
@@ -507,7 +546,12 @@ def _toeplitz_exact_pairs(size, l_toeplitz, l_exact, dl_band):
 def _coupling_matrix_tt_toeplitz(
     window_cls, *, lmax, l_toeplitz, l_exact, dl_band
 ):
-    """Scalar MASTER matrix without evaluating entries Toeplitz will replace."""
+    """Scalar MCM under the Toeplitz approximation.
+
+    Evaluates exactly (by the Wigner-3j sum) only the entries that NaMaster's
+    Toeplitz fill reads (see :func:`_toeplitz_exact_pairs`), then fills the
+    rest with :func:`_apply_toeplitz`.
+    """
     size = lmax + 1
     rows, columns = _toeplitz_exact_pairs(
         size, l_toeplitz, l_exact, dl_band
@@ -548,12 +592,17 @@ def _coupling_matrix_tt_toeplitz(
 
 @lru_cache(maxsize=16)
 def _gauss_legendre(order):
+    """Cached Gauss-Legendre nodes (ascending) and weights on [-1, 1]."""
     return roots_legendre(order)
 
 
 @partial(jax.jit, static_argnames=("m", "n", "lmax"))
 def _wigner_d_table(beta, *, m, n, lmax):
-    """Return unnormalised d^ell_mn(beta) for all ell."""
+    """Wigner d^l_mn(beta) for ``l <= lmax``, shape ``(len(beta), lmax + 1)``.
+
+    Uses the Jacobi-polynomial three-term recurrence in ``l`` starting at
+    ``l = max(|m|, |n|)``; entries below that are zero.
+    """
     minimum = max(abs(m), abs(n))
     if minimum > lmax:
         return jnp.zeros((len(beta), lmax + 1), dtype=beta.dtype)
@@ -606,14 +655,11 @@ def _wigner_d_table(beta, *, m, n, lmax):
         )
         return (current, following), following
 
-    # The scan's stacked values are a second full table.  Ask for that room here, not
-    # at the start of the workspace: by this point the field transform is resident.
+    # The scan output is a second full table; free device memory for it now.
     _config.make_room(int(len(beta)) * int(lmax + 1) * 8 * 4)
-    # The recurrence is stacked instead of written column by column: a traced
-    # column index makes XLA copy the whole (nodes, ell) table on every degree.
-    # It is also launch-bound -- at lmax 768 with 1535 nodes each step is only
-    # ~1535 elements, so unrolling eight degrees per kernel is what actually
-    # buys the speedup (31.5 ms -> 4.0 ms for the three tables of one call).
+    # Stack the scan outputs rather than writing columns into the table: a
+    # traced column index would make XLA copy the whole table every step.
+    # Each step is small (one value per node), so unroll=8 amortises launches.
     _, rest = jax.lax.scan(
         advance, (previous, current), jnp.arange(2, lmax - minimum + 1),
         unroll=8,
@@ -633,6 +679,14 @@ def _general_coupling_matrix_quadrature(
     lmax,
     lmax_mask,
 ):
+    """Even- and odd-parity general coupling matrices by Gauss-Legendre quadrature.
+
+    With ``tables = (d^l1_{n1 n2}, d^l2_{-s1,-s2}, d^L_{s1-n1, s2-n2})`` on the
+    nodes, the mask correlation ``xi(x) = sum_L (2L+1)/(4 pi) C^mask_L d^L(x)``
+    gives ``M[l1, l2] = (2 l2 + 1)/2 sum_i w_i d^l1(x_i) xi(x_i) d^l2(x_i)``.
+    The parity split uses the ``(-1)^L``-signed mask correlation. Returns a
+    ``(2, lmax+1, lmax+1)`` array (even, odd).
+    """
     first, second, mask = tables
     mask_ell = jnp.arange(lmax_mask + 1)
     coefficients = (
@@ -646,8 +700,8 @@ def _general_coupling_matrix_quadrature(
 
     def integrate(correlation):
         if use_f32:
-            # `HIGHEST` keeps the products off the tf32 units: at DEFAULT the same call is another
-            # 1.7x faster and the matrix error grows from 2.1e-06 to 5.5e-04.
+            # HIGHEST keeps the products off the TF32 path: DEFAULT precision is
+            # faster but raises the matrix error from ~2e-6 to ~5e-4.
             left = first_l * (weights_l * correlation.astype(jnp.float32))
             return (
                 jnp.matmul(left, second_l, precision=jax.lax.Precision.HIGHEST)
@@ -670,32 +724,26 @@ def _general_coupling_matrix_quadrature(
 
 
 _WD_TRIPLE_CACHE = {}
-_config._ROOM_HOOKS.append(_WD_TRIPLE_CACHE.clear)   # 9 GiB of device tables at Nside 4096
-# The Wigner-d quadrature tables are kept between workspace builds while they are small against
-# the device pool.  A fixed 2 GiB threshold dropped them at every geometry that matters: at
-# Nside 2048 spin 2 the three `(12287, 12287)` float64 tables are 3.6 GiB, so every
-# `compute_coupling_matrix` rebuilt them through a 12287-step scan -- about 650 ms of the 709 ms
-# coupling stage, for tables that never change.  The threshold is now the larger of 2 GiB and a
-# tenth of the pool, so a 96 GiB card keeps them and a small one still evicts.
+_config._ROOM_HOOKS.append(_WD_TRIPLE_CACHE.clear)   # evictable: ~9 GiB at Nside 4096 spin 2
+# Wigner-d quadrature tables depend only on the geometry and are cached between
+# workspace builds; rebuilding them (a sequential scan over l) dominates the
+# polarised coupling stage (e.g. the 3.6 GiB of tables at Nside 2048 spin 2).
+# They are kept while their size is at most max(2 GiB, this fraction of the pool).
 _WD_CACHE_KEEP_FRACTION = float(os.environ.get("GMASTER_WD_CACHE_FRACTION", "0.10"))
 
 
-# The cache is also dropped when the free pool is no longer a comfortable multiple of it: at Nside
-# 4096 spin 2 the coupling stage asks for an 11 GiB block with the polarised field resident and
-# failed with 55 GiB in use of 71.2 GiB while these tables were kept.  Keeping them where there is
-# room is worth most of the stage: at Nside 2048 spin 2 rebuilding the three tables through their
-# 12287-step scan was ~600 ms of a 660 ms `compute_coupling_matrix`.
+# The cache is also dropped when free pool memory is less than this multiple of
+# its size, so later large allocations (e.g. at Nside 4096 spin 2) still fit.
 _WD_POOL_HEADROOM = float(os.environ.get("GMASTER_WD_POOL_HEADROOM", "4.0"))
 
 
 def _pool_limit_and_free():
-    """`(limit, free)` bytes of the device pool.
+    """``(limit, free)`` bytes of the device memory pool (``(0, None)`` if unknown).
 
-    A preallocated pool reports its limit; the non-preallocated `cuda_async` pool (the README's
-    invocation for large maps) reports 0, and a 0 here once sized the Wigner-table cache at its
-    2 GiB floor: the 3.6 GiB tables of Nside 2048 spin 2 were then rebuilt by every workspace --
-    ~40 ms of a 106 ms coupling stage.  Without a limit the driver's own numbers are used
-    (90 % of the device, and its free memory, which on a shared card is the conservative one).
+    A preallocated pool reports its limit. The non-preallocated ``cuda_async``
+    allocator reports 0; then the driver's numbers are used instead (90 % of
+    the device as the limit, and the driver's free memory, which is the
+    conservative figure on a shared GPU).
     """
     try:
         stats = jax.devices()[0].memory_stats() or {}
@@ -713,21 +761,22 @@ def _pool_limit_and_free():
 
 
 def _pool_is_tight(total):
+    """True when free pool memory is below ``_WD_POOL_HEADROOM * total``."""
     limit, free = _pool_limit_and_free()
     return bool(limit) and free is not None and free < _WD_POOL_HEADROOM * total
 
 
 def _wd_cache_keep_bytes():
+    """Largest Wigner-d cache size worth keeping between workspaces."""
     limit, _ = _pool_limit_and_free()
     return max(2 * 1024 ** 3, int(limit * _WD_CACHE_KEEP_FRACTION))
 
 
 def _drop_large_wigner_cache():
-    """Forget quadrature tables too large to keep between workspaces.
+    """Drop cached quadrature tables that are too large to keep between workspaces.
 
-    The cache pays off for repeated small workspaces; at Nside 4096 spin 2 it is 9 GiB of device
-    memory that outlived its workspace and pushed the next field's mask transform over the pool
-    (`.qwen/tmp/chain_s36u.log`, cuFFT plan allocation aborting the process).
+    Otherwise, at large Nside, the tables outlive their workspace and leave no
+    room for the next field's transforms.
     """
     total = sum(int(t.size) * int(t.dtype.itemsize) for t in _WD_TRIPLE_CACHE.values())
     if total and (total > _wd_cache_keep_bytes() or _pool_is_tight(total)):
@@ -735,19 +784,13 @@ def _drop_large_wigner_cache():
 
 
 def _wigner_d_shared(beta, m, n, order):
-    """``_wigner_d_table`` with the ``(-m, -n)`` redundancy folded away.
+    """Cached :func:`_wigner_d_table`, sharing ``(m, n)`` and ``(-m, -n)``.
 
-    ``d^l_{-m,-n}(beta) == d^l_{m,n}(beta)`` when ``m - n`` is even (checked
-    bit-for-bit against the builder); when ``m - n`` is odd the identity carries
-    a minus sign, so those tables are left alone rather than shared with the
-    wrong sign.  Even differences are exactly what the temperature and
-    polarised couplings ask for -- ``(0,2)``, ``(2,2)``, ``(0,0)``.  Each table
-    is a *sequential* scan over degree, which is what the polarised coupling
-    build spends its time on -- at lmax 95 it costs the same 5 ms as at lmax
-    767 -- so handing the same array back twice is a latency win, not just a
-    memory one.  The key carries the node count rather than the nodes: only
-    :func:`_general_coupling_matrix` asks for tables, and it always passes the
-    Gauss-Legendre nodes of that order.
+    ``d^l_{-m,-n} = (-1)^(m-n) d^l_{m,n}``, so the two are the same table when
+    ``m - n`` is even (the case for every pair the couplings use); odd
+    differences are not folded. The cache key uses the node count rather than
+    the nodes, which is valid because callers always pass the Gauss-Legendre
+    nodes of that count.
     """
     if (m - n) % 2 == 0 and (m < 0 or (m == 0 and n < 0)):
         m, n = -m, -n
@@ -763,7 +806,7 @@ def _wigner_d_shared(beta, m, n, order):
 
 
 def _wigner_d_triple(beta, *, s1, s2, n1, n2, lmax, lmax_mask):
-    """The three Wigner-d tables one quadrature call integrates against."""
+    """The three Wigner-d tables used by :func:`_general_coupling_matrix_quadrature`."""
     return (
         _wigner_d_shared(beta, n1, n2, lmax),
         _wigner_d_shared(beta, -s1, -s2, lmax),
@@ -771,16 +814,16 @@ def _wigner_d_triple(beta, *, s1, s2, n1, n2, lmax, lmax_mask):
     )
 
 
-# Above this many bytes of float64 Wigner-d tables the quadrature is summed over blocks of nodes
-# instead of holding the tables whole.  At Nside 8192 spin 2 the three tables are 38.6 GiB (the
-# mask one alone 49151^2 float64 = 18 GiB) on top of the resident field, and the build failed at
-# every attempt; Nside 4096 (9.7 GiB) keeps the cached whole-table path.
+# Above GMASTER_WD_STREAM_GIB of float64 Wigner-d tables, the quadrature is summed
+# over blocks of GMASTER_WD_STREAM_NODES nodes instead of holding whole tables.
+# The three tables are 38.6 GiB at Nside 8192 spin 2 (too large to fit next to
+# the field) and 9.7 GiB at Nside 4096, which keeps the cached whole-table path.
 _WD_STREAM_BYTES = int(float(os.environ.get("GMASTER_WD_STREAM_GIB", "16")) * 1024 ** 3)
 _WD_STREAM_NODES = int(os.environ.get("GMASTER_WD_STREAM_NODES", "4096"))
 
 
 def _folded(m, n):
-    """The `(m, n)` key `_wigner_d_shared` stores a table under."""
+    """The ``(m, n)`` key under which :func:`_wigner_d_shared` stores a table."""
     if (m - n) % 2 == 0 and (m < 0 or (m == 0 and n < 0)):
         return -m, -n
     return m, n
@@ -788,7 +831,7 @@ def _folded(m, n):
 
 @partial(jax.jit, static_argnames=("pairs", "lmax", "lmax_mask"), donate_argnames="acc")
 def _coupling_quadrature_block(acc, mask_cls, beta, weights, *, pairs, lmax, lmax_mask):
-    """`acc` plus one block of nodes' share of `_general_coupling_matrix_quadrature`."""
+    """Add one node block's contribution to the quadrature into ``acc`` (donated)."""
     built = {}
     tables = []
     for (m, n), order in zip(pairs, (lmax, lmax, lmax_mask)):
@@ -801,9 +844,10 @@ def _coupling_quadrature_block(acc, mask_cls, beta, weights, *, pairs, lmax, lma
 
 
 def _general_coupling_matrix_streamed(mask_cls, nodes, weights, *, pairs, lmax, lmax_mask):
-    """The quadrature as a sum over node blocks; only one block's tables are live.
+    """Quadrature summed over node blocks, so only one block's tables are live.
 
-    The last block is padded with weight-0 nodes at the equator, which add exactly zero.
+    The last block is padded with zero-weight nodes at the equator, which
+    contribute exactly zero.
     """
     block = _WD_STREAM_NODES
     total = -(-len(nodes) // block) * block
@@ -825,6 +869,11 @@ def _general_coupling_matrix_streamed(mask_cls, nodes, weights, *, pairs, lmax, 
 def _general_coupling_matrix(
     mask_cls, *, s1, s2, n1, n2, lmax, lmax_mask, tables=None
 ):
+    """Even/odd general coupling matrices, ``(2, lmax+1, lmax+1)``.
+
+    Uses enough Gauss-Legendre nodes to integrate the triple product exactly,
+    with cached whole tables or, above ``_WD_STREAM_BYTES``, node streaming.
+    """
     order = (2 * lmax + lmax_mask) // 2 + 1
     nodes, weights = _gauss_legendre(order)
     if tables is None and order * (2 * lmax + lmax_mask + 3) * 8 > _WD_STREAM_BYTES:
@@ -848,11 +897,11 @@ def _general_coupling_matrix(
 
 
 def _coupling_matrices_spin2(window_cls, *, lmax, need_te=True, need_ee=True):
-    """`(te, even, odd)` for spin-0/2 fields; blocks the channel layout does not use are None.
+    """``(te, even, odd)`` coupling blocks for spin-0/spin-2 fields.
 
-    Each is a full Gauss-Legendre quadrature (two O(lmax^2 N_q) GEMMs): a spin-2 x spin-2 workspace
-    never places `te` and a spin-0 x spin-2 one never places `even` / `odd`, and building them
-    anyway was a third of the spin-2 coupling stage (Nside 4096: ~600 ms).
+    ``te`` is the spin-0 x spin-2 block; ``even``/``odd`` are ``M+``/``M-`` of
+    spin-2 x spin-2. Blocks not requested (``need_te``/``need_ee``) are None,
+    since each is a full quadrature.
     """
     mixed = even = odd = None
     if need_te:
@@ -870,6 +919,15 @@ def _coupling_matrices_spin2(window_cls, *, lmax, need_te=True, need_ee=True):
 def _coupling_matrices_pure_quadrature(
     window_cls, nodes, weights, *, lmax
 ):
+    """Standard and pure-E/B spin-2 coupling blocks by Gauss-Legendre quadrature.
+
+    Purification brings in mask derivatives, i.e. mask correlations with spin
+    weights 1 and 2 (``c_mn`` / signed ``s_mn`` below) and ``l``-dependent
+    factors on the rows. Returns eight ``(lmax+1, lmax+1)`` blocks:
+    ``(standard_te, standard_even, standard_odd, pure_te, one_even, one_odd,
+    two_even, two_odd)``, where "one" / "two" are the blocks with one and two
+    purified fields.
+    """
     beta = jnp.arccos(nodes)
     mask_ell = jnp.arange(2 * lmax + 1)
     mask_first = jnp.sqrt(mask_ell * (mask_ell + 1))
@@ -984,6 +1042,7 @@ def _coupling_matrices_pure_quadrature(
 
 
 def _coupling_matrices_spin2_pure(window_cls, *, lmax):
+    """All eight blocks of :func:`_coupling_matrices_pure_quadrature`."""
     nodes, weights = _gauss_legendre(2 * lmax + 1)
     return _coupling_matrices_pure_quadrature(
         window_cls,
@@ -994,11 +1053,37 @@ def _coupling_matrices_spin2_pure(window_cls, *, lmax):
 
 
 def _coupling_matrices_pure(window_cls, *, lmax):
+    """The five purified blocks ``(te, one_even, one_odd, two_even, two_odd)``."""
     return _coupling_matrices_spin2_pure(window_cls, lmax=lmax)[3:]
 
 
 def get_general_coupling_matrix(pcl_mask, s1, s2, n1, n2, parity="all"):
-    """Return a general spin coupling matrix with optional parity selection."""
+    """Return a general mode-coupling matrix, as in ``pymaster``.
+
+    Computes
+
+        M[l, l'] = sum_l'' (2l' + 1)(2l'' + 1) / (4 pi) C_l'' P_{l+l'+l''}
+                   (l l' l''; n1 -s1 s1-n1) (l l' l''; n2 -s2 s2-n2)
+
+    with ``P_L = 1`` for ``parity="all"``, ``(1 + (-1)^L)/2`` for ``"even"``
+    and ``(1 - (-1)^L)/2`` for ``"odd"``.
+
+    Parameters
+    ----------
+    pcl_mask : array_like
+        1D mask (cross-)power spectrum ``C_l``; its length ``nl`` sets the
+        multipole range ``0 .. nl-1``.
+    s1, s2, n1, n2 : int
+        Spin indices in the formula above.
+    parity : {"all", "even", "odd", "both"}, optional
+        Parity selection. ``"both"`` returns the even and odd matrices stacked.
+
+    Returns
+    -------
+    jax.Array
+        ``(nl, nl)`` matrix, or ``(2, nl, nl)`` (even, odd) for ``"both"``.
+        Rows and columns below ``max(s1, s2, n1, n2)`` are zero.
+    """
     if parity not in ("all", "even", "odd", "both"):
         raise ValueError(
             '`parity` must be "all", "even", "odd", or "both".'
@@ -1029,6 +1114,7 @@ def get_general_coupling_matrix(pcl_mask, s1, s2, n1, n2, parity="all"):
 
 
 def _toeplitz_sanity(l_toeplitz, l_exact, dl_band, lmax, fields=()):
+    """Validate Toeplitz parameters as NaMaster does (no-op when ``l_toeplitz <= 0``)."""
     if l_toeplitz <= 0:
         return
     if any(field.pure_e or field.pure_b for field in fields):
@@ -1044,6 +1130,14 @@ def _toeplitz_sanity(l_toeplitz, l_exact, dl_band, lmax, fields=()):
 
 
 def _apply_toeplitz(matrix, l_toeplitz, l_exact, dl_band):
+    """Toeplitz approximation of a scalar MCM (Louis et al. 2020), as in NaMaster.
+
+    The correlation matrix ``R[l, l'] = M[l, l'] / sqrt(M[l, l] M[l', l'])`` is
+    taken as Toeplitz and read from column ``l_toeplitz``. Columns up to
+    ``l_exact``, the diagonal, and the ``dl_band`` sub-diagonals for columns
+    below ``l_toeplitz`` keep their exact values; the result is symmetrised
+    from its lower triangle. No-op when ``l_toeplitz <= 0``.
+    """
     if l_toeplitz <= 0:
         return matrix
     matrix = jnp.asarray(matrix)
@@ -1102,7 +1196,35 @@ def get_master_coefficients(
     l_exact=-1,
     dl_band=-1,
 ):
-    """Return the scalar, mixed-spin, and parity MASTER kernels."""
+    """Return the distinct MASTER coupling blocks for a spin pair.
+
+    Parameters
+    ----------
+    pcl_mask : array_like
+        Mask (cross-)power spectrum, ``(nl_mask,)`` or ``(n_masks, nl_mask)``.
+    lmax : int
+        Maximum multipole of the blocks.
+    spin1, spin2 : int
+        Field spins.
+    is_teb : bool, optional
+        Also build the blocks of a joint (spin-0, spin-s) T/E/B workspace.
+    pure_any : bool, optional
+        Include the pure-E/B blocks (spin 2 only).
+    l_toeplitz, l_exact, dl_band : int, optional
+        Toeplitz approximation parameters (disabled when ``l_toeplitz <= 0``).
+
+    Returns
+    -------
+    dict
+        ``"00"`` (spin-0 x spin-0), ``"0s"`` (spin-0 x spin-s), ``"pp"`` and
+        ``"mm"`` (the even ``M+`` and odd ``M-`` spin-s x spin-s blocks), each
+        None when not applicable. Blocks are divided by ``2 l' + 1``. The
+        ``"0s"`` / ``"pp"`` / ``"mm"`` entries carry a leading purification-
+        level axis (length 1 without purification; 2 or 3 with it), and a
+        mask axis before the last two when ``pcl_mask`` is 2D. Metadata keys
+        ``pure_any``, ``toeplitz``, ``spins``, ``lmax`` and ``lmax_mask`` are
+        also set.
+    """
     spin1, spin2, lmax = int(spin1), int(spin2), int(lmax)
     if is_teb and not (spin1 == 0 and spin2 != 0):
         raise ValueError("is_teb is only valid for spin1=0 and spin2!=0")
@@ -1231,6 +1353,14 @@ def _anisotropic_coupling_matrix(
     lmax,
     lmax_mask,
 ):
+    """Full MCM for fields with anisotropic (spin-weighted) mask components.
+
+    ``spectra`` holds the mask cross-spectra (``"00"``, ``"0e"``, ``"e0"``,
+    ``"ee"``, ...) between the isotropic and spin-``s`` mask components; each
+    enters a general coupling with the appropriate spin arguments and sign,
+    and the results are combined into the ``(ncls (lmax+1))^2`` matrix in
+    ``l * ncls + c`` ordering.
+    """
     def coupling(spectrum, s1, s2, n1=spin1, n2=spin2):
         return _general_coupling_matrix(
             spectrum,
@@ -1292,15 +1422,14 @@ def _anisotropic_coupling_matrix(
     return matrix.reshape((ncls * (lmax + 1), ncls * (lmax + 1)))
 
 
-# The two binning operators are a pure function of the binning scheme, and both are
-# assembled with eager indexed scatters — the slowest way to build an array in XLA (two
-# scatters cost ~1.2ms of host time, which is the whole coupling-matrix call at small
-# Nsides).  The key is the host-side copies of the band arrays, so it is exact content
-# equality and needs no device synchronisation.
+# The binning operators depend only on the binning scheme and are built with eager
+# scatters (~1 ms of host time), so they are cached. The key is built from the
+# host copies of the band arrays: exact content equality, no device sync.
 _binning_operator_cache: dict = {}
 
 
 def _binning_key(bins):
+    """Hashable key identifying a binning scheme by content."""
     return (
         bins.n_bands,
         bins.lmax,
@@ -1312,6 +1441,12 @@ def _binning_key(bins):
 
 
 def _binning_operators(bins):
+    """``(output, theory)`` binning operators, shapes ``(nb, L)`` and ``(L, nb)``.
+
+    ``output`` averages a spectrum into bandpowers with the bin weights and
+    ``f_ell`` factors; ``theory`` spreads bandpowers back over ``l`` divided
+    by ``f_ell``.
+    """
     key = _binning_key(bins)
     cached = _binning_operator_cache.get(key)
     if cached is not None:
@@ -1326,16 +1461,14 @@ def _binning_operators(bins):
     return cached
 
 
-# `_postprocess` expands both operators by eye(ncls) before touching them; the expansion
-# and the two projections below are six more eager dispatches (~0.5ms) whose only varying
-# input is the coupling matrix itself.
+# Cache of the operators expanded by kron(., eye(ncls)). These are dense (5.1 GiB
+# at Nside 8192 spin 2), so the cache is dropped whenever a transform needs room.
 _expanded_binning_cache: dict = {}
-# Dense `kron(op, eye(ncls))` pairs: 5.1 GiB at Nside 8192 spin 2, kept from one workspace into the
-# next field's transform, which then did not fit.  Dropped when a transform asks for room.
 _config._ROOM_HOOKS.append(_expanded_binning_cache.clear)
 
 
 def _expanded_binning_operators(bins, ncls):
+    """``(kron(output, I_ncls), kron(theory, I_ncls))``, cached."""
     key = _binning_key(bins) + (ncls,)
     cached = _expanded_binning_cache.get(key)
     if cached is not None:
@@ -1350,61 +1483,59 @@ def _expanded_binning_operators(bins, ncls):
 
 
 class _RowPieces(tuple):
-    """The mode-coupling matrix held as `ncls` row-channel pieces, never assembled on device.
+    """A dense MCM held as ``ncls`` row-channel pieces, never assembled on the device.
 
-    Piece `c1` is `(lmax + 1, lmax + 1, ncls)` with `piece[l1, l2, c2] = M[(l1, c1), (l2, c2)]`,
-    i.e. the rows of channel `c1` in the `l * ncls + c` ordering.  Above `_MCM_PIECED_BYTES` the
-    dense matrix is a single contiguous buffer the size of the whole set (18 GiB at Nside 4096
-    spin 2) that the allocator could not place next to the pieces themselves
-    (`.qwen/tmp/chain_s36p.log`: 19.3 GiB in use, a further 18 GiB refused with 52 GiB free), so
-    the consumers contract from the pieces and the dense form exists only on the host.
+    Piece ``c1`` has shape ``(lmax+1, lmax+1, ncls)`` with
+    ``piece[l1, l2, c2] = M[l1 * ncls + c1, l2 * ncls + c2]``. Used above
+    ``_MCM_PIECED_BYTES``, where a second contiguous matrix-sized buffer
+    (18 GiB at Nside 4096 spin 2) would not fit next to the pieces; consumers
+    contract piece by piece and the dense form exists only on the host.
     """
 
     @property
     def n(self):
+        """Matrix dimension ``ncls * (lmax + 1)``."""
         return self[0].shape[0] * len(self)
 
     def dense_host(self):
-        """The `(n, n)` float64 matrix as a numpy array (host memory)."""
+        """The ``(n, n)`` float64 matrix as a host numpy array."""
         n = self.n
         return np.concatenate([np.asarray(p)[:, None] for p in self], axis=1).reshape((n, n))
 
     def matvec(self, v):
-        """`M @ v` for a flat `(n,)` vector, returned flat in the same ordering."""
+        """``M @ v`` for a flat ``(n,)`` vector, returned flat in the same ordering."""
         lmax1 = self[0].shape[0]
         cols = [p.reshape((lmax1, self.n)) @ v for p in self]          # each (lmax + 1,)
         return jnp.stack(cols, axis=1).reshape(-1)
 
 
 def _mcm_dense(mcm):
-    """Host numpy copy of the matrix whichever form it is held in."""
+    """Host numpy copy of the MCM, whichever form it is held in."""
     return mcm.dense_host() if isinstance(mcm, (_RowPieces, _BlockMCM)) else np.asarray(mcm)
 
 
-# Contract `output @ mcm` in row chunks of the matrix above this size (`_left_contract`).
+# Above this size, `_left_contract` contracts `output @ mcm` in row chunks of the matrix.
 _LEFT_CONTRACT_CHUNK_BYTES = 4 * 1024 ** 3
 
 
 def _left_contract(output, mcm, *, f32=False):
-    """`output @ mcm`, in row chunks of `mcm` when the matrix is large.
+    """``output @ mcm``, contracted in row chunks of ``mcm`` when it is large.
 
-    XLA autotunes the GEMM with duplicate operand buffers; at Nside 4096 spin 2 the 18 GiB
-    matrix could not be duplicated inside the pool after the field, so the contraction ran out
-    of memory at the first sync after `compute_coupling_matrix` (`.qwen/tmp/chain_s36m2.log`).
-    `sum_k output[:, rows_k] @ mcm[rows_k, :]` over contiguous row blocks has the same value up
-    to summation order; below `_LEFT_CONTRACT_CHUNK_BYTES` the single GEMM is kept.
+    XLA autotunes a GEMM with duplicate operand buffers, which does not fit
+    for a matrix of tens of GiB. ``sum_k output[:, rows_k] @ mcm[rows_k, :]``
+    over contiguous row blocks is equal up to summation order. ``mcm`` may
+    also be a :class:`_RowPieces` tuple. ``f32`` selects float32 operands.
     """
     def dot(a, b):
         if not f32:
             return a @ b
-        # `HIGHEST` keeps the products off the tf32 units, as in the quadrature: the binned
-        # operator inherits the matrix's own ~2e-06, and tf32 would put 5e-04 there instead.
+        # HIGHEST keeps float32 products off the TF32 path (~2e-6 error rather than ~5e-4).
         return jnp.matmul(a.astype(jnp.float32), b.astype(jnp.float32),
                           precision=jax.lax.Precision.HIGHEST).astype(jnp.float64)
 
     if isinstance(mcm, tuple):
-        # Row-channel pieces (`_RowPieces`): rows `(l1, c1)` of the matrix are piece `c1`,
-        # and the matching columns of `output` are `c1::ncls`.
+        # Row-channel pieces: matrix rows (l1, c1) are piece c1; the matching
+        # columns of `output` are c1::ncls.
         ncls = len(mcm)
         lmax1 = mcm[0].shape[0]
         acc = dot(output[:, 0::ncls], mcm[0].reshape((lmax1, lmax1 * ncls)))
@@ -1414,14 +1545,13 @@ def _left_contract(output, mcm, *, f32=False):
     n = mcm.shape[0]
     if mcm.size * jnp.dtype(mcm.dtype).itemsize <= _LEFT_CONTRACT_CHUNK_BYTES:
         return dot(output, mcm)
-    # The chunk count is the smallest divisor of `n` at or above the byte target, so no row is
-    # padded: padding would copy the whole matrix, which is the allocation this avoids.
+    # Use the smallest divisor of n at or above the byte target as the chunk
+    # count, so no padding (i.e. no copy of the matrix) is needed.
     target = -(-(mcm.size * jnp.dtype(mcm.dtype).itemsize) // _LEFT_CONTRACT_CHUNK_BYTES)
     nchunk = next(k for k in range(target, n + 1) if n % k == 0)
     chunk = n // nchunk
-    # Static slices, not a `fori_loop`: XLA's copy insertion duplicates a jit parameter that
-    # enters a while loop, and for this operand that duplicate is the matrix itself
-    # (`.qwen/tmp/chain_s36n2.log`: a second 18 GiB request with the matrix already resident).
+    # Static slices rather than a fori_loop: XLA copies a jit parameter that
+    # enters a while loop, which here would duplicate the whole matrix.
     acc = dot(output[:, 0:chunk], mcm[0:chunk, :])
     for k in range(1, nchunk):
         acc = acc + dot(output[:, k * chunk:(k + 1) * chunk], mcm[k * chunk:(k + 1) * chunk, :])
@@ -1430,20 +1560,19 @@ def _left_contract(output, mcm, *, f32=False):
 
 @partial(jax.jit, static_argnames=("ncls", "norm_type", "lmax"))
 def _banded_operators(mcm, beam1, beam2, output, theory, wawb, *, ncls, norm_type, lmax):
-    """Bandpower operators from the mode-coupling matrix.
+    """Binned MCM and one-sided bandpower operator from a dense MCM.
 
-    `output @ mcm` is the largest contraction of the whole pipeline: at Nside 2048 spin 2 it is
-    `(1636, 24576) @ (24576, 24576)`, 2.0 TFLOP, and in float64 on this card (1.8 TFLOP/s) it was
-    **567 ms of the 661 ms coupling stage** while the matrices it contracts cost 58 ms
-    (`.qwen/tmp/cprof_coup_s37.py`).  Under the same `auto` rule as the matrix build it runs with
-    float32 operands and `Precision.HIGHEST`, which is the accuracy the matrix already carries.
+    Returns ``(mcm_binned, one_sided)`` with ``one_sided = B M diag(beam)``
+    and ``mcm_binned = one_sided T`` (or ``wawb * I`` for FKP normalisation),
+    where ``B`` and ``T`` are the expanded output/theory binning operators.
+    ``B M`` is the largest GEMM of the pipeline (2 TFLOP at Nside 2048
+    spin 2), so it follows the coupling precision setting: float32 operands
+    add no error beyond what the matrix already carries.
     """
     beam = jnp.repeat(beam1 * beam2, ncls)
-    # The beam scales columns of the mode-coupling matrix, and a column scaling commutes past a
-    # left matmul, so it is applied after the contraction instead of before it.  Written the other
-    # way XLA has to materialise `mcm * beam` before the dot: a second full copy of the largest
-    # tensor in the stage (18.0 GiB for the polarised matrix at Nside 4096, where the very next
-    # allocation is what fails -- `.qwen/tmp/s2_4096_s31.log`).
+    # The beam scales MCM columns, which commutes with the left product, so apply
+    # it after the contraction: scaling first would materialise a second copy of
+    # the matrix (18 GiB at Nside 4096 spin 2).
     one_sided = _left_contract(output, mcm, f32=_coupling_f32(lmax)) * beam[None, :]
     if norm_type:
         mcm_binned = wawb * jnp.eye(output.shape[0])
@@ -1453,11 +1582,43 @@ def _banded_operators(mcm, beam1, beam2, output, theory, wawb, *, ncls, norm_typ
 
 
 class NmtWorkspace:
-    """Curved-sky MASTER coupling matrix and bandpower operators."""
+    """Curved-sky MASTER workspace: mode-coupling matrix and bandpower operators.
+
+    Mirrors ``pymaster.NmtWorkspace``. A workspace holds the MCM of a pair of
+    fields (which depends only on their masks, spins, beams and purification
+    settings), its binned form, and the bandpower window functions, so that
+    coupled pseudo-spectra can be decoupled into bandpowers.
+
+    Parameters
+    ----------
+    fl1, fl2 : NmtField, optional
+        Fields whose masks define the coupling. If given with ``bins``, the
+        MCM is computed at construction (see :meth:`compute_coupling_matrix`).
+    bins : NmtBin, optional
+        Binning scheme.
+    is_teb : bool, optional
+        Build the joint 7x7 T/E/B coupling (``fl1`` spin 0, ``fl2`` spin s).
+    l_toeplitz, l_exact, dl_band : int, optional
+        Toeplitz approximation parameters; disabled when ``l_toeplitz <= 0``.
+    fname : str, optional
+        Read a saved workspace from this file instead of computing one.
+    normalization : {"MASTER", "FKP"}, optional
+        ``"MASTER"`` inverts the full binned MCM; ``"FKP"`` divides by the
+        mean product of the masks instead.
+
+    Attributes
+    ----------
+    mcm : jax.Array or internal block form
+        Unbinned MCM, ``(ncls (lmax+1), ncls (lmax+1))``.
+    mcm_binned : jax.Array
+        Binned MCM, ``(ncls nbands, ncls nbands)``.
+    bpws : jax.Array
+        Bandpower windows, ``(ncls nbands, ncls (lmax+1))``.
+    """
 
     @property
     def bpws(self):
-        """Bandpower windows `solve(mcm_binned, one_sided)`, formed on first use."""
+        """Bandpower windows ``solve(mcm_binned, one_sided)``, computed on first access."""
         if getattr(self, "_bpws", None) is None and getattr(self, "_one_sided", None) is not None:
             self._bpws = jnp.linalg.solve(self.mcm_binned, self._one_sided)
             self._one_sided = None
@@ -1497,10 +1658,12 @@ class NmtWorkspace:
 
     @classmethod
     def from_fields(cls, fl1, fl2, bins, **kwargs):
+        """Create a workspace and compute its MCM from two fields (see ``__init__``)."""
         return cls(fl1, fl2, bins, **kwargs)
 
     @classmethod
     def from_file(cls, fname):
+        """Create a workspace by reading it from ``fname``."""
         return cls(fname=fname)
 
     def compute_coupling_matrix(
@@ -1514,6 +1677,24 @@ class NmtWorkspace:
         dl_band=-1,
         normalization="MASTER",
     ):
+        """Compute the mode-coupling matrix and bandpower operators of two fields.
+
+        Parameters
+        ----------
+        fl1, fl2 : NmtField
+            Fields to correlate; they must share pixelization, and their band
+            limit must equal ``bins.lmax``.
+        bins : NmtBin
+            Binning scheme.
+        is_teb : bool, optional
+            Build the joint T/E/B coupling (7 spectra); requires ``fl1`` spin 0
+            and ``fl2`` of non-zero spin, and isotropic masks.
+        l_toeplitz, l_exact, dl_band : int, optional
+            Toeplitz approximation parameters (not allowed with purification);
+            disabled when ``l_toeplitz <= 0``.
+        normalization : {"MASTER", "FKP"}, optional
+            Normalisation of the binned coupling matrix.
+        """
         if not fl1.is_compatible(fl2, strict=False):
             raise ValueError("Fields have incompatible pixelizations")
         if fl1.ainfo.lmax != bins.lmax:
@@ -1558,27 +1739,21 @@ class NmtWorkspace:
         self.normalization = normalization
         self.norm_type = int(normalization == "FKP")
 
-        # The field transform's ring spectra are still live until its outputs are
-        # consumed.  Wait here so that ~26 GiB is back in the pool before the
-        # quadrature asks for its own table.  Nside 8192 spin 0 otherwise sits at
-        # 85.5 GiB and fails a further 34.3 GiB allocation.
-        # Mask-only fields (catalogs, covariance inputs) have no alms to wait for.
+        # Wait for the field transforms to finish so their temporaries (tens of
+        # GiB at Nside 8192) return to the pool before the quadrature tables are
+        # allocated. Mask-only fields (catalogs, covariance inputs) have no alms.
         for fl in (fl1,) if fl2 is fl1 else (fl1, fl2):
             if getattr(fl, "alm", None) is not None:
                 jax.block_until_ready(fl.alm)
             jax.block_until_ready(fl.get_mask_alms())
         alm1 = fl1.get_mask_alms()[None, :]
         alm2 = alm1 if fl2 is fl1 else fl2.get_mask_alms()[None, :]
-        # The stage needs room for the matrix twice over (its blocks and the assembled form) plus
-        # the quadrature's own temporaries; with a polarised field at Nside 4096 both ring-table
-        # sets (30 GiB) are still cached and the quadrature's Wigner-d transpose could not even be
-        # autotuned (`.qwen/tmp/chain_s36q.log`).  Evict them up front if the pool is short.
+        # Reserve room for the matrix twice (blocks and assembled form) plus the
+        # quadrature temporaries, evicting cached transform tables if needed.
         nside = getattr(fl1.minfo, "nside", None) or 0
-        # The mask transform is spin 0 whatever the field is, so its ring spectrum is
-        # `(ntheta, lmax_mask+1)` complex128 -- the `2 (lmax_mask+1)` width belongs to the
-        # polarised transform alone.  Asking for twice what the stage needs made `make_room`
-        # evict the march's window tables during a scalar Nside 4096 pipeline, and rebuilding
-        # them is 1.2 s a time.
+        # Ring-spectrum width is (lmax_mask+1) complex128 per ring for a scalar
+        # transform and twice that for a polarised one; over-reserving would
+        # needlessly evict the transform engine's cached tables.
         ring_width = 2 * (self.lmax_mask + 1) if self.spin1 or self.spin2 else self.lmax_mask + 1
         _config.make_room(2 * (self.ncls * (self.lmax + 1)) ** 2 * 8
                         + 6 * (4 * nside - 1) * ring_width * 16)
@@ -1664,6 +1839,11 @@ class NmtWorkspace:
             te_levels = (te, pure_te)
             even_levels = (even, even_one, even_two)
             odd_levels = (odd, odd_one, odd_two)
+        # Map distinct blocks to their (row channel, column channel) slots and
+        # signs. With purification, the block used for a slot depends on how
+        # many of the two fields are purified in that channel (0, 1 or 2). For
+        # spin x spin, M+ fills the diagonal (EE, EB, BE, BB) slots and M- the
+        # anti-diagonal ones; a TEB workspace puts TT, TE, TB first (offset 3).
         blocks = []
         slots = []
         signs = []
@@ -1787,6 +1967,7 @@ class NmtWorkspace:
         self._postprocess()
 
     def _postprocess(self):
+        """Recompute the binned MCM and bandpower operators after any change."""
         output, theory = _expanded_binning_operators(self.bins, self.ncls)
         if isinstance(self.mcm, _BlockMCM):
             weights, theory_raw = _binning_operators(self.bins)
@@ -1794,10 +1975,9 @@ class NmtWorkspace:
                                                 f32=_coupling_f32(self.lmax))
             self.mcm_binned = (self.wawb * jnp.eye(one_sided.shape[0]) if self.norm_type
                                else binned)
-            # The bandpower windows `solve(mcm_binned, one_sided)` are formed on first use
-            # (`bpws`): `decouple_cell` solves against the binned spectrum, as NaMaster does, and
-            # the eager solve was a float64 LU with `ncls (lmax+1)` right-hand sides -- 131 GFLOP,
-            # the largest cost of the coupling stage at Nside 2048 spin 2.
+            # Bandpower windows are formed lazily (see `bpws`): decoupling only
+            # needs `mcm_binned`, and the solve with ncls (lmax+1) right-hand
+            # sides is expensive at high resolution.
             self._one_sided, self._bpws = one_sided, None
             return
         self.mcm_binned, one_sided = _banded_operators(
@@ -1814,10 +1994,14 @@ class NmtWorkspace:
         self.bpws = jnp.linalg.solve(self.mcm_binned, one_sided)
 
     def get_coupling_matrix(self):
-        """The dense `(ncls (lmax+1), ncls (lmax+1))` matrix.
+        """Return the unbinned mode-coupling matrix.
 
-        Above `_MCM_PIECED_BYTES` the matrix is held as row-channel pieces on the device and
-        the dense form is returned as a host numpy array (18 GiB at Nside 4096 spin 2).
+        Returns
+        -------
+        jax.Array or numpy.ndarray
+            ``(ncls (lmax+1), ncls (lmax+1))`` matrix in ``l * ncls + c``
+            ordering. Matrices larger than ``_MCM_PIECED_BYTES`` are returned
+            as a host numpy array rather than a device array.
         """
         if isinstance(self.mcm, _RowPieces):
             return self.mcm.dense_host()
@@ -1828,6 +2012,14 @@ class NmtWorkspace:
         return self.mcm
 
     def update_coupling_matrix(self, new_matrix):
+        """Replace the unbinned MCM and recompute the binned operators.
+
+        Parameters
+        ----------
+        new_matrix : array_like
+            ``(ncls (lmax+1), ncls (lmax+1))`` matrix in the same ordering as
+            :meth:`get_coupling_matrix`.
+        """
         size = self.ncls * (self.lmax + 1)
         expected = (size, size)
         if np.shape(new_matrix) != expected:
@@ -1839,6 +2031,13 @@ class NmtWorkspace:
         self._postprocess()
 
     def update_beams(self, beam1, beam2):
+        """Replace the beams of both fields and recompute the binned operators.
+
+        Parameters
+        ----------
+        beam1, beam2 : array_like
+            Beam transfer functions of length ``lmax + 1``.
+        """
         if np.shape(beam1) != (self.lmax + 1,) or np.shape(beam2) != (
             self.lmax + 1,
         ):
@@ -1848,6 +2047,13 @@ class NmtWorkspace:
         self._postprocess()
 
     def update_bins(self, bins):
+        """Replace the binning scheme (same ``lmax``) and recompute the binned operators.
+
+        Parameters
+        ----------
+        bins : NmtBin
+            New binning scheme.
+        """
         if bins.lmax != self.lmax:
             raise ValueError(
                 "The new binning scheme has a different maximum multipole"
@@ -1857,6 +2063,19 @@ class NmtWorkspace:
         self._postprocess()
 
     def couple_cell(self, cl_in):
+        """Convolve theory power spectra with the MCM and beams.
+
+        Parameters
+        ----------
+        cl_in : array_like
+            ``(ncls, >= lmax + 1)`` full-sky power spectra.
+
+        Returns
+        -------
+        jax.Array
+            ``(ncls, lmax + 1)`` coupled spectra, the expectation value of
+            :func:`compute_coupled_cell` for these theory spectra.
+        """
         cl_in = jnp.asarray(cl_in)
         if (
             cl_in.ndim != 2
@@ -1876,6 +2095,22 @@ class NmtWorkspace:
         return coupled.reshape((self.lmax + 1, self.ncls)).T
 
     def decouple_cell(self, cl_in, cl_bias=None, cl_noise=None):
+        """Bin and decouple a coupled pseudo-spectrum into bandpowers.
+
+        Parameters
+        ----------
+        cl_in : array_like
+            ``(ncls, >= lmax + 1)`` coupled pseudo-spectra, e.g. from
+            :func:`compute_coupled_cell`.
+        cl_bias, cl_noise : array_like, optional
+            Coupled deprojection bias and noise bias of the same shape; both
+            are subtracted before decoupling.
+
+        Returns
+        -------
+        jax.Array
+            ``(ncls, nbands)`` decoupled bandpowers.
+        """
         cl_in = jnp.asarray(cl_in)
         expected = (self.ncls, self.lmax + 1)
         if (
@@ -1903,11 +2138,26 @@ class NmtWorkspace:
         return decoupled.reshape((self.nbands, self.ncls)).T
 
     def get_bandpower_windows(self):
+        """Return the bandpower window functions.
+
+        Returns
+        -------
+        jax.Array
+            ``(ncls, nbands, ncls, lmax + 1)`` array ``W`` such that the
+            expected bandpowers are ``sum_{c', l} W[c, b, c', l] C_{c'}(l)``.
+        """
         return self.bpws.reshape(
             (self.nbands, self.ncls, self.lmax + 1, self.ncls)
         ).transpose((1, 0, 3, 2))
 
     def read_from(self, fname):
+        """Read a workspace from a NaMaster-compatible FITS file.
+
+        Parameters
+        ----------
+        fname : str
+            Path to the file.
+        """
         import fitsio
 
         with fitsio.FITS(fname) as fits:
@@ -1950,6 +2200,13 @@ class NmtWorkspace:
         self._postprocess()
 
     def write_to(self, fname):
+        """Write the workspace to a NaMaster-compatible FITS file.
+
+        Parameters
+        ----------
+        fname : str
+            Output path; an existing file is overwritten.
+        """
         import fitsio
 
         header = {
@@ -1990,6 +2247,7 @@ class NmtWorkspace:
 
 
 def _filter_alms(alms, spectra, ell):
+    """Multiply each alm component by ``spectra[in, out][l]`` and sum over inputs."""
     return jnp.stack(
         [
             sum(alms[index] * spectra[index, output][ell] for index in range(len(alms)))
@@ -1999,7 +2257,26 @@ def _filter_alms(alms, spectra, ell):
 
 
 def deprojection_bias(f1, f2, cl_guess, n_iter=None):
-    """Compute the contaminant-deprojection pseudo-spectrum bias."""
+    """Compute the bias to the coupled pseudo-spectrum from template deprojection.
+
+    Parameters
+    ----------
+    f1, f2 : NmtField
+        Fields to correlate; they must share pixelization and must not be
+        lightweight (the templates are needed).
+    cl_guess : array_like
+        ``(n1 * n2, lmax + 1)`` best-guess full-sky power spectrum of the
+        signal, used to model the deprojection bias.
+    n_iter : int, optional
+        Iterations of the spherical-harmonic analysis (defaults to the
+        field's ``n_iter``).
+
+    Returns
+    -------
+    jax.Array
+        ``(n1 * n2, lmax + 1)`` coupled deprojection bias, to be passed as
+        ``cl_bias`` to :meth:`NmtWorkspace.decouple_cell`.
+    """
     if not f1.is_compatible(f2):
         raise ValueError("Fields have incompatible pixelizations")
     expected = (f1.nmaps * f2.nmaps, f1.ainfo.lmax + 1)
@@ -2101,7 +2378,24 @@ def deprojection_bias(f1, f2, cl_guess, n_iter=None):
 
 
 def uncorr_noise_deprojection_bias(f1, map_var, n_iter=None):
-    """Bias from deprojecting templates in uncorrelated inhomogeneous noise."""
+    """Deprojection bias for uncorrelated, inhomogeneous noise.
+
+    Parameters
+    ----------
+    f1 : NmtField
+        Field with templates (not lightweight).
+    map_var : array_like
+        Per-pixel noise variance map.
+    n_iter : int, optional
+        Iterations of the spherical-harmonic analysis (defaults to the
+        field's ``n_iter``).
+
+    Returns
+    -------
+    jax.Array
+        ``(n1 * n1, lmax + 1)`` coupled bias of the auto-spectrum of ``f1``
+        (zero if it has no templates).
+    """
     if f1.lite:
         raise ValueError("Can't compute deprojection bias for lightweight fields")
     variance = jnp.asarray(map_var).reshape(-1)
@@ -2163,7 +2457,34 @@ def compute_full_master(
     dl_band=-1,
     normalization="MASTER",
 ):
-    """Compute coupled spectra, subtract biases, and decouple bandpowers."""
+    """Run the full MASTER estimator for two fields.
+
+    Computes the coupled pseudo-spectrum, subtracts the deprojection bias
+    (from ``cl_guess``) and the noise bias, and decouples into bandpowers.
+
+    Parameters
+    ----------
+    f1, f2 : NmtField
+        Fields to correlate.
+    b : NmtBin, optional
+        Binning scheme; required if ``workspace`` is not given.
+    cl_noise : array_like, optional
+        ``(n1 * n2, lmax + 1)`` coupled noise bias.
+    cl_guess : array_like, optional
+        ``(n1 * n2, lmax + 1)`` best-guess signal spectrum for the
+        deprojection bias.
+    workspace : NmtWorkspace, optional
+        Precomputed workspace; if None one is built from ``f1``, ``f2``, ``b``.
+    l_toeplitz, l_exact, dl_band : int, optional
+        Toeplitz approximation parameters used when building the workspace.
+    normalization : {"MASTER", "FKP"}, optional
+        Normalisation used when building the workspace.
+
+    Returns
+    -------
+    jax.Array
+        ``(n1 * n2, nbands)`` decoupled bandpowers.
+    """
     if b is None and workspace is None:
         raise SyntaxError("Must supply either workspace or bins")
     if not f1.is_compatible(f2, strict=False):

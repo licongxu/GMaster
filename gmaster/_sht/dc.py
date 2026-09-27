@@ -1,4 +1,11 @@
-"""Sub-cubic spin-0 latitudinal transform: divide-and-conquer eigenbasis + 1-D FMM (CUDA).
+"""Divide-and-conquer latitudinal engine: O(L^2 log L) Legendre / Wigner-d transforms on CUDA.
+
+A sub-cubic alternative to the Wigner-d march of :mod:`gmaster._sht.march_v2` for spin 0 and
+spin s.  The plan depends only on the geometry; it is built once on the host
+(``gmaster/_native/cpu/dc_plan.cpp``, OpenMP), cached on disk in `GMASTER_CUDA_CACHE` (default
+``~/.cache/gmaster``), and kept on the device; the apply kernels live in
+``gmaster/_native/cuda/dc_lat.cu``.  The march delegates here for ``L`` in
+``[GMASTER_DC_MIN_L, GMASTER_DC_MAX_L]`` (see :func:`enabled`).
 
 For order ``m`` and parity ``p`` the orthonormal Legendre functions of that parity,
 ``phi_k(y) = psi_{m+p+2k}(sqrt y)`` with ``y = cos^2 theta`` and ``psi = sqrt(2 pi) lambda_lm``
@@ -9,17 +16,17 @@ ring ``y_r`` into
 
     f(y_r) = sum_k c_k phi_k(y_r) = E_{n-1} phi_n(y_r) sum_j V[n-1, j] (V^T c)_j / (y_r - y_j).
 
-``V^T`` is applied through Cuppen's divide-and-conquer tree of ``T`` (Gu & Eisenstat's stable form):
-16 x 16 leaves (eigenvectors rebuilt on the fly from stored eigenvalues), then one Cauchy-like rank-one-update merge per level, each a 1-D Cauchy sum
-``sum_i q_i / (lam_j - d_i)`` done directly for small nodes and by a 1-D FMM for large ones; the
-final sum over ``j`` is another 1-D FMM from the Gauss nodes to the rings.  Every step costs
-``O(n)`` or ``O(n log n)`` for an ``n``-term order, so a transform is ``O(L^2 log L)`` against the
-march's ``O(L^2 N_ring) = O(L^3)``.  Analysis is the exact adjoint (same plan, transposed kernels).
+``V^T`` is applied through Cuppen's divide-and-conquer tree of ``T`` in Gu & Eisenstat's stable
+form: 16 x 16 leaves (eigenvectors rebuilt on the fly from stored eigenvalues), then one rank-one
+update merge per level, each a 1-D Cauchy sum ``sum_i q_i / (lam_j - d_i)`` evaluated directly for
+small nodes and by a 1-D FMM for large ones.  The final sum over ``j`` is another 1-D FMM from the
+Gauss nodes to the rings.  Every step is ``O(n)`` or ``O(n log n)`` for an ``n``-term order, so a
+transform is ``O(L^2 log L)`` against the march's ``O(L^2 N_ring) = O(L^3)``.  Analysis is the
+exact adjoint (same plan, transposed kernels).  Spin s uses the same machinery on the Jacobi
+recurrence of ``d^l_{m,-s}``.
 
-The plan depends on the geometry only (``L`` and the ring colatitudes) and is built once on the
-host (``_native/cpu/dc_plan.cpp``), cached on disk, and kept on the device.  Contract of the two public
-calls is the folded march's (``_march_v2.forward/inverse_latitudinal_positive``), so the router
-can swap engines per geometry.
+The public calls share the march's contracts (``march_v2.forward/inverse_latitudinal_positive``
+and the spin-2 ``forward/inverse_latitudinal``), so the router can swap engines per geometry.
 """
 from __future__ import annotations
 
@@ -40,14 +47,14 @@ _NATIVE = os.path.join(os.path.dirname(_HERE), "_native")
 _CU = os.path.join(_NATIVE, "cuda", "dc_lat.cu")
 _CC = os.path.join(_NATIVE, "cpu", "dc_plan.cpp")
 _CACHE = os.environ.get("GMASTER_CUDA_CACHE", os.path.join(os.path.expanduser("~"), ".cache", "gmaster"))
-# Below this bandlimit the march is at least as fast: at L 3072 this route is 0.98x (synthesis) / 0.91x
-# (analysis) of it, at 6144 1.77x / 1.66x (`.qwen/tmp/s38/dc_vs_march.py`, GPU0).
+# Below this band limit the march is at least as fast: at L = 3072 this engine runs at 0.98x
+# (synthesis) / 0.91x (analysis) the march's speed, at L = 6144 at 1.77x / 1.66x.
 _MIN_L = int(os.environ.get("GMASTER_DC_MIN_L", "6144"))
-# Above this the plan (O(L^2 log L): ~12-13 GiB per spin at L 12288, ~4.5x that at L 24576) and its
-# host build (~L^3: ~3.5 h per spin at Nside 8192 on 8 threads) are not worth building by default;
-# the march serves larger maps.
+# Above this band limit the plan (O(L^2 log L) device memory: ~12-13 GiB per spin at L = 12288,
+# ~4.5x that at L = 24576) and its host build (~L^3: ~3.5 h per spin at Nside 8192 on 8 threads)
+# are not built by default; the march serves larger maps.
 _MAX_L = int(os.environ.get("GMASTER_DC_MAX_L", "12288"))
-# The plan builder runs on the host; keep it small on shared machines.
+# Host threads for the plan builder; keep this small on shared machines.
 _THREADS = int(os.environ.get("GMASTER_DC_THREADS", "8"))
 _DIRECT_MAX = int(os.environ.get("GMASTER_DC_DIRECT_MAX", "256"))
 _DIRECT_THREADS = 128        # merge_direct's block size: a direct node carries <= this many deflations
@@ -125,11 +132,11 @@ def _build():
 
 
 def enabled(L=None) -> bool:
-    """True when this route serves latitudinal transforms at bandlimit ``L``.
+    """True when this engine serves latitudinal transforms at band limit ``L``.
 
-    ``set_latitudinal_method("march")`` refuses it. ``"dc"`` serves every bandlimit up to
-    ``_MAX_L``, including below the auto window. ``"auto"`` keeps ``[_MIN_L, _MAX_L]`` and
-    honours ``GMASTER_DC=0``.
+    ``set_latitudinal_method("march")`` disables it; ``"dc"`` serves every band limit up to
+    ``GMASTER_DC_MAX_L``; ``"auto"`` serves ``[GMASTER_DC_MIN_L, GMASTER_DC_MAX_L]`` unless
+    ``GMASTER_DC=0``.  Also requires the CUDA library and plan builder to compile.
     """
     from .._config import nmt_params
 
@@ -147,6 +154,7 @@ def enabled(L=None) -> bool:
 
 
 def _ring_x(L, nside, spin=0):
+    """``cos theta`` of the rings the plan is built for."""
     from .healpix import _stable_thetas
 
     theta = np.asarray(_stable_thetas(L, nside), dtype=np.float64)
@@ -155,7 +163,11 @@ def _ring_x(L, nside, spin=0):
 
 
 def _host_plan(L, nside, spin=0):
-    """The packed plan as numpy arrays, from the disk cache or built on the host."""
+    """The packed plan as numpy arrays, from the disk cache or built on the host.
+
+    Cached as ``dcplan_L{L}_n{nside}_s{spin}_{key}.npz``, keyed by the builder source, the ring
+    colatitudes and the plan parameters.
+    """
     lib, plan, tag = _build()
     x = _ring_x(L, nside, spin)
     key = _digest(tag, hashlib.sha1(x.tobytes()).hexdigest(), str((_DIRECT_MAX, _DIRECT_THREADS, _CD_SKIP, spin)))
@@ -187,6 +199,8 @@ def _host_plan(L, nside, spin=0):
 
 
 class _Plan:
+    """Device-resident plan for one ``(L, nside, spin)`` plus the packing index arrays."""
+
     def __init__(self, L, nside, spin=0):
         h = _host_plan(L, nside, spin)
         self.L, self.nside, self.spin = L, nside, spin
@@ -323,9 +337,12 @@ def _hemispheres(ring, L, nside):
 
 
 def _ring_phase(phase, L):
-    """``exp(i m phase_r)`` as complex64: the angle is reduced mod 2 pi in float64 (``m phase`` reaches
-    ~4e4 rad, which float32 would carry to 1e-3), the sincos is float32.  The card's float64 rate is
-    1/64 of float32, so a float64 ``exp`` over the ``(4 nside - 1, L)`` block was most of a pass."""
+    """``exp(i m phase_r)`` as complex64, shape ``(nring, L)``.
+
+    The angle is reduced mod 2 pi in float64 (``m phase`` reaches ~4e4 rad, which float32 would
+    carry only to 1e-3); the sincos itself is float32, because a float64 ``exp`` over the whole
+    block is expensive on GPUs with reduced float64 throughput.
+    """
     ang = jnp.mod(jnp.arange(L, dtype=jnp.float64)[None, :] * phase[:, None], 2 * jnp.pi)
     ang = ang.astype(jnp.float32)
     return jax.lax.complex(jnp.cos(ang), jnp.sin(ang))
@@ -385,9 +402,9 @@ def forward_latitudinal_positive_pair(positive_a, positive_b, weights, phase, *,
 
 # ------------------------------------------------------------------------ packed-state interface
 # The MASTER refinement loop can keep its alm state in this engine's packed layout (problem
-# t = 2m + p, ell = m + p + 2k) for all of its iterations and convert once at the end: going
-# through the (L, L) complex128 block on every pass was ~45 ms of XLA gathers, pads and casts per
-# field at Nside 2048.  Packed values are alm (Condon-Shortley), i.e. already scaled by `fac`.
+# t = 2m + p, ell = m + p + 2k) for all of its iterations and convert once at the end, avoiding
+# gathers, pads and casts through the (L, L) complex128 block on every pass.  Packed values are
+# alm (Condon-Shortley), i.e. already scaled by `fac`.
 
 @partial(jax.jit, static_argnames=("L", "nside", "static"))
 def _forward_packed_impl(positives, weights, phase, args, fac, *, L, nside, static):
@@ -431,7 +448,7 @@ def packed_to_alm(coef, ell, order, *, L, nside):
 
 
 # ------------------------------------------------------------------------------------- spin s
-# The march's spin-2 contract (`_march_v2.forward_latitudinal` / `inverse_latitudinal`): ring spectra
+# The march's spin-2 contract (`march_v2.forward_latitudinal` / `inverse_latitudinal`): ring spectra
 # `(ntheta, 2L)` with column `L + m` holding order `m`, and `flm[ell, L - 1 + m]`.  Orders m >= 0 use
 # plan row m directly; order -m uses the same row on the ring-reversed data with the sign
 # (-1)^(ell + s), since d^l_{-m,-s}(theta) = (-1)^(l+s) d^l_{m,-s}(pi - theta).  Both channels go
@@ -559,26 +576,28 @@ def _tree_finish_spin_impl(w, args, inv, fac, msign, *, L, static):
 
 
 def cd_forward_spin(ftm, *, L, spin, nside):
+    """``(ntheta, 2L)`` ring spectrum -> node-space w, ``(ntot, 2)`` (direct, mirror)."""
     pl = plan_for(L, nside, spin)
     return _cd_forward_spin_impl(ftm, pl.args, L=int(L), static=pl.static())
 
 
 def cd_inverse_spin(w, *, L, spin, nside):
+    """Node-space w -> ``(ntheta, 2L)`` ring spectrum of C w / (2 pi)."""
     pl = plan_for(L, nside, spin)
     return _cd_inverse_spin_impl(w, pl.args, L=int(L), static=pl.static())
 
 
 def tree_finish_spin(w, *, L, spin, nside):
+    """Node-space w -> ``(L, 2L-1)`` flm (applies the tree once)."""
     pl = plan_for(L, nside, spin)
     return _tree_finish_spin_impl(w, pl.args, pl.inv_m, pl.fac, pl.msign, L=int(L), static=pl.static())
 
 
 # Fused ring-side glue for the spin-s node-space loop: raw centred ring spectra `(nring, 2L-1)`
 # (column j <-> order j - (L-1)) straight to / from the (direct, mirror) channel stack, in
-# complex64 with the float64-reduced, float32 sincos ring phase.  Built from the generic wrappers
-# (weights, `ring_phase_shifts_hp_jax`, a zero column, the channel slicing) this was ~110 ms of
-# complex128 XLA passes per spin-2 field at Nside 2048 -- the fp64 sincos alone ~40 ms -- against
-# ~80 ms for the D&C kernels themselves.
+# complex64 with the float64-reduced, float32 sincos ring phase (`_ring_phase`).  Fusing the
+# weights, ring phase and channel slicing here keeps these passes in complex64 and out of separate
+# complex128 XLA programs, which would otherwise cost more than the D&C kernels themselves.
 
 @partial(jax.jit, static_argnames=("L", "static"))
 def _cd_forward_spin_raw_impl(centered, weights, phase, args, *, L, static):
@@ -612,9 +631,9 @@ def cd_inverse_spin_raw(w, phase, *, L, spin, nside):
 
 
 # ------------------------------------------------------------------ one-program node-space refinement
-# The spin-0 refinement loop (`healpix`) was ~20 eagerly dispatched programs per field -- ~15 ms of
-# host gaps at Nside 2048 against 93 ms of kernels.  Here it is one program, with the plan arrays as
-# arguments (never captured as constants): ring spectra in, `(ell, order)`-packed alms out.
+# The whole spin-0 refinement loop as one program, so that its iterations incur no host dispatch
+# gaps between the ~20 steps.  The plan arrays enter as arguments (never captured as constants):
+# ring spectra in, `(ell, order)`-packed alms out.
 
 @partial(jax.jit, static_argnames=("L", "nside", "static", "n_iter"))
 def _refine_s0_impl(ftms, weights, phase, args, fac, inv, ell, order, *, L, nside, static, n_iter):

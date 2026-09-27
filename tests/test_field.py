@@ -1,3 +1,5 @@
+"""Curved-sky NmtField construction (plain, deprojected, purified, anisotropic) against pymaster."""
+
 import jax
 import numpy as np
 import pytest
@@ -13,6 +15,7 @@ _HAS_NVIDIA_GPU = on_cuda_gpu()
 
 
 def test_standard_fields_and_coupled_spectra_match_namaster():
+    """Spin-0 and spin-2 fields give NaMaster's masked maps, alms and coupled Cls."""
     reference = pytest.importorskip("pymaster")
     rng = np.random.default_rng(9)
     nside = 8
@@ -44,6 +47,7 @@ def test_standard_fields_and_coupled_spectra_match_namaster():
 
 
 def test_template_deprojection_matches_namaster():
+    """Template deprojection gives NaMaster's coefficients, cleaned maps, templates and alms."""
     reference = pytest.importorskip("pymaster")
     rng = np.random.default_rng(10)
     nside = 4
@@ -62,6 +66,9 @@ def test_template_deprojection_matches_namaster():
 
 
 def test_pure_fields_match_namaster():
+    """E-, B- and E+B-purified spin-2 fields (with templates, and with pre-masked input) match
+    NaMaster.
+    """
     reference = pytest.importorskip("pymaster")
     healpy = pytest.importorskip("healpy")
     rng = np.random.default_rng(11)
@@ -109,6 +116,7 @@ def test_pure_fields_match_namaster():
 
 
 def test_anisotropic_fields_match_namaster():
+    """A spin-2 field with an anisotropic (2x2) mask matches NaMaster, including its coupled Cl."""
     reference = pytest.importorskip("pymaster")
     rng = np.random.default_rng(12)
     nside = 4
@@ -143,6 +151,7 @@ def test_anisotropic_fields_match_namaster():
 
 
 def test_mask_only_lite_and_invalid_options():
+    """Mask-only fields refuse to return alms, and inconsistent constructor options raise."""
     npix = 12 * 4**2
     field = nmt.NmtField(np.ones(npix), None, spin=2, lmax=7, lmax_mask=7)
     with pytest.raises(ValueError, match="no alms"):
@@ -189,20 +198,13 @@ def test_mask_only_lite_and_invalid_options():
 
 @pytest.mark.skipif(not _HAS_NVIDIA_GPU, reason="requires an NVIDIA GPU")
 def test_scalar_field_shares_one_band_between_field_and_mask():
-    """A scalar field's own analysis and its mask analysis are one fused pass.
+    """A scalar field's map and mask analyses may be fused into one pass without changing either.
 
-    `nmt_params.n_iter_default` and `nmt_params.n_iter_mask_default` are both 3 here
-    and in NaMaster and `lmax_mask` defaults to `lmax`, so a field built the way a
-    pipeline builds one carries two independent spin-0 transforms of identical shape
-    over the same Legendre band; `NmtField` now runs them together for 0.53-0.68x of
-    the price of the two (`utils.map2alm_pair`), which is why `alm_mask` is populated
-    by the constructor and the benchmark's `mask` column has gone to ~0.  The mask
-    alms must be the ones the lazy route would have produced, and `alm` the one it
-    always produced -- measured bit-identical on both halves, with the decoupled cell
-    agreeing to 6.5e-16 (`.qwen/tmp/pairverify_s33.log`).  Both iteration counts are
-    passed explicitly because the fusion needs them equal; giving only `n_iter` makes
-    the mask transform a different transform, and the next test asserts that case
-    falls back rather than silently changing the answer.
+    When `n_iter == n_iter_mask` and `lmax_mask == lmax`, `NmtField` computes the field alms and
+    the mask alms together (`utils.map2alm_pair`), sharing one read of the Legendre band, and
+    fills `alm_mask` in the constructor.  Both results must be bit-identical to the unfused
+    route, which is obtained here by making `map2alm_pair` decline.  Both iteration counts are
+    passed explicitly because fusion requires them to be equal.
     """
     rng = np.random.default_rng(31)
     nside = 16
@@ -238,12 +240,11 @@ def test_scalar_field_shares_one_band_between_field_and_mask():
 @pytest.mark.skipif(not _HAS_NVIDIA_GPU, reason="requires an NVIDIA GPU")
 @pytest.mark.parametrize("option", ["n_iter_mask", "lmax_mask", "spin", "lite"])
 def test_mask_fusion_needs_two_transforms_of_the_same_shape(option):
-    """Anything that makes the mask's transform differ must fall back cleanly.
+    """Fusion is skipped whenever the mask transform differs from the field transform.
 
-    The fusion is only valid when both halves are the same transform of the same
-    geometry, so a differing `n_iter_mask` or `lmax_mask`, a spin-2 field (whose
-    mask is spin 0 against a spin-2 field) and a `lite` field all have to take the
-    old lazy route -- and still return the mask alms the lazy route returns.
+    A different `n_iter_mask` or `lmax_mask`, a spin-2 field (whose spin-0 mask needs a
+    different transform) and a `lite` field must all leave `alm_mask` unset and later return
+    the same mask alms as a direct `map2alm` of the mask.
     """
     rng = np.random.default_rng(37)
     nside = 16
