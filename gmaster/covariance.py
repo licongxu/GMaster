@@ -1,4 +1,12 @@
-"""Gaussian pseudo-C_ell covariance workspaces."""
+"""Gaussian covariance matrices of pseudo-C_ell bandpowers.
+
+GPU counterparts of ``pymaster.NmtCovarianceWorkspace``, ``NmtCovarianceWorkspaceFlat``,
+``gaussian_covariance``, ``gaussian_covariance_flat`` and ``get_iNKA_cell``.  The
+covariance of the power spectra ``<a1 a2>`` and ``<b1 b2>`` is evaluated in the
+narrow-kernel approximation (Garcia-Garcia et al. 2019; Nicola et al. 2021), using
+coupling kernels built from the power spectra of the mask products.  Catalog fields
+add the shot-noise (SN, NS, NN) terms of Wolz et al. (2024).
+"""
 
 import jax
 import jax.numpy as jnp
@@ -21,19 +29,27 @@ from .workspaces import (
 )
 
 
+# Coupling-kernel types: spin 0 x spin 0, spin 0 x spin 2, and the spin-2 "plus" and
+# "minus" kernels.
 _KERNEL_NAMES = ("00", "0s", "pp", "mm")
 
 
 def _is_catalog(field):
+    """True for catalog-based fields."""
     return isinstance(field, NmtFieldCatalog)
 
 
 def _is_mask_catalog(field):
+    """True for catalog fields whose mask is itself a catalog (no mask map)."""
     return _is_catalog(field) and field.mask is None
 
 
 def _mask_product_alm(first, second):
-    """Harmonics of a mask product, including catalog self-pair removal."""
+    """Alms of the product of two fields' masks.
+
+    Catalog masks are first rendered as smoothed HEALPix maps; for the square of a
+    catalog mask the self-pair contribution is subtracted.
+    """
     if not first.is_compatible(second, strict=False):
         raise ValueError("Fields have incompatible pixelizations.")
 
@@ -75,6 +91,7 @@ def _mask_product_alm(first, second):
 
 
 def _alm_cross_cell(first, second, ainfo, lmax):
+    """Cross power spectrum of two single alm arrays."""
     return _compute_coupled_cell(
         first[None], second[None], ainfo._ell, ainfo._m, lmax=lmax
     )[0]
@@ -89,7 +106,12 @@ def _covariance_kernels(
     l_exact=-1,
     dl_band=-1,
 ):
-    """Return NaMaster's Xi kernels using GMaster's existing recurrences."""
+    """Covariance coupling kernels (NaMaster's Xi) from a mask-product power spectrum.
+
+    Built from the same Wigner-3j recurrences as the mode-coupling matrices, divided
+    by ``2 ell' + 1``.  Only the kernels required by the spin pair are computed; the
+    others are None.
+    """
     padded = jnp.pad(
         jnp.asarray(mask_cell),
         (0, max(0, 2 * lmax + 1 - len(mask_cell))),
@@ -109,10 +131,10 @@ def _covariance_kernels(
             else _coupling_matrix_tt(padded, lmax=lmax)
         ) / columns
     elif (spin1 == 0) != (spin2 == 0):
-        mixed, _, _ = _coupling_matrices_spin2(padded, lmax=lmax)
+        mixed, _, _ = _coupling_matrices_spin2(padded, lmax=lmax, need_ee=False)
         kernels["0s"] = mixed / columns
     else:
-        _, even, odd = _coupling_matrices_spin2(padded, lmax=lmax)
+        _, even, odd = _coupling_matrices_spin2(padded, lmax=lmax, need_te=False)
         kernels["pp"] = even / columns
         kernels["mm"] = odd / columns
     if l_toeplitz > 0:
@@ -125,6 +147,10 @@ def _covariance_kernels(
 
 
 def _signal_index(nmaps1, nmaps2, out1, out2, inp1, inp2):
+    """Which kernel family links output components to input components of a signal term.
+
+    "0" for spin-0 pairs, "+", "-+", "--" for the spin-2 combinations, "Z" for zero.
+    """
     if nmaps1 == 1:
         if nmaps2 == 1:
             return "0"
@@ -140,6 +166,7 @@ def _signal_index(nmaps1, nmaps2, out1, out2, inp1, inp2):
 
 
 def _noise_index(nmaps1, nmaps2, out1, out2):
+    """As `_signal_index`, for a white-noise term (input components fixed)."""
     if nmaps1 != nmaps2:
         return "Z"
     if nmaps1 == 1:
@@ -148,6 +175,7 @@ def _noise_index(nmaps1, nmaps2, out1, out2):
 
 
 def _paired_kernel(first, second):
+    """Sign and kernel name for the product of two index families (0, None if zero)."""
     if first == second == "0":
         return 1, "00"
     if (first, second) in (("0", "+"), ("+", "0")):
@@ -162,11 +190,34 @@ def _paired_kernel(first, second):
 
 
 def _zero_kernel_set():
+    """Empty kernel dictionaries for the two Wick contractions (1122 and 1221)."""
     return [{name: None for name in _KERNEL_NAMES} for _ in range(2)]
 
 
 class NmtCovarianceWorkspace:
-    """Coupling coefficients for curved-sky Gaussian covariances."""
+    """Coupling kernels for the Gaussian covariance of curved-sky pseudo-C_ell.
+
+    Describes the covariance between the power spectrum of fields ``(fla1, fla2)`` and
+    that of ``(flb1, flb2)``.  Same interface as ``pymaster.NmtCovarianceWorkspace``;
+    only spin-0 and spin-2 fields with isotropic masks are supported.
+
+    Parameters
+    ----------
+    fla1, fla2 : NmtField, optional
+        Fields of the first power spectrum.
+    flb1, flb2 : NmtField, optional
+        Fields of the second power spectrum.  Default to `fla1` and `fla2`.
+    l_toeplitz : int, optional
+        If positive, use the Toeplitz approximation of Louis et al. (2020) for the
+        coupling kernels; this is ``ell_toeplitz`` in their Fig. 3.
+    l_exact : int, optional
+        ``ell_exact`` of the Toeplitz approximation (ignored if ``l_toeplitz <= 0``).
+    dl_band : int, optional
+        ``Delta ell_band`` of the Toeplitz approximation (ignored if
+        ``l_toeplitz <= 0``).
+    fname : str, optional
+        FITS file written by `write_to`.  If given, the fields are ignored.
+    """
 
     def __init__(
         self,
@@ -189,10 +240,20 @@ class NmtCovarianceWorkspace:
 
     @classmethod
     def from_fields(cls, fla1, fla2, flb1=None, flb2=None, **kwargs):
+        """Create a covariance workspace from four fields.
+
+        Keyword arguments (`l_toeplitz`, `l_exact`, `dl_band`) are as in the class
+        docstring.
+
+        Returns
+        -------
+        NmtCovarianceWorkspace
+        """
         return cls(fla1, fla2, flb1, flb2, **kwargs)
 
     @classmethod
     def from_file(cls, fname):
+        """Read a covariance workspace from a FITS file written by `write_to`."""
         return cls(fname=fname)
 
     def _post_init(self):
@@ -201,6 +262,7 @@ class NmtCovarianceWorkspace:
         self.nclsb = self.nmaps[2] * self.nmaps[3]
 
     def _get_covariance_kernels(self, cell_1122=None, cell_1221=None):
+        """Kernels for both Wick contractions, with the spin pair each one needs."""
         combinations = {
             (0, 0, 0, 0): ((0, 0), (0, 0)),
             (0, 0, 0, 2): ((0, 0), (0, 0)),
@@ -247,6 +309,11 @@ class NmtCovarianceWorkspace:
         l_exact=-1,
         dl_band=-1,
     ):
+        """Compute the coupling kernels for four fields.
+
+        Parameters are as in the class docstring.  For catalog fields the shot-noise
+        kernels are also computed when a field appears in both spectra.
+        """
         flb1 = fla1 if flb1 is None else flb1
         flb2 = fla2 if flb2 is None else flb2
         fields = (fla1, fla2, flb1, flb2)
@@ -338,6 +405,7 @@ class NmtCovarianceWorkspace:
             self.xiNN = self._get_covariance_kernels(*nn)
 
     def _signal_covariance(self, spectra, xis, outputs, wick):
+        """Signal x signal term of one output block for one Wick contraction."""
         na, nb, nc, nd = self.nmaps
         ia, ib, ic, id_ = outputs
         result = jnp.zeros((self.lmax + 1, self.lmax + 1))
@@ -361,6 +429,7 @@ class NmtCovarianceWorkspace:
         return result
 
     def _mixed_covariance(self, spectra, xis, outputs, wick, noise_first):
+        """Signal x shot-noise term of one output block (catalog fields)."""
         na, nb, nc, nd = self.nmaps
         ia, ib, ic, id_ = outputs
         if noise_first:
@@ -393,6 +462,7 @@ class NmtCovarianceWorkspace:
         return result
 
     def _noise_covariance(self, xis, outputs, wick):
+        """Shot-noise x shot-noise term of one output block (catalog fields)."""
         na, nb, nc, nd = self.nmaps
         ia, ib, ic, id_ = outputs
         if wick == 0:
@@ -409,6 +479,28 @@ class NmtCovarianceWorkspace:
     def gaussian_covariance(
         self, cla1b1, cla1b2, cla2b1, cla2b2, wa, wb=None, coupled=False
     ):
+        """Gaussian covariance matrix of the two power spectra.
+
+        Parameters
+        ----------
+    cla1b1, cla1b2, cla2b1, cla2b2 : array_like, shape (n_cls, lmax + 1) or longer
+        Best-guess power spectra between the named field pairs (e.g. from
+        `get_iNKA_cell`).  ``n_cls`` is the product of the two fields' map counts.
+        wa : NmtWorkspace
+            Workspace of the ``(fla1, fla2)`` spectrum.
+        wb : NmtWorkspace, optional
+            Workspace of the ``(flb1, flb2)`` spectrum.  Defaults to `wa`.
+        coupled : bool, optional
+            If True, return the covariance of the unbinned coupled pseudo-C_ell;
+            otherwise that of the decoupled bandpowers.
+
+        Returns
+        -------
+        jax.Array
+            Shape ``(n_bands_a * ncls_a, n_bands_b * ncls_b)`` (or ``(lmax + 1) *
+            ncls`` per side if `coupled`), ordered with the bandpower index slowest,
+            i.e. reshapeable to ``(n_bands_a, ncls_a, n_bands_b, ncls_b)``.
+        """
         wb = wa if wb is None else wb
         na, nb, nc, nd = self.nmaps
         if wa.ncls != na * nb or wb.ncls != nc * nd:
@@ -484,6 +576,7 @@ class NmtCovarianceWorkspace:
         return covariance
 
     def write_to(self, fname):
+        """Write the coupling kernels to a FITS file."""
         if not hasattr(self, "xiSS"):
             raise RuntimeError("Must initialize workspace before writing")
         import fitsio
@@ -515,6 +608,7 @@ class NmtCovarianceWorkspace:
                             )
 
     def read_from(self, fname):
+        """Read the coupling kernels from a FITS file written by `write_to`."""
         import fitsio
 
         labels = {"00": "00", "0s": "02", "pp": "22P", "mm": "22M"}
@@ -564,6 +658,11 @@ class NmtCovarianceWorkspace:
 
 @jax.jit
 def _flat_covariance_kernels(mask_1122, mask_1221, selectors, cosine, sine, norm):
+    """Band-averaged flat-sky coupling kernels for the two Wick contractions.
+
+    Each kernel is a 2-D convolution of a mask-product power spectrum with the band
+    selectors (weighted by cos/sin of twice the wavevector angle for spin 2).
+    """
     def convolution(mask, inputs):
         return jnp.fft.ifft2(
             jnp.fft.fft2(mask)[None] * jnp.fft.fft2(inputs)
@@ -599,7 +698,23 @@ def _flat_covariance_kernels(mask_1122, mask_1221, selectors, cosine, sine, norm
 
 
 class NmtCovarianceWorkspaceFlat:
-    """GPU-accelerated flat-sky Gaussian covariance workspace."""
+    """Coupling kernels for the Gaussian covariance of flat-sky bandpowers.
+
+    Same interface as ``pymaster.NmtCovarianceWorkspaceFlat``.
+
+    Parameters
+    ----------
+    fla1, fla2 : NmtFieldFlat, optional
+        Fields of the first power spectrum.
+    bin_a : NmtBinFlat, optional
+        Bandpowers of the first power spectrum.
+    flb1, flb2 : NmtFieldFlat, optional
+        Fields of the second power spectrum.  Default to `fla1` and `fla2`.
+    bin_b : NmtBinFlat, optional
+        Bandpowers of the second spectrum; must equal `bin_a`.
+    fname : str, optional
+        FITS file written by `write_to`.
+    """
 
     def __init__(
         self, fla1=None, fla2=None, bin_a=None,
@@ -615,15 +730,18 @@ class NmtCovarianceWorkspaceFlat:
 
     @classmethod
     def from_fields(cls, fla1, fla2, bin_a, flb1=None, flb2=None, bin_b=None):
+        """Create a flat-sky covariance workspace; parameters as in the class docstring."""
         return cls(fla1, fla2, bin_a, flb1, flb2, bin_b)
 
     @classmethod
     def from_file(cls, fname):
+        """Read a flat-sky covariance workspace from a FITS file."""
         return cls(fname=fname)
 
     def compute_coupling_coefficients(
         self, fla1, fla2, bin_a, flb1=None, flb2=None, bin_b=None
     ):
+        """Compute the coupling kernels; parameters as in the class docstring."""
         flb1 = fla1 if flb1 is None else flb1
         flb2 = fla2 if flb2 is None else flb2
         bin_b = bin_a if bin_b is None else bin_b
@@ -674,6 +792,26 @@ class NmtCovarianceWorkspaceFlat:
         self, spin_a1, spin_a2, spin_b1, spin_b2, larr,
         cla1b1, cla1b2, cla2b1, cla2b2, wa, wb=None,
     ):
+        """Gaussian covariance matrix of the decoupled flat-sky bandpowers.
+
+        Parameters
+        ----------
+        spin_a1, spin_a2, spin_b1, spin_b2 : int
+            Spins of the four fields.
+        larr : array_like, shape (n_ell,)
+            Multipoles at which the input spectra are sampled.
+        cla1b1, cla1b2, cla2b1, cla2b2 : array_like, shape (n_cls, n_ell)
+            Best-guess power spectra between the named field pairs.
+        wa : NmtWorkspaceFlat
+            Workspace of the first power spectrum.
+        wb : NmtWorkspaceFlat, optional
+            Workspace of the second power spectrum.  Defaults to `wa`.
+
+        Returns
+        -------
+        jax.Array, shape (n_bands * ncls_a, n_bands * ncls_b)
+            Ordered with the bandpower index slowest.
+        """
         wb = wa if wb is None else wb
         nmaps = tuple(1 if spin == 0 else 2 for spin in (
             spin_a1, spin_a2, spin_b1, spin_b2
@@ -738,6 +876,7 @@ class NmtCovarianceWorkspaceFlat:
         )
 
     def write_to(self, fname):
+        """Write the coupling kernels and the binning to a FITS file."""
         if self.wsp is None:
             raise RuntimeError("Must initialize workspace before writing")
         import fitsio
@@ -756,6 +895,7 @@ class NmtCovarianceWorkspaceFlat:
                     )
 
     def read_from(self, fname):
+        """Read the coupling kernels and the binning from a FITS file."""
         import fitsio
 
         labels = {"00": "00", "0s": "02", "pp": "22P", "mm": "22M"}
@@ -777,6 +917,29 @@ def gaussian_covariance(
     cw, spin_a1, spin_a2, spin_b1, spin_b2,
     cla1b1, cla1b2, cla2b1, cla2b2, wa, wb=None, coupled=False,
 ):
+    """Gaussian covariance matrix of two curved-sky power spectra.
+
+    Parameters
+    ----------
+    cw : NmtCovarianceWorkspace
+        Covariance workspace built from the four fields.
+    spin_a1, spin_a2, spin_b1, spin_b2 : int
+        Spins of the four fields; must match those of `cw`.
+    cla1b1, cla1b2, cla2b1, cla2b2 : array_like, shape (n_cls, lmax + 1) or longer
+        Best-guess power spectra between the named field pairs (e.g. from
+        `get_iNKA_cell`).  ``n_cls`` is the product of the two fields' map counts.
+    wa : NmtWorkspace
+        Workspace of the first power spectrum.
+    wb : NmtWorkspace, optional
+        Workspace of the second power spectrum.  Defaults to `wa`.
+    coupled : bool, optional
+        If True, return the covariance of the unbinned coupled pseudo-C_ell.
+
+    Returns
+    -------
+    jax.Array
+        See `NmtCovarianceWorkspace.gaussian_covariance`.
+    """
     spins = (spin_a1, spin_a2, spin_b1, spin_b2)
     if spins != cw.spins:
         raise ValueError("Requested spins do not match those used to initialize the workspace")
@@ -789,6 +952,15 @@ def gaussian_covariance_flat(
     cw, spin_a1, spin_a2, spin_b1, spin_b2, larr,
     cla1b1, cla1b2, cla2b1, cla2b2, wa, wb=None,
 ):
+    """Gaussian covariance matrix of two flat-sky power spectra.
+
+    Thin wrapper around `NmtCovarianceWorkspaceFlat.gaussian_covariance`; see there
+    for the parameters.  `cw` is the covariance workspace.
+
+    Returns
+    -------
+    jax.Array, shape (n_bands * ncls_a, n_bands * ncls_b)
+    """
     return cw.gaussian_covariance(
         spin_a1, spin_a2, spin_b1, spin_b2, larr,
         cla1b1, cla1b2, cla2b1, cla2b2, wa, wb=wb,
@@ -796,7 +968,30 @@ def gaussian_covariance_flat(
 
 
 def get_iNKA_cell(fla, flb, cl_guess=None, w=None):
-    """Return the improved narrow-kernel input spectrum."""
+    """Power spectrum to use in the Gaussian covariance under the improved NKA.
+
+    Implements the improved narrow-kernel approximation (iNKA) of Nicola et al. (2021):
+    the coupled pseudo-C_ell (measured, or predicted from `cl_guess`) divided by the
+    mean of the product of the two masks.  That mean is taken in pixel space when both
+    fields share a map pixelization, and otherwise from the masks' harmonic
+    cross-spectrum (with the shot-noise and cloud smoothing corrections for catalogs).
+
+    Parameters
+    ----------
+    fla, flb : NmtField
+        The two fields (compatible in harmonic space).
+    cl_guess : array_like, shape (n_cls, lmax + 1), optional
+        Guess of the true power spectra.  If None, the measured pseudo-C_ell of the
+        two fields is used.
+    w : NmtWorkspace, optional
+        Workspace of the two fields, used to couple `cl_guess`.  Built on the fly
+        (with linear bands) if needed and not given.
+
+    Returns
+    -------
+    jax.Array, shape (n_cls, lmax + 1)
+        Input spectrum for `gaussian_covariance`.
+    """
     if not fla.is_compatible(flb, strict=False):
         raise ValueError("Fields have incompatible pixelizations")
     map_product = (

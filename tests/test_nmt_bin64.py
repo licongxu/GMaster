@@ -1,4 +1,9 @@
-"""64-bit NaMaster MCM binning: match C at small nside, trip i64 at 4096 spin 2."""
+"""64-bit coupling-matrix binning for pymaster (``gmaster._nmt_bin64``).
+
+NaMaster's C binning indexes the unbinned coupling matrix with a signed 32-bit integer, which
+overflows for spin-2 fields at Nside 4096.  The numpy replacement must switch on only past that
+limit and must reproduce the C binning wherever the C code still works.
+"""
 
 import numpy as np
 import pytest
@@ -7,6 +12,7 @@ from gmaster._nmt_bin64 import bin_mcm_i64, mcm_needs_i64, patch_pymaster
 
 
 def test_mcm_needs_i64_only_past_signed_32bit():
+    """The 64-bit path is requested exactly when the unbinned matrix exceeds a signed 32-bit index."""
     # nside 2048 spin 2: ncls=4, nls=6144, 16*6144^2 = 6.04e8 < INT_MAX
     assert not mcm_needs_i64(3 * 2048, 4)
     # nside 4096 spin 0 / 0x2: ncls=1 or 2 still fit
@@ -21,6 +27,7 @@ def test_mcm_needs_i64_only_past_signed_32bit():
 @pytest.mark.parametrize("oneside", [False, True])
 @pytest.mark.parametrize("is_dell", [False, True])
 def test_bin_mcm_i64_matches_namaster_c(ncls, oneside, is_dell):
+    """The numpy binning of the coupling matrix matches NaMaster's C binning for Cl and D_ell bins."""
     reference = pytest.importorskip("pymaster")
     bins = reference.NmtBin.from_lmax_linear(64, 7, is_Dell=is_dell)
     rng = np.random.default_rng(3)
@@ -34,6 +41,7 @@ def test_bin_mcm_i64_matches_namaster_c(ncls, oneside, is_dell):
 
 
 def test_bin_mcm_i64_fkp_matches_namaster_c():
+    """The numpy binning with FKP normalisation matches NaMaster's C binning."""
     reference = pytest.importorskip("pymaster")
     bins = reference.NmtBin.from_lmax_linear(48, 5)
     rng = np.random.default_rng(4)
@@ -48,7 +56,7 @@ def test_bin_mcm_i64_fkp_matches_namaster_c():
 
 
 def test_forced_i64_workspace_matches_c(monkeypatch):
-    """End-to-end: force the numpy path at a size C can still bin."""
+    """With the 64-bit path forced at a small size, a pymaster workspace decouples as the C path does."""
     reference = pytest.importorskip("pymaster")
     import healpy as hp
     import gmaster._nmt_bin64 as b64

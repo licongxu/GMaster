@@ -1,34 +1,31 @@
-"""Session-wide table precision and the comparison bar that belongs to it.
+"""Session-wide precision options and the comparison tolerance that goes with them.
 
-Every assertion in this suite compares a device array against a value that
-pymaster/ducc0 computed in float64, against bars written as ``atol=2e-13`` or similar.
-Those bars are right at the shipped fp64 table precision, where a table transform and
-the recurrence that generated it agree to ~1e-16.
+Most assertions in this suite compare a GMaster array against a value that
+pymaster/ducc0 computed in float64, with tolerances such as ``atol=2e-13``.  Those
+tolerances assume the default fp64 Legendre/Wigner tables, which agree with the
+recurrence that generated them to ~1e-16.
 
-``set_table_precision("fp32")`` stores the precomputed Legendre/Wigner tables in
-float32.  Their own representation error is ~1e-7, which is six orders of magnitude
-above the fp64 bars and has nothing to do with the code under test, so the fp32 arm
-needs a stated bar instead of the fp64 one.  ``--gm-precision=fp32`` therefore does two
-things:
+``set_table_precision("fp32")`` stores those tables in float32, whose own
+representation error is ~1e-7 -- six orders of magnitude above the fp64
+tolerances, and unrelated to the code under test.  ``--gm-precision=fp32``
+therefore does two things:
 
-* pins the whole session to that precision, re-asserting it before every test so that a
-  module's own restore-the-default fixture cannot hand fp64 back halfway through the run
-  (a `-c`/`-p` bootstrap that imports before the test modules enable x64 gets this
-  wrong in both directions);
-* puts a floor under the ``atol`` of ``numpy.testing.assert_allclose`` for as long as
-  fp32 is live.  The floor is 2e-6 *of the compared quantity* — ``max|desired|``, not a
-  fixed absolute — because this suite asserts on O(1) ring sums and O(1e-12) decoupled
-  ``Cl``s in the same run, and one absolute number can only be meaningless for one of
-  them.
+* pins the whole session to that precision, re-applying it before every test so
+  that a module fixture which restores the default cannot switch back to fp64
+  partway through the run;
+* puts a floor under the ``atol`` of ``numpy.testing.assert_allclose`` while fp32
+  is active.  The floor is 2e-6 *of the compared quantity* (``max|desired|``),
+  not a fixed absolute value, because the suite compares O(1) ring sums and
+  O(1e-12) decoupled ``Cl``s in the same run.
 
-``--gm-ring-precision`` pins the azimuthal transforms separately.  It matters because
-``set_table_precision`` used to move them too: the analysis chirp-Z casts the map pixels
-to the chirp's own real dtype, so a float32 table session analyzed the map in float32 and
-failed every direct-DFT ring parity in ``test_sht.py``.  Held to ``fp64`` the fp32 table
-route passes the whole suite.
+``--gm-ring-precision`` sets the precision of the azimuthal (ring FFT) transforms
+separately.  The analysis chirp-Z casts the map pixels to the chirp's real dtype,
+so float32 rings analyse the map in float32 and cannot pass the direct-DFT ring
+checks in ``test_sht.py`` at fp64 tolerances; with rings held at ``fp64`` the fp32
+table route passes the whole suite.
 
-At the default fp64 nothing here is installed: ``numpy.testing.assert_allclose`` is the
-real function and every bar is exactly what its test file says.
+At the default fp64 none of this is installed: ``numpy.testing.assert_allclose``
+is the real function and every tolerance is exactly what its test file says.
 """
 
 import numpy as np
@@ -62,20 +59,16 @@ def _floored_assert_allclose(actual, desired, *args, **kwargs):
     from gmaster import nmt_params
 
     if nmt_params.table_dtype == "fp32" or nmt_params.ring_precision == "fp32":
-        # A fixed absolute bar is meaningless across this suite's scales: transform
-        # parities compare O(1) ring sums while a decoupled Cl is O(1e-12), and 2e-6
+        # A fixed absolute tolerance is meaningless across this suite's scales: transform
+        # checks compare O(1) ring sums while a decoupled Cl is O(1e-12), and 2e-6
         # absolute would be vacuous for the latter.  The floor is 2e-6 *of the compared
-        # quantity*, so it says the same thing everywhere: agree to two parts per million.
+        # quantity*, so it means the same everywhere: agreement to two parts per million.
         #
-        # The ring precision joins the condition because a float32 azimuthal stage is the
-        # same kind of licence.  The generic s2fft path does not read it at all -- its alms
-        # and its gradients are bit-identical between `set_ring_precision("fp64")` and
-        # `"fp32"` (`.qwen/tmp/ad_probe2_s35.log`) -- so an fp32-ring parity test compares a
-        # float32-ringed GMaster against a float64 reference and can only agree to the
-        # ring's own rounding: measured 3.5e-07 of scale on the analysis gradient and
-        # 1.7e-07 on the synthesis, against 2.5e-13 with float64 rings.  The fused
-        # float32-ring gradient is as close to the exact one as its own forward transform
-        # is, which is what the floor says.
+        # fp32 rings also trigger the floor.  The generic s2fft path ignores the ring
+        # precision, so an fp32-ring check compares a float32-ring GMaster result against
+        # a float64 reference and can only agree to the ring's own rounding: about 3.5e-7
+        # of scale on the analysis gradient and 1.7e-7 on the synthesis (versus 2.5e-13
+        # with float64 rings), well inside the 2e-6 floor.
         scale = float(np.max(np.abs(np.asarray(desired))))
         kwargs["atol"] = max(float(kwargs.get("atol", 0.0) or 0.0), FP32_ATOL * scale)
     return _REAL_ASSERT_ALLCLOSE(actual, desired, *args, **kwargs)
@@ -100,7 +93,21 @@ def pytest_configure(config):
 
 
 @pytest.fixture(autouse=True)
+def _exact_sht_unless_v2(request, monkeypatch):
+    """Run unmarked tests on the exact fp64 transform routes.
+
+    The default transform is the float32 v2 CUDA march (~1e-6 agreement with NaMaster),
+    while most tests hold GMaster to NaMaster at ~1e-13, which only the exact fp64 routes
+    reach.  Tests of the default route carry `@pytest.mark.march_v2`; every other test
+    runs with `GMASTER_MARCH_V2=0`.
+    """
+    if request.node.get_closest_marker("march_v2") is None:
+        monkeypatch.setenv("GMASTER_MARCH_V2", "0")
+
+
+@pytest.fixture(autouse=True)
 def _session_table_precision(request):
+    """Re-apply the session's ``--gm-precision``/``--gm-ring-precision`` around every test."""
     wanted = request.config.getoption("--gm-precision")
     wanted_ring = request.config.getoption("--gm-ring-precision")
     if wanted == "fp64" and wanted_ring == "follow":
@@ -108,10 +115,10 @@ def _session_table_precision(request):
         return
     from gmaster import nmt_params, set_ring_precision, set_table_precision
 
-    # Every test in this module is about the shipped default and the effect of leaving
-    # it — that the default is fp64, that selecting fp32 halves the band, that switching
-    # rebuilds rather than reuses.  A session pinned to fp32 has already left it, so the
-    # module runs at fp64 regardless; its subject is the policy, not the arithmetic.
+    # test_table_precision.py tests the default precision and what happens when it is
+    # changed (the default is fp64, fp32 halves the table size, switching rebuilds the
+    # caches).  Those tests must start from fp64, so that module always runs at fp64
+    # even when the session is pinned to fp32.
     if request.node.path.name == "test_table_precision.py":
         if nmt_params.table_dtype != "fp64":
             set_table_precision("fp64")

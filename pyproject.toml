@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "gmaster"
-version = "0.1.0"
-description = "JAX implementation of NaMaster"
+version = "1.0.0"
+description = "GPU pseudo-C_ell (MASTER) power spectra with a NaMaster-compatible API, in JAX"
 readme = "README.md"
 requires-python = ">=3.10"
 # PyPI s2fft 1.4.0 does `from s2fft_lib import _s2fft` at import (breaks Colab
@@ -22,13 +22,22 @@ dependencies = [
     "scipy",
 ]
 
+[project.optional-dependencies]
+# The reference implementation the tests compare against, and the test runner.
+test = ["pytest", "pymaster", "ducc0"]
+# Tutorials and examples.
+examples = ["matplotlib", "jupyter", "camb"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "march_v2: exercise the shipped v2 CUDA march (unit tests otherwise pin GMASTER_MARCH_V2=0)",
+]
 
 [tool.setuptools]
-packages = ["gmaster"]
+packages = ["gmaster", "gmaster._sht"]
 
-# The v2 march compiles gmaster/_cuda/march_v2.cu with nvcc on first use; without this a
-# non-editable install (pip install git+...) ships no .cu and the march is silently unavailable.
+# The CUDA and C++ kernels are compiled on first use (nvcc / g++) and cached by source hash;
+# a non-editable install must ship their sources.
 [tool.setuptools.package-data]
-gmaster = ["_cuda/*.cu"]
+gmaster = ["_native/cuda/*.cu", "_native/cpu/*.cc", "_native/cpu/*.cpp"]

@@ -1,8 +1,8 @@
 """``gmaster.nusht``: the GPU general (non-uniform) spherical harmonic transform.
 
-Every claim here is checked against ``ducc0.sht.experimental``, which is the reference the module
-is written to be a drop-in replacement for.  The accuracy floor is the march's float32 arithmetic
-(~4e-7 at L = 64, ~6e-6 at lmax 4095), not the NUFFT, so the tolerances below are set from that.
+Every test compares against ``ducc0.sht.experimental``, for which the module is a drop-in
+replacement.  Accuracy is limited by the march's float32 arithmetic (~4e-7 at L = 64, ~6e-6 at
+lmax 4095), not by the NUFFT, and the tolerances below are set from that.
 """
 
 import numpy as np
@@ -16,11 +16,26 @@ jax.config.update("jax_enable_x64", True)
 import ducc0
 
 from gmaster import nusht
-from gmaster._cuda_gpu import on_cuda_gpu
+from gmaster._sht.cuda_gpu import on_cuda_gpu
 
 
 _HAS_NVIDIA_GPU = on_cuda_gpu()
-pytestmark = pytest.mark.skipif(not _HAS_NVIDIA_GPU, reason="needs an NVIDIA GPU")
+# The general SHT is built on the v2 march, which `conftest.py` switches off unless asked for.
+pytestmark = [pytest.mark.skipif(not _HAS_NVIDIA_GPU, reason="needs an NVIDIA GPU"),
+              pytest.mark.march_v2]
+
+
+
+def _has_cufinufft():
+    try:
+        nusht._cufinufft()
+    except ImportError:
+        return False
+    return True
+
+
+# The general transforms put the NUFFT on the torus through cufinufft (an optional dependency).
+needs_cufinufft = pytest.mark.skipif(not _has_cufinufft(), reason="needs cufinufft")
 
 L = 64
 LMAX = L - 1
@@ -28,6 +43,7 @@ TOL = 5e-6
 
 
 def _alm(spin, rng):
+    """Random alms in ducc0's packed layout, real at m = 0 and zero below |spin|."""
     ncomp = 1 if spin == 0 else 2
     nelem = L * (L + 1) // 2
     mstart = nusht.default_mstart(LMAX)
@@ -39,6 +55,7 @@ def _alm(spin, rng):
 
 
 def _points(rng, n=2000):
+    """`n` points distributed uniformly on the sphere, as (theta, phi) rows."""
     loc = np.empty((n, 2))
     loc[:, 0] = np.arccos(rng.uniform(-1, 1, n))
     loc[:, 1] = rng.uniform(0, 2 * np.pi, n)
@@ -46,6 +63,9 @@ def _points(rng, n=2000):
 
 
 def test_grid_for_covers_the_band_limit():
+    """The intermediate grid resolves the band limit, has even dimensions, uses powers of two at
+    lmax = 2^k - 1, and rejects an explicit ntheta that is too small.
+    """
     for lmax in (63, 1023, 4095):
         ntheta, nphi = nusht.grid_for(lmax)
         assert ntheta >= lmax + 1 and nphi >= 2 * lmax + 1
@@ -57,7 +77,7 @@ def test_grid_for_covers_the_band_limit():
 
 @pytest.mark.parametrize("spin", [0, 2])
 def test_ring_spectrum_matches_ducc(spin):
-    """Stage 1: the march on the Fejer-1 rings reproduces ducc0's isolatitude synthesis."""
+    """The first stage (the march on the Fejer-1 rings) reproduces ducc0's isolatitude synthesis."""
     rng = np.random.default_rng(5)
     alm, mstart = _alm(spin, rng)
     ntheta, nphi = nusht.grid_for(LMAX)
@@ -124,8 +144,10 @@ def test_march_is_transpose(spin):
         assert abs(lhs - rhs) / abs(lhs) < TOL
 
 
+@needs_cufinufft
 @pytest.mark.parametrize("spin", [0, 2])
 def test_synthesis_general_matches_ducc(spin):
+    """Synthesis at arbitrary points matches ducc0's synthesis_general for spins 0 and 2."""
     rng = np.random.default_rng(7)
     alm, mstart = _alm(spin, rng)
     loc = _points(rng)
@@ -137,8 +159,10 @@ def test_synthesis_general_matches_ducc(spin):
     assert np.linalg.norm(got - want) / np.linalg.norm(want) < TOL
 
 
+@needs_cufinufft
 @pytest.mark.parametrize("spin", [0, 2])
 def test_adjoint_synthesis_general_matches_ducc(spin):
+    """Adjoint synthesis from arbitrary points matches ducc0's adjoint_synthesis_general."""
     rng = np.random.default_rng(9)
     _, mstart = _alm(spin, rng)
     loc = _points(rng)
@@ -152,8 +176,10 @@ def test_adjoint_synthesis_general_matches_ducc(spin):
     assert np.linalg.norm(got - want) / np.linalg.norm(want) < TOL
 
 
+@needs_cufinufft
 @pytest.mark.parametrize("upsampfac", [1.25, 2.0])
 def test_upsampfac_does_not_change_the_answer(upsampfac):
+    """The NUFFT upsampling factor affects speed only; both supported values give ducc0's result."""
     rng = np.random.default_rng(11)
     alm, mstart = _alm(0, rng)
     loc = _points(rng)
@@ -164,6 +190,7 @@ def test_upsampfac_does_not_change_the_answer(upsampfac):
     assert np.linalg.norm(got - want) / np.linalg.norm(want) < TOL
 
 
+@needs_cufinufft
 def test_custom_mstart_packing():
     """A non-default (but still valid) mstart must give the same field."""
     rng = np.random.default_rng(13)

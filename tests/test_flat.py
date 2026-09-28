@@ -1,3 +1,5 @@
+"""Flat-sky fields, workspaces, apodization and simulations against pymaster."""
+
 import jax
 import numpy as np
 import pytest
@@ -11,6 +13,7 @@ from gmaster.field_flat import _flat_alm2map, _flat_map2alm
 @pytest.mark.parametrize("shape", [(7, 8), (8, 9)])
 @pytest.mark.parametrize("spin", [0, 1, 2, 3])
 def test_flat_transform_roundtrip(shape, spin):
+    """The flat-sky spin-s Fourier transform and its inverse round-trip a map to fp64 rounding."""
     rng = np.random.default_rng(20 + spin)
     nmaps = 1 if spin == 0 else 2
     maps = rng.normal(size=(nmaps, *shape))
@@ -20,6 +23,7 @@ def test_flat_transform_roundtrip(shape, spin):
 
 
 def test_flat_fields_and_coupled_spectra_match_namaster():
+    """Flat-sky spin-0/spin-2 fields give NaMaster's masked maps, ell sampling and coupled Cls."""
     reference = pytest.importorskip("pymaster")
     rng = np.random.default_rng(31)
     ny, nx = 8, 10
@@ -51,6 +55,7 @@ def test_flat_fields_and_coupled_spectra_match_namaster():
 
 
 def test_flat_templates_and_purification_match_namaster():
+    """A deprojected, E+B-purified flat-sky field gives NaMaster's maps, templates and coupled Cls."""
     reference = pytest.importorskip("pymaster")
     rng = np.random.default_rng(32)
     ny, nx = 9, 8
@@ -78,6 +83,7 @@ def test_flat_templates_and_purification_match_namaster():
 
 
 def test_flat_mask_only_and_validation():
+    """Mask-only flat fields refuse to return alms, and inconsistent constructor options raise."""
     mask = np.ones((4, 5))
     field = nmt.NmtFieldFlat(0.2, 0.3, mask, None, spin=2)
     with pytest.raises(ValueError, match="no alms"):
@@ -100,6 +106,9 @@ def test_flat_mask_only_and_validation():
     ],
 )
 def test_flat_workspace_matches_namaster(spins, purities, is_teb):
+    """Flat-sky coupling matrices (unbinned and binned), couple_cell and decouple_cell match
+    NaMaster for plain, purified and TEB workspaces.
+    """
     reference = pytest.importorskip("pymaster")
     rng = np.random.default_rng(41)
     ny, nx = 8, 10
@@ -162,6 +171,7 @@ def test_flat_workspace_matches_namaster(spins, purities, is_teb):
 
 
 def test_flat_workspace_fits_interoperability(tmp_path):
+    """A flat workspace survives a FITS round trip and the file is readable by pymaster."""
     reference = pytest.importorskip("pymaster")
     rng = np.random.default_rng(42)
     mask = rng.uniform(0.3, 1, (6, 8))
@@ -186,6 +196,7 @@ def test_flat_workspace_fits_interoperability(tmp_path):
 
 @pytest.mark.parametrize("pure", [False, True])
 def test_flat_deprojection_bias_and_full_master_match_namaster(pure):
+    """Flat-sky deprojection bias and compute_full_master_flat match NaMaster, with and without purification."""
     reference = pytest.importorskip("pymaster")
     rng = np.random.default_rng(43)
     ny, nx = 7, 8
@@ -247,6 +258,7 @@ def test_flat_deprojection_bias_and_full_master_match_namaster(pure):
 
 @pytest.mark.parametrize("apotype", ["C1", "C2", "Smooth"])
 def test_flat_mask_apodization_matches_namaster(apotype):
+    """Flat-sky C1, C2 and Smooth apodization match NaMaster."""
     reference = pytest.importorskip("pymaster")
     ny, nx = 21, 25
     lx, ly = 0.2, 0.17
@@ -262,6 +274,9 @@ def test_flat_mask_apodization_matches_namaster(apotype):
 
 
 def test_synfast_flat_is_reproducible_and_has_requested_covariance():
+    """synfast_flat is reproducible for a fixed seed, and its measured T/E/B band powers recover the
+    input covariance.  The 0.15 tolerance allows for the sampling variance of one 64x64 realisation.
+    """
     covariance = np.array(
         [[1.0, 0.2, -0.1], [0.2, 2.0, 0.3], [-0.1, 0.3, 1.5]]
     )

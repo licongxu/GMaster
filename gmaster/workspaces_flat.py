@@ -1,4 +1,9 @@
-"""Flat-sky MASTER workspaces."""
+"""Flat-sky MASTER: coupling matrices, decoupling and deprojection bias.
+
+GPU counterpart of ``pymaster.NmtWorkspaceFlat`` and its companion functions.  The
+mode-coupling matrix is built as a 2-D convolution of the mask power spectrum with the
+spin response of each field, evaluated with FFTs on the device.
+"""
 
 import jax.numpy as jnp
 import numpy as np
@@ -9,6 +14,7 @@ from .workspaces import _compute_coupled_cell_flat
 
 
 def _geometry(nx, ny, lx, ly):
+    """Full-plane wavevectors kx, ky, their modulus ell and angle phi."""
     ix = jnp.arange(nx)
     iy = jnp.arange(ny)
     kx = 2 * jnp.pi * jnp.where(2 * ix <= nx, ix, ix - nx) / lx
@@ -19,7 +25,13 @@ def _geometry(nx, ny, lx, ly):
 
 
 def _response_terms(spin, pure_e, pure_b, ell, phi):
-    """Separable output/input factors for a flat-sky spin response."""
+    """Separable output/input factors of a field's flat-sky spin response.
+
+    Each factor has shape ``(nmaps, nmaps, 2, ny, nx)``: output component, input
+    component, and two separable terms whose products sum to the response.  Spin
+    fields rotate by ``spin * phi``; purified components replace the rotation by the
+    pure-mode weighting.
+    """
     shape = ell.shape
     if spin == 0:
         out = jnp.zeros((1, 1, 2, *shape)).at[0, 0, 0].set(1)
@@ -47,6 +59,7 @@ def _response_terms(spin, pure_e, pure_b, ell, phi):
 
 
 def _beam_values(field, ell):
+    """Field beam interpolated onto `ell` (1 without a beam, 0 beyond its last ell)."""
     if field.beam is None:
         return jnp.ones_like(ell)
     sampled = jnp.interp(
@@ -56,6 +69,7 @@ def _beam_values(field, ell):
 
 
 def _factor_batches(response_pairs):
+    """Flatten pairs of field responses into (output, input, row, column) term lists."""
     out_factors = []
     in_factors = []
     rows = []
@@ -93,6 +107,11 @@ def _convolved_matrix(
     ncls,
     normalization,
 ):
+    """Coupling matrix: mask power convolved with each response term, binned in and out.
+
+    Returns shape ``(n_out * ncls, n_in * ncls)``, with the output selectors (bands)
+    and input selectors (ell rings or bands) as the slow index.
+    """
     out_factors, in_factors, rows, columns = factors
     ny, nx = mask_power.shape
     inputs = (
@@ -118,7 +137,26 @@ def _convolved_matrix(
 
 
 class NmtWorkspaceFlat:
-    """Mode-coupling matrix and decoupling operators for flat-sky fields."""
+    """Mode-coupling matrix and decoupling operator for a pair of flat-sky fields.
+
+    Same interface as ``pymaster.NmtWorkspaceFlat``.  If fields and bins are given the
+    coupling matrix is computed immediately; with `fname` it is read from a file.
+
+    Parameters
+    ----------
+    fl1, fl2 : NmtFieldFlat, optional
+        Fields to correlate (must share the pixel grid).
+    bins : NmtBinFlat, optional
+        Bandpowers.
+    ell_cut_x, ell_cut_y : tuple of float, optional
+        Fourier modes with ``ell_cut_x[0] <= k_x <= ell_cut_x[1]`` (or likewise in y)
+        are removed.  The default ``(1.0, -1.0)`` is an empty range: no cut.
+    is_teb : bool, optional
+        If True, `fl1` must be spin 0 and `fl2` spin 2, and the full 7x7 T/E/B coupling
+        (TT, TE, TB, EE, EB, BE, BB) is computed together.
+    fname : str, optional
+        FITS file written by `write_to` to read the workspace from.
+    """
 
     def __init__(
         self,
@@ -153,6 +191,14 @@ class NmtWorkspaceFlat:
         ell_cut_y=(1.0, -1.0),
         is_teb=False,
     ):
+        """Create a workspace and compute its coupling matrix from two fields.
+
+        See the class docstring for the parameters.
+
+        Returns
+        -------
+        NmtWorkspaceFlat
+        """
         return cls(
             fl1,
             fl2,
@@ -164,6 +210,12 @@ class NmtWorkspaceFlat:
 
     @classmethod
     def from_file(cls, fname):
+        """Read a workspace from a FITS file written by `write_to`.
+
+        Returns
+        -------
+        NmtWorkspaceFlat
+        """
         return cls(fname=fname)
 
     def compute_coupling_matrix(
@@ -175,6 +227,12 @@ class NmtWorkspaceFlat:
         ell_cut_y=(1.0, -1.0),
         is_teb=False,
     ):
+        """Compute the mode-coupling matrix of two flat-sky fields.
+
+        Stores the matrix with unbinned input (``mcm``, input sampled on rings of width
+        ``dell``) and the fully binned matrix used for decoupling (``mcm_binned``).
+        Parameters are as in the class docstring.
+        """
         if not fl1.is_compatible(fl2):
             raise ValueError("Fields must have same resolution")
         if not isinstance(bins, NmtBinFlat):
@@ -283,6 +341,20 @@ class NmtWorkspaceFlat:
         )
 
     def couple_cell(self, ells, cl_in):
+        """Apply the mode-coupling matrix to theory power spectra.
+
+        Parameters
+        ----------
+        ells : array_like, shape (n_ell,)
+            Multipoles at which `cl_in` is sampled (increasing).
+        cl_in : array_like, shape (ncls, n_ell)
+            Power spectra, interpolated onto the Fourier grid.
+
+        Returns
+        -------
+        jax.Array, shape (ncls, n_bands)
+            Coupled bandpowers, comparable to `compute_coupled_cell_flat`.
+        """
         if self.mcm is None:
             raise RuntimeError("Must initialize workspace before coupling")
         ells = jnp.asarray(ells)
@@ -317,6 +389,22 @@ class NmtWorkspaceFlat:
         return coupled.reshape(self.nbands, self.ncls).T
 
     def decouple_cell(self, cl_in, cl_bias=None, cl_noise=None):
+        """Invert the binned mode-coupling matrix.
+
+        Parameters
+        ----------
+        cl_in : array_like, shape (ncls, n_bands)
+            Coupled bandpowers.
+        cl_bias : array_like, shape (ncls, n_bands), optional
+            Deprojection bias to subtract first.
+        cl_noise : array_like, shape (ncls, n_bands), optional
+            Coupled noise bias to subtract first.
+
+        Returns
+        -------
+        jax.Array, shape (ncls, n_bands)
+            Decoupled bandpowers.
+        """
         if self.mcm_binned is None:
             raise RuntimeError("Must initialize workspace before decoupling")
         cl_in = jnp.asarray(cl_in)
@@ -337,6 +425,7 @@ class NmtWorkspaceFlat:
         return result.reshape(self.nbands, self.ncls).T
 
     def read_from(self, fname):
+        """Read the workspace from a FITS file in NaMaster's flat workspace layout."""
         import fitsio
 
         with fitsio.FITS(fname) as fits:
@@ -370,6 +459,11 @@ class NmtWorkspaceFlat:
         self.ell_cut_y = (float(header["ELLCUT_Y_I"]), float(header["ELLCUT_Y_F"]))
 
     def write_to(self, fname):
+        """Write the workspace to a FITS file in NaMaster's flat workspace layout.
+
+        The file also carries the LU factorisation of the binned matrix, as NaMaster
+        writes it.
+        """
         if self.mcm is None:
             raise RuntimeError("Must initialize workspace before writing")
         import fitsio
@@ -430,6 +524,7 @@ class NmtWorkspaceFlat:
 
 
 def _interpolate_spectra(ells, cls, ell):
+    """Interpolate spectra onto the Fourier-plane `ell` (0 beyond the last multipole)."""
     return jnp.stack(
         [
             jnp.where(
@@ -443,6 +538,7 @@ def _interpolate_spectra(ells, cls, ell):
 
 
 def _filter_alms(alms, cls, ells, field_out):
+    """Multiply Fourier coefficients by a matrix of spectra: out_a = sum_b C_ab alm_b."""
     kx = 2 * jnp.pi * jnp.arange(field_out.nx // 2 + 1) / field_out.lx
     iy = jnp.arange(field_out.ny)
     ky = (
@@ -458,12 +554,14 @@ def _filter_alms(alms, cls, ells, field_out):
 
 
 def _masked_alms(field, maps):
+    """Fourier coefficients of `maps` after masking (and purification) as for `field`."""
     if field.pure_e or field.pure_b:
         return field._purify(maps)[0]
     return _flat_map2alm(maps * field.mask[None], field.spin, field.lx, field.ly)
 
 
 def _raw_coupled(alms1, alms2, field, bins, ell_cut_x, ell_cut_y):
+    """Binned coupled power spectrum of two sets of flat Fourier coefficients."""
     return _compute_coupled_cell_flat(
         alms1,
         alms2,
@@ -486,7 +584,27 @@ def deprojection_bias_flat(
     ell_cut_x=(1.0, -1.0),
     ell_cut_y=(1.0, -1.0),
 ):
-    """Compute the flat-sky contaminant-deprojection bias."""
+    """Bias to the coupled power spectrum caused by contaminant deprojection (flat sky).
+
+    Parameters
+    ----------
+    f1, f2 : NmtFieldFlat
+        Fields (not `lite`).
+    b : NmtBinFlat
+        Bandpowers.
+    ells : array_like, shape (n_ell,)
+        Multipoles at which `cl_guess` is sampled.
+    cl_guess : array_like, shape (nmaps1 * nmaps2, n_ell)
+        Best guess of the true power spectra.
+    ell_cut_x, ell_cut_y : tuple of float, optional
+        Fourier modes with ``ell_cut_x[0] <= k_x <= ell_cut_x[1]`` (or likewise in y)
+        are removed.  The default ``(1.0, -1.0)`` is an empty range: no cut.
+
+    Returns
+    -------
+    jax.Array, shape (nmaps1 * nmaps2, n_bands)
+        Deprojection bias, to be passed as ``cl_bias`` to `decouple_cell`.
+    """
     if f1.lite or f2.lite:
         raise ValueError("No deprojection bias for lightweight fields")
     if not f1.is_compatible(f2):
@@ -592,7 +710,31 @@ def compute_full_master_flat(
     ell_cut_x=(1.0, -1.0),
     ell_cut_y=(1.0, -1.0),
 ):
-    """Compute coupled spectra, biases, and flat-sky MASTER decoupling."""
+    """Full flat-sky MASTER estimate: coupled spectrum, deprojection bias and decoupling.
+
+    Parameters
+    ----------
+    f1, f2 : NmtFieldFlat
+        Fields to correlate.
+    b : NmtBinFlat
+        Bandpowers.
+    cl_noise : array_like, shape (nmaps1 * nmaps2, n_bands), optional
+        Coupled noise bias.
+    cl_guess : array_like, shape (nmaps1 * nmaps2, n_ell), optional
+        Guess of the true spectra for the deprojection bias (zero if None).
+    ells_guess : array_like, shape (n_ell,), optional
+        Multipoles of `cl_guess`; required if `cl_guess` is given.
+    workspace : NmtWorkspaceFlat, optional
+        Precomputed workspace; computed from the fields if None.
+    ell_cut_x, ell_cut_y : tuple of float, optional
+        Fourier modes with ``ell_cut_x[0] <= k_x <= ell_cut_x[1]`` (or likewise in y)
+        are removed.  The default ``(1.0, -1.0)`` is an empty range: no cut.
+
+    Returns
+    -------
+    jax.Array, shape (nmaps1 * nmaps2, n_bands)
+        Decoupled bandpowers.
+    """
     expected = (f1.nmaps * f2.nmaps, b.n_bands)
     noise = jnp.zeros(expected) if cl_noise is None else jnp.asarray(cl_noise)
     if noise.shape != expected:

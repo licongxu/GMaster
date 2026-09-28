@@ -1,0 +1,2977 @@
+{
+ "description": "Warm wall time and peak memory, GMaster vs NaMaster vs SHTns, HEALPix Nside 64-8192.",
+ "hardware": {
+  "gpu": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition, 96 GB (one card)",
+  "cpu": "AMD Ryzen Threadripper PRO 9995WX, 96 cores / 192 threads"
+ },
+ "method": "Each cell is one process inside a Docker container on an exclusive cpuset (GMaster: 8 cores + the GPU; NaMaster: 32 or all 96 physical cores). One untimed call, then warm calls; 'five warm runs' cells list all five, 'median' cells come from an earlier board that kept only the median. Transforms: alm2map and one map2alm pass (n_iter=0), lmax = 3 nside - 1, random inputs. End to end: ACT DR6 map and footprint mask, n_iter=3, NmtField + NmtWorkspace + coupled cell + decouple, linear bins of 30. GMaster uses XLA_PYTHON_CLIENT_PREALLOCATE=false and its default routes.",
+ "transforms": [
+  {
+   "engine": "gmaster",
+   "nside": 64,
+   "spin": 0,
+   "op": "alm2map",
+   "seconds": [
+    0.00028294301591813564
+   ],
+   "runs": "median"
+  },
+  {
+   "engine": "shtns",
+   "nside": 64,
+   "spin": 0,
+   "op": "alm2map",
+   "seconds": [
+    6.705097621306777e-05,
+    6.410098285414279e-05,
+    6.481999298557639e-05,
+    6.333101191557944e-05,
+    6.450997898355126e-05
+   ],
+   "runs": "five warm runs",
+   "note": null
+  },
+  {
+   "engine": "namaster",
+   "cores": 32,
+   "nside": 64,
+   "spin": 0,
+   "op": "alm2map",
+   "seconds": [
+    0.00025357299819006585,
+    0.00024647300233482383,
+    0.00025169299988192506,
+    0.000244222999754129,
+    0.00025684299907879904
+   ],
+   "runs": "five warm runs"
+  },
+  {
+   "engine": "namaster",
+   "cores": 96,
+   "nside": 64,
+   "spin": 0,
+   "op": "alm2map",
+   "seconds": [
+    0.00051788099881378
+   ],
+   "runs": "median"
+  },
+  {
+   "engine": "gmaster",
+   "nside": 64,
+   "spin": 0,
+   "op": "map2alm",
+   "seconds": [
+    0.0002505120064597577
+   ],
+   "runs": "median"
+  },
+  {
+   "engine": "shtns",
+   "nside": 64,
+   "spin": 0,
+   "op": "map2alm",
+   "seconds": [
+    4.4110987801104784e-05,
+    4.5769993448629975e-05,
+    4.127100692130625e-05,
+    4.0929997339844704e-05,
+    4.198099486529827e-05
+   ],
+   "runs": "five warm runs",
+   "note": null
+  },
+  {
+   "engine": "namaster",
+   "cores": 32,
+   "nside": 64,
+   "spin": 0,
+   "op": "map2alm",
+   "seconds": [
+    0.00025875199935398996,
+    0.00019497100220178254,
+    0.0001892910004244186,
+    0.00017885100169223733,
+    0.00017792099970392883
+   ],
+   "runs": "five warm runs"
+  },
+  {
+   "engine": "namaster",
+   "cores": 96,
+   "nside": 64,
+   "spin": 0,
+   "op": "map2alm",
+   "seconds": [
+    0.00038152500201249495
+   ],
+   "runs": "median"
+  },
+  {
+   "engine": "gmaster",
+   "nside": 128,
+   "spin": 0,
+   "op": "alm2map",
+   "seconds": [
+    0.000436573987826705
+   ],
+   "runs": "median"
+  },
+  {
+   "engine": "shtns",
+   "nside": 128,
+   "spin": 0,
+   "op": "alm2map",
+   "seconds": [
+    0.00011028099106624722,
+    0.00010940100764855742,
+    0.00011002100654877722,
+    0.00010947100236080587,
+    0.00010947097325697541
+   ],
+   "runs": "five warm runs",
+   "note": null
+  },
+  {
+   "engine": "namaster",
+   "cores": 32,
+   "nside": 128,
+   "spin": 0,
+   "op": "alm2map",
+   "seconds": [
+    0.0006812469982833136,
+    0.0006610359996557236,
+    0.0006662570012849756,
+    0.0006833970001025591,
+    0.0006955360004212707
+   ],
+   "runs": "five warm runs"
+  },
+  {
+   "engine": "namaster",
+   "cores": 96,
+   "nside": 128,
+   "spin": 0,
+   "op": "alm2map",
+   "seconds": [
+    0.0013194789971748833
+   ],
+   "runs": "median"
+  },
+  {
+   "engine": "gmaster",
+   "nside": 128,
+   "spin": 0,
+   "op": "map2alm",
+   "seconds": [
+    0.0002857430081348866
+   ],
+   "runs": "median"
+  },
+  {
+   "engine": "shtns",
+   "nside": 128,
+   "spin": 0,
+   "op": "map2alm",
+   "seconds": [
+    8.286998490802944e-05,
+    8.142099250108004e-05,
+    8.054100908339024e-05,
+    8.259102469310164e-05,
+    8.236098801717162e-05
+   ],
+   "runs": "five warm runs",
+   "note": null
+  },
+  {
+   "engine": "namaster",
+   "cores": 32,
+   "nside": 128,
+   "spin": 0,
+   "op": "map2alm",
+   "seconds": [
+    0.0007232659991132095,
+    0.000501184997119708,
+    0.0005002540019631851,
+    0.0004832640006497968,
+    0.00047384400022565387
+   ],
+   "runs": "five warm runs"
+  },
+  {
+   "engine": "namaster",
+   "cores": 96,
+   "nside": 128,
+   "spin": 0,
+   "op": "map2alm",
+   "seconds": [
+    0.001140919001045404
+   ],
+   "runs": "median"
+  },
+  {
+   "engine": "gmaster",
+   "nside": 256,
+   "spin": 0,
+   "op": "alm2map",
+   "seconds": [
+    0.0005213650001678616
+   ],
+   "runs": "median"
+  },
+  {
+   "engine": "shtns",
+   "nside": 256,
+   "spin": 0,
+   "op": "alm2map",
+   "seconds": [
+    0.0004661249986384064,
+    0.0004652439965866506,
+    0.0004645239969249815,
+    0.0004645349981728941,
+    0.00046280398964881897
+   ],
+   "runs": "five warm runs",
+   "note": null
+  },
+  {
+   "engine": "namaster",
+   "cores": 32,
+   "nside": 256,
+   "spin": 0,
+   "op": "alm2map",
+   "seconds": [
+    0.0026648450002539903,
+    0.002690625002287561,
+    0.002600615000119433,
+    0.0025744439990376122,
+    0.002562284000305226
+   ],
+   "runs": "five warm runs"
+  },
+  {
+   "engine": "namaster",
+   "cores": 96,
+   "nside": 256,
+   "spin": 0,
+   "op": "alm2map",
+   "seconds": [
+    0.0019678160024341196
+   ],
+   "runs": "median"
+  },
+  {
+   "engine": "gmaster",
+   "nside": 256,
+   "spin": 0,
+   "op": "map2alm",
+   "seconds": [
+    0.00047806400107219815
+   ],
+   "runs": "median"
+  },
+  {
+   "engine": "shtns",
+   "nside": 256,
+   "spin": 0,
+   "op": "map2alm",
+   "seconds": [
+    0.0003985439834650606,
+    0.00039002401172183454,
+    0.0003958040033467114,
+    0.0003939230227842927,
+    0.000397453986806795
+   ],
+   "runs": "five warm runs",
+   "note": null
+  },
+  {
+   "engine": "namaster",
+   "cores": 32,
+   "nside": 256,
+   "spin": 0,
+   "op": "map2alm",
+   "seconds": [
+    0.0032898309982556384,
+    0.003176599002472358,
+    0.0022480109983007424,
+    0.0021653300027537625,
+    0.0021401399972091895
+   ],
+   "runs": "five warm runs"
+  },
+  {
+   "engine": "namaster",
+   "cores": 96,
+   "nside": 256,
+   "spin": 0,
+   "op": "map2alm",
+   "seconds": [
+    0.0024565429994254373
+   ],
+   "runs": "median"
+  },
+  {
+   "engine": "gmaster",
+   "nside": 512,
+   "spin": 0,
+   "op": "alm2map",
+   "seconds": [
+    0.001867676997790113
+   ],
+   "runs": "median"
+  },
+  {
+   "engine": "shtns",
+   "nside": 512,
+   "spin": 0,
+   "op": "alm2map",
+   "seconds": [
+    0.002762476011412218,
+    0.0027601170004345477,
+    0.0027570759993977845,
+    0.0027573670085985214,
+    0.002757306006969884
+   ],
+   "runs": "five warm runs",
+   "note": null
+  },
+  {
+   "engine": "namaster",
+   "cores": 32,
+   "nside": 512,
+   "spin": 0,
+   "op": "alm2map",
+   "seconds": [
+    0.015238402000250062,
+    0.015225813000142807,
+    0.015358702999947127,
+    0.015455243999895174,
+    0.015015269997093128
+   ],
+   "runs": "five warm runs"
+  },
+  {
+   "engine": "namaster",
+   "cores": 96,
+   "nside": 512,
+   "spin": 0,
+   "op": "alm2map",
+   "seconds": [
+    0.01280637200034107
+   ],
+   "runs": "median"
+  },
+  {
+   "engine": "gmaster",
+   "nside": 512,
+   "spin": 0,
+   "op": "map2alm",
+   "seconds": [
+    0.0019283280125819147
+   ],
+   "runs": "median"
+  },
+  {
+   "engine": "shtns",
+   "nside": 512,
+   "spin": 0,
+   "op": "map2alm",
+   "seconds": [
+    0.00246891297865659,
+    0.002453242981573567,
+    0.0024536240089219064,
+    0.002455363981425762,
+    0.0024550929956603795
+   ],
+   "runs": "five warm runs",
+   "note": null
+  },
+  {
+   "engine": "namaster",
+   "cores": 32,
+   "nside": 512,
+   "spin": 0,
+   "op": "map2alm",
+   "seconds": [
+    0.016210891997616272,
+    0.015355752999312244,
+    0.014915239000401925,
+    0.015466994998860173,
+    0.014612887000112096
+   ],
+   "runs": "five warm runs"
+  },
+  {
+   "engine": "namaster",
+   "cores": 96,
+   "nside": 512,
+   "spin": 0,
+   "op": "map2alm",
+   "seconds": [
+    0.014498763001029147
+   ],
+   "runs": "median"
+  },
+  {
+   "engine": "gmaster",
+   "nside": 1024,
+   "spin": 0,
+   "op": "alm2map",
+   "seconds": [
+    0.0068992119922768325
+   ],
+   "runs": "median"
+  },
+  {
+   "engine": "shtns",
+   "nside": 1024,
+   "spin": 0,
+   "op": "alm2map",
+   "seconds": [
+    0.01752175801084377,
+    0.017497537977760658,
+    0.017515118001028895,
+    0.017480668000644073,
+    0.017492327984655276
+   ],
+   "runs": "five warm runs",
+   "note": null
+  },
+  {
+   "engine": "namaster",
+   "cores": 32,
+   "nside": 1024,
+   "spin": 0,
+   "op": "alm2map",
+   "seconds": [
+    0.08607299399955082,
+    0.0844010580003669,
+    0.08452451899938751,
+    0.08516778600096586,
+    0.08863323799960199
+   ],
+   "runs": "five warm runs"
+  },
+  {
+   "engine": "namaster",
+   "cores": 96,
+   "nside": 1024,
+   "spin": 0,
+   "op": "alm2map",
+   "seconds": [
+    0.05613268399974913
+   ],
+   "runs": "median"
+  },
+  {
+   "engine": "gmaster",
+   "nside": 1024,
+   "spin": 0,
+   "op": "map2alm",
+   "seconds": [
+    0.007336536014918238
+   ],
+   "runs": "median"
+  },
+  {
+   "engine": "shtns",
+   "nside": 1024,
+   "spin": 0,
+   "op": "map2alm",
+   "seconds": [
+    0.017413806985132396,
+    0.017386747000273317,
+    0.017453426989959553,
+    0.017478677997132763,
+    0.01748230800149031
+   ],
+   "runs": "five warm runs",
+   "note": null
+  },
+  {
+   "engine": "namaster",
+   "cores": 32,
+   "nside": 1024,
+   "spin": 0,
+   "op": "map2alm",
+   "seconds": [
+    0.08936255400112714,
+    0.0882232939984533,
+    0.08831145499789272,
+    0.08904702099971473,
+    0.0914908140002808
+   ],
+   "runs": "five warm runs"
+  },
+  {
+   "engine": "namaster",
+   "cores": 96,
+   "nside": 1024,
+   "spin": 0,
+   "op": "map2alm",
+   "seconds": [
+    0.06242562899933546
+   ],
+   "runs": "median"
+  },
+  {
+   "engine": "gmaster",
+   "nside": 2048,
+   "spin": 0,
+   "op": "alm2map",
+   "seconds": [
+    0.03689674101769924
+   ],
+   "runs": "median"
+  },
+  {
+   "engine": "shtns",
+   "nside": 2048,
+   "spin": 0,
+   "op": "alm2map",
+   "seconds": [
+    0.12941538201994263,
+    0.12946691099205054,
+    0.12946021201787516,
+    0.12950736199854873,
+    0.12947139199241064
+   ],
+   "runs": "five warm runs",
+   "note": null
+  },
+  {
+   "engine": "namaster",
+   "cores": 32,
+   "nside": 2048,
+   "spin": 0,
+   "op": "alm2map",
+   "seconds": [
+    0.5432244690018706,
+    0.5242629819986178,
+    0.5083857329991588,
+    0.5093839219989604,
+    0.5115435510015232
+   ],
+   "runs": "five warm runs"
+  },
+  {
+   "engine": "namaster",
+   "cores": 96,
+   "nside": 2048,
+   "spin": 0,
+   "op": "alm2map",
+   "seconds": [
+    0.29794016199957696
+   ],
+   "runs": "median"
+  },
+  {
+   "engine": "gmaster",
+   "nside": 2048,
+   "spin": 0,
+   "op": "map2alm",
+   "seconds": [
+    0.04232494899770245
+   ],
+   "runs": "median"
+  },
+  {
+   "engine": "shtns",
+   "nside": 2048,
+   "spin": 0,
+   "op": "map2alm",
+   "seconds": [
+    0.13227746900520287,
+    0.13243877000059,
+    0.13244489999487996,
+    0.13244538998696953,
+    0.13244345999555662
+   ],
+   "runs": "five warm runs",
+   "note": null
+  },
+  {
+   "engine": "namaster",
+   "cores": 32,
+   "nside": 2048,
+   "spin": 0,
+   "op": "map2alm",
+   "seconds": [
+    0.5375820959998237,
+    0.5287206030006928,
+    0.503554538001481,
+    0.5057125269995595,
+    0.5084082629982731
+   ],
+   "runs": "five warm runs"
+  },
+  {
+   "engine": "namaster",
+   "cores": 96,
+   "nside": 2048,
+   "spin": 0,
+   "op": "map2alm",
+   "seconds": [
+    0.3097514550026972
+   ],
+   "runs": "median"
+  },
+  {
+   "engine": "gmaster",
+   "nside": 4096,
+   "spin": 0,
+   "op": "alm2map",
+   "seconds": [
+    0.5109717829909641
+   ],
+   "runs": "median"
+  },
+  {
+   "engine": "shtns",
+   "nside": 4096,
+   "spin": 0,
+   "op": "alm2map",
+   "seconds": [
+    0.9902277509972919,
+    0.9899766889866441,
+    0.9899806379980873,
+    0.9899690879974514,
+    0.9899700369860511
+   ],
+   "runs": "five warm runs",
+   "note": null
+  },
+  {
+   "engine": "namaster",
+   "cores": 32,
+   "nside": 4096,
+   "spin": 0,
+   "op": "alm2map",
+   "seconds": [
+    3.5766528869971808,
+    3.5446788139997807,
+    3.57485715599978,
+    3.5382068210019497,
+    3.5560382590010704
+   ],
+   "runs": "five warm runs"
+  },
+  {
+   "engine": "namaster",
+   "cores": 96,
+   "nside": 4096,
+   "spin": 0,
+   "op": "alm2map",
+   "seconds": [
+    1.8680590180010768,
+    1.8378069270002015,
+    1.8626919980015373,
+    1.8779327339980227,
+    1.845597514999099
+   ],
+   "runs": "five warm runs"
+  },
+  {
+   "engine": "gmaster",
+   "nside": 4096,
+   "spin": 0,
+   "op": "map2alm",
+   "seconds": [
+    0.45328383200103417
+   ],
+   "runs": "median"
+  },
+  {
+   "engine": "shtns",
+   "nside": 4096,
+   "spin": 0,
+   "op": "map2alm",
+   "seconds": [
+    1.0278263000072911,
+    1.0277206680038944,
+    1.0277442490041722,
+    1.027741697995225,
+    1.0277355079888366
+   ],
+   "runs": "five warm runs",
+   "note": null
+  },
+  {
+   "engine": "namaster",
+   "cores": 32,
+   "nside": 4096,
+   "spin": 0,
+   "op": "map2alm",
+   "seconds": [
+    3.43417167699954,
+    3.4375230810001085,
+    3.4317613120001624,
+    3.474358688999928,
+    3.423628533997544
+   ],
+   "runs": "five warm runs"
+  },
+  {
+   "engine": "namaster",
+   "cores": 96,
+   "nside": 4096,
+   "spin": 0,
+   "op": "map2alm",
+   "seconds": [
+    1.8240558240031532,
+    1.7875118369993288,
+    1.831085546000395,
+    1.8809854020000785,
+    1.8534444450015144
+   ],
+   "runs": "five warm runs"
+  },
+  {
+   "engine": "gmaster",
+   "nside": 8192,
+   "spin": 0,
+   "op": "alm2map",
+   "seconds": [
+    3.277557337016333,
+    3.2846250220027287,
+    3.285535828996217,
+    3.2878434699960053,
+    3.2823929259902798
+   ],
+   "runs": "five warm runs"
+  },
+  {
+   "engine": "shtns",
+   "nside": 8192,
+   "spin": 0,
+   "op": "alm2map",
+   "seconds": [
+    7.735918453021441,
+    7.735720494994894,
+    7.735846241004765,
+    7.747763118997682,
+    7.764221160003217
+   ],
+   "runs": "five warm runs",
+   "note": null
+  },
+  {
+   "engine": "namaster",
+   "cores": 32,
+   "nside": 8192,
+   "spin": 0,
+   "op": "alm2map",
+   "seconds": [
+    26.933319502000813,
+    26.96678003999841,
+    26.929472141000588,
+    27.089405464001175,
+    26.89085934600007
+   ],
+   "runs": "five warm runs"
+  },
+  {
+   "engine": "namaster",
+   "cores": 96,
+   "nside": 8192,
+   "spin": 0,
+   "op": "alm2map",
+   "seconds": [
+    13.419037980998837,
+    13.428908788999252,
+    13.523487272999773,
+    13.481800892001047,
+    13.648461220996978
+   ],
+   "runs": "five warm runs"
+  },
+  {
+   "engine": "gmaster",
+   "nside": 8192,
+   "spin": 0,
+   "op": "map2alm",
+   "seconds": [
+    3.018415850994643,
+    3.012787328014383,
+    3.0109205690096132,
+    3.0135746330197435,
+    3.0174697900074534
+   ],
+   "runs": "five warm runs"
+  },
+  {
+   "engine": "shtns",
+   "nside": 8192,
+   "spin": 0,
+   "op": "map2alm",
+   "seconds": [
+    8.130310141976224,
+    8.130466848000651,
+    8.132043997000437,
+    8.13237260497408,
+    8.13425266701961
+   ],
+   "runs": "five warm runs",
+   "note": null
+  },
+  {
+   "engine": "namaster",
+   "cores": 32,
+   "nside": 8192,
+   "spin": 0,
+   "op": "map2alm",
+   "seconds": [
+    25.737630237999838,
+    25.72423229299966,
+    25.6676123080033,
+    25.745521828001074,
+    25.702566216998093
+   ],
+   "runs": "five warm runs"
+  },
+  {
+   "engine": "namaster",
+   "cores": 96,
+   "nside": 8192,
+   "spin": 0,
+   "op": "map2alm",
+   "seconds": [
+    12.753963232997194,
+    12.781878360998235,
+    12.857918740002788,
+    12.986566030998802,
+    12.94190077500025
+   ],
+   "runs": "five warm runs"
+  },
+  {
+   "engine": "gmaster",
+   "nside": 64,
+   "spin": 2,
+   "op": "alm2map",
+   "seconds": [
+    0.0003324229910504073
+   ],
+   "runs": "median"
+  },
+  {
+   "engine": "shtns",
+   "nside": 64,
+   "spin": 2,
+   "op": "alm2map",
+   "seconds": [
+    0.00012741101090796292,
+    0.00012671100557781756,
+    0.00012637200416065753,
+    0.00012592098210006952,
+    0.00012584100477397442
+   ],
+   "runs": "five warm runs",
+   "note": "spin-1 vector transform (SHTns has no spin 2)"
+  },
+  {
+   "engine": "namaster",
+   "cores": 32,
+   "nside": 64,
+   "spin": 2,
+   "op": "alm2map",
+   "seconds": [
+    0.00041943399992305785,
+    0.00039082299917936325,
+    0.00041078399954130873,
+    0.00041292400055681355,
+    0.00038348399903043173
+   ],
+   "runs": "five warm runs"
+  },
+  {
+   "engine": "namaster",
+   "cores": 96,
+   "nside": 64,
+   "spin": 2,
+   "op": "alm2map",
+   "seconds": [
+    0.0008595959989179391
+   ],
+   "runs": "median"
+  },
+  {
+   "engine": "gmaster",
+   "nside": 64,
+   "spin": 2,
+   "op": "map2alm",
+   "seconds": [
+    0.0003013130044564605
+   ],
+   "runs": "median"
+  },
+  {
+   "engine": "shtns",
+   "nside": 64,
+   "spin": 2,
+   "op": "map2alm",
+   "seconds": [
+    8.466097642667592e-05,
+    8.110998896881938e-05,
+    8.006999269127846e-05,
+    8.15809762571007e-05,
+    7.839099271222949e-05
+   ],
+   "runs": "five warm runs",
+   "note": "spin-1 vector transform (SHTns has no spin 2)"
+  },
+  {
+   "engine": "namaster",
+   "cores": 32,
+   "nside": 64,
+   "spin": 2,
+   "op": "map2alm",
+   "seconds": [
+    0.0003832540023722686,
+    0.00030941300065023825,
+    0.00029357300081755966,
+    0.00028362299781292677,
+    0.0002852520010492299
+   ],
+   "runs": "five warm runs"
+  },
+  {
+   "engine": "namaster",
+   "cores": 96,
+   "nside": 64,
+   "spin": 2,
+   "op": "map2alm",
+   "seconds": [
+    0.0005768990013166331
+   ],
+   "runs": "median"
+  },
+  {
+   "engine": "gmaster",
+   "nside": 128,
+   "spin": 2,
+   "op": "alm2map",
+   "seconds": [
+    0.00042568400385789573
+   ],
+   "runs": "median"
+  },
+  {
+   "engine": "shtns",
+   "nside": 128,
+   "spin": 2,
+   "op": "alm2map",
+   "seconds": [
+    0.00021739199291914701,
+    0.00021692202426493168,
+    0.000216532003832981,
+    0.00021609198302030563,
+    0.00021596200531348586
+   ],
+   "runs": "five warm runs",
+   "note": "spin-1 vector transform (SHTns has no spin 2)"
+  },
+  {
+   "engine": "namaster",
+   "cores": 32,
+   "nside": 128,
+   "spin": 2,
+   "op": "alm2map",
+   "seconds": [
+    0.0014990339986979961,
+    0.0015203039984044153,
+    0.0014982440006860998,
+    0.0014816839975537732,
+    0.0014963239991629962
+   ],
+   "runs": "five warm runs"
+  },
+  {
+   "engine": "namaster",
+   "cores": 96,
+   "nside": 128,
+   "spin": 2,
+   "op": "alm2map",
+   "seconds": [
+    0.0010910349992627744
+   ],
+   "runs": "median"
+  },
+  {
+   "engine": "gmaster",
+   "nside": 128,
+   "spin": 2,
+   "op": "map2alm",
+   "seconds": [
+    0.0003476330020930618
+   ],
+   "runs": "median"
+  },
+  {
+   "engine": "shtns",
+   "nside": 128,
+   "spin": 2,
+   "op": "map2alm",
+   "seconds": [
+    0.00016519101336598396,
+    0.0001620519906282425,
+    0.00016025200602598488,
+    0.0001593109918758273,
+    0.00016056199092417955
+   ],
+   "runs": "five warm runs",
+   "note": "spin-1 vector transform (SHTns has no spin 2)"
+  },
+  {
+   "engine": "namaster",
+   "cores": 32,
+   "nside": 128,
+   "spin": 2,
+   "op": "map2alm",
+   "seconds": [
+    0.0014945139992050827,
+    0.0011315709998598322,
+    0.0011215109989279881,
+    0.001113690002966905,
+    0.0016115350008476526
+   ],
+   "runs": "five warm runs"
+  },
+  {
+   "engine": "namaster",
+   "cores": 96,
+   "nside": 128,
+   "spin": 2,
+   "op": "map2alm",
+   "seconds": [
+    0.0014314279978862032
+   ],
+   "runs": "median"
+  },
+  {
+   "engine": "gmaster",
+   "nside": 256,
+   "spin": 2,
+   "op": "alm2map",
+   "seconds": [
+    0.0008388569985982031
+   ],
+   "runs": "median"
+  },
+  {
+   "engine": "shtns",
+   "nside": 256,
+   "spin": 2,
+   "op": "alm2map",
+   "seconds": [
+    0.0009367690072394907,
+    0.0009377589740324765,
+    0.0009357689996249974,
+    0.0009354889916721731,
+    0.0009367890015710145
+   ],
+   "runs": "five warm runs",
+   "note": "spin-1 vector transform (SHTns has no spin 2)"
+  },
+  {
+   "engine": "namaster",
+   "cores": 32,
+   "nside": 256,
+   "spin": 2,
+   "op": "alm2map",
+   "seconds": [
+    0.00489155600007507,
+    0.0048788060012157075,
+    0.005020096999942325,
+    0.0049146159981319215,
+    0.004885135000222363
+   ],
+   "runs": "five warm runs"
+  },
+  {
+   "engine": "namaster",
+   "cores": 96,
+   "nside": 256,
+   "spin": 2,
+   "op": "alm2map",
+   "seconds": [
+    0.004166880000411766
+   ],
+   "runs": "median"
+  },
+  {
+   "engine": "gmaster",
+   "nside": 256,
+   "spin": 2,
+   "op": "map2alm",
+   "seconds": [
+    0.0006668260029982775
+   ],
+   "runs": "median"
+  },
+  {
+   "engine": "shtns",
+   "nside": 256,
+   "spin": 2,
+   "op": "map2alm",
+   "seconds": [
+    0.0007946669938974082,
+    0.0007891279819887131,
+    0.0007898879994172603,
+    0.000787777011282742,
+    0.0007878979959059507
+   ],
+   "runs": "five warm runs",
+   "note": "spin-1 vector transform (SHTns has no spin 2)"
+  },
+  {
+   "engine": "namaster",
+   "cores": 32,
+   "nside": 256,
+   "spin": 2,
+   "op": "map2alm",
+   "seconds": [
+    0.005555702002311591,
+    0.004787744001077954,
+    0.004685423999035265,
+    0.004717163999885088,
+    0.004720754001027672
+   ],
+   "runs": "five warm runs"
+  },
+  {
+   "engine": "namaster",
+   "cores": 96,
+   "nside": 256,
+   "spin": 2,
+   "op": "map2alm",
+   "seconds": [
+    0.006160155000543455
+   ],
+   "runs": "median"
+  },
+  {
+   "engine": "gmaster",
+   "nside": 512,
+   "spin": 2,
+   "op": "alm2map",
+   "seconds": [
+    0.0027394549979362637
+   ],
+   "runs": "median"
+  },
+  {
+   "engine": "shtns",
+   "nside": 512,
+   "spin": 2,
+   "op": "alm2map",
+   "seconds": [
+    0.005551142996409908,
+    0.00555627400171943,
+    0.005545902997255325,
+    0.005558003002079204,
+    0.0055505130148958415
+   ],
+   "runs": "five warm runs",
+   "note": "spin-1 vector transform (SHTns has no spin 2)"
+  },
+  {
+   "engine": "namaster",
+   "cores": 32,
+   "nside": 512,
+   "spin": 2,
+   "op": "alm2map",
+   "seconds": [
+    0.031510844000877114,
+    0.031108380000659963,
+    0.030253433000325458,
+    0.030280542003310984,
+    0.030578706002415856
+   ],
+   "runs": "five warm runs"
+  },
+  {
+   "engine": "namaster",
+   "cores": 96,
+   "nside": 512,
+   "spin": 2,
+   "op": "alm2map",
+   "seconds": [
+    0.025719145000039134
+   ],
+   "runs": "median"
+  },
+  {
+   "engine": "gmaster",
+   "nside": 512,
+   "spin": 2,
+   "op": "map2alm",
+   "seconds": [
+    0.0023507620207965374
+   ],
+   "runs": "median"
+  },
+  {
+   "engine": "shtns",
+   "nside": 512,
+   "spin": 2,
+   "op": "map2alm",
+   "seconds": [
+    0.00495582798612304,
+    0.004941467981552705,
+    0.004939297010423616,
+    0.00494286700268276,
+    0.00494301799335517
+   ],
+   "runs": "five warm runs",
+   "note": "spin-1 vector transform (SHTns has no spin 2)"
+  },
+  {
+   "engine": "namaster",
+   "cores": 32,
+   "nside": 512,
+   "spin": 2,
+   "op": "map2alm",
+   "seconds": [
+    0.03453940300096292,
+    0.03424223999900278,
+    0.03459199300050386,
+    0.034334091000346234,
+    0.03372126500107697
+   ],
+   "runs": "five warm runs"
+  },
+  {
+   "engine": "namaster",
+   "cores": 96,
+   "nside": 512,
+   "spin": 2,
+   "op": "map2alm",
+   "seconds": [
+    0.0271445729995321
+   ],
+   "runs": "median"
+  },
+  {
+   "engine": "gmaster",
+   "nside": 1024,
+   "spin": 2,
+   "op": "alm2map",
+   "seconds": [
+    0.01313641801243648
+   ],
+   "runs": "median"
+  },
+  {
+   "engine": "shtns",
+   "nside": 1024,
+   "spin": 2,
+   "op": "alm2map",
+   "seconds": [
+    0.03504825700656511,
+    0.0350729460187722,
+    0.03503577597439289,
+    0.03503875702153891,
+    0.035148256982211024
+   ],
+   "runs": "five warm runs",
+   "note": "spin-1 vector transform (SHTns has no spin 2)"
+  },
+  {
+   "engine": "namaster",
+   "cores": 32,
+   "nside": 1024,
+   "spin": 2,
+   "op": "alm2map",
+   "seconds": [
+    0.1710882869992929,
+    0.16509480099921348,
+    0.16206924300058745,
+    0.159311258001253,
+    0.15676742299910984
+   ],
+   "runs": "five warm runs"
+  },
+  {
+   "engine": "namaster",
+   "cores": 96,
+   "nside": 1024,
+   "spin": 2,
+   "op": "alm2map",
+   "seconds": [
+    0.11162360199887189
+   ],
+   "runs": "median"
+  },
+  {
+   "engine": "gmaster",
+   "nside": 1024,
+   "spin": 2,
+   "op": "map2alm",
+   "seconds": [
+    0.013464140996802598
+   ],
+   "runs": "median"
+  },
+  {
+   "engine": "shtns",
+   "nside": 1024,
+   "spin": 2,
+   "op": "map2alm",
+   "seconds": [
+    0.035270698979729787,
+    0.03506548600853421,
+    0.03506408701650798,
+    0.035060705995419994,
+    0.035062265989836305
+   ],
+   "runs": "five warm runs",
+   "note": "spin-1 vector transform (SHTns has no spin 2)"
+  },
+  {
+   "engine": "namaster",
+   "cores": 32,
+   "nside": 1024,
+   "spin": 2,
+   "op": "map2alm",
+   "seconds": [
+    0.17845754599693464,
+    0.17130321899821865,
+    0.1712303089989291,
+    0.1652728320004826,
+    0.16341509499761742
+   ],
+   "runs": "five warm runs"
+  },
+  {
+   "engine": "namaster",
+   "cores": 96,
+   "nside": 1024,
+   "spin": 2,
+   "op": "map2alm",
+   "seconds": [
+    0.12094837699987693
+   ],
+   "runs": "median"
+  },
+  {
+   "engine": "gmaster",
+   "nside": 2048,
+   "spin": 2,
+   "op": "alm2map",
+   "seconds": [
+    0.09035030502127483
+   ],
+   "runs": "median"
+  },
+  {
+   "engine": "shtns",
+   "nside": 2048,
+   "spin": 2,
+   "op": "alm2map",
+   "seconds": [
+    0.25919747501029633,
+    0.2591421240067575,
+    0.25923589599551633,
+    0.25918847499997355,
+    0.25916706401039846
+   ],
+   "runs": "five warm runs",
+   "note": "spin-1 vector transform (SHTns has no spin 2)"
+  },
+  {
+   "engine": "namaster",
+   "cores": 32,
+   "nside": 2048,
+   "spin": 2,
+   "op": "alm2map",
+   "seconds": [
+    1.0007391399994958,
+    1.0247915029976866,
+    1.016964177997579,
+    1.0058333830020274,
+    1.0105440650004311
+   ],
+   "runs": "five warm runs"
+  },
+  {
+   "engine": "namaster",
+   "cores": 96,
+   "nside": 2048,
+   "spin": 2,
+   "op": "alm2map",
+   "seconds": [
+    0.5828470199994626
+   ],
+   "runs": "median"
+  },
+  {
+   "engine": "gmaster",
+   "nside": 2048,
+   "spin": 2,
+   "op": "map2alm",
+   "seconds": [
+    0.0917452180001419
+   ],
+   "runs": "median"
+  },
+  {
+   "engine": "shtns",
+   "nside": 2048,
+   "spin": 2,
+   "op": "map2alm",
+   "seconds": [
+    0.2650998310127761,
+    0.2650825520104263,
+    0.26509136200184,
+    0.2651036820025183,
+    0.26509484098642133
+   ],
+   "runs": "five warm runs",
+   "note": "spin-1 vector transform (SHTns has no spin 2)"
+  },
+  {
+   "engine": "namaster",
+   "cores": 32,
+   "nside": 2048,
+   "spin": 2,
+   "op": "map2alm",
+   "seconds": [
+    1.0011023430015484,
+    0.9964926290012954,
+    1.0056250630004797,
+    1.0018450060015311,
+    1.0243863049981883
+   ],
+   "runs": "five warm runs"
+  },
+  {
+   "engine": "namaster",
+   "cores": 96,
+   "nside": 2048,
+   "spin": 2,
+   "op": "map2alm",
+   "seconds": [
+    0.6173181060003117
+   ],
+   "runs": "median"
+  },
+  {
+   "engine": "gmaster",
+   "nside": 4096,
+   "spin": 2,
+   "op": "alm2map",
+   "seconds": [
+    0.6952869180240668
+   ],
+   "runs": "median"
+  },
+  {
+   "engine": "shtns",
+   "nside": 4096,
+   "spin": 2,
+   "op": "alm2map",
+   "seconds": [
+    1.9806352730083745,
+    1.9805463329830673,
+    1.9808150040043984,
+    1.9807211220031604,
+    1.9807055720011704
+   ],
+   "runs": "five warm runs",
+   "note": "spin-1 vector transform (SHTns has no spin 2)"
+  },
+  {
+   "engine": "namaster",
+   "cores": 32,
+   "nside": 4096,
+   "spin": 2,
+   "op": "alm2map",
+   "seconds": [
+    7.179884387001948,
+    7.1630672510000295,
+    7.188405494998733,
+    7.179829559001519,
+    7.1664773099982995
+   ],
+   "runs": "five warm runs"
+  },
+  {
+   "engine": "namaster",
+   "cores": 96,
+   "nside": 4096,
+   "spin": 2,
+   "op": "alm2map",
+   "seconds": [
+    3.7076999210003123,
+    3.713213219001773,
+    3.699418633001187,
+    3.6766285080011585,
+    3.6484349649981596
+   ],
+   "runs": "five warm runs"
+  },
+  {
+   "engine": "gmaster",
+   "nside": 4096,
+   "spin": 2,
+   "op": "map2alm",
+   "seconds": [
+    0.706686695019016
+   ],
+   "runs": "median"
+  },
+  {
+   "engine": "shtns",
+   "nside": 4096,
+   "spin": 2,
+   "op": "map2alm",
+   "seconds": [
+    2.0637637049949262,
+    2.064757332991576,
+    2.064617772004567,
+    2.0645337399910204,
+    2.064764192007715
+   ],
+   "runs": "five warm runs",
+   "note": "spin-1 vector transform (SHTns has no spin 2)"
+  },
+  {
+   "engine": "namaster",
+   "cores": 32,
+   "nside": 4096,
+   "spin": 2,
+   "op": "map2alm",
+   "seconds": [
+    6.8726938370018615,
+    6.8705488679988775,
+    6.862732118999702,
+    6.877565619000961,
+    6.914238170997123
+   ],
+   "runs": "five warm runs"
+  },
+  {
+   "engine": "namaster",
+   "cores": 96,
+   "nside": 4096,
+   "spin": 2,
+   "op": "map2alm",
+   "seconds": [
+    3.602369779997389,
+    3.6019319349979924,
+    3.610652741001104,
+    3.6929544750018977,
+    3.6684773240012873
+   ],
+   "runs": "five warm runs"
+  },
+  {
+   "engine": "gmaster",
+   "nside": 8192,
+   "spin": 2,
+   "op": "alm2map",
+   "seconds": [
+    4.325912961969152,
+    4.337587595975492,
+    4.346083167009056,
+    4.354466399992816,
+    4.36642103001941
+   ],
+   "runs": "five warm runs"
+  },
+  {
+   "engine": "shtns",
+   "nside": 8192,
+   "spin": 2,
+   "op": "alm2map",
+   "seconds": [
+    15.538232457998674,
+    15.54063911398407,
+    15.542282101989258,
+    15.60513922397513,
+    15.60493299702648
+   ],
+   "runs": "five warm runs",
+   "note": "spin-1 vector transform (SHTns has no spin 2)"
+  },
+  {
+   "engine": "namaster",
+   "cores": 32,
+   "nside": 8192,
+   "spin": 2,
+   "op": "alm2map",
+   "seconds": [
+    54.34211676400082,
+    54.288781961000495,
+    54.42237648999799,
+    54.26738742199814,
+    54.366353301000345
+   ],
+   "runs": "five warm runs"
+  },
+  {
+   "engine": "namaster",
+   "cores": 96,
+   "nside": 8192,
+   "spin": 2,
+   "op": "alm2map",
+   "seconds": [
+    27.34398881800007,
+    27.121422860000166,
+    27.114232684001763,
+    27.191379716001393,
+    27.147815978001745
+   ],
+   "runs": "five warm runs"
+  },
+  {
+   "engine": "gmaster",
+   "nside": 8192,
+   "spin": 2,
+   "op": "map2alm",
+   "seconds": [
+    4.545338945987169,
+    4.552534241054673,
+    4.561639193969313,
+    4.56628336396534,
+    4.575257133052219
+   ],
+   "runs": "five warm runs"
+  },
+  {
+   "engine": "shtns",
+   "nside": 8192,
+   "spin": 2,
+   "op": "map2alm",
+   "seconds": [
+    16.33584360399982,
+    16.33771081501618,
+    16.339848898001947,
+    16.33983742201235,
+    16.341036967001855
+   ],
+   "runs": "five warm runs",
+   "note": "spin-1 vector transform (SHTns has no spin 2)"
+  },
+  {
+   "engine": "namaster",
+   "cores": 32,
+   "nside": 8192,
+   "spin": 2,
+   "op": "map2alm",
+   "seconds": [
+    51.908732682000846,
+    51.71622808900065,
+    51.83354116800183,
+    51.68810285699874,
+    51.6932065760011
+   ],
+   "runs": "five warm runs"
+  },
+  {
+   "engine": "namaster",
+   "cores": 96,
+   "nside": 8192,
+   "spin": 2,
+   "op": "map2alm",
+   "seconds": [
+    25.884630859000026,
+    26.187755908998952,
+    25.854918031000125,
+    25.844261480997375,
+    25.94860762999815
+   ],
+   "runs": "five warm runs"
+  }
+ ],
+ "end_to_end": [
+  {
+   "engine": "gmaster",
+   "cores": null,
+   "nside": 64,
+   "spin": 0,
+   "seconds": [
+    0.005397750996053219
+   ],
+   "runs": "1 warm run"
+  },
+  {
+   "engine": "gmaster",
+   "cores": null,
+   "nside": 128,
+   "spin": 0,
+   "seconds": [
+    0.007158655964303762
+   ],
+   "runs": "1 warm run"
+  },
+  {
+   "engine": "gmaster",
+   "cores": null,
+   "nside": 256,
+   "spin": 0,
+   "seconds": [
+    0.00972923100925982
+   ],
+   "runs": "1 warm run"
+  },
+  {
+   "engine": "gmaster",
+   "cores": null,
+   "nside": 512,
+   "spin": 0,
+   "seconds": [
+    0.019476543995551765,
+    0.02416459599044174,
+    0.017699338000966236,
+    0.016999882005620748,
+    0.01687884097918868
+   ],
+   "runs": "5 warm runs"
+  },
+  {
+   "engine": "gmaster",
+   "cores": null,
+   "nside": 1024,
+   "spin": 0,
+   "seconds": [
+    0.10755981100373901,
+    0.08635788198444061,
+    0.08632939102244563,
+    0.08666785497916862,
+    0.08630976200220175
+   ],
+   "runs": "5 warm runs"
+  },
+  {
+   "engine": "gmaster",
+   "cores": null,
+   "nside": 2048,
+   "spin": 0,
+   "seconds": [
+    0.5510622360161506,
+    0.4724269740108866,
+    0.47296387900132686,
+    0.4726730959955603,
+    0.472827417019289
+   ],
+   "runs": "5 warm runs"
+  },
+  {
+   "engine": "gmaster",
+   "cores": null,
+   "nside": 4096,
+   "spin": 0,
+   "seconds": [
+    4.246343389997492,
+    4.245122441992862,
+    4.25072102600825,
+    4.250968501000898,
+    4.255080791015644
+   ],
+   "runs": "5 warm runs"
+  },
+  {
+   "engine": "gmaster",
+   "cores": null,
+   "nside": 8192,
+   "spin": 0,
+   "seconds": [
+    43.473127486009616,
+    43.67692615900887,
+    43.77080994300195,
+    43.78478669398464,
+    43.84477070698631
+   ],
+   "runs": "5 warm runs"
+  },
+  {
+   "engine": "gmaster",
+   "cores": null,
+   "nside": 64,
+   "spin": 2,
+   "seconds": [
+    0.0040904959896579385,
+    0.002661384001839906,
+    0.0024209120019804686,
+    0.0023061910178512335,
+    0.002275709994137287
+   ],
+   "runs": "5 warm runs"
+  },
+  {
+   "engine": "gmaster",
+   "cores": null,
+   "nside": 128,
+   "spin": 2,
+   "seconds": [
+    0.004569551005261019,
+    0.0030161069880705327,
+    0.0029436970071401447,
+    0.0029211360088083893,
+    0.0029281369934324175
+   ],
+   "runs": "5 warm runs"
+  },
+  {
+   "engine": "gmaster",
+   "cores": null,
+   "nside": 256,
+   "spin": 2,
+   "seconds": [
+    0.0092194729950279,
+    0.008301983994897455,
+    0.007927362021291628,
+    0.007898410985944793,
+    0.007863429986173287
+   ],
+   "runs": "5 warm runs"
+  },
+  {
+   "engine": "gmaster",
+   "cores": null,
+   "nside": 512,
+   "spin": 2,
+   "seconds": [
+    0.03451175001100637,
+    0.03412799700163305,
+    0.03380904399091378,
+    0.03409984600148164,
+    0.034045476000756025
+   ],
+   "runs": "5 warm runs"
+  },
+  {
+   "engine": "gmaster",
+   "cores": null,
+   "nside": 1024,
+   "spin": 2,
+   "seconds": [
+    0.1694304239936173,
+    0.16928105198894627,
+    0.16921975099830888,
+    0.16901582898572087,
+    0.1691971420077607
+   ],
+   "runs": "5 warm runs"
+  },
+  {
+   "engine": "gmaster",
+   "cores": null,
+   "nside": 2048,
+   "spin": 2,
+   "seconds": [
+    1.365579692996107,
+    1.3642883409920614,
+    1.365286501008086,
+    1.3651194799749646,
+    1.3668771450174972
+   ],
+   "runs": "5 warm runs"
+  },
+  {
+   "engine": "gmaster",
+   "cores": null,
+   "nside": 4096,
+   "spin": 2,
+   "seconds": [
+    8.779136333992938,
+    8.797075759997824,
+    8.822020227002213,
+    8.831073242006823,
+    8.842766601999756
+   ],
+   "runs": "5 warm runs"
+  },
+  {
+   "engine": "gmaster",
+   "cores": null,
+   "nside": 8192,
+   "spin": 2,
+   "seconds": [
+    57.19874241400066
+   ],
+   "runs": "1 warm run"
+  },
+  {
+   "engine": "namaster",
+   "cores": 32,
+   "nside": 64,
+   "spin": 0,
+   "seconds": [
+    0.013843558030202985
+   ],
+   "runs": "1 warm run"
+  },
+  {
+   "engine": "namaster",
+   "cores": 32,
+   "nside": 128,
+   "spin": 0,
+   "seconds": [
+    0.04271020699525252
+   ],
+   "runs": "1 warm run"
+  },
+  {
+   "engine": "namaster",
+   "cores": 32,
+   "nside": 256,
+   "spin": 0,
+   "seconds": [
+    0.08362681698054075
+   ],
+   "runs": "1 warm run"
+  },
+  {
+   "engine": "namaster",
+   "cores": 32,
+   "nside": 512,
+   "spin": 0,
+   "seconds": [
+    0.4893966389936395
+   ],
+   "runs": "1 warm run"
+  },
+  {
+   "engine": "namaster",
+   "cores": 32,
+   "nside": 1024,
+   "spin": 0,
+   "seconds": [
+    2.995053287013434
+   ],
+   "runs": "1 warm run"
+  },
+  {
+   "engine": "namaster",
+   "cores": 32,
+   "nside": 2048,
+   "spin": 0,
+   "seconds": [
+    18.421002299000975,
+    18.42665079300059,
+    18.508882219000952,
+    18.432729185995413,
+    18.478205344028538
+   ],
+   "runs": "5 warm runs"
+  },
+  {
+   "engine": "namaster",
+   "cores": 32,
+   "nside": 4096,
+   "spin": 0,
+   "seconds": [
+    136.57550442099455,
+    136.58763877800084,
+    136.76935117598623,
+    136.99904163001338,
+    136.97279102701577
+   ],
+   "runs": "5 warm runs"
+  },
+  {
+   "engine": "namaster",
+   "cores": 32,
+   "nside": 8192,
+   "spin": 0,
+   "seconds": [
+    1054.7700901360076,
+    1054.6590145249793,
+    1055.4676708490006,
+    1059.8600630040164,
+    1055.992241910979
+   ],
+   "runs": "5 warm runs"
+  },
+  {
+   "engine": "namaster",
+   "cores": 32,
+   "nside": 64,
+   "spin": 2,
+   "seconds": [
+    0.012085390015272424,
+    0.011748207994969562,
+    0.010616178013151512,
+    0.010160743986489251,
+    0.010229204985080287
+   ],
+   "runs": "5 warm runs"
+  },
+  {
+   "engine": "namaster",
+   "cores": 32,
+   "nside": 128,
+   "spin": 2,
+   "seconds": [
+    0.04130902301403694,
+    0.03901106398552656,
+    0.03825813700677827,
+    0.04043468600139022,
+    0.03900730298482813
+   ],
+   "runs": "5 warm runs"
+  },
+  {
+   "engine": "namaster",
+   "cores": 32,
+   "nside": 256,
+   "spin": 2,
+   "seconds": [
+    0.18445546098519117,
+    0.17463241898803972,
+    0.17289670402533375,
+    0.17362423101440072,
+    0.16984567997860722
+   ],
+   "runs": "5 warm runs"
+  },
+  {
+   "engine": "namaster",
+   "cores": 32,
+   "nside": 512,
+   "spin": 2,
+   "seconds": [
+    0.859861667995574,
+    0.85708977500326,
+    0.8683531300048344,
+    0.8439457879867405,
+    0.8584217799943872
+   ],
+   "runs": "5 warm runs"
+  },
+  {
+   "engine": "namaster",
+   "cores": 32,
+   "nside": 1024,
+   "spin": 2,
+   "seconds": [
+    4.8719380169932265,
+    4.842211203009356,
+    4.837038492987631,
+    4.892660969024291,
+    4.911660111014498
+   ],
+   "runs": "5 warm runs"
+  },
+  {
+   "engine": "namaster",
+   "cores": 32,
+   "nside": 2048,
+   "spin": 2,
+   "seconds": [
+    31.464092520996928,
+    31.202920670009917,
+    31.27528442000039,
+    31.295606572006363,
+    31.21150004302035
+   ],
+   "runs": "5 warm runs"
+  },
+  {
+   "engine": "namaster",
+   "cores": 32,
+   "nside": 4096,
+   "spin": 2,
+   "seconds": [
+    215.3751376089931,
+    215.52531738800462,
+    215.39956374297617,
+    215.2110540579888,
+    215.25900906999595
+   ],
+   "runs": "5 warm runs"
+  },
+  {
+   "engine": "namaster",
+   "cores": 32,
+   "nside": 8192,
+   "spin": 2,
+   "seconds": [
+    1668.5363877869968,
+    1657.9528114150162,
+    1657.9671486970037,
+    1656.87909806901,
+    1657.058222644002
+   ],
+   "runs": "5 warm runs"
+  },
+  {
+   "engine": "namaster",
+   "cores": 96,
+   "nside": 64,
+   "spin": 0,
+   "seconds": [
+    0.020756889978656545,
+    0.01778501400258392,
+    0.030301752995001152,
+    0.007960979011841118,
+    0.006263443996431306
+   ],
+   "runs": "5 warm runs"
+  },
+  {
+   "engine": "namaster",
+   "cores": 96,
+   "nside": 128,
+   "spin": 0,
+   "seconds": [
+    0.014190362999215722,
+    0.02224393200594932,
+    0.021392276015831158,
+    0.015645246021449566,
+    0.014188122993800789
+   ],
+   "runs": "5 warm runs"
+  },
+  {
+   "engine": "namaster",
+   "cores": 96,
+   "nside": 256,
+   "spin": 0,
+   "seconds": [
+    0.0663844259979669,
+    0.06449492901447229,
+    0.061534943990409374,
+    0.06014698202488944,
+    0.06828671199036762
+   ],
+   "runs": "5 warm runs"
+  },
+  {
+   "engine": "namaster",
+   "cores": 96,
+   "nside": 512,
+   "spin": 0,
+   "seconds": [
+    0.34662163601024076,
+    0.344056173984427,
+    0.33514596699387766,
+    0.3189911970112007,
+    0.314346197003033
+   ],
+   "runs": "5 warm runs"
+  },
+  {
+   "engine": "namaster",
+   "cores": 96,
+   "nside": 1024,
+   "spin": 0,
+   "seconds": [
+    1.7523146659950726,
+    1.736574351991294,
+    1.7421983249951154,
+    1.7693313539784867,
+    1.734801766986493
+   ],
+   "runs": "5 warm runs"
+  },
+  {
+   "engine": "namaster",
+   "cores": 96,
+   "nside": 2048,
+   "spin": 0,
+   "seconds": [
+    10.366552658990258,
+    10.210981428012019,
+    10.250621204002528,
+    10.194884386000922,
+    10.394503668998368
+   ],
+   "runs": "5 warm runs"
+  },
+  {
+   "engine": "namaster",
+   "cores": 96,
+   "nside": 4096,
+   "spin": 0,
+   "seconds": [
+    70.14688240000396,
+    70.40857270400738,
+    70.28780134700355,
+    70.22743485801038,
+    70.13191299600294
+   ],
+   "runs": "5 warm runs"
+  },
+  {
+   "engine": "namaster",
+   "cores": 96,
+   "nside": 8192,
+   "spin": 0,
+   "seconds": [
+    528.8620352139988,
+    529.9351822659955,
+    530.0385895950021,
+    530.9845621789864,
+    530.3324822839932
+   ],
+   "runs": "5 warm runs"
+  },
+  {
+   "engine": "namaster",
+   "cores": 96,
+   "nside": 64,
+   "spin": 2,
+   "seconds": [
+    0.012857535999501124,
+    0.0145126809948124,
+    0.02215365899610333,
+    0.012562193995108828,
+    0.014850714011117816
+   ],
+   "runs": "5 warm runs"
+  },
+  {
+   "engine": "namaster",
+   "cores": 96,
+   "nside": 128,
+   "spin": 2,
+   "seconds": [
+    0.056767492002109066,
+    0.050000610994175076,
+    0.044234618020709604,
+    0.03906602298957296,
+    0.04330712999217212
+   ],
+   "runs": "5 warm runs"
+  },
+  {
+   "engine": "namaster",
+   "cores": 96,
+   "nside": 256,
+   "spin": 2,
+   "seconds": [
+    0.16737367899622768,
+    0.16807093599345535,
+    0.17564665398094803,
+    0.18326065302244388,
+    0.1831251510011498
+   ],
+   "runs": "5 warm runs"
+  },
+  {
+   "engine": "namaster",
+   "cores": 96,
+   "nside": 512,
+   "spin": 2,
+   "seconds": [
+    0.7314466460084077,
+    0.715895586006809,
+    0.708879653015174,
+    0.7101024629955646,
+    0.6932109619956464
+   ],
+   "runs": "5 warm runs"
+  },
+  {
+   "engine": "namaster",
+   "cores": 96,
+   "nside": 1024,
+   "spin": 2,
+   "seconds": [
+    3.459678622020874,
+    3.4149873289861716,
+    3.3795074820227455,
+    3.3277173050155398,
+    3.365953879983863
+   ],
+   "runs": "5 warm runs"
+  },
+  {
+   "engine": "namaster",
+   "cores": 96,
+   "nside": 2048,
+   "spin": 2,
+   "seconds": [
+    18.327413113001967,
+    18.64537427201867,
+    18.436638307000976,
+    18.445274063007673,
+    18.562549918016884
+   ],
+   "runs": "5 warm runs"
+  },
+  {
+   "engine": "namaster",
+   "cores": 96,
+   "nside": 4096,
+   "spin": 2,
+   "seconds": [
+    110.49548794701695,
+    110.45380346602178,
+    110.33396722300677,
+    110.32995610299986,
+    110.12463582097553
+   ],
+   "runs": "5 warm runs"
+  },
+  {
+   "engine": "namaster",
+   "cores": 96,
+   "nside": 8192,
+   "spin": 2,
+   "seconds": [
+    804.999658426008,
+    805.3243573800137,
+    804.8876296309754,
+    804.3744937760057,
+    804.4110587850155
+   ],
+   "runs": "5 warm runs"
+  }
+ ],
+ "memory": {
+  "transforms": [
+   {
+    "engine": "gmaster",
+    "nside": 64,
+    "spin": 0,
+    "peak_gib": 0.0853167399764061,
+    "kind": "device peak (XLA accounting)"
+   },
+   {
+    "engine": "gmaster",
+    "nside": 128,
+    "spin": 0,
+    "peak_gib": 0.06962922587990761,
+    "kind": "device peak (XLA accounting)"
+   },
+   {
+    "engine": "gmaster",
+    "nside": 256,
+    "spin": 0,
+    "peak_gib": 0.14860735088586807,
+    "kind": "device peak (XLA accounting)"
+   },
+   {
+    "engine": "gmaster",
+    "nside": 512,
+    "spin": 0,
+    "peak_gib": 0.5446745790541172,
+    "kind": "device peak (XLA accounting)"
+   },
+   {
+    "engine": "gmaster",
+    "nside": 1024,
+    "spin": 0,
+    "peak_gib": 2.1439869217574596,
+    "kind": "device peak (XLA accounting)"
+   },
+   {
+    "engine": "gmaster",
+    "nside": 2048,
+    "spin": 0,
+    "peak_gib": 8.521772589534521,
+    "kind": "device peak (XLA accounting)"
+   },
+   {
+    "engine": "gmaster",
+    "nside": 4096,
+    "spin": 0,
+    "peak_gib": 25.02665225043893,
+    "kind": "device peak (XLA accounting)"
+   },
+   {
+    "engine": "gmaster",
+    "nside": 8192,
+    "spin": 0,
+    "peak_gib": 81.51770825311542,
+    "kind": "device peak (XLA accounting)"
+   },
+   {
+    "engine": "gmaster",
+    "nside": 64,
+    "spin": 2,
+    "peak_gib": 0.08988155052065849,
+    "kind": "device peak (XLA accounting)"
+   },
+   {
+    "engine": "gmaster",
+    "nside": 128,
+    "spin": 2,
+    "peak_gib": 0.12195784971117973,
+    "kind": "device peak (XLA accounting)"
+   },
+   {
+    "engine": "gmaster",
+    "nside": 256,
+    "spin": 2,
+    "peak_gib": 0.2052200846374035,
+    "kind": "device peak (XLA accounting)"
+   },
+   {
+    "engine": "gmaster",
+    "nside": 512,
+    "spin": 2,
+    "peak_gib": 0.7725894451141357,
+    "kind": "device peak (XLA accounting)"
+   },
+   {
+    "engine": "gmaster",
+    "nside": 1024,
+    "spin": 2,
+    "peak_gib": 2.9946673661470413,
+    "kind": "device peak (XLA accounting)"
+   },
+   {
+    "engine": "gmaster",
+    "nside": 2048,
+    "spin": 2,
+    "peak_gib": 12.255096634849906,
+    "kind": "device peak (XLA accounting)"
+   },
+   {
+    "engine": "gmaster",
+    "nside": 4096,
+    "spin": 2,
+    "peak_gib": 43.855446917936206,
+    "kind": "device peak (XLA accounting)"
+   },
+   {
+    "engine": "gmaster",
+    "nside": 8192,
+    "spin": 2,
+    "peak_gib": 75.8356356099248,
+    "kind": "device peak (XLA accounting)"
+   },
+   {
+    "engine": "shtns",
+    "nside": 64,
+    "spin": 0,
+    "peak_gib": 0.0078125,
+    "kind": "device memory growth over the cell"
+   },
+   {
+    "engine": "shtns",
+    "nside": 128,
+    "spin": 0,
+    "peak_gib": 0.029296875,
+    "kind": "device memory growth over the cell"
+   },
+   {
+    "engine": "shtns",
+    "nside": 256,
+    "spin": 0,
+    "peak_gib": 0.083984375,
+    "kind": "device memory growth over the cell"
+   },
+   {
+    "engine": "shtns",
+    "nside": 512,
+    "spin": 0,
+    "peak_gib": 0.296875,
+    "kind": "device memory growth over the cell"
+   },
+   {
+    "engine": "shtns",
+    "nside": 1024,
+    "spin": 0,
+    "peak_gib": 1.294921875,
+    "kind": "device memory growth over the cell"
+   },
+   {
+    "engine": "shtns",
+    "nside": 2048,
+    "spin": 0,
+    "peak_gib": 5.14453125,
+    "kind": "device memory growth over the cell"
+   },
+   {
+    "engine": "shtns",
+    "nside": 4096,
+    "spin": 0,
+    "peak_gib": 20.546875,
+    "kind": "device memory growth over the cell"
+   },
+   {
+    "engine": "shtns",
+    "nside": 8192,
+    "spin": 0,
+    "peak_gib": 82.154296875,
+    "kind": "device memory growth over the cell"
+   },
+   {
+    "engine": "shtns",
+    "nside": 64,
+    "spin": 2,
+    "peak_gib": 0.009765625,
+    "kind": "device memory growth over the cell"
+   },
+   {
+    "engine": "shtns",
+    "nside": 128,
+    "spin": 2,
+    "peak_gib": 0.041015625,
+    "kind": "device memory growth over the cell"
+   },
+   {
+    "engine": "shtns",
+    "nside": 256,
+    "spin": 2,
+    "peak_gib": 0.115234375,
+    "kind": "device memory growth over the cell"
+   },
+   {
+    "engine": "shtns",
+    "nside": 512,
+    "spin": 2,
+    "peak_gib": 0.40625,
+    "kind": "device memory growth over the cell"
+   },
+   {
+    "engine": "shtns",
+    "nside": 1024,
+    "spin": 2,
+    "peak_gib": 1.720703125,
+    "kind": "device memory growth over the cell"
+   },
+   {
+    "engine": "shtns",
+    "nside": 2048,
+    "spin": 2,
+    "peak_gib": 6.837890625,
+    "kind": "device memory growth over the cell"
+   },
+   {
+    "engine": "shtns",
+    "nside": 4096,
+    "spin": 2,
+    "peak_gib": 27.3046875,
+    "kind": "device memory growth over the cell"
+   },
+   {
+    "engine": "shtns",
+    "nside": 8192,
+    "spin": 2,
+    "peak_gib": 82.16796875,
+    "kind": "device memory growth over the cell"
+   }
+  ],
+  "end_to_end": [
+   {
+    "engine": "gmaster",
+    "nside": 64,
+    "spin": 0,
+    "peak_gib": 0.14939434453845024,
+    "kind": "device peak (XLA accounting)"
+   },
+   {
+    "engine": "gmaster",
+    "nside": 128,
+    "spin": 0,
+    "peak_gib": 0.17343376204371452,
+    "kind": "device peak (XLA accounting)"
+   },
+   {
+    "engine": "gmaster",
+    "nside": 256,
+    "spin": 0,
+    "peak_gib": 0.38568393513560295,
+    "kind": "device peak (XLA accounting)"
+   },
+   {
+    "engine": "gmaster",
+    "nside": 512,
+    "spin": 0,
+    "peak_gib": 0.7832541950047016,
+    "kind": "device peak (XLA accounting)"
+   },
+   {
+    "engine": "gmaster",
+    "nside": 1024,
+    "spin": 0,
+    "peak_gib": 3.1062490828335285,
+    "kind": "device peak (XLA accounting)"
+   },
+   {
+    "engine": "gmaster",
+    "nside": 2048,
+    "spin": 0,
+    "peak_gib": 10.98904156498611,
+    "kind": "device peak (XLA accounting)"
+   },
+   {
+    "engine": "gmaster",
+    "nside": 4096,
+    "spin": 0,
+    "peak_gib": 39.82431476190686,
+    "kind": "device peak (XLA accounting)"
+   },
+   {
+    "engine": "gmaster",
+    "nside": 8192,
+    "spin": 0,
+    "peak_gib": 86.61811095103621,
+    "kind": "device peak (XLA accounting)"
+   },
+   {
+    "engine": "gmaster",
+    "nside": 64,
+    "spin": 2,
+    "peak_gib": 0.10846652090549469,
+    "kind": "device peak (XLA accounting)"
+   },
+   {
+    "engine": "gmaster",
+    "nside": 128,
+    "spin": 2,
+    "peak_gib": 0.12863752990961075,
+    "kind": "device peak (XLA accounting)"
+   },
+   {
+    "engine": "gmaster",
+    "nside": 256,
+    "spin": 2,
+    "peak_gib": 0.2911796122789383,
+    "kind": "device peak (XLA accounting)"
+   },
+   {
+    "engine": "gmaster",
+    "nside": 512,
+    "spin": 2,
+    "peak_gib": 1.0127022303640842,
+    "kind": "device peak (XLA accounting)"
+   },
+   {
+    "engine": "gmaster",
+    "nside": 1024,
+    "spin": 2,
+    "peak_gib": 3.9988369457423687,
+    "kind": "device peak (XLA accounting)"
+   },
+   {
+    "engine": "gmaster",
+    "nside": 2048,
+    "spin": 2,
+    "peak_gib": 18.504412597045302,
+    "kind": "device peak (XLA accounting)"
+   },
+   {
+    "engine": "gmaster",
+    "nside": 4096,
+    "spin": 2,
+    "peak_gib": 66.60606372728944,
+    "kind": "device peak (XLA accounting)"
+   },
+   {
+    "engine": "namaster",
+    "cores": 96,
+    "nside": 64,
+    "spin": 0,
+    "peak_gib": 0.8660392761230469,
+    "kind": "host peak RSS"
+   },
+   {
+    "engine": "namaster",
+    "cores": 96,
+    "nside": 128,
+    "spin": 0,
+    "peak_gib": 0.878814697265625,
+    "kind": "host peak RSS"
+   },
+   {
+    "engine": "namaster",
+    "cores": 96,
+    "nside": 256,
+    "spin": 0,
+    "peak_gib": 0.9114646911621094,
+    "kind": "host peak RSS"
+   },
+   {
+    "engine": "namaster",
+    "cores": 96,
+    "nside": 512,
+    "spin": 0,
+    "peak_gib": 1.1135482788085938,
+    "kind": "host peak RSS"
+   },
+   {
+    "engine": "namaster",
+    "cores": 96,
+    "nside": 1024,
+    "spin": 0,
+    "peak_gib": 1.880157470703125,
+    "kind": "host peak RSS"
+   },
+   {
+    "engine": "namaster",
+    "cores": 96,
+    "nside": 2048,
+    "spin": 0,
+    "peak_gib": 5.030311584472656,
+    "kind": "host peak RSS"
+   },
+   {
+    "engine": "namaster",
+    "cores": 96,
+    "nside": 4096,
+    "spin": 0,
+    "peak_gib": 17.781757354736328,
+    "kind": "host peak RSS"
+   },
+   {
+    "engine": "namaster",
+    "cores": 96,
+    "nside": 8192,
+    "spin": 0,
+    "peak_gib": 68.58400344848633,
+    "kind": "host peak RSS"
+   },
+   {
+    "engine": "namaster",
+    "cores": 96,
+    "nside": 64,
+    "spin": 2,
+    "peak_gib": 0.8737297058105469,
+    "kind": "host peak RSS"
+   },
+   {
+    "engine": "namaster",
+    "cores": 96,
+    "nside": 128,
+    "spin": 2,
+    "peak_gib": 0.9218788146972656,
+    "kind": "host peak RSS"
+   },
+   {
+    "engine": "namaster",
+    "cores": 96,
+    "nside": 256,
+    "spin": 2,
+    "peak_gib": 1.1398963928222656,
+    "kind": "host peak RSS"
+   },
+   {
+    "engine": "namaster",
+    "cores": 96,
+    "nside": 512,
+    "spin": 2,
+    "peak_gib": 1.8736572265625,
+    "kind": "host peak RSS"
+   },
+   {
+    "engine": "namaster",
+    "cores": 96,
+    "nside": 1024,
+    "spin": 2,
+    "peak_gib": 5.019126892089844,
+    "kind": "host peak RSS"
+   },
+   {
+    "engine": "namaster",
+    "cores": 96,
+    "nside": 2048,
+    "spin": 2,
+    "peak_gib": 17.79198455810547,
+    "kind": "host peak RSS"
+   },
+   {
+    "engine": "namaster",
+    "cores": 96,
+    "nside": 4096,
+    "spin": 2,
+    "peak_gib": 35.11243438720703,
+    "kind": "host peak RSS"
+   },
+   {
+    "engine": "namaster",
+    "cores": 96,
+    "nside": 8192,
+    "spin": 2,
+    "peak_gib": 137.6399269104004,
+    "kind": "host peak RSS"
+   },
+   {
+    "engine": "gmaster",
+    "nside": 8192,
+    "spin": 2,
+    "peak_gib": 79.0414848998189,
+    "kind": "device peak (XLA accounting)"
+   }
+  ]
+ },
+ "agreement": [
+  {
+   "nside": 64,
+   "spin": 0,
+   "reference": "NaMaster 96 cores",
+   "max_rel_diff_to_largest": 4.5819524411888914e-07,
+   "per_bandpower_rms": 4.660746648085963e-07,
+   "per_bandpower_max": 9.62217367117546e-07,
+   "per_bandpower_rms_below_2nside": 5.676299810235824e-07,
+   "per_bandpower_max_below_2nside": 9.62217367117546e-07,
+   "spectrum": "TT"
+  },
+  {
+   "nside": 128,
+   "spin": 0,
+   "reference": "NaMaster 96 cores",
+   "max_rel_diff_to_largest": 6.075692591534205e-07,
+   "per_bandpower_rms": 5.210690970340464e-07,
+   "per_bandpower_max": 1.3641965652677612e-06,
+   "per_bandpower_rms_below_2nside": 6.264757272984938e-07,
+   "per_bandpower_max_below_2nside": 1.3641965652677612e-06,
+   "spectrum": "TT"
+  },
+  {
+   "nside": 256,
+   "spin": 0,
+   "reference": "NaMaster 96 cores",
+   "max_rel_diff_to_largest": 1.7897006433800784e-06,
+   "per_bandpower_rms": 6.112017938396206e-07,
+   "per_bandpower_max": 1.7897006433509333e-06,
+   "per_bandpower_rms_below_2nside": 7.120875250586048e-07,
+   "per_bandpower_max_below_2nside": 1.7897006433509333e-06,
+   "spectrum": "TT"
+  },
+  {
+   "nside": 512,
+   "spin": 0,
+   "reference": "NaMaster 96 cores",
+   "max_rel_diff_to_largest": 8.182297462733047e-06,
+   "per_bandpower_rms": 1.5530725381945458e-06,
+   "per_bandpower_max": 8.182297462688837e-06,
+   "per_bandpower_rms_below_2nside": 1.8426322219072073e-06,
+   "per_bandpower_max_below_2nside": 8.182297462688837e-06,
+   "spectrum": "TT"
+  },
+  {
+   "nside": 1024,
+   "spin": 0,
+   "reference": "NaMaster 96 cores",
+   "max_rel_diff_to_largest": 1.5781796637599827e-05,
+   "per_bandpower_rms": 8.05150570135079e-06,
+   "per_bandpower_max": 3.0030387809132364e-05,
+   "per_bandpower_rms_below_2nside": 9.37314445861456e-06,
+   "per_bandpower_max_below_2nside": 3.0030387809132364e-05,
+   "spectrum": "TT"
+  },
+  {
+   "nside": 2048,
+   "spin": 0,
+   "reference": "NaMaster 96 cores",
+   "max_rel_diff_to_largest": 2.7512496562336338e-05,
+   "per_bandpower_rms": 2.4682760320958515e-05,
+   "per_bandpower_max": 5.239801334666616e-05,
+   "per_bandpower_rms_below_2nside": 2.6596118304655397e-05,
+   "per_bandpower_max_below_2nside": 5.239801334666616e-05,
+   "spectrum": "TT"
+  },
+  {
+   "nside": 4096,
+   "spin": 0,
+   "reference": "NaMaster 96 cores",
+   "max_rel_diff_to_largest": 6.676393952357997e-05,
+   "per_bandpower_rms": 0.00012790852537604113,
+   "per_bandpower_max": 0.0001542132425333964,
+   "per_bandpower_rms_below_2nside": 0.0001238117688896643,
+   "per_bandpower_max_below_2nside": 0.0001542132425333964,
+   "spectrum": "TT"
+  },
+  {
+   "nside": 8192,
+   "spin": 0,
+   "reference": "NaMaster 96 cores",
+   "max_rel_diff_to_largest": 0.00020126194002058944,
+   "per_bandpower_rms": 0.0021388063985861134,
+   "per_bandpower_max": 0.007119845830280358,
+   "per_bandpower_rms_below_2nside": 0.0007706696857214482,
+   "per_bandpower_max_below_2nside": 0.0009761125103038282,
+   "spectrum": "TT"
+  },
+  {
+   "nside": 64,
+   "spin": 2,
+   "reference": "NaMaster 96 cores",
+   "max_rel_diff_to_largest": 1.3538463675020136e-06,
+   "per_bandpower_rms": 1.048436237959823e-06,
+   "per_bandpower_max": 1.3538463674578338e-06,
+   "per_bandpower_rms_below_2nside": 1.1305545252519962e-06,
+   "per_bandpower_max_below_2nside": 1.3538463674578338e-06,
+   "spectrum": "EE"
+  },
+  {
+   "nside": 128,
+   "spin": 2,
+   "reference": "NaMaster 96 cores",
+   "max_rel_diff_to_largest": 5.608001142690155e-07,
+   "per_bandpower_rms": 8.694171203232112e-07,
+   "per_bandpower_max": 1.23977375565687e-06,
+   "per_bandpower_rms_below_2nside": 7.695099739302195e-07,
+   "per_bandpower_max_below_2nside": 1.0535209846729288e-06,
+   "spectrum": "EE"
+  },
+  {
+   "nside": 256,
+   "spin": 2,
+   "reference": "NaMaster 96 cores",
+   "max_rel_diff_to_largest": 2.6132813645256286e-06,
+   "per_bandpower_rms": 4.667340904846026e-06,
+   "per_bandpower_max": 7.743058290765603e-06,
+   "per_bandpower_rms_below_2nside": 5.269821247644513e-06,
+   "per_bandpower_max_below_2nside": 7.743058290765603e-06,
+   "spectrum": "EE"
+  },
+  {
+   "nside": 512,
+   "spin": 2,
+   "reference": "NaMaster 96 cores",
+   "max_rel_diff_to_largest": 6.272610294146609e-06,
+   "per_bandpower_rms": 1.0735490328209697e-05,
+   "per_bandpower_max": 2.141067386818296e-05,
+   "per_bandpower_rms_below_2nside": 1.2522137966134033e-05,
+   "per_bandpower_max_below_2nside": 2.141067386818296e-05,
+   "spectrum": "EE"
+  },
+  {
+   "nside": 1024,
+   "spin": 2,
+   "reference": "NaMaster 96 cores",
+   "max_rel_diff_to_largest": 5.741881869912814e-06,
+   "per_bandpower_rms": 1.7149564107326326e-05,
+   "per_bandpower_max": 3.614416277741839e-05,
+   "per_bandpower_rms_below_2nside": 2.0490932952866022e-05,
+   "per_bandpower_max_below_2nside": 3.614416277741839e-05,
+   "spectrum": "EE"
+  },
+  {
+   "nside": 2048,
+   "spin": 2,
+   "reference": "NaMaster 96 cores",
+   "max_rel_diff_to_largest": 1.2932627177813779e-05,
+   "per_bandpower_rms": 4.122811495063841e-05,
+   "per_bandpower_max": 9.038623119916878e-05,
+   "per_bandpower_rms_below_2nside": 4.758737533190077e-05,
+   "per_bandpower_max_below_2nside": 9.038623119916878e-05,
+   "spectrum": "EE"
+  },
+  {
+   "nside": 4096,
+   "spin": 2,
+   "reference": "NaMaster 96 cores",
+   "max_rel_diff_to_largest": 3.617887080810297e-05,
+   "per_bandpower_rms": 8.365520728411787e-05,
+   "per_bandpower_max": 0.00023515881470026478,
+   "per_bandpower_rms_below_2nside": 8.183493051171377e-05,
+   "per_bandpower_max_below_2nside": 0.00023515881470026478,
+   "spectrum": "EE"
+  },
+  {
+   "nside": 8192,
+   "spin": 2,
+   "reference": "NaMaster 96 cores",
+   "max_rel_diff_to_largest": 4.0321241577584945e-05,
+   "per_bandpower_rms": 0.0021065379203007457,
+   "per_bandpower_max": 0.007324943653978178,
+   "per_bandpower_rms_below_2nside": 0.0007054734652725412,
+   "per_bandpower_max_below_2nside": 0.000959706312022135,
+   "spectrum": "EE"
+  }
+ ],
+ "agreement_note": "GMaster vs NaMaster (96 cores) on the ACT DR6 end-to-end cells. max_rel_diff_to_largest: max |GM - NM| over the largest |NM| bandpower (all spectra of the cell). per_bandpower_*: |GM/NM - 1| of TT (spin 0) or EE (spin 2), over all bandpowers or those below ell = 2 nside."
+}

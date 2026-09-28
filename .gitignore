@@ -19,3 +19,11 @@ build/
 # Secrets / local env
 .env
 .env.*
+
+# Notebooks and outputs of the examples / benchmarks
+.ipynb_checkpoints/
+act_cache/
+act_cl/
+act_dr6_overlay/
+act_dr6_cross/
+cl.npz

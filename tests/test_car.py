@@ -1,3 +1,5 @@
+"""CAR (plate carree) pixelisation: geometry, transforms, fields and workspaces against pymaster."""
+
 import jax
 import numpy as np
 import pytest
@@ -8,6 +10,7 @@ import gmaster as nmt
 
 
 def _wcs(resolution=30.0):
+    """Full-sky CAR WCS with `resolution`-degree pixels."""
     WCS = pytest.importorskip("astropy.wcs").WCS
     wcs = WCS(naxis=2)
     wcs.wcs.ctype = ["RA---CAR", "DEC--CAR"]
@@ -19,6 +22,7 @@ def _wcs(resolution=30.0):
 
 @pytest.mark.parametrize("spin", [0, 1, 2, 3])
 def test_car_geometry_and_transforms_match_namaster(spin):
+    """CAR map geometry, quadrature weights and spin-s map2alm/alm2map match NaMaster to fp64 rounding."""
     reference = pytest.importorskip("pymaster")
     wcs = _wcs()
     shape = (7, 12)
@@ -52,6 +56,7 @@ def test_car_geometry_and_transforms_match_namaster(spin):
 
 @pytest.mark.parametrize("spins", [(0, 0), (0, 2), (2, 2)])
 def test_car_fields_and_workspaces_match_namaster(spins):
+    """Coupling matrices built from CAR fields match NaMaster for spin-0/spin-2 combinations."""
     reference = pytest.importorskip("pymaster")
     wcs = _wcs()
     shape = (7, 12)
@@ -78,6 +83,9 @@ def test_car_fields_and_workspaces_match_namaster(spins):
 
 
 def test_car_templates_purification_and_synfast():
+    """Deprojected and E/B-purified CAR fields match NaMaster, and CAR synfast is
+    reproducible for a fixed seed and returns maps of the CAR shape.
+    """
     reference = pytest.importorskip("pymaster")
     wcs = _wcs()
     shape = (7, 12)
@@ -107,6 +115,7 @@ def test_car_templates_purification_and_synfast():
 
 
 def test_car_validation():
+    """A non-2D CAR map shape and a non-CAR projection are rejected."""
     wcs = _wcs()
     with pytest.raises(ValueError, match="2D"):
         nmt.NmtMapInfo(wcs, (84,))

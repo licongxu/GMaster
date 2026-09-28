@@ -17,7 +17,7 @@ multiplied by `D' = (N+α)(N+β)(N+α-1)(N+β-1)`, is the exact difference `W(k+
 
   W(k) = -q0(k) t_k + (q2(k-1) - C (u+1)(k+1)(k+1+α)) t_{k+1},
 
-a certificate found with sympy (session 36); `W(0) = 0` by (I1) at `k = 0` and `W(N+1) = 0` because
+a certificate found with sympy; `W(0) = 0` by (I1) at `k = 0` and `W(N+1) = 0` because
 the summands vanish past `N`.  Every identity is closed by `linear_combination`.
 -/
 import Mathlib
