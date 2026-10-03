@@ -40,7 +40,7 @@ os.environ.setdefault("XLA_PYTHON_CLIENT_ALLOCATOR", "cuda_async")
 
 import jax
 
-from . import utils
+from . import lensing, utils
 from .bins import NmtBin, NmtBinFlat
 from .field import NmtField
 from .field_flat import NmtFieldFlat
@@ -142,6 +142,7 @@ __all__ = [
     "synfast_spherical",
     "synfast_flat",
     "uncorr_noise_deprojection_bias",
+    "lensing",
     "utils",
 ]
 __version__ = "1.0.0"

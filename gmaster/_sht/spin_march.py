@@ -97,7 +97,7 @@ def march_requested(spin, *, L=None, nside=None) -> bool:
     test `slice_declined` makes, so where a slab exists the flag has no effect.
     """
     if int(spin) != SPIN:
-        return False
+        return int(spin) in _march_v2.SPINS and _march_v2.spin_enabled(spin, L)
     flag = os.environ.get("GMASTER_SPIN2_MARCH")
     if flag is not None:
         return flag == "1" and (_on_nvidia() or _march_v2.enabled(L))
@@ -129,7 +129,7 @@ def synth_requested(spin, *, L=None, nside=None) -> bool:
     sub-spin power will silently lose it.
     """
     if int(spin) != SPIN:
-        return False
+        return int(spin) in _march_v2.SPINS and _march_v2.spin_enabled(spin, L)
     flag = os.environ.get("GMASTER_SPIN2_MARCH_SYNTH")
     if flag is not None:
         return flag == "1" and (_on_nvidia() or _march_v2.enabled(L))
@@ -538,9 +538,9 @@ def forward_latitudinal(ftm, *, L, spin, nside):
     and the ``sqrt((2l+1)/4pi)`` / ``(-1)**|spin|`` factors come later in
     ``_finish_forward_s2fft``; neither belongs here.
     """
-    if int(spin) != SPIN:
+    if int(spin) != SPIN and not _march_v2.spin_enabled(spin, L):
         raise ValueError(f"march route implements spin=+{SPIN}, got spin={spin}")
-    if _march_v2.enabled(L):
+    if _march_v2.spin_enabled(spin, L):
         return _march_v2.forward_latitudinal(ftm, L=L, spin=spin, nside=nside)
     return _forward_impl(ftm, L=L, spin=spin, nside=nside)
 
@@ -1229,9 +1229,9 @@ def inverse_latitudinal(flm, *, L, spin, nside):
     `healpix._inverse_latitudinal` expects.  The kernel marches the same ``d^l_(m,-2)`` rows as the
     analysis; see :func:`synth_requested` for accuracy.
     """
-    if int(spin) != SPIN:
+    if int(spin) != SPIN and not _march_v2.spin_enabled(spin, L):
         raise ValueError(f"march route implements spin=+{SPIN}, got spin={spin}")
-    if _march_v2.enabled(L):
+    if _march_v2.spin_enabled(spin, L):
         return _march_v2.inverse_latitudinal(flm, L=L, spin=spin, nside=nside)
     return _inverse_impl(flm, L=L, spin=spin, nside=nside)
 

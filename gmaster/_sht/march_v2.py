@@ -1,7 +1,8 @@
-"""CUDA float32 difference-form Wigner-d march for the spin-0 and spin-2 latitudinal transforms.
+"""CUDA float32 difference-form Wigner-d march for the spin-0 and spin-s latitudinal transforms.
 
 Implements the latitudinal step of the HEALPix SHT (spin-0 folded analysis / synthesis of the
-positive-m block, spin-2 analysis / synthesis of the full ``(L, 2L-1)`` block) with the same
+positive-m block, spin-s analysis / synthesis of the full ``(L, 2L-1)`` block for s = 1, 2, 3;
+spins 1 and 3 serve the lensing estimators of :mod:`gmaster.lensing`) with the same
 contracts as the Pallas march in :mod:`gmaster._sht.spin_march`.  The Wigner-d rows are generated
 in registers, never stored.  The CUDA kernels (``gmaster/_native/cuda/march_v2.cu``) are compiled
 with ``nvcc`` on first GPU use and cached by source hash; when JAX runs on CPU the OpenMP port
@@ -81,6 +82,9 @@ _CU = os.path.join(_NATIVE, "cuda", "march_v2.cu")
 _CPU_CC = os.path.join(_NATIVE, "cpu", "march_v2_cpu.cc")
 _NAMES = ("gm_march_ana_s0", "gm_march_ana_s0_pair", "gm_march_ana_s2",
           "gm_march_syn_s0", "gm_march_syn_s0_pair", "gm_march_syn_s2")
+# Spin-weighted kernels beyond spin 2 (CUDA only): the spin-2 kernels instantiated at spin 1 and 3.
+_SPIN_NAMES = ("gm_march_ana_s1", "gm_march_syn_s1", "gm_march_ana_s3", "gm_march_syn_s3")
+SPINS = (1, 2, 3)
 _LIB = None
 _LIB_ERROR = None
 _CPU_LIB = None
@@ -199,7 +203,7 @@ def _build():
                 raise RuntimeError("nvcc failed:\n" + out.stderr[-4000:])
             os.replace(tmp, so)
         lib = ctypes.CDLL(so)
-        for name in _NAMES + ("gm_ring_fold", "gm_ring_fold_c"):
+        for name in _NAMES + _SPIN_NAMES + ("gm_ring_fold", "gm_ring_fold_c"):
             jax.ffi.register_ffi_target(name, jax.ffi.pycapsule(getattr(lib, name)),
                                         platform="CUDA")
         _LIB = lib
@@ -257,6 +261,17 @@ def _want_cpu():
 # small geometries).  Below Nside 64 the geometry pads to one 512-lane tile, so small maps spend
 # most of each tile on padding; raise this floor to route them elsewhere.
 _MIN_L = int(os.environ.get("GMASTER_MARCH_V2_MIN_L", "0"))
+
+
+def spin_enabled(spin, L=None) -> bool:
+    """True when the march serves a spin-``spin`` transform at band limit ``L``.
+
+    Spin 2 runs wherever the march does; spins 1 and 3 have CUDA kernels only.
+    """
+    spin = int(spin)
+    if spin not in SPINS or not enabled(L):
+        return False
+    return spin == 2 or (not _want_cpu() and _LIB is not None)
 
 
 def enabled(L=None) -> bool:
@@ -580,7 +595,7 @@ def _ffi_analysis(spin, geo, m0, mbp, L, man, ex0, tab, rhs, nmaps=1):
     if spin == 0:
         name = "gm_march_ana_s0_pair" if nmaps == 2 else "gm_march_ana_s0"
     else:
-        name = "gm_march_ana_s2"
+        name = f"gm_march_ana_s{int(spin)}"
     parts = jax.ffi.ffi_call(name, out_t)(
         geo["xs_hi"], geo["xs_lo"], man, ex0, tab, rhs, geo["mlim"], geo["hemi"],
         m0=np.int64(m0), L=np.int64(L))
@@ -594,7 +609,7 @@ def _ffi_synthesis(spin, geo, m0, mbp, L, man, ex0, tab, coef, nmaps=1):
     if spin == 0:
         name = "gm_march_syn_s0_pair" if nmaps == 2 else "gm_march_syn_s0"
     else:
-        name = "gm_march_syn_s2"
+        name = f"gm_march_syn_s{int(spin)}"
     return jax.ffi.ffi_call(name, out_t)(
         geo["xs_hi"], geo["xs_lo"], man, ex0, tab, coef, geo["mlim"], geo["hemi"],
         m0=np.int64(m0), L=np.int64(L))
@@ -814,14 +829,13 @@ def inverse_latitudinal_positive_pair(positive_a, positive_b, phase, *, L, nside
 
 
 # ------------------------------------------------------------------------------------- spin 2
-@partial(jax.jit, static_argnames=("L", "nside", "cdtype"))
-def _forward_impl(ftm, garr, tabs, *, L, nside, cdtype=jnp.complex128):
+@partial(jax.jit, static_argnames=("L", "nside", "cdtype", "spin"))
+def _forward_impl(ftm, garr, tabs, *, L, nside, cdtype=jnp.complex128, spin=2):
     """``(ntheta, 2L)`` ring spectrum (column ``L + m`` is order ``m``) to ``(L, 2L-1)``.
 
     ``cdtype`` is the output's element type.  The kernel's partials are float32, so complex64
     holds them exactly; Nside 8192 uses it (its complex128 block would be 18 GiB).
     """
-    spin = 2
     geo = _geo_dict(garr, L, nside, spin)
     ftm = jnp.asarray(ftm)
     ntheta = geo["ntheta"]
@@ -840,7 +854,9 @@ def _forward_impl(ftm, garr, tabs, *, L, nside, cdtype=jnp.complex128):
     negT = lax.optimization_barrier(ftm[:, 1:L + 1].T)      # row k is order -m at k = L-1-m
     mring = jnp.where(valid, ntheta - 1 - lane_ring, 0)
     sign = 1.0 - 2.0 * ((jnp.arange(L) + spin) % 2).astype(jnp.float64)      # (-1)^(ell + s)
-    rowsign = 1.0 - 2.0 * (jnp.arange(L) % 2).astype(jnp.float64)            # (-1)^m of the row
+    # (-1)^m of the row, times (-1)^s: the marched rows are (-1)^s times the s2fft convention's,
+    # which only odd spins see.
+    rowsign = (1.0 - 2.0 * (jnp.arange(L) % 2).astype(jnp.float64)) * (-1.0) ** spin
     rows, mrows = [], []
     for w, (m0, mb, mbp) in enumerate(_windows(L, nside, spin)):
         man, ex0, tab = _win_tables(tabs, w, m0, mbp, geo, L, spin)
@@ -873,25 +889,26 @@ def _forward_impl(ftm, garr, tabs, *, L, nside, cdtype=jnp.complex128):
 
 
 def forward_latitudinal(ftm, *, L, spin, nside, cdtype=jnp.complex128):
-    """Spin-2 analysis: ``(ntheta, 2L)`` ring spectrum to ``(L, 2L-1)`` (see `_forward_impl`)."""
-    if int(spin) != 2:
-        raise ValueError(f"v2 march implements spin=+2, got spin={spin}")
-    dc = _dc(L, ftm)
+    """Spin-s analysis: ``(ntheta, 2L)`` ring spectrum to ``(L, 2L-1)`` (see `_forward_impl`)."""
+    spin = int(spin)
+    if spin not in SPINS:
+        raise ValueError(f"v2 march implements spins {SPINS}, got spin={spin}")
+    # The D&C engine is validated for spin 2 only; other spins keep the march.
+    dc = _dc(L, ftm) if spin == 2 else None
     if dc is not None:
-        return dc.forward_latitudinal_spin(ftm, L=L, spin=2, nside=nside)
-    return _forward_impl(ftm, geo_arrays(L, nside, 2), tables_for(L, nside, 2), L=L, nside=nside,
-                         cdtype=cdtype)
+        return dc.forward_latitudinal_spin(ftm, L=L, spin=spin, nside=nside)
+    return _forward_impl(ftm, geo_arrays(L, nside, spin), tables_for(L, nside, spin), L=L,
+                         nside=nside, cdtype=cdtype, spin=spin)
 
 
-@partial(jax.jit, static_argnames=("L", "nside", "cdtype", "group"))
-def _inverse_impl(flm, garr, tabs, *, L, nside, cdtype=jnp.complex128, group=None):
+@partial(jax.jit, static_argnames=("L", "nside", "cdtype", "group", "spin"))
+def _inverse_impl(flm, garr, tabs, *, L, nside, cdtype=jnp.complex128, group=None, spin=2):
     """``(L, 2L-1)`` (``flm[ell, L-1+m]``) to ``(ntheta, 2L)`` (column ``L + m``; column 0 zero).
 
     ``cdtype`` as in :func:`_forward_impl`: the kernel writes float32.  ``group = (w0, w1)`` runs
     only those windows and returns their direct block and their mirror block column-reversed, so
     that `inverse_latitudinal` places every block with one concatenation.
     """
-    spin = 2
     geo = _geo_dict(garr, L, nside, spin)
     flm = jnp.asarray(flm)
     ntheta = geo["ntheta"]
@@ -903,7 +920,7 @@ def _inverse_impl(flm, garr, tabs, *, L, nside, cdtype=jnp.complex128, group=Non
         if group is not None and not group[0] <= w < group[1]:
             continue
         man, ex0, tab = _win_tables(tabs, w, m0, mbp, geo, L, spin)
-        rs = (1.0 - 2.0 * ((m0 + jnp.arange(mb)) % 2))[:, None]                    # (-1)^m of the row
+        rs = (1.0 - 2.0 * ((m0 + jnp.arange(mb)) % 2))[:, None] * (-1.0) ** spin  # (-1)^(m+s), see _forward_impl
         ap = flm[:, L - 1 + m0:L - 1 + m0 + mb].T * rs                             # (mb, L)
         am = flm[:, L - 1 - m0 - mb + 1:L - 1 - m0 + 1][:, ::-1].T * rs            # order -m
         coef = jnp.zeros((mbp, Lp, 4), jnp.float32)
@@ -935,16 +952,17 @@ def inverse_latitudinal(flm, *, L, spin, nside, cdtype=jnp.complex128):
 
     In complex64 the windows run in groups of `GMASTER_V2_INVERSE_GROUP` to bound peak memory.
     """
-    if int(spin) != 2:
-        raise ValueError(f"v2 march implements spin=+2, got spin={spin}")
-    dc = _dc(L, flm)
+    spin = int(spin)
+    if spin not in SPINS:
+        raise ValueError(f"v2 march implements spins {SPINS}, got spin={spin}")
+    dc = _dc(L, flm) if spin == 2 else None
     if dc is not None:
-        return dc.inverse_latitudinal_spin(flm, L=L, spin=2, nside=nside)
-    garr, tabs = geo_arrays(L, nside, 2), tables_for(L, nside, 2)
+        return dc.inverse_latitudinal_spin(flm, L=L, spin=spin, nside=nside)
+    garr, tabs = geo_arrays(L, nside, spin), tables_for(L, nside, spin)
     if cdtype != jnp.complex64:
-        return _inverse_impl(flm, garr, tabs, L=L, nside=nside, cdtype=cdtype)
-    nwin = len(_windows(L, nside, 2))
-    parts = [_inverse_impl(flm, garr, tabs, L=L, nside=nside, cdtype=cdtype,
+        return _inverse_impl(flm, garr, tabs, L=L, nside=nside, cdtype=cdtype, spin=spin)
+    nwin = len(_windows(L, nside, spin))
+    parts = [_inverse_impl(flm, garr, tabs, L=L, nside=nside, cdtype=cdtype, spin=spin,
                            group=(w0, min(w0 + _INVERSE_GROUP, nwin)))
              for w0 in range(0, nwin, _INVERSE_GROUP)]
     # Column-reversed mirror blocks in reverse group order run from order -(L-1) up; the last

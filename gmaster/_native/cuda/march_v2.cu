@@ -1,6 +1,7 @@
 // GMaster v2 latitudinal march: difference-form float32 Wigner-d recurrence, one warp per
-// (order m, tile of 32*LPT rings).  Four kernels: spin-0 folded analysis / synthesis and spin-2
-// analysis / synthesis, plus XLA FFI handlers so JAX can call them inside jit.
+// (order m, tile of 32*LPT rings).  Four kernels: spin-0 folded analysis / synthesis and spin-s
+// analysis / synthesis (instantiated at s = 1, 2, 3), plus XLA FFI handlers so JAX can call them
+// inside jit.
 //
 // Recurrence (docs/march_v2_maths.md): for the Jacobi row v_n = (c1 x + c0) v_{n-1} - cb v_{n-2},
 // northern lanes march (v, D = v_n - v_{n-1}) as
@@ -554,6 +555,13 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(gm_march_ana_s2, (AnalysisImpl<2, 4, 1>), ANA_BIND
 XLA_FFI_DEFINE_HANDLER_SYMBOL(gm_march_syn_s0, (SynthesisImpl<0, 1>), ANA_BIND);
 XLA_FFI_DEFINE_HANDLER_SYMBOL(gm_march_syn_s0_pair, (SynthesisImpl<0, 2>), ANA_BIND);
 XLA_FFI_DEFINE_HANDLER_SYMBOL(gm_march_syn_s2, (SynthesisImpl<2, 1>), ANA_BIND);
+// Odd and higher spins reuse the spin-2 kernels: spin enters only through the seed exponents,
+// M = max(m, s) and the mirror sign (-1)^(l+s).  Spin 1 serves lensing gradients, spin 3 the
+// polarised lensing quadratic estimators.
+XLA_FFI_DEFINE_HANDLER_SYMBOL(gm_march_ana_s1, (AnalysisImpl<1, 4, 1>), ANA_BIND);
+XLA_FFI_DEFINE_HANDLER_SYMBOL(gm_march_syn_s1, (SynthesisImpl<1, 1>), ANA_BIND);
+XLA_FFI_DEFINE_HANDLER_SYMBOL(gm_march_ana_s3, (AnalysisImpl<3, 4, 1>), ANA_BIND);
+XLA_FFI_DEFINE_HANDLER_SYMBOL(gm_march_syn_s3, (SynthesisImpl<3, 1>), ANA_BIND);
 
 ffi::Error RingFoldImpl(cudaStream_t stream, ffi::Buffer<ffi::C64> F, ffi::Buffer<ffi::C64> Mf,
                         ffi::Buffer<ffi::S32> nphi, ffi::ResultBuffer<ffi::C64> R)

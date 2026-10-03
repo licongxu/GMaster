@@ -634,7 +634,7 @@ def _dc_spin(L_work, spin):
     program) so the plan's arrays enter as jit arguments; traced inside the fused programs
     below they would be captured as constants (~20 GiB of HLO at Nside 4096).
     """
-    return _spin_march._march_v2._dc(L_work) if spin != 0 else None
+    return _spin_march._march_v2._dc(L_work) if spin == 2 else None
 
 
 @partial(jax.jit, static_argnames=("L", "spin", "nside"))

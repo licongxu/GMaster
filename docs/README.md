@@ -13,6 +13,8 @@
     [dc_latitudinal_study_note.pdf](notes/dc_latitudinal_study_note.pdf): the divide-and-conquer
     latitudinal transform, its complexity and measurements.
   * [three_way_gpu.md](notes/three_way_gpu.md): GMaster's two GPU engines against SHTns.
+  * [lensing_qe.md](notes/lensing_qe.md): CMB lensing quadratic estimators (falafel's) and their
+    normalisation on the GPU, validation against falafel / tempura / lensed sims, and timings.
 * [figures/](figures/): the figures used by the README and the notes.
 
 The Lean 4 proofs of the identities behind the march are in [../formal/lean](../formal/lean/).
