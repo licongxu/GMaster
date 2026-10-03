@@ -96,7 +96,8 @@ def pytest_configure(config):
 def _exact_sht_unless_v2(request, monkeypatch):
     """Run unmarked tests on the exact fp64 transform routes.
 
-    The default transform is the float32 v2 CUDA march (~1e-6 agreement with NaMaster),
+    The default transform is the float32 v2 CUDA march (~1e-6 relative agreement with NaMaster
+    on isolated transforms; decoupled bandpowers on real maps follow benchmarks/README.md),
     while most tests hold GMaster to NaMaster at ~1e-13, which only the exact fp64 routes
     reach.  Tests of the default route carry `@pytest.mark.march_v2`; every other test
     runs with `GMASTER_MARCH_V2=0`.

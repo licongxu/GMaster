@@ -27,3 +27,12 @@ act_cl/
 act_dr6_overlay/
 act_dr6_cross/
 cl.npz
+
+# LaTeX (letter)
+paper/gmaster_letter/*.aux
+paper/gmaster_letter/*.bbl
+paper/gmaster_letter/*.blg
+paper/gmaster_letter/*.fdb_latexmk
+paper/gmaster_letter/*.fls
+paper/gmaster_letter/*.log
+paper/gmaster_letter/*.out
