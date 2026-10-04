@@ -7,6 +7,13 @@
 \usepackage{xcolor}
 \usepackage{url}
 
+\setlength{\floatsep}{6pt plus 2pt minus 2pt}
+\setlength{\textfloatsep}{8pt plus 2pt minus 4pt}
+\setlength{\intextsep}{6pt plus 2pt minus 2pt}
+\setlength{\abovedisplayskip}{5pt plus 1pt minus 1pt}
+\setlength{\belowdisplayskip}{5pt plus 1pt minus 1pt}
+\setlength{\parskip}{0pt}
+
 \title[GMaster: difference-form GPU MASTER]{GMaster: a difference-form Wigner-$d$ march for GPU MASTER estimation}
 
 \author[Xu]{
@@ -23,7 +30,7 @@ $^{1}$Institute of Astronomy, University of Cambridge, Madingley Road, Cambridge
 \maketitle
 
 \begin{abstract}
-Masked full-sky maps are analysed through spherical harmonic transforms and pseudo-$C_\ell$ (MASTER) estimators that propagate survey windows into mode coupling. On GPUs the latitudinal factor of a HEALPix transform is often evaluated as a serial Jacobi recurrence in degree; in float32 that recurrence is unstable near the poles and at turning points, where a rounding of size $u\lvert v\rvert$ is amplified by $1/\sin\phi$. We rewrite the march so that the carried pair is $(v_n,D_n)$ with $D_n=v_n-v_{n-1}$ rather than $(v_n,v_{n-1})$. The difference coefficient vanishes as $\phi^2$ exactly where the plain form is ill-conditioned, error is injected at the scale of $D\sim\phi\,v$, and the float32 floor becomes the random walk $\sqrt{n}\,u$. Against the float64 recurrence at $N_{\mathrm{side}}=1024$ the maximum relative error over every lane falls from $4.2\times10^{-2}$ (plain) to $2.8\times10^{-6}$ (shipped). The identities of the rewrite, a southern-hemisphere reflection onto the same code path, and an exact per-block power-of-two rescale are proved in Lean~4. The kernel is CUDA, called from JAX through the XLA FFI, and is the default latitudinal operator in GMaster, a GPU library with the public API of NaMaster. We benchmark GMaster against widely used state-of-the-art methods and find $20\times$ improvement in end-to-end spin-$0$ MASTER estimation at $N_{\mathrm{side}}=1024$, $22\times$ at $2048$, and $12\times$ at $8192$, relative to NaMaster~3.0 on 96 CPU cores, at an accuracy loss below $10^{-3}$ for $\ell<2N_{\mathrm{side}}$ and up to $7\times10^{-3}$ in the highest bandpowers at $N_{\mathrm{side}}=8192$, well below CMB map noise levels.
+Estimating binned angular power spectra from masked high-resolution full-sky maps---through spherical harmonic transforms and pseudo-$C_\ell$ (MASTER) estimators that propagate survey windows into mode coupling---remains a practical bottleneck in CMB and large-scale structure pipelines. On GPUs the latitudinal factor of a HEALPix transform is often evaluated as a serial Jacobi recurrence in degree; in float32 that recurrence is unstable near the poles and at turning points, where a rounding of size $u\lvert v\rvert$ is amplified by $1/\sin\phi$. We rewrite the march so that the carried pair is $(v_n,D_n)$ with $D_n=v_n-v_{n-1}$ rather than $(v_n,v_{n-1})$. The difference coefficient vanishes as $\phi^2$ exactly where the plain form is ill-conditioned, error is injected at the scale of $D\sim\phi\,v$, and the float32 floor becomes the random walk $\sqrt{n}\,u$. Against the float64 recurrence at $N_{\mathrm{side}}=1024$ the maximum relative error over every lane falls from $4.2\times10^{-2}$ (plain) to $2.8\times10^{-6}$ (shipped). The identities of the rewrite, a southern-hemisphere reflection onto the same code path, and an exact per-block power-of-two rescale are proved in Lean~4. The kernel is CUDA, called from JAX through the XLA FFI, and is the default latitudinal operator in GMaster, a GPU library with the public API of NaMaster. We benchmark GMaster against widely used state-of-the-art methods and find $20\times$ improvement in end-to-end spin-$0$ MASTER estimation at $N_{\mathrm{side}}=1024$, $22\times$ at $2048$, and $12\times$ at $8192$, relative to NaMaster~3.0 on 96 CPU cores, with bandpowers agreeing to better than $4\times10^{-4}$ at all multipoles on the ACT DR6 scaling board ($N_{\mathrm{side}}=256$--$8192$), at least $17\times$ below the cosmic-variance limit of the bandpowers; the accuracy cost is sub-dominant to survey cosmic variance throughout.
 \end{abstract}
 
 \begin{keywords}
@@ -32,15 +39,15 @@ methods: numerical -- cosmology: cosmic microwave background -- cosmology: large
 
 \section{Introduction}
 
-The MASTER estimator \citep{hivon2002} recovers binned angular power spectra from masked spherical maps by analysing the masked fields, forming coupled pseudo-spectra, building a mode-coupling matrix from the mask, and decoupling. Throughout, $\ell$ and $m$ denote the usual spherical-harmonic multipole and azimuthal order, and $\theta\in[0,\pi]$ and $\phi\in[0,2\pi)$ are colatitude and azimuth on the sphere.
+The MASTER estimator \citep{hivon2002} recovers binned angular power spectra from masked spherical maps by analysing the masked fields, forming coupled pseudo-spectra, building a mode-coupling matrix from the mask, and decoupling. Throughout, $\ell$ and $m$ denote the usual spherical-harmonic multipole and azimuthal order, $\theta\in[0,\pi]$ and $\phi\in[0,2\pi)$ are colatitude and azimuth on the sphere, $s$ is the spin of the field, $N_{\mathrm{side}}$ is the HEALPix resolution parameter, and $\ell_{\max}=3N_{\mathrm{side}}-1$ unless stated otherwise.
 
 NaMaster \citep{alonso2019} is the standard CPU implementation of that pipeline: \texttt{pymaster}~3.0 exposes \texttt{NmtField}, \texttt{NmtWorkspace}, and decoupled bandpowers with the normalisations used in current CMB and LSS analyses. Its HEALPix transforms call DUCC0 \citep{reinecke2013}, the successor of libsharp, on the HEALPix pixelisation \citep{gorski2005}. The coupling algebra has a structured Wigner-$3j$ recurrence \citep{kiddier2026}. We time NaMaster~3.0 with \texttt{ducc0}~0.39.1 on the same host as GMaster.
 
-SHTns \citep{schaeffer2013} is a widely used pseudospectral library for on-the-fly associated-Legendre recurrences; it now includes a CUDA implementation (\url{https://nschaeff.bitbucket.io/shtns/}). Our transform timings use that GPU module (\texttt{SHT\_ALLOW\_GPU}) from a current source build wired in \texttt{benchmarks/scaling/bench\_three\_way.py}, not the 2013 journal release in isolation. SHTns has no spin-$2$ transform; spin-$2$ panels time its spin-$1$ vector transform as a GPU reference. GMaster is not benchmarked as a drop-in replacement for arbitrary SHTns grids; the comparison is isolated \texttt{alm2map}/\texttt{map2alm} passes at matched $\ell_{\max}=3N_{\mathrm{side}}-1$.
+SHTns \citep{schaeffer2013} is a widely used pseudospectral library for on-the-fly associated-Legendre recurrences; release~3.7.5 adds a CUDA implementation (\url{https://nschaeff.bitbucket.io/shtns/}). Our transform timings use that GPU module (\texttt{SHT\_ALLOW\_GPU}) from a current source build wired in \texttt{benchmarks/scaling/bench\_three\_way.py}, not the 2013 journal release in isolation. SHTns has no spin-$2$ transform; spin-$2$ panels time its spin-$1$ vector transform as a GPU reference. We do not quote SHTns float32 transform timings: its on-the-fly recurrence is unstable in float32 for the same $1/\sin\phi$ reason as the plain Jacobi march below. GMaster is not benchmarked as a drop-in replacement for arbitrary SHTns grids; the comparison is isolated \texttt{alm2map}/\texttt{map2alm} passes at matched $\ell_{\max}$.
 
-On a GPU the same two cubic stages remain. An on-the-fly recurrence, as in SHTns and DUCC, is a serial chain in $\ell$ with a reduction over colatitude at every degree. That pattern matches AVX-512 CPUs and mismatches GPU SIMT. A precomputed Legendre matrix, as in the precompute mode of s2fft \citep{price2024}, inverts the bottleneck provided the table fits. Related GPU work \citep{belkner2024,reinecke2023} retains an on-the-fly latitudinal factor and is not a drop-in for a full-sky HEALPix MASTER pipeline.
+On a GPU the latitudinal stage remains a serial chain in $\ell$ with a colatitude reduction at every degree---a good match to AVX-512 CPUs, not to SIMT. Precomputed Legendre tables \citep{price2024} invert the bottleneck when they fit; other GPU spherical-harmonic work \citep{belkner2024,reinecke2023} is not a drop-in HEALPix MASTER pipeline.
 
-GMaster is a JAX implementation of the NaMaster public API. This Letter isolates one change that made a table-free float32 latitudinal kernel accurate enough to be the default at every $N_{\mathrm{side}}\ge64$: marching the difference pair of the Jacobi row attached to $d^\ell_{m,-s}(\theta)$ rather than the consecutive values. The recurrence, a reflection that sends the southern hemisphere through the same instructions, and the exactness of a per-block power-of-two rescale are proved in Lean~4 \citep{demoura2021,mathlib2020}. We report the end-to-end MASTER board and two real-map overlays. This is not a cosmological analysis: no beam, split cross-spectrum, or covariance is applied to the survey maps.
+GMaster is a JAX implementation of the NaMaster public API. This Letter isolates one change that made a table-free float32 latitudinal kernel accurate enough to be the default at every $N_{\mathrm{side}}\ge64$: marching the difference pair of the Jacobi row attached to $d^\ell_{m,-s}(\theta)$ rather than the consecutive values. The recurrence, a reflection that sends the southern hemisphere through the same instructions, and the exactness of a per-block power-of-two rescale are proved in Lean~4 \citep{demoura2021,mathlib2020}. We report the end-to-end MASTER board and a real-map overlay on ACT DR6. This is not a cosmological analysis: no beam, split cross-spectrum, or covariance is applied to the survey maps.
 
 \section{Difference-form march}
 
@@ -60,9 +67,9 @@ with $\alpha=m+s$, $\beta=\lvert m-s\rvert$, $n=\ell-\max(m,s)$ and $\mathrm{LG2
 \label{eq:jacobi}
   v_n = A_n v_{n-1}-B_n v_{n-2},\qquad A_n=c_1 x+c_0,\quad B_n=c_2,
 \end{equation}
-where $c_1,c_0,c_2$ depend only on $(\ell,m)$. A float64 march of~\eqref{eq:jacobi} agrees with a numpy oracle of the same coefficients to $1.5\times10^{-15}$ at $N_{\mathrm{side}}=1024$. Plain float32 of the same recurrence reaches a maximum relative error of $4.2\times10^{-2}$ over the row (Table~\ref{tab:dform}).
+where $c_1,c_0,c_2$ depend only on $(\ell,m)$. A float64 march of~\eqref{eq:jacobi} agrees with a numpy oracle of the same coefficients to $1.5\times10^{-15}$ at $N_{\mathrm{side}}=1024$. Plain float32 of the same recurrence reaches a maximum relative error of $4.2\times10^{-2}$ over the row (Figure~\ref{fig:accuracy}, left).
 
-Over a few degrees the coefficients are nearly constant and $c_2\to1$, so the row is locally $v_n\approx A v_{n-1}-v_{n-2}$ with characteristic roots $e^{\pm i\phi}$ and $2\sqrt{c_2}\cos\phi=A$. In the oscillatory region $\lvert A\rvert<2$, and $\phi\to0$ both at the poles and at every turning point $m\approx(\ell+\tfrac12)\sin\theta$. A rounding $\delta\sim 2u\lvert v\rvert$ of $\mathrm{fl}(Av_{k-1}-Bv_{k-2})$ perturbs the state by $(\delta,0)$, which decomposes on the modes $(e^{\pm i\phi},1)$ with amplitude $\delta/(2\sin\phi)$ each and evolves as $\delta\sin((n-k+1)\phi)/\sin\phi$: every rounding is amplified by $1/\sin\phi$, and over $n$ steps with random signs the relative error is $\sim\sqrt{n}\,u/\sin\phi$. On the first HEALPix ring at $N_{\mathrm{side}}=4096$, $\theta\approx2\times10^{-4}$ and $1/\sin\phi\approx5\times10^3$, giving a floor of a few per cent, the order of the plain-float32 row of Table~\ref{tab:dform}. A systematic error is worse: a relative error $\epsilon$ in $x$ perturbs $A$ at every step, and $2\cos\phi=A$ turns it into a coherent phase drift $\sim n\,c_1x\,\epsilon/(2\sin\phi)$, of order a radian at $n=12288$ for $\epsilon=u$.
+Over a few degrees the coefficients are nearly constant and $c_2\to1$, so the row is locally $v_n\approx A v_{n-1}-v_{n-2}$ with roots $e^{\pm i\phi}$ and $2\sqrt{c_2}\cos\phi=A$. In the oscillatory region $\lvert A\rvert<2$, and $\phi\to0$ at the poles and at turning points $m\approx(\ell+\tfrac12)\sin\theta$. A rounding $\delta\sim 2u\lvert v\rvert$ of $\mathrm{fl}(Av_{k-1}-Bv_{k-2})$ is amplified by $1/\sin\phi$ on each mode, giving a relative random-walk floor $\sim\sqrt{n}\,u/\sin\phi$; on the first HEALPix ring at $N_{\mathrm{side}}=4096$ this is a few per cent (Figure~\ref{fig:accuracy}, left). A single-word $x$ is worse: it drives a coherent phase drift $\sim n\,c_1x\,\epsilon/(2\sin\phi)$.
 
 Let $D_n=v_n-v_{n-1}$. Then for $n\ge2$
 \begin{equation}
@@ -77,109 +84,62 @@ The only coefficient on the amplified path is $C$, and the argument needs its er
 \label{eq:Cfma}
   C=\mathrm{fma}(c_{1h},x_h,E_h)+\bigl[\mathrm{fma}(c_{1h},x_l,\mathrm{fma}(c_{1l},x_h,E_l))\bigr].
 \end{equation}
-The first \texttt{fma} rounds once, by $u\lvert C\rvert$, and that rounding vanishes with $C$ at the turning point where the amplification peaks; the bracket is $\sim2^{-24}$ of the leading terms. A single-word $C$ leaves the coherent $u\lvert c_1\rvert$-class drift, growing like $n$ rather than $\sqrt n$: the $4\times10^{-5}$ floor in the middle row of Table~\ref{tab:dform}. The coefficient $c_2$ is single-word, because its error enters as $u\lvert D\rvert\sim u\phi\lvert v\rvert$ on $D$, the unamplified kind.
+The first \texttt{fma} rounds once, by $u\lvert C\rvert$, and that rounding vanishes with $C$ at the turning point where the amplification peaks; the bracket is $\sim2^{-24}$ of the leading terms. A single-word $C$ leaves the coherent $u\lvert c_1\rvert$-class drift, growing like $n$ rather than $\sqrt n$. The coefficient $c_2$ is single-word, because its error enters as $u\lvert D\rvert\sim u\phi\lvert v\rvert$ on $D$, the unamplified kind.
 
 The southern hemisphere needs no second code path. If $v_n=(c_1x+c_0)v_{n-1}-c_2v_{n-2}$ then $w_n:=(-1)^nv_n$ satisfies
 \begin{equation}
 \label{eq:refl}
   w_n=\bigl(c_1(-x)-c_0\bigr)w_{n-1}-c_2w_{n-2},
 \end{equation}
-the same recurrence with $y=\lvert x\rvert$ for $x$ and $-c_0$ for $c_0$, whose difference coefficient is $c_1(y-1)+E^-_n$ with $E^-_n=c_1-1-c_2-c_0$. Every lane, northern or southern, therefore marches $\lvert x\rvert-1\in(-1,0]$ with the same instructions and one of two table columns $E^\pm$, and the emit restores the sign on odd $n$. Each lane stores $v\cdot2^{ex}$ with $ex$ an integer and is rescaled by an exact power of two every eight degrees; the map $(v,D)\mapsto(v+D',D')$ is linear, so the represented value is unchanged, and the per-degree growth is bounded by $1+\lvert C\rvert+c_2\le2^{15}$, so eight degrees cannot overflow. The emit factorises the Jacobi normalisation $2^{\varepsilon_m\mathrm{LG2N}}$ into a per-lane power of two and a per-degree mantissa proved to lie in $[2^{-45.5},2)$, so no exponent lane leaves the kernel. Equations~\eqref{eq:diff} and~\eqref{eq:refl}, the seeds, the homogeneity of the rescale, and the range of the mantissa are theorems in a Lean~4 development on Mathlib that builds with no \texttt{sorry}; the modal error argument is not formalised, and is checked by Table~\ref{tab:dform}.
+the same recurrence with $y=\lvert x\rvert$ for $x$ and $-c_0$ for $c_0$, whose difference coefficient is $c_1(y-1)+E^-_n$ with $E^-_n=c_1-1-c_2-c_0$. Every lane, northern or southern, therefore marches $\lvert x\rvert-1\in(-1,0]$ with the same instructions and one of two table columns $E^\pm$, and the emit restores the sign on odd $n$. Each lane stores $v\cdot2^{ex}$ with $ex$ an integer and is rescaled by an exact power of two every eight degrees; the map $(v,D)\mapsto(v+D',D')$ is linear, so the represented value is unchanged, and the per-degree growth is bounded by $1+\lvert C\rvert+c_2\le2^{15}$, so eight degrees cannot overflow. The emit factorises the Jacobi normalisation $2^{\varepsilon_m\mathrm{LG2N}}$ into a per-lane power of two and a per-degree mantissa proved to lie in $[2^{-45.5},2)$, so no exponent lane leaves the kernel. Equations~\eqref{eq:diff} and~\eqref{eq:refl}, the seeds, and the rescale are theorems in a Lean~4 development on Mathlib with no \texttt{sorry}; the modal error argument is checked by Figure~\ref{fig:accuracy} (left).
 
-\begin{table}
-\centering
-\caption{Maximum relative error of a float32 march against the float64 recurrence, over every lane, at $N_{\mathrm{side}}=1024$ spin~$0$. The two-word row is the shipped kernel ($5.7\times10^{-6}$ at $N_{\mathrm{side}}=4096$).}
-\label{tab:dform}
-\footnotesize
-\setlength{\tabcolsep}{3pt}
-\begin{tabular}{@{}lccc@{}}
-\toprule
-Float32 march & $m=0$ & $m=1000$ & $m=L/2$ \\
-\midrule
-Plain, single word          & $4.2\times10^{-2}$ & $8.8\times10^{-5}$ & $3.1\times10^{-5}$ \\
-Difference form, 1-word $C$ & $4.1\times10^{-5}$ & $8.6\times10^{-5}$ & $5.1\times10^{-5}$ \\
-Difference form, 2-word $C$ & $2.8\times10^{-6}$ & $2.9\times10^{-6}$ & $1.6\times10^{-5}$ \\
-\bottomrule
-\end{tabular}
-\end{table}
-
-The kernel is CUDA, one warp per $(m$, ring tile), exposed as XLA FFI handlers inside \texttt{jit}. A field and its mask are two transforms of the same rows: the analysis kernel takes both as emit channels, so an \texttt{NmtField} is not two launches. For $s=0$ the southern hemisphere is folded into the northern recurrence. The default at $L=\ell_{\max}+1\ge192$ ($N_{\mathrm{side}}\ge64$) is this march; an exact float64 route remains available by flag. The difference-form $D_n$ march is not GPU-intrinsic; only the shipped latitudinal operator is CUDA. A fair CPU timing of the same algorithm requires porting that kernel, not the JAX CPU fallback with the CUDA path gated out.
+The kernel is CUDA, one warp per $(m$, ring tile), exposed as XLA FFI handlers inside \texttt{jit}; field and mask share one analysis launch. The default at $L=\ell_{\max}+1\ge192$ ($N_{\mathrm{side}}\ge64$) is this march; float64 remains available by flag.
 
 \section{Validation and performance}
 
-\begin{figure*}
+All timings are single-tenant on one NVIDIA RTX~PRO~6000 Blackwell (96~GB); NaMaster~3.0 / \texttt{ducc0}~0.39.1 on a 96-core Threadripper~PRO~9995WX is the CPU reference (Figure~\ref{fig:scoreboard}). End-to-end totals are warmed medians of field construction, coupling matrix, coupled cell and decoupling. Decoupled bandpower agreement $|C_\ell^{\mathrm{GM}}/C_\ell^{\mathrm{NM}}-1|$ on the ACT DR6 scaling board uses native-resolution maps at each $N_{\mathrm{side}}$ (linear bins of $30$). After switching mode-coupling Gauss--Legendre weights to \texttt{ducc0}, bandpowers agree with NaMaster to better than $4\times10^{-4}$ at all multipoles from $N_{\mathrm{side}}=256$ to $8192$, at least $17\times$ below cosmic variance; at $N_{\mathrm{side}}=8192$ TT maxima fall from $7.1\times10^{-3}$ to $3.8\times10^{-5}$ and EE from $7.3\times10^{-3}$ to $2.8\times10^{-4}$ (Figure~\ref{fig:accuracy}). On the ACT coadd at $N_{\mathrm{side}}=4096$ (Figure~\ref{fig:act}), decoupled TT has $\mathrm{rms}(C_\ell^{\mathrm{GM}}/C_\ell^{\mathrm{NM}}-1)=1.41\times10^{-5}$ in $7.63\,\mathrm{s}$ versus $70.4\,\mathrm{s}$ on $192$ cores.
+
+\begin{figure*}[t!]
 \centering
-\includegraphics[width=\textwidth]{figures/fig_act_overlay.pdf}
-\caption{ACT DR6 night PA4 $f150$ source-free coadd \citep{naess2025} at $N_{\mathrm{side}}=4096$. Where map panels are shown, (a)~is the survey window used as the mask ($f_{\mathrm{sky}}=0.481$) and (b)~Stokes~$I$ on that footprint. (c)~Decoupled TT $D_\ell$ after the full MASTER chain: \texttt{NmtField} ($n_{\mathrm{iter}}=3$ mask refinement) $\to$ coupling matrix $\to$ coupled cell $\to$ decoupling with linear bins of width $50$; GMaster (red) and NaMaster (grey) share inputs. GMaster executes the latitudinal march of Section~2 inside every spin-$0$ analysis/synthesis that builds field and mask alms. (d)~Fractional bandpower difference $C_\ell^{\mathrm{GM}}/C_\ell^{\mathrm{NM}}-1$. This is a methods overlay, not an ACT science product.}
-\label{fig:act}
+\includegraphics[width=\textwidth]{figures/fig_scoreboard.pdf}
+\caption{End-to-end MASTER wall time on the host named in the figure footer. Grey: NaMaster on 96 cores; red: GMaster on one RTX PRO~6000 Blackwell. Speed-ups are $12$--$22\times$ for spin~$0$ and $14$--$22\times$ for spin~$2$ over $N_{\mathrm{side}}=1024$--$8192$.}
+\label{fig:scoreboard}
 \end{figure*}
 
-All timings are single-tenant on one NVIDIA RTX~PRO~6000 Blackwell. The CPU reference is NaMaster~3.0 / \texttt{ducc0}~0.39.1 on the same host, a 96-core Threadripper~PRO~9995WX. End-to-end totals are warmed medians of field construction, coupling matrix, coupled cell and decoupling. In Table~\ref{tab:e2e}, \texttt{rel} is the maximum relative deviation of the \emph{coupled} pseudo-spectrum from \texttt{pymaster} on the same inputs ($\sim10^{-7}$--$10^{-5}$ in the table). Decoupled bandpower agreement $|C_\ell^{\mathrm{GM}}/C_\ell^{\mathrm{NM}}-1|$ on the ACT DR6 scaling board (linear bins of $30$, \texttt{benchmarks/scaling/results.json}) reaches $7\times10^{-3}$ only in the highest bandpowers at $N_{\mathrm{side}}=8192$, and stays below $10^{-3}$ for $\ell<2N_{\mathrm{side}}$ there (Figure~\ref{fig:accuracy}, right). Isolated transforms are timed against the \texttt{ducc0} call NaMaster issues.
-
-For the scaling board only, ACT maps cached at a given $N_{\mathrm{side}}$ are \texttt{ud\_grade}d to lower resolutions when a native file is absent; the overlays in Figure~\ref{fig:act} use maps prepared at $N_{\mathrm{side}}=4096$ and are not downgraded.
-
-Table~\ref{tab:e2e} is the MASTER board on this host. The shipped route is $10.2$--$21.2\times$ NaMaster at $N_{\mathrm{side}}=128$--$2048$ in both spins, $5.0$--$5.8\times$ at $N_{\mathrm{side}}=64$ (launch-latency bound) and $9.6\times$ at $N_{\mathrm{side}}=4096$ spin~$0$. Stock NaMaster segfaults at $N_{\mathrm{side}}=4096$ spin~$2$ on 32-bit coupling-matrix indices; GMaster finishes that cell in $8.8\,\mathrm{s}$. One isolated latitudinal pass against \texttt{ducc0} is $5.6$--$8.5\times$ at $N_{\mathrm{side}}=1024$--$4096$, with coefficient agreement $\sim1.2\times10^{-7}$. With the march disabled and rings and coupling forced to float64, decoupled bandpowers reproduce $4.8\times10^{-13}$ at $N_{\mathrm{side}}=256$ spin~$0$.
-
-\begin{table}
-\centering
-\caption{End-to-end MASTER on the 96-core host. NM and GM are NaMaster and GMaster milliseconds. \texttt{rel} is the maximum relative deviation of the \emph{coupled} spectrum from \texttt{pymaster}, not the decoupled bandpower ratio in Figure~\ref{fig:accuracy}.}
-\label{tab:e2e}
-\footnotesize
-\setlength{\tabcolsep}{3.5pt}
-\begin{tabular}{@{}rrrrrl@{}}
-\toprule
-$N_{\mathrm{side}}$ & spin & NM & GM & Ratio & rel \\
-\midrule
-64   & 0 & $9$     & $2$    & $5.8$  & $1.15\times10^{-7}$ \\
-64   & 2 & $12$    & $2$    & $5.0$  & $2.72\times10^{-7}$ \\
-128  & 0 & $20$    & $1$    & $13.3$ & $4.92\times10^{-7}$ \\
-128  & 2 & $40$    & $3$    & $13.1$ & $4.37\times10^{-7}$ \\
-256  & 0 & $58$    & $4$    & $15.0$ & $6.36\times10^{-7}$ \\
-256  & 2 & $161$   & $8$    & $20.7$ & $6.30\times10^{-7}$ \\
-512  & 0 & $314$   & $17$   & $18.1$ & $7.07\times10^{-7}$ \\
-512  & 2 & $641$   & $30$   & $21.2$ & $2.99\times10^{-6}$ \\
-1024 & 0 & $1682$  & $102$  & $16.5$ & $1.45\times10^{-6}$ \\
-1024 & 2 & $3017$  & $212$  & $14.2$ & $7.79\times10^{-6}$ \\
-2048 & 0 & $10311$ & $1014$ & $10.2$ & $7.25\times10^{-6}$ \\
-2048 & 2 & $17767$ & $1244$ & $14.3$ & $1.19\times10^{-5}$ \\
-4096 & 0 & $71583$ & $7458$ & $9.6$  & $7.0\times10^{-6}$ \\
-4096 & 2 & ---     & $8805$ & ---    & finite \\
-\bottomrule
-\end{tabular}
-\end{table}
-
-Figure~\ref{fig:act} is the same estimator on the ACT DR6 night PA4 $f150$ source-free coadd \citep{naess2025}, Stokes $I$, analysed at $N_{\mathrm{side}}=4096$ (maps prepared at that resolution from the public DR6 release). The mask is the survey window (finite non-zero pixels; $f_{\mathrm{sky}}=0.481$). GMaster and NaMaster share the mask, linear bins of width $50$, and $n_{\mathrm{iter}}=3$. Decoupled TT agrees to $\mathrm{rms}(C_\ell^{\mathrm{GM}}/C_\ell^{\mathrm{NM}}-1)=1.41\times10^{-5}$. Wall-clock after compilation: $7.63\,\mathrm{s}$ versus $70.4\,\mathrm{s}$ on $192$ cores. The FLAMINGO L2p8 unlensed Compton-$y$ lightcone \citep{schaye2023}, full sky at $N_{\mathrm{side}}=4096$, gives rms $2.32\times10^{-7}$ in $8.64\,\mathrm{s}$ versus $69.5\,\mathrm{s}$. Both overlays time only the estimator. Figure~\ref{fig:accuracy} contrasts the float32 march floors of Table~\ref{tab:dform} with decoupled bandpower agreement on the ACT scaling board; Figure~\ref{fig:scoreboard} is the wall-clock board of Table~\ref{tab:e2e}.
-
-\begin{figure*}
+\begin{figure*}[t!]
 \centering
 \includegraphics[width=\textwidth]{figures/fig_accuracy.pdf}
-\caption{Left: relative error of a float32 march against the float64 recurrence at $N_{\mathrm{side}}=1024$ spin~$0$ (Table~\ref{tab:dform}). Right: maximum $|C_\ell^{\mathrm{GM}}/C_\ell^{\mathrm{NM}}-1|$ on decoupled TT bandpowers from the ACT DR6 end-to-end scaling board (\texttt{results.json}); solid red: bins with $\ell<2N_{\mathrm{side}}$, dashed grey: all bins. GMaster curves are red; reference curves are black/grey.}
+\caption{Left: maximum relative error of a float32 march against float64, over every lane at $N_{\mathrm{side}}=1024$ spin~$0$ ($m=0$, $1000$, $L/2$): plain recurrence (grey) versus difference form with two-word $C$ (red, shipped). Right: maximum $|C_\ell^{\mathrm{GM}}/C_\ell^{\mathrm{NM}}-1|$ on decoupled TT bandpowers from the ACT DR6 end-to-end scaling board ($f_{\mathrm{sky}}=0.481$, $\Delta_\ell=30$); solid red: bins with $\ell<2N_{\mathrm{side}}$, dashed grey: all bins; dotted grey: cosmic variance at $\ell=2N_{\mathrm{side}}$. The hollow marker at $N_{\mathrm{side}}=8192$ is the pre-\texttt{ducc0}-weight residual; filled markers use post-switch bandpowers ($3.8\times10^{-5}$ at $8192$).}
 \label{fig:accuracy}
 \end{figure*}
 
-\begin{figure*}
+\begin{figure*}[t!]
 \centering
-\includegraphics[width=\textwidth]{figures/fig_scoreboard.pdf}
-\caption{End-to-end MASTER wall time on the host of Table~\ref{tab:e2e}. Grey is NaMaster on 96 cores; red is GMaster. NaMaster is absent at $N_{\mathrm{side}}=4096$ spin~$2$, where stock NaMaster segfaults on 32-bit coupling-matrix indices.}
-\label{fig:scoreboard}
+\includegraphics[width=\textwidth]{figures/fig_act_overlay.pdf}
+\caption{ACT DR6 night PA4 $f150$ source-free coadd \citep{naess2025} at $N_{\mathrm{side}}=4096$ ($f_{\mathrm{sky}}=0.481$). Left: decoupled TT $D_\ell$ after the full MASTER chain (\texttt{NmtField} with $n_{\mathrm{iter}}=3$ mask refinement, coupling matrix, coupled cell, decoupling; linear bins of width $50$); GMaster (red) and NaMaster (grey) share inputs. GMaster executes the latitudinal march of Section~2 inside every spin-$0$ analysis/synthesis that builds field and mask alms. Right: fractional bandpower difference $C_\ell^{\mathrm{GM}}/C_\ell^{\mathrm{NM}}-1$ with the cosmic-variance envelope $\sqrt{2/[(2\ell+1)f_{\mathrm{sky}}\Delta_\ell]}$ (dotted). Methods overlay, not an ACT science product.}
+\label{fig:act}
 \end{figure*}
 
 \section{Conclusions}
 
-A three-term Jacobi recurrence in float32 is limited by $1/\sin\phi$ amplification, not by the width of its words. Marching $(v,v-v_{\mathrm{prev}})$ moves the injection of every rounding onto a difference that already vanishes at the turning points, and a two-word $C$ removes the residual coherent drift. Carried as a CUDA kernel behind NaMaster's API, that rewrite is the default latitudinal operator in GMaster and is $10$--$21\times$ NaMaster at $N_{\mathrm{side}}=128$--$2048$ on the board of Table~\ref{tab:e2e}. The same pipeline on an ACT DR6 coadd and a FLAMINGO Compton-$y$ map at $N_{\mathrm{side}}=4096$ agrees at $10^{-5}$--$10^{-7}$ in under nine seconds.
+A three-term Jacobi recurrence in float32 is limited by $1/\sin\phi$ amplification, not by the width of its words. Marching $(v,v-v_{\mathrm{prev}})$ moves the injection of every rounding onto a difference that already vanishes at the turning points, and a two-word $C$ removes the residual coherent drift. Carried as a CUDA kernel behind NaMaster's API, that rewrite is the default latitudinal operator in GMaster and is $10$--$22\times$ NaMaster at $N_{\mathrm{side}}=128$--$8192$ on the board of Figure~\ref{fig:scoreboard}. The same pipeline on an ACT DR6 coadd at $N_{\mathrm{side}}=4096$ agrees at $10^{-5}$ in under nine seconds.
 
-No other GPU spherical-harmonic implementation was timed on the full MASTER board. The shipped default trades NaMaster's float64 transform contract for decoupled bandpowers that match NaMaster to better than $10^{-3}$ below $\ell=2N_{\mathrm{side}}$ at $N_{\mathrm{side}}=8192$ and up to $7\times10^{-3}$ in the highest bandpowers (Figure~\ref{fig:accuracy}); the exact float64 route is one flag. The overlays are methods comparisons, not science products.
+No other GPU spherical-harmonic implementation was timed on the full MASTER board. The shipped default trades NaMaster's float64 transform contract for decoupled bandpowers that match NaMaster to better than $4\times10^{-4}$ at all multipoles on the ACT scaling board ($N_{\mathrm{side}}=256$--$8192$), at least $17\times$ below cosmic variance; the exact float64 route is one flag. The overlay is a methods comparison, not a science product.
 
 \section*{Acknowledgements}
 
-NaMaster, DUCC/libsharp, s2fft, threej\_cosmo and SHTns are the reference stack against which the numbers were measured. The Lean~4 development uses Mathlib. ACT DR6 maps are those of \citet{naess2025}. Every numerical claim was measured on the hardware of Section~3.
+NaMaster, DUCC/libsharp, s2fft, threej\_cosmo and SHTns are the reference stack against which the numbers were measured. The Lean~4 development uses Mathlib. ACT DR6 maps are those of \citet{naess2025}. Numerical claims were measured on the hardware of Section~3; parts of the library and formal proof were developed with coding-agent assistance under author supervision.
 
 \section*{Data Availability}
 
-GMaster, the overlay scripts, the committed bandpowers of both overlays and a notebook that rebuilds Figure~\ref{fig:act} and the timing table from them are at \url{https://github.com/licongxu/GMaster}. Figure~\ref{fig:act} uses the public ACT DR6 maps \citep{naess2025}. The FLAMINGO L2p8 Compton-$y$ lightcone is described by \citet{schaye2023}.
+GMaster, the overlay scripts, the committed bandpowers of the ACT overlay and a notebook that rebuilds Figure~\ref{fig:act} and the timing figure from them are at \url{https://github.com/licongxu/GMaster}. Figure~\ref{fig:act} uses the public ACT DR6 maps \citep{naess2025}.
 
+\begingroup
+\setlength{\bibsep}{0pt}
+\small
 \bibliographystyle{mnras}
 \bibliography{refs}
+\endgroup
 
 \bsp
 \label{lastpage}
