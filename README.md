@@ -20,8 +20,8 @@ cl = workspace.decouple_cell(nmt.compute_coupled_cell(field, field))
 On one NVIDIA RTX PRO 6000 (96 GB), the full MASTER estimator on the ACT DR6 map runs
 **12-22x faster than NaMaster on all 96 cores** of an AMD Threadripper PRO 9995WX from Nside 1024
 to 8192 (7-22x from Nside 256), for both temperature and polarization. On that map the bandpowers
-agree with NaMaster's to better than $10^{-4}$ up to Nside 2048 and $2.4\times10^{-4}$ at Nside 4096
-(details below).
+agree with NaMaster's to better than $4\times10^{-4}$ at all $\ell$, at least 17 times below cosmic
+variance, from Nside 256 to 8192 (details below).
 
 ![Warm wall time versus resolution](docs/figures/time_vs_nside.png)
 
@@ -34,7 +34,7 @@ pip install "jax[cuda12]"                                    # or follow the JAX
 pip install "gmaster @ git+https://github.com/licongxu/GMaster.git"
 ```
 
-For the tests and tutorials: `pip install "gmaster[test,examples]"` (adds NaMaster, ducc0,
+For the tests and tutorials: `pip install "gmaster[test,examples]"` (adds NaMaster,
 matplotlib, Jupyter and CAMB). Set `JAX_ENABLE_X64=1` before JAX is imported; GMaster warns if
 double precision is off.
 
@@ -101,15 +101,21 @@ Nside 8192 spin-2 GMaster cell is a single warm run.
 | 4096 | 2 | 8.8 s | 215 s | 110 s | 13x |
 | 8192 | 2 | 57 s | 1658 s | 805 s | 14x |
 
-**Accuracy.** On the ACT DR6 map and footprint, GMaster's bandpowers differ from NaMaster's by at
-most $3\times10^{-5}$ (TT) and $4\times10^{-5}$ (EE) up to Nside 1024, $9\times10^{-5}$ at 2048 and
-$2.4\times10^{-4}$ at 4096. At Nside 8192 the difference is below $10^{-3}$ for
-$\ell < 2N_{\rm side}$ and reaches $7\times10^{-3}$ in the highest bandpowers. It comes from GMaster's
-float32 latitudinal transforms (relative error ~$10^{-7}$), which set a floor on the tiny
-high-$\ell$ power of a smooth mask; decoupling carries that into the highest bandpowers. It therefore
-depends on the mask: for a Galactic cut apodized over 1 degree at Nside 1024 it is $3\times10^{-4}$
-below $\ell = 2N_{\rm side}$ and $2\times10^{-3}$ at $\ell \approx 3N_{\rm side}$. HEALPix analyses are
-usually restricted to $\ell \lesssim 2N_{\rm side}$ anyway. See
+**Accuracy.** On the ACT DR6 map and its binary footprint mask ($f_{\rm sky} = 0.481$), GMaster's
+decoupled bandpowers differ from NaMaster's (96 cores) by at most $3\times10^{-5}$ (TT) and
+$3\times10^{-5}$ (EE) at Nside 1024, $5\times10^{-5}$ and $8\times10^{-5}$ at 2048,
+$5.7\times10^{-5}$ and $3.6\times10^{-4}$ at 4096, and $3.8\times10^{-5}$ and $2.8\times10^{-4}$ at
+8192, over all bandpowers ($\ell_{\max} = 3N_{\rm side} - 1$, $\Delta\ell = 30$). At every Nside
+from 256 to 8192 and every $\ell$ the difference is at least 17 times below the cosmic variance of a
+bandpower. The mode-coupling matrices use Gauss-Legendre nodes and weights from ducc0; scipy's
+lose accuracy at large order and biased the bandpowers by up to $10^{-3}$ at Nside 8192.
+
+The spherical-harmonic transforms run their latitudinal (Wigner-$d$) recurrence in float32. Against
+float64 ducc0 on the same HEALPix grid, a single transform has a relative rms error of about
+$3\times10^{-6}$ at Nside 256, growing roughly linearly with $\ell_{\max}$ to $5\times10^{-5}$ at
+Nside 4096 ($\ell_{\max} = 3N_{\rm side} - 1$; maximum errors are about twice the rms). A
+`map2alm` / `alm2map` round trip closes to ~$10^{-7}$-$10^{-6}$ at $\ell_{\max} = 2N_{\rm side}$,
+but that measures float32 self-consistency, not accuracy. See
 [docs/architecture.md](docs/architecture.md#precision).
 
 Up to Nside 8192 the whole spin-2 estimator fits on one 96 GB GPU (peak 79 GiB); NaMaster needs
