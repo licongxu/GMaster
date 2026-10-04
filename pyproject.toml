@@ -18,6 +18,7 @@ dependencies = [
     "healpy",
     "jax",
     "numpy",
+    "ducc0",
     "s2fft @ git+https://github.com/astro-informatics/s2fft.git@86a4dff303539202ebbfa28661d85331e0e2bff4",
     "scipy",
 ]

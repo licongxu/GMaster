@@ -20,11 +20,11 @@ Spectra are ordered as in NaMaster: for fields of spins ``(s1, s2)`` there are
 import os
 from functools import lru_cache, partial
 
+import ducc0
 import jax
 import jax.numpy as jnp
 import numpy as np
 from jax.scipy.special import gammaln
-from scipy.special import roots_legendre
 
 from .bins import NmtBin, NmtBinFlat
 from . import _config
@@ -592,8 +592,17 @@ def _coupling_matrix_tt_toeplitz(
 
 @lru_cache(maxsize=16)
 def _gauss_legendre(order):
-    """Cached Gauss-Legendre nodes (ascending) and weights on [-1, 1]."""
-    return roots_legendre(order)
+    """Cached Gauss-Legendre nodes (ascending) and weights on [-1, 1].
+
+    From ducc0, whose rule is exact to ~1e-16 at every order. scipy's
+    ``roots_legendre`` loses accuracy in the weights at large order (relative
+    error 6.6e-6 at 12289 nodes and 1.9e-3 at 49151, the Nside 8192 coupling
+    order), which biases the far off-diagonal coupling-matrix tail.
+    """
+    nodes = np.cos(ducc0.misc.GL_thetas(order))
+    weights = np.asarray(ducc0.misc.GL_weights(order, 1))
+    ascending = np.argsort(nodes)
+    return nodes[ascending], (weights * (2.0 / weights.sum()))[ascending]
 
 
 @partial(jax.jit, static_argnames=("m", "n", "lmax"))
