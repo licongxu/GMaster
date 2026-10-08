@@ -1,0 +1,190 @@
+diff --git a/sht_gpu.cu b/sht_gpu.cu
+index b74ce1d..0622ab6 100644
+--- a/sht_gpu.cu
++++ b/sht_gpu.cu
+@@ -123,7 +123,7 @@ double cushtns_profiling_read_time(shtns_cfg shtns, double* time_1, double* time
+ static void destroy_cuda_buffer_fft(shtns_cfg shtns)
+ {
+ 	#if defined(HAVE_LIBCUFFT) || defined(HAVE_LIBROCFFT)
+-	if (shtns->nphi > 1) cufftDestroy(shtns->cufft_plan);
++	if (shtns->nphi > 1 && shtns->cufft_plan) cufftDestroy(shtns->cufft_plan);
+ 	#endif
+ 	#ifdef VKFFT_BACKEND
+ 	deleteVkFFT(&shtns->vkfft_plan);
+@@ -145,7 +145,11 @@ static int init_cuda_buffer_fft(shtns_cfg shtns, int cuda_gpu_id, int sizeof_rea
+ 	/* GPU FFT init */
+ 	int nfft = shtns->nphi;
+ 	//int nreal = 2*(nfft/2+1);
+-	if (nfft > 1) {
++	const char* no_fft = getenv("SHTNS_GPU_NO_FFT");	// 1: Legendre-only plan, longitude FFT done by the caller (cu_*_fourier_* only)
++	#if defined(HAVE_LIBCUFFT) || defined(HAVE_LIBROCFFT)
++	shtns->cufft_plan = 0;
++	#endif
++	if (nfft > 1 && !(no_fft && atoi(no_fft)==1)) {
+ 		#if defined(HAVE_LIBCUFFT) || defined(HAVE_LIBROCFFT)
+ 			cufftResult res = CUFFT_SUCCESS;
+ 			if (shtns->fft_mode & FFT_THETA_CONTIG) {
+@@ -339,7 +343,7 @@ int init_cuda_program(shtns_cfg shtns, const char* gpu_arch_target)
+ 	int nw_s=2;		int nf_s=1;			int nf_a=1;
+ 	int lspan_a = 16;	// V100 and MI100: 16/nf_a works best (mmax>0)
+ #if WARPSZE == 32
+-	const bool h100 = (strcmp(gpu_arch_target,"_90") >= 0);         // H100
++	const bool h100 = (atoi(gpu_arch_target+1) >= 90);             // H100 and newer, including _100/_120
+ 	if (nwarp_target % 3 == 0) nw_s=3;	// if we need a multiple of 3, nw_s=3 is likely a bit better
+ 	// adjust values (heuristics)
+ 	if (shtns->howmany % 4 == 0) 	  {	nf_s=4;	nw_s=1;		nf_a=4;	}
+@@ -459,7 +463,9 @@ int init_cuda_program(shtns_cfg shtns, const char* gpu_arch_target)
+ 		//s += sprintf(s, "#define SHT_HI_PREC 2\n");		// improve numerical accuracy by using full FP64 for m=0 (not only recurrence, but also accumulators) ==> TODO: some work needed in kernels.
+ 		s += sprintf(s, "typedef double real_g;\n#define SHT_ACCURACY 1.0e-33\n#define SHT_SCALE_FACTOR 2.0370359763344860863e90\n");	// for double-precision recurrence
+ 	}
+-	s += sprintf(s, "#define SHT_HI_PREC %d\n", (shtns->sizeof_real == 4) ? 1 : 0);		// improve numerical accuracy by computing the mean separately for scalar (S=0) transforms.
++	const char* no_fft_env = getenv("SHTNS_GPU_NO_FFT");	// Legendre-only plan with caller-supplied latitudes (e.g. HEALPix): the separate mean
++	const int custom_grid = (no_fft_env && atoi(no_fft_env)==1);	// assumes the quadrature annihilates Y_l0 for l>0, which only holds for Gauss nodes.
++	s += sprintf(s, "#define SHT_HI_PREC %d\n", (shtns->sizeof_real == 4 && !custom_grid) ? 1 : 0);		// improve numerical accuracy by computing the mean separately for scalar (S=0) transforms.
+ 	if ((shtns->kernel_flags & CUSHT_NO_ISHIOKA) == 0) 	s += sprintf(s, "#define LEG_ISHIOKA\n#define ILEG_ISHIOKA\n");		// use ishioka's recurrence in gpu kernels
+ 	if (shtns->fft_mode & FFT_PHI_CONTIG) s += sprintf(s, "#define LAYOUT_REAL_FFT\n");
+ 	#if SHT_VERBOSE > 1
+@@ -583,7 +589,7 @@ void cushtns_release_gpu(shtns_cfg shtns)
+ 	shtns->cu_flags = 0;
+ }
+ 
+-int gpu_upload_convert(void* dst, double* src, size_t n_real, int dst_sizeof_real)
++int gpu_upload_convert(void* dst, const double* src, size_t n_real, int dst_sizeof_real)
+ {
+ 	float* tmp_f = 0;
+ 	if (dst_sizeof_real == 4) {		// convert from double to float
+@@ -596,6 +602,37 @@ int gpu_upload_convert(void* dst, double* src, size_t n_real, int dst_sizeof_rea
+ 	return (err != cudaSuccess);
+ }
+ 
++// Replace the latitude quadrature without changing the native recurrence or FFT plan.
++extern "C"
++int cushtns_set_latitudes(shtns_cfg shtns, const double* costheta, const double* weights)
++{
++	if (!shtns || !costheta || !weights || !shtns->d_ct || (shtns->nlat & 1)) return -1;
++	const int nlat = shtns->nlat;
++	double sum = 0;
++	for (int i=0; i<nlat; i++) {
++		if (!isfinite(costheta[i]) || !isfinite(weights[i]) || fabs(costheta[i]) >= 1 || weights[i] < 0) return -1;
++		if (i && costheta[i] > costheta[i-1]) return -1;
++		if (fabs(costheta[i] + costheta[nlat-1-i]) > 1.e-12 || fabs(weights[i] - weights[nlat-1-i]) > 1.e-12) return -1;
++		sum += weights[i];
++	}
++	if (fabs(sum - 2) > 1.e-10) return -1;
++	if (cudaStreamSynchronize(shtns->comp_stream) != cudaSuccess) return -1;
++	for (int i=0; i<nlat; i++) {
++		shtns->ct[i] = costheta[i];
++		shtns->st[i] = sqrt((1-costheta[i])*(1+costheta[i]));
++		shtns->st_1[i] = 1/shtns->st[i];
++		if (i < shtns->nlat_2) shtns->wg[i] = weights[i]/shtns->wg[-1];
++	}
++	memset(shtns->tm, 0, (shtns->mmax+1)*sizeof(*shtns->tm));
++	const int n = shtns->nlat_2;
++	const int size = shtns->sizeof_real_g;
++	int err = gpu_upload_convert(shtns->d_ct, shtns->ct, n, size);
++	err += gpu_upload_convert(((char*)shtns->d_ct) + n*size, shtns->wg, n, size);
++	err += gpu_upload_convert(((char*)shtns->d_ct) + 2*n*size, shtns->st, n, size);
++	err += gpu_upload_convert(((char*)shtns->d_ct) + 3*n*size, shtns->st_1, n, size);
++	return err ? -1 : 0;
++}
++
+ extern "C"
+ int cushtns_init_gpu(shtns_cfg shtns)
+ {
+@@ -877,7 +914,7 @@ static void ilegendre(shtns_cfg shtns, const int S, const void *q, void* ql, con
+ 
+ /// Perform SH transform on data that is already on the GPU. d_Qlm and d_Vr are pointers to GPU memory (obtained by cudaMalloc() for instance)
+ template<int S, typename real=double>
+-void cuda_SH_to_spat(shtns_cfg shtns, std::complex<real>* d_Qlm, real *d_Vr, const long int llim, const int mmax)
++void cuda_SH_to_spat(shtns_cfg shtns, std::complex<real>* d_Qlm, real *d_Vr, const long int llim, const int mmax, const bool perform_fft=true)
+ {
+ 	std::complex<real>* d_qlm = d_Qlm;
+ 	
+@@ -891,13 +928,13 @@ void cuda_SH_to_spat(shtns_cfg shtns, std::complex<real>* d_Qlm, real *d_Vr, con
+ 		if (d_Vr == (real*) d_Qlm) { printf("ERROR: cuda_SH_to_spat must have distinct in and out fields");	exit(1); }
+ 	legendre(shtns, S, d_qlm, d_Vr, llim, mmax);
+ 	if (S==0) profiling_record_time(shtns, 1, shtns->comp_stream);
+-	fourier_to_spat_gpu(shtns, d_Vr, mmax, sizeof(real));	// in-place
++	if (perform_fft) fourier_to_spat_gpu(shtns, d_Vr, mmax, sizeof(real));	// in-place
+ 	if (S==0) profiling_record_time(shtns, 2, shtns->comp_stream);
+ }
+ 
+ /// Perform SH transform on data that is already on the GPU. d_Qlm and d_Vr are pointers to GPU memory (obtained by cudaMalloc() for instance)
+ template<int S, typename real=double>
+-void cuda_spat_to_SH(shtns_cfg shtns, real *d_Vr, std::complex<real>* d_Qlm, const long int llim)
++void cuda_spat_to_SH(shtns_cfg shtns, real *d_Vr, std::complex<real>* d_Qlm, const long int llim, const bool perform_fft=true)
+ {
+ 	int mmax = shtns->mmax;
+ 	const int mres = shtns->mres;
+@@ -906,7 +943,7 @@ void cuda_spat_to_SH(shtns_cfg shtns, real *d_Vr, std::complex<real>* d_Qlm, con
+ 	if (sizeof(real) != shtns->sizeof_real) { printf("ERROR: SHTns plan not prepared for fp%ld data\n", sizeof(real)*8);	exit(1); }
+ 
+ 	if (S==0) profiling_record_time(shtns, 0, shtns->comp_stream);
+-	spat_to_fourier_gpu(shtns, d_Vr, mmax, sizeof(real));
++	if (perform_fft) spat_to_fourier_gpu(shtns, d_Vr, mmax, sizeof(real));
+ 	if (S==0) profiling_record_time(shtns, 1, shtns->comp_stream);
+ 	if (S==0) {
+ 		std::complex<real>* d_Qlm_ish = (std::complex<real>*) shtns->gpu_buf_in;
+@@ -938,6 +975,20 @@ void cu_SH_to_spat_float(shtns_cfg shtns, cplx_f* d_Qlm, float *d_Vr, int llim)
+ 	cuda_SH_to_spat<0,float>(shtns, d_Qlm, d_Vr, llim, mmax);
+ }
+ 
++extern "C"
++void cu_SH_to_fourier_float(shtns_cfg shtns, cplx_f* d_Qlm, cplx_f* d_Fm, int llim)
++{
++	int mmax = shtns->mmax;
++	if (llim < mmax*shtns->mres) mmax = llim/shtns->mres;
++	cuda_SH_to_spat<0,float>(shtns, d_Qlm, (float*)d_Fm, llim, mmax, false);
++}
++
++extern "C"
++void cu_fourier_to_SH_float(shtns_cfg shtns, cplx_f* d_Fm, cplx_f* d_Qlm, int llim)
++{
++	cuda_spat_to_SH<0,float>(shtns, (float*)d_Fm, d_Qlm, llim, false);
++}
++
+ 
+ extern "C"
+ void cu_SHsphtor_to_spat(shtns_cfg shtns, cplx* d_Slm, cplx* d_Tlm, double* d_Vt, double* d_Vp, int llim)
+diff --git a/sht_init.c b/sht_init.c
+index 7f76610..51e9705 100644
+--- a/sht_init.c
++++ b/sht_init.c
+@@ -1531,6 +1531,8 @@ int shtns_set_grid_auto(shtns_cfg shtns, enum shtns_type flags, double eps, int
+ 		if (layout & SHT_LOAD_SAVE_CFG) config_save(shtns, req_flags);
+ 	} else if (t_estimate >= 0.3*shtns->nthreads)  accuracy_check = 0;	// don't perform accuracy checks for too large transforms (takes too much time).
+ 
++	{	const char* no_fft = getenv("SHTNS_GPU_NO_FFT");	// Legendre-only GPU plan: full transforms are unavailable, skip the self-test
++		if (no_fft && atoi(no_fft)==1) accuracy_check = 0;	}
+ 	if (accuracy_check) {
+ 		t = SHT_error(shtns, vector);		// compute SHT accuracy.
+ 		if (verbose) printf("        + SHT accuracy = %.3g\n",t);
+diff --git a/shtns_cuda.h b/shtns_cuda.h
+index 15496ad..b8cdd11 100644
+--- a/shtns_cuda.h
++++ b/shtns_cuda.h
+@@ -50,6 +50,11 @@ void cu_spat_to_SH_float(shtns_cfg shtns, float *Vr, cplx_f *Qlm, int ltr);
+ void cu_SH_to_spat(shtns_cfg shtns, cplx *Qlm, double *Vr, int ltr);
+ /// Same as \ref cu_SH_to_spat, but working on single precision data.
+ void cu_SH_to_spat_float(shtns_cfg shtns, cplx_f *Qlm, float *Vr, int ltr);
++/// Native scalar latitude stages without longitude FFT. With SHT_PHI_CONTIGUOUS,
++/// Fm is complex m-major [m][nlat], at least (mmax+1)*nlat values. Analysis expects
++/// longitude FFT sums normalized to the plan's nphi (ring means multiplied by nphi).
++void cu_SH_to_fourier_float(shtns_cfg shtns, cplx_f *Qlm, cplx_f *Fm, int ltr);
++void cu_fourier_to_SH_float(shtns_cfg shtns, cplx_f *Fm, cplx_f *Qlm, int ltr);
+ /// Same as \ref spat_to_SHsphtor, but working on data residing on the GPU.
+ void cu_spat_to_SHsphtor(shtns_cfg, double *Vt, double *Vp, cplx *Slm, cplx *Tlm, int ltr);
+ void cu_spat_to_SHsphtor_float(shtns_cfg, float *Vt, float *Vp, cplx_f *Slm, cplx_f *Tlm, int ltr);
+@@ -80,6 +85,12 @@ void cu_SHqst_to_spat_float(shtns_cfg, cplx_f *Qlm, cplx_f *Slm, cplx_f *Tlm, fl
+ /// \returns device_id on success, or -1 on failure.
+ int cushtns_init_gpu(shtns_cfg shtns);
+ 
++/// Replace latitudes and quadrature of an initialized GPU plan. Arrays have nlat
++/// entries, ordered north to south, symmetric about the equator, with an even nlat.
++/// Weights are nonnegative ring quadrature weights summing to 2. Returns 0 or -1.
++/// HEALPix may duplicate its equator with half of the equator weight in each copy.
++int cushtns_set_latitudes(shtns_cfg shtns, const double *costheta, const double *weights);
++
+ /// Clone a gpu-enabled shtns config, and assign it to different streams (to allow compute overlap and/or usage from multiple threads).
+ /// This implies allocation of memory on the GPU and other limited resources, and thus may fail.
+ /// \param[in] shtns is a valid shtns configuration created with \ref shtns_create and with an associated grid (see \ref shtns_set_grid_auto )
