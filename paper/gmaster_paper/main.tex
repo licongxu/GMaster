@@ -1,0 +1,347 @@
+\documentclass[letters,usenatbib,useAMS]{mnras}
+
+\usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+\usepackage[T1]{fontenc}
+\usepackage{booktabs}
+\usepackage{fontawesome5}
+
+\title[GMaster: fast single-precision spherical harmonic transforms]
+{Fast and accurate single-precision spherical harmonic transforms for cosmological map analysis}
+
+\author[L. Xu \& B. Bolliet]{
+Licong Xu$^{1,2}$\thanks{E-mail: lx256@cam.ac.uk}
+and Boris Bolliet$^{3,2}$
+\\
+$^{1}$Institute of Astronomy, University of Cambridge, Madingley Road, Cambridge CB3 0HA, UK\\
+$^{2}$Kavli Institute for Cosmology, University of Cambridge, Madingley Road, Cambridge CB3 0HA, UK\\
+$^{3}$Cavendish Astrophysics, University of Cambridge, Madingley Road, Cambridge CB3 0HA, UK
+}
+
+\date{Accepted XXX. Received YYY; in original form ZZZ}
+\pubyear{2026}
+
+\begin{document}
+\label{firstpage}
+\pagerange{\pageref{firstpage}--\pageref{lastpage}}
+\maketitle
+
+\begin{abstract}
+High-resolution analysis of maps on the sphere is limited by the computational cost of spherical harmonic transforms (SHTs). We introduce a difference-form Wigner-$d$/Jacobi recurrence that suppresses the amplification of floating-point error and makes accurate single-precision transforms practical on a GPU. The functions are generated on the fly, so the full latitudinal basis is never stored. The method is implemented in \texttt{GMaster}\,\href{https://github.com/licongxu/GMaster}{\faGithub}, with CUDA kernels integrated with JAX. On one GPU, float32 \texttt{map2alm} at $N_{\mathrm{side}}=1024$--$2048$ is $7.3$--$8.5\times$ faster for spin~0 and $6.7$--$9.0\times$ faster for spin~2 than \texttt{ducc0} on 96 CPU cores, and $2.2$--$4.7\times$ faster than float64 \texttt{SHTns} on the HEALPix grid for spin-0 \texttt{map2alm} over $N_{\mathrm{side}}=512$--$8192$. The shipped default uses that march outside a band-limit window and a divide-and-conquer latitudinal engine inside it. On the ACT DR6 maps the default route is $58.6\times$ and $56.3\times$ faster than 96-core \texttt{NaMaster} at $N_{\mathrm{side}}=2048$ (spin~0 and spin~2) and $96.5\times$ and $72.5\times$ faster at $N_{\mathrm{side}}=4096$, with TT and EE bandpowers agreeing to $1.5\times10^{-5}$ at $N_{\mathrm{side}}=2048$ and $1.7\times10^{-4}$ at $N_{\mathrm{side}}=4096$. The float32 march evaluates the curved-sky CMB lensing quadratic estimator. At $\ell_{\max}=2000$ and $4000$ the seven estimators take $0.103\,\mathrm{s}$ and $0.594\,\mathrm{s}$, $61\times$ and $41\times$ faster than \texttt{falafel} on its CAR grid and $96.5\times$ and $64\times$ faster than \texttt{falafel} on HEALPix, agreeing with the HEALPix reconstruction to $2.8\times10^{-5}$ and $7.0\times10^{-5}$.
+\end{abstract}
+
+\begin{keywords}
+methods: numerical -- cosmology: cosmic microwave background -- cosmology: large-scale structure of Universe
+\end{keywords}
+
+\section{Introduction}
+Spherical harmonic transforms (SHTs) are a fundamental numerical operation in the analysis of data on spheres. They are widely used in cosmology, including the analyses of cosmic microwave background (CMB) and large-scale structure. Scalar observables such as CMB temperature and projected density fields require spin-0 transforms, while CMB polarization and weak lensing shear are described by spin-2 fields. SHTs therefore enter repeatedly in map filtering, inverse-variance operations, lensing reconstructions, and pseudo-$C_\ell$ power-spectrum estimation. As modern cosmological surveys move to higher resolution and increasingly rely on large suites of simulations, the computational cost of these transforms has become an important component of these analyses.
+
+% Angular power spectra are one of the standard and most useful statistics for extracting cosmological information from observations of the cosmic microwave background (CMB) and large-scale structure. In practice, cosmological observations cover only part of the sky and require masks to exclude foreground-contaminated regions, point sources, survey boundaries, and other unusable data. Masking induces mode coupling in spherical harmonic space, leading to a bias on the naive estimate of the underlying power spectrum. 
+
+% The pseudo-$C_\ell$ approach \citep{hivon2002} provides an efficient framework for correcting this mode coupling by relating spectra measured on the masked sky to the underlying full-sky spectra through a mask-dependent mode-coupling matrix. Its computational cost scales as $\mathcal{O}(\ell_{\max}^3)$, where $\ell_{\max}$ denotes the maximum multipole included in the analysis, compared with the substantially steeper $\mathcal{O}(\ell_{\max}^6)$ scaling of exact pixel-space likelihood methods. \texttt{NaMaster} \citep{alonso2019} implements the pseudo-$C_\ell$ formalism as a general software package for scalar and spin fields, including angular auto- and cross-power spectra.
+
+On iso-latitude pixelizations such as HEALPix \citep{gorski2005}, the azimuthal part of an SHT can be evaluated using Fourier transforms, while the latitudinal part requires repeated evaluation of associated Legendre functions, or more generally Wigner-$d$ functions for spin fields. The dominant cost lies in the evaluation of Wigner-$d$ functions over a large number of harmonic modes and sky rings. Modern SHT libraries generate them on the fly using recurrence relations, in which the functions at a given harmonic degree are obtained from those at neighboring degrees. This approach is highly optimized in high-performance CPU implementations. \texttt{libsharp}, and subsequently \texttt{DUCC} \citep{reinecke2013}, combine on the fly recurrence with single-instruction, multiple-data (SIMD) vectorization and multithreading, while \texttt{DUCC} further incorporates the accelerated recurrence of \citet{ishioka2018}. \texttt{NaMaster}\footnote{\url{https://github.com/LSSTDESC/NaMaster}} \citep{alonso2019} uses \texttt{DUCC} for scalar and spin SHTs within its pseudo-$C_\ell$ estimator. \texttt{SHTns} \citep{schaeffer2013,ishioka2018} follows a similar recurrence-based approach, combining on the fly evaluation with vectorization, multithreading, optimized FFTs, and GPU backends for NVIDIA and AMD hardware.
+
+More recently, several approaches have been developed specifically to accelerate SHTs on GPUs and other accelerator hardware. \texttt{S2FFT} \citep{price2024} implements differentiable scalar and spin transforms in JAX using a highly parallel Wigner-$d$ recurrence. The Wigner-$d$ functions can either be precomputed and stored for faster evaluation, or generated on the fly using the recurrence to reduce memory requirements. \texttt{cunuSHT} \citep{belkner2024} targets transforms on arbitrary and non-uniform grids, combining a regular-grid SHT with a double-Fourier-sphere construction and non-uniform FFTs, with applications to CMB lensing and remapping. \texttt{cuHPX} \citep{cheng2025cuhpxgpuaccelerateddifferentiablespherical} provides differentiable GPU transforms tailored to HEALPix, using precomputed associated-Legendre functions together with GPU ring FFTs and tensor contractions, with an out-of-core strategy for handling the resulting basis tables at high resolution. A different approach is taken by \texttt{parallALT} \citep{tolmachev2026}, which converts associated-Legendre expansions to Chebyshev expansions and evaluates them using GPU-accelerated discrete cosine and sine transforms, reporting speed-ups of up to a factor of three over \texttt{SHTns} on an NVIDIA H100.
+
+These implementations expose a trade-off between memory use and numerical precision. Precomputing the Wigner-$d$ functions avoids evaluating the recurrence during each transform, but the required memory grows rapidly with resolution. The recurrence-based method therefore remains competitive at high resolution, with \texttt{SHTns}\footnote{\url{https://bitbucket.org/nschaeff/shtns}} providing a state-of-the-art publicly available implementation of this approach on both CPUs and GPUs. \texttt{SHTns} is primarily designed around double-precision arithmetic to maintain the accuracy of the recurrence relations. On GPUs, however, single-precision arithmetic can offer substantially higher throughput. Moreover, \texttt{SHTns} does not provide the spin-2 transforms required for CMB polarization. General-spin GPU transforms are available in \texttt{S2FFT}, but high-resolution calculations with comparable accuracy similarly rely on 64-bit arithmetic. Efficient use of modern GPU hardware therefore requires SHT algorithms that can exploit lower-precision arithmetic to increase computational throughput while maintaining the numerical accuracy of high-resolution transforms.
+
+
+% High-performance CPU libraries such as \texttt{libsharp}/DUCC \citep{reinecke2013} and \texttt{SHTns} \citep{schaeffer2013} evaluate these functions on the fly using recurrence relations and exploit vectorization to achieve high computational efficiency. \texttt{NaMaster}\footnote{\url{https://github.com/LSSTDESC/NaMaster}, version 3.0.} \citep{alonso2019} uses DUCC for scalar and spin SHTs and constructs the mode-coupling matrix to implement the pseudo-$C_\ell$ estimator. \texttt{SHTns} \citep{schaeffer2013,ishioka2018} instead provides highly optimized SHTs based on on-the-fly recurrence of the latitudinal functions, combined with FFTs, SIMD vectorization, and multithreading. More recently, SHTs have become an active target for GPU acceleration. \texttt{S2FFT} \citep{price2024} implements highly parallel and differentiable spherical and Wigner transforms in JAX, while \texttt{cunuSHT} \citep{belkner2024} combines GPU-accelerated ring transforms with double-Fourier-sphere and non-uniform FFT methods. These developments demonstrate the potential of accelerator hardware for spherical harmonic analysis, while also highlighting the importance of how the latitudinal transform is formulated and evaluated. 
+
+% At high angular resolution, the computational cost of the estimator is concentrated in two main operations: spherical harmonic transforms (SHTs) of the weighted fields and masks, and construction of the mode-coupling matrices. On iso-latitude pixelizations such as HEALPix \citep{gorski2005}, the azimuthal part of an SHT can be evaluated using Fourier transforms, while the latitudinal part requires repeated evaluation of associated Legendre functions, or more generally Wigner-$d$ functions for spin fields. High-performance CPU libraries such as \texttt{libsharp}/DUCC \citep{reinecke2013} and \texttt{SHTns} \citep{schaeffer2013} evaluate these functions on the fly using recurrence relations and exploit vectorization to achieve high computational efficiency. More recently, SHTs have become an active target for GPU acceleration. \texttt{S2FFT} \citep{price2024} implements highly parallel and differentiable spherical and Wigner transforms in JAX, while \texttt{cunuSHT} \citep{belkner2024} combines GPU-accelerated ring transforms with double-Fourier-sphere and non-uniform FFT methods. These developments demonstrate the potential of accelerator hardware for spherical harmonic analysis, while also highlighting the importance of how the latitudinal transform is formulated and evaluated. Recent work has also accelerated mode-coupling calculations through recurrence relations for the relevant Wigner-$3j$ symbols \citep{kiddier2026}.
+
+% For high-resolution SHTs, the associated Wigner-$d$ functions along the colatitude direction may either be precomputed and stored or generated on the fly using recurrences. Asymptotically faster algorithms can reduce the leading cost below $\mathcal{O}(N^3)$ \citep{driscoll1994,rokhlin2006,tygert2008}, but generally require substantial precomputation; \citet{schaeffer2013}, for example, found the on-the-fly Gauss--Legendre recurrence in \texttt{SHTns} to remain faster than the \citet{driscoll1994} method up to $N=1023$. Precomputing the full latitudinal basis removes the sequential dependence on degree and can improve throughput, at a memory cost that grows rapidly with resolution \citep{price2024}. \texttt{SHTns}\footnote{\url{https://bitbucket.org/nschaeff/shtns}. The GPU comparisons use version 3.7.5.} avoids that storage by combining FFTs with an on-the-fly recurrence in harmonic degree, using the recurrence of \citet{ishioka2018}, and is highly optimized for both multicore CPUs and GPUs through vectorization, multithreading, and CUDA/HIP backends \citep{schaeffer2013}. Asymptotically faster SHT algorithms can reduce the leading cost below $\mathcal{O}(N^3)$ \citep{driscoll1994,rokhlin2006,tygert2008}, but typically require additional precomputation or storage, and direct recurrence-based transforms remain competitive in practice. Here we retain the low-memory recurrence in harmonic degree and reformulate it in difference form, enabling accurate single-precision SHTs on GPUs.
+
+% Alternative formulations include recurrences in azimuthal order \citep{price2024}, convolution-based exact spin transforms \citep{wandelt2001,huffenberger2010}, and recent GPU implementations such as \texttt{cunuSHT} \citep{belkner2024} and \texttt{parallALT} \citep{tolmachev2026} which reports speed-ups of up to a factor of three over \texttt{SHTns} on an NVIDIA H100. Here we retain the low-memory recurrence in harmonic degree and reformulate it in difference form, enabling accurate single-precision SHTs on GPUs.
+
+
+In this Letter, we introduce a difference-form reformulation of the standard Wigner-$d$ recurrence that enables accurate single-precision evaluation at high band limits. Our approach retains the established structure of recurrence-based SHTs, with Fourier transforms along iso-latitude rings and on-the-fly evaluation of the Wigner-$d$ functions through a recurrence in harmonic degree, as used in \texttt{libsharp}/\texttt{DUCC} and \texttt{SHTns} \citep{reinecke2013,schaeffer2013,ishioka2018}. The new formulation replaces the standard recurrence by its difference form, suppressing the loss of numerical accuracy encountered in direct single-precision evaluation while retaining the same recurrence-based SHT algorithm. We then implement the method in \texttt{GMaster}, a GPU-native framework for scalar and spin spherical harmonic transforms using custom CUDA kernels integrated with JAX. Section~\ref{sec:formalism} presents the recurrence formulation and implementation, Section~\ref{sec:performance} gives the numerical validation and performance benchmarks, and Section~\ref{sec:conclusion} summarizes our conclusions.
+
+
+
+
+% \citet{price2024} instead recur the Wigner-$d$ functions downward in azimuthal order, independently in degree and colatitude, and report stability to at least $\ell\sim10^{4}$. The coefficient of that recurrence contains $1/\sin\beta$ and is undefined at the poles, where the same paper inserts the closed forms $d^{\ell}_{mn}(0)=\delta_{mn}$ and $d^{\ell}_{mn}(\pi)=(-1)^{\ell+m}\delta_{m,-n}$. Exact spin-weighted transforms, in both the analysis and synthesis directions, can also be built from Wigner-$d$ functions at a single colatitude together with fast convolution on the sphere \citep{wandelt2001,huffenberger2010}. On GPUs, \texttt{cunuSHT} treats arbitrary pixelizations by a double-Fourier-sphere method and non-uniform FFTs, taking the iso-latitude ring transform from \texttt{SHTns} \citep{belkner2024}, while \texttt{parallALT} uses a fully spectral algorithm and reports speed-ups of up to a factor of three over \texttt{SHTns} on an NVIDIA H100 \citep{tolmachev2026}. We keep the on-the-fly recurrence, which stores no latitudinal basis, and rewrite its carried state in difference form. The standard recurrence loses the accuracy required for a high-resolution transform when it is evaluated directly in single precision; the difference form recovers that accuracy for both the forward and inverse transforms, while remaining in the single-precision arithmetic that makes the recurrence inexpensive on a GPU.
+
+% In this Letter we present \texttt{GMaster}, a GPU-native framework for pseudo-$C_\ell$ estimation that accelerates both SHTs and mode-coupling matrix construction. \texttt{GMaster} combines GPU ring transforms with on-the-fly evaluation of the Wigner-$d$ functions using a difference-form recurrence that enables accurate single-precision computation without storing the full latitudinal basis. The implementation supports both scalar and spin fields and combines JAX with custom CUDA kernels for the performance-critical operations. We validate the numerical accuracy of the method and benchmark the complete estimator against established CPU implementations over a range of HEALPix resolutions. Section~2 describes the numerical methods, Section~3 presents the accuracy and performance results, and Section~4 summarizes our conclusions.
+
+
+\begin{figure*}
+\centering
+\includegraphics[width=0.32\textwidth]{figures/fig_act_T.pdf}
+\hfill
+\includegraphics[width=0.32\textwidth]{figures/fig_act_Q.pdf}
+\hfill
+\includegraphics[width=0.32\textwidth]{figures/fig_act_U.pdf}
+\caption{Full-sky HEALPix mollweide view of the ACT DR6 night PA4 $f150$ source-free $T$, $Q$ and $U$ \citep{naess2025}, averaged from $N_{\mathrm{side}}=8192$ to $512$ for display. Unobserved pixels are grey ($f_{\mathrm{sky}}=0.481$). The colour ranges are $\pm 100\,\mu\mathrm{K}$ for $T$ and $\pm 20\,\mu\mathrm{K}$ for $Q$ and $U$.}
+\label{fig:act_tqu}
+\end{figure*}
+
+\section{Formalism and Implementation}
+\label{sec:formalism}
+In this section, we review the mathematical formulation of the spherical harmonic transform. We then derive a numerically stable recurrence relations for its efficient and accurate evaluation in single precision, and describe its implementation on the GPU.
+
+A field of integer spin $s$ on the sphere is expanded in spin-weighted spherical harmonics as
+${}_s f(\theta,\phi)=\sum_{\ell m}{}_s f_{\ell m}\,{}_sY_{\ell m}(\theta,\phi)$ for $\ell \ge |s|$ and $|m| \le \ell$, where $\theta\in[0,\pi]$ is the colatitude measured from the north pole, the latitude is $\pi/2-\theta$, $\phi\in[0,2\pi)$ is the azimuth and the longitude, $\ell$ is the multipole degree, $m$ is the azimuthal order and $\ell_{\max}$ is the highest multipole retained in a transform. These basis functions relate directly to the Wigner little-$d$ matrix element via ${}_s Y_{\ell m}(\theta, \phi) = (-1)^m \sqrt{\frac{2\ell + 1}{4\pi}} d^\ell_{m, -s}(\theta) e^{im\phi}$. On an iso-latitude grid, the azimuthal dependence is handled by Fourier transforms along each ring, leaving the repeated evaluation of the Wigner-$d$ functions in the colatitude direction. Every Wigner function $d^\ell_{m,-s}(\theta)$ is an algebraic multiple of a Jacobi polynomial \citep[NIST DLMF 14.9.16, 18.3]{olver2010},
+\begin{equation}
+\begin{split}
+  d^\ell_{m,-s}(\theta)
+  &= (-1)^{m+s}\,2^{\varepsilon_m\mathrm{LG2N}}\\
+  &\quad\times
+    \Bigl(\sin\tfrac{\theta}{2}\Bigr)^\alpha
+    \Bigl(\cos\tfrac{\theta}{2}\Bigr)^\beta
+    P_n^{(\alpha,\beta)}(\cos\theta),
+\end{split}
+\end{equation}
+with $\alpha=m+s$, $\beta=\lvert m-s\rvert$, $n=\ell-\max(m,s)$,
+$\varepsilon_m=+1$ for $m\ge s$ and $-1$ otherwise, and
+$\mathrm{LG2N}=\log_2\sqrt{(\ell+m)!(\ell-m)!/((\ell-s)!(\ell+s)!)}$. The family obeys a three-term recurrence in $n$ \citep[DLMF 18.9.1]{olver2010}. Writing $x=\cos\theta$ and $v_n=P_n^{(\alpha,\beta)}(x)$, the Jacobi sequence obeys the standard three-term recurrence \citep[DLMF 18.9.2]{olver2010},
+\begin{equation}
+\label{eq:jacobi}
+v_n=A_n v_{n-1}-B_n v_{n-2},
+\qquad
+A_n=c_{1,n}x+c_{0,n},
+\quad
+B_n=c_{b,n},
+\end{equation}
+where $c_{1,n}$, $c_{0,n}$ and $c_{b,n}$ are the standard Jacobi recurrence coefficients.
+% A float64 march of~\eqref{eq:jacobi} agrees with a numpy oracle of the same coefficients to $1.5\times10^{-15}$ at $N_{\mathrm{side}}=1024$. Plain float32 of the same recurrence reaches a maximum relative error of $4.2\times10^{-2}$ over the row (Table~\ref{tab:dform}).
+
+For fixed $(m,s)$, the Jacobi recurrence coefficients vary slowly in the high-degree limit: asymptotically,
+$c_{1,n}=2-n^{-1}+\mathcal{O}(n^{-2})$,
+$c_{b,n}=1-n^{-1}+\mathcal{O}(n^{-2})$, and
+$c_{0,n}=\mathcal{O}(n^{-2})$.
+Hence their change over one recurrence step is $\mathcal{O}(n^{-2})$, allowing a local constant-coefficient analysis over intervals $\Delta n\ll n$. Writing
+\begin{equation}
+v_n\simeq A v_{n-1}-Bv_{n-2},
+\end{equation}
+the characteristic roots in the oscillatory regime are
+$r=\sqrt{B}\,e^{\pm i\phi}$, with
+$A=2\sqrt{B}\cos\phi$. This angle $\phi$ is the phase of those characteristic roots. Consider a rounding error $\delta_k$ introduced in $v_k$, with $v_{k-1}$ unchanged. Under the local constant-coefficient approximation, its contribution after $n-k$ subsequent steps is
+\begin{equation}
+\Delta v_n
+\simeq
+\delta_k\,B^{(n-k)/2}
+\frac{\sin[(n-k+1)\phi]}{\sin\phi}.
+\end{equation}
+Since $B\simeq1$ at high degree, each local perturbation can be amplified
+by a factor of order $1/|\sin\phi|$. For approximately independent
+floating-point errors of characteristic size $u|v|$ accumulated over $N$
+recurrence steps, the relative error scales as
+$\lvert\Delta v\rvert/|v|\sim\sqrt{N}\,u/|\sin\phi|$, where $u$ is the
+unit roundoff ($u=2^{-24}$ for IEEE float32). The amplification becomes
+large when the two characteristic roots approach degeneracy,
+$A^2\simeq4B$, for which $|\sin\phi|\ll1$. For the scalar case, this
+corresponds asymptotically to the turning condition
+$|m|\simeq(\ell+\tfrac12)\sin\theta$. Since an SHT spans the full range
+$|m|\leq\ell$, its required mode space includes modes close to this
+condition, making the standard single-precision recurrence poorly
+conditioned there. 
+% This motivates the difference-form reformulation below.
+
+We therefore introduce the difference
+$D_n=v_n-v_{n-1}$. Substituting
+$v_{n-2}=v_{n-1}-D_{n-1}$ into Eq.~\eqref{eq:jacobi} gives
+\begin{equation}
+\label{eq:diff}
+D_n=C_n v_{n-1}+B_nD_{n-1},
+\qquad
+v_n=v_{n-1}+D_n,
+\end{equation}
+where $C_n=A_n-1-B_n$. Near the $\phi\rightarrow0$ degeneracy,
+$B\simeq1$, $C=\mathcal{O}(\phi^2)$, and
+$D_n=\mathcal{O}(\phi v)$. Provided that $C_n$ is evaluated accurately,
+the floating-point error introduced in the $D_n$ update is therefore
+$\mathcal{O}(u\phi|v|)$. An error in $D_k$ enters $v_k$ with
+$\Delta v_k\neq0$ and $\Delta v_{k-1}=0$, and hence follows the
+$1/|\sin\phi|$ propagation derived above. Since
+$|\sin\phi|\simeq|\phi|$ in this limit, the propagated error remains
+$\mathcal{O}(u|v|)$ instead of being enhanced by
+$1/|\sin\phi|$.
+
+% Let $D_n=v_n-v_{n-1}$. Then for $n\ge2$
+% \begin{equation}
+% \label{eq:diff}
+%   D_n=(A_n-1-B_n)\,v_{n-1}+B_n D_{n-1},\qquad v_n=v_{n-1}+D_n.
+% \end{equation}
+% In terms of $\phi$, the difference coefficient is $C=A-1-c_2\approx-\phi^2$, so $D\approx\phi\,\lvert v\rvert$ exactly where the plain march is ill-conditioned. A rounding of $v\leftarrow\mathrm{fl}(v+D)$ lands on $v$ with $D$ fixed and is not amplified. A rounding of $D\leftarrow\mathrm{fl}(c_2 D+C v)$ lands on $D$ at scale $u\phi\lvert v\rvert$ and, after the $1/(2\sin\phi)$ modal factor, contributes $O(u\lvert v\rvert)$ per step. Both kinds therefore give a random-walk floor $\sqrt{n}\,u$ independent of $\phi$: $\sqrt{3072}\,u\approx3.3\times10^{-6}$ at $N_{\mathrm{side}}=1024$, against the measured $2.8\times10^{-6}$.
+
+The error reduction above relies on resolving the small coefficient
+$C_n$ accurately. Near the $\phi\rightarrow0$ degeneracy,
+$C_n=\mathcal{O}(\phi^2)$, but its direct form,
+\[
+C_n=A_n-1-B_n
+    =c_{1,n}x+c_{0,n}-1-c_{b,n},
+\]
+subtracts quantities of order unity. In float32, the rounding error in
+these terms can therefore exceed the value of $C_n$ itself and reintroduce
+an $\mathcal{O}(u|v|)$ error into the difference update. We avoid this
+cancellation by writing
+\begin{equation}
+C_n=c_{1,n}(x-1)+E_n^+,
+\qquad
+E_n^+=c_{1,n}+c_{0,n}-1-c_{b,n}.
+\end{equation}
+Near the northern pole, $x-1$ is small, while the high-degree expansions above give $E_n^+=\mathcal{O}(n^{-2})$. Thus $C_n$ is constructed from
+small quantities rather than obtained as the residual of order-unity
+terms.
+
+To preserve these quantities in the float32 kernel, they are first
+evaluated in float64 and represented as high--low float32 pairs,
+$z\simeq z_{\rm h}+z_{\rm l}$, where $z_{\rm h}$ is the leading float32
+part and $z_{\rm l}$ stores the remaining residual
+\citep{dekker1971}. The GPU kernel combines the two parts using fused
+multiply--add (FMA) operations, which evaluate $ab+c$ with a single final
+rounding. This prevents the evaluation of $C_n$ from introducing an
+$\mathcal{O}(u|v|)$ error while the recurrence variables $(v_n,D_n)$
+remain in float32. The coefficient $B_n=c_{b,n}$ is kept in a single
+float32 value because its rounding error multiplies
+$D_{n-1}=\mathcal{O}(\phi v)$ and therefore introduces only an
+$\mathcal{O}(u\phi|v|)$ perturbation.
+
+The analysis above applies to the $\phi\rightarrow0$ branch, for which
+the characteristic roots approach $+1$. For the opposite branch,
+$\phi\rightarrow\pi$, the roots approach $-1$ and consecutive values
+alternate in sign. Defining $w_n=(-1)^n v_n$ maps this branch onto the
+same difference recurrence, with $x$ replaced by $|x|$ and
+$c_{0,n}$ changing sign. Northern and southern rings can therefore be
+marched by the same kernel using
+$E_n^\pm=c_{1,n}-1-c_{b,n}\pm c_{0,n}$, with the factor $(-1)^n$
+restored on output.
+
+\begin{figure*}
+\centering
+\includegraphics[width=\textwidth]{figures/fig_sht_times.pdf}
+\caption{One \texttt{map2alm} pass (upper) and \texttt{alm2map} (lower), on random inputs with $\ell_{\max}=3N_{\mathrm{side}}-1$. These are single transforms, not the ACT maps. All three codes evaluate them on the HEALPix grid. The GMaster curve is its float32 difference-form Wigner-$d$ march, with the recurrence in float32. \texttt{SHTns} runs its GPU Legendre kernels on the HEALPix ring latitudes and weights, with the HEALPix ring FFTs done outside \texttt{SHTns}. \texttt{SHTns} fp64 is float64 throughout; \texttt{SHTns} fp32 is float32 throughout, including its Legendre recurrence. \texttt{SHTns} has no spin-2 transform; its spin-2 curves combine its scalar and vector ($\partial_\theta$) kernels through $\eth^2 Y_{\ell m}$ (Section~\ref{sec:performance}). \texttt{SHTns} fp64 at spin~2 and $N_{\mathrm{side}}=8192$ does not fit in the 96\,GB of the GPU. The dotted guide is $\propto N_{\mathrm{side}}^{3}$, anchored on GMaster at $N_{\mathrm{side}}=2048$. GMaster is shown in red and the reference codes in black and grey.}
+\label{fig:sht}
+\end{figure*}
+
+The latitudinal transform is implemented as a custom CUDA kernel designed around the sequential structure of the recurrence. Each warp is assigned one azimuthal order $m$ and a tile of iso-latitude rings. The rings are processed in parallel, while each thread advances the recurrence sequentially in $\ell$ and retains only the current recurrence variables. At each step, the newly generated Wigner-$d$ value is immediately multiplied by the corresponding ring Fourier coefficient and accumulated into the harmonic coefficient, so the full Wigner-$d$ basis is never stored. The custom kernels are called directly from JAX-compiled code, keeping the full transform and its intermediate arrays on the GPU.
+
+% The remaining SHT operations follow standard high-performance
+% ring-transform techniques. Along the azimuthal direction,
+% \texttt{GMaster} uses batched FFTs for the full-length equatorial
+% HEALPix rings and Bluestein chirp-$Z$ transforms for the shorter polar
+% rings \citep{bluestein1970}, avoiding padding all rings to a common
+% length. North--south and Hermitian symmetries reduce redundant work,
+% while standard dynamic rescaling and polar-mode truncation maintain
+% numerical stability and avoid evaluating exponentially suppressed modes
+% \citep{schaeffer2013,reinecke2013}.
+
+% The latitudinal transform is implemented as a custom CUDA kernel designed around the sequential structure of the recurrence. Each warp is assigned one azimuthal order $m$ and a tile of iso-latitude rings. The rings are processed in parallel, while each thread advances the recurrence sequentially in $\ell$ and retains only the current recurrence variables. At each step, the newly generated Wigner-$d$ value is immediately multiplied by the corresponding ring Fourier coefficient and accumulated into the harmonic coefficient, so the full Wigner-$d$ basis is never stored. For scalar fields, north--south symmetry folds paired rings into a single recurrence march. When both a field and its mask require scalar transforms with the same geometry, their Fourier coefficients are accumulated as separate channels within the same march, allowing the Wigner-$d$ recurrence to be shared between the two transforms. The custom CUDA kernels are called directly from JAX-compiled code, keeping the full transform and its intermediate arrays on the GPU.
+
+% The second computationally intensive step is the construction of the mode-coupling matrix. For the scalar coupling, we use the exact Wigner-$3j$ formulation of \citet{kiddier2026}, to which we refer the reader for a detailed derivation of the recurrence relations and their application to pseudo-$C_\ell$ coupling matrices. \texttt{GMaster} reorganizes the resulting sum for GPU execution by parameterizing the allowed configurations with an offset $o$. At fixed $o$, only the trailing $(N_\ell-o)\times(N_\ell-o)$ block contributes, reducing the number of visited matrix elements to $\sum_o (N_\ell-o)^2\simeq N_\ell^3/3$, where $N_\ell=\ell_{\max}+1$. For mixed and spin couplings, we instead rewrite the Wigner-$3j$ sums as one-dimensional integrals over products of Wigner-$d$ functions. The mask multipole sum is first transformed into an angular correlation function evaluated on Gauss--Legendre nodes, after which the coupling matrix becomes a weighted contraction of two recurrence-generated Wigner-$d$ tables. The remaining $(\ell_1,\ell_2)$ calculation is therefore reduced to dense matrix multiplications on the GPU, while parity-even and parity-odd couplings are obtained simultaneously from the corresponding parity-weighted mask correlations.
+
+
+
+% The only coefficient on the amplified path is $C$, and the argument needs its error to be $O(u\lvert C\rvert)$, not $O(u\lvert A\rvert)$. Writing $C_n=c_1(x-1)+E_n$ with $E_n=c_1-1-c_2+c_0$, the kernel carries $x-1$ rather than $x$: near a pole $x-1\sim-\theta^2/2$, so a single-word $x$ would inject a relative error $u/(\theta^2/2)$ into the leading term of $C$, and a single-word $E$ would leave an error $\sim u\lvert c_1\rvert$ that does not shrink with $C$. Both are systematic and drift the phase. The kernel therefore stores $\lvert x\rvert-1=x_h+x_l$, $c_1=c_{1h}+c_{1l}$ and $E=E_h+E_l$ as float32 pairs, each split from float64 to $2^{-48}$ \citep{dekker1971}, and forms
+% \begin{equation}
+% \label{eq:Cfma}
+%   C=\mathrm{fma}(c_{1h},x_h,E_h)+\bigl[\mathrm{fma}(c_{1h},x_l,\mathrm{fma}(c_{1l},x_h,E_l))\bigr].
+% \end{equation}
+% The first \texttt{fma} rounds once, by $u\lvert C\rvert$, and that rounding vanishes with $C$ at the turning point where the amplification peaks; the bracket is $\sim2^{-24}$ of the leading terms. A single-word $C$ leaves the coherent $u\lvert c_1\rvert$-class drift, growing like $n$ rather than $\sqrt n$: the $4\times10^{-5}$ floor in the middle row of Table~\ref{tab:dform}. The coefficient $c_2$ is single-word, because its error enters as $u\lvert D\rvert\sim u\phi\lvert v\rvert$ on $D$, the unamplified kind.
+
+% The southern hemisphere needs no second code path. If $v_n=(c_1x+c_0)v_{n-1}-c_2v_{n-2}$ then $w_n:=(-1)^nv_n$ satisfies
+% \begin{equation}
+% \label{eq:refl}
+%   w_n=\bigl(c_1(-x)-c_0\bigr)w_{n-1}-c_2w_{n-2},
+% \end{equation}
+% the same recurrence with $y=\lvert x\rvert$ for $x$ and $-c_0$ for $c_0$, whose difference coefficient is $c_1(y-1)+E^-_n$ with $E^-_n=c_1-1-c_2-c_0$. Every lane, northern or southern, therefore marches $\lvert x\rvert-1\in(-1,0]$ with the same instructions and one of two table columns $E^\pm$, and the emit restores the sign on odd $n$. Each lane stores $v\cdot2^{ex}$ with $ex$ an integer and is rescaled by an exact power of two every eight degrees; the map $(v,D)\mapsto(v+D',D')$ is linear, so the represented value is unchanged, and the per-degree growth is bounded by $1+\lvert C\rvert+c_2\le2^{15}$, so eight degrees cannot overflow. The emit factorises the Jacobi normalisation $2^{\varepsilon_m\mathrm{LG2N}}$ into a per-lane power of two and a per-degree mantissa proved to lie in $[2^{-45.5},2)$, so no exponent lane leaves the kernel. Equations~\eqref{eq:diff} and~\eqref{eq:refl}, the seeds, the homogeneity of the rescale, and the range of the mantissa are theorems in a Lean~4 development on Mathlib that builds with no \texttt{sorry}; the modal error argument is not formalised, and is checked by Table~\ref{tab:dform}.
+
+% \begin{table}
+% \centering
+% \caption{Maximum relative error of a float32 march against the float64 recurrence, over every lane, at $N_{\mathrm{side}}=1024$ spin~$0$. The two-word row is the shipped kernel ($5.7\times10^{-6}$ at $N_{\mathrm{side}}=4096$).}
+% \label{tab:dform}
+% \footnotesize
+% \setlength{\tabcolsep}{3pt}
+% \begin{tabular}{@{}lccc@{}}
+% \toprule
+% Float32 march & $m=0$ & $m=1000$ & $m=L/2$ \\
+% \midrule
+% Plain, single word          & $4.2\times10^{-2}$ & $8.8\times10^{-5}$ & $3.1\times10^{-5}$ \\
+% Difference form, 1-word $C$ & $4.1\times10^{-5}$ & $8.6\times10^{-5}$ & $5.1\times10^{-5}$ \\
+% Difference form, 2-word $C$ & $2.8\times10^{-6}$ & $2.9\times10^{-6}$ & $1.6\times10^{-5}$ \\
+% \bottomrule
+% \end{tabular}
+% \end{table}
+
+% The kernel is CUDA, one warp per $(m$, ring tile), exposed as XLA FFI handlers inside \texttt{jit}. A field and its mask are two transforms of the same rows: the analysis kernel takes both as emit channels, so an \texttt{NmtField} is not two launches. For $s=0$ the southern hemisphere is folded into the northern recurrence. The default at $L=\ell_{\max}+1\ge192$ ($N_{\mathrm{side}}\ge64$) is this march; an exact float64 route remains available by flag.
+
+\section{Benchmark and Performance}
+\label{sec:performance}
+
+Here, we assess the numerical accuracy and computational performance of the SHTs using different algorithms and hardware platforms. A \texttt{map2alm} transform converts a pixel-space scalar or spin field into spherical-harmonic coefficients, while \texttt{alm2map} performs the inverse synthesis.
+
+We benchmark \texttt{GMaster} using the ACT DR6 night PA4 $f150$ source-free Stokes maps shown in Figure~\ref{fig:act_tqu} \citep{naess2025}. To benchmark over a range of resolutions, the native $N_{\mathrm{side}}=8192$ maps are downgraded to each $N_{\mathrm{side}}$ from $64$ to $4096$ by averaging their child pixels. At every resolution, the maps are multiplied by the binary ACT footprint ($f_{\mathrm{sky}}=0.481$ at native resolution). In the spin-0 case, the masked temperature map $T$ is transformed into its scalar spherical-harmonic coefficients $a^T_{\ell m}$. In the spin-2 case, the masked polarization maps $(Q,U)$ are transformed into the corresponding $E$- and $B$-mode coefficients $(a^E_{\ell m},a^B_{\ell m})$. These masked-sky coefficients are then used to form the pseudo-spectra, with the mode-coupling matrix correcting the mixing introduced by the mask, including $E$--$B$ mixing in the spin-2 case.
+
+We compare \texttt{GMaster} against \texttt{SHTns} on the same single NVIDIA RTX~PRO~6000 Blackwell GPU, and against \texttt{NaMaster} with the \texttt{ducc0} backend on an AMD Threadripper~PRO~9995WX using 32 and 96 CPU cores. All three transform the HEALPix grid. \texttt{SHTns} handles only grids with the same number of longitudes on every ring, so we run its GPU Legendre kernels on the HEALPix ring latitudes and weights and perform the HEALPix ring FFTs ourselves, with a chirp-$z$ transform for the polar rings. \texttt{SHTns} has no spin-2 transform. We build one from its scalar and vector kernels with the identity $\eth^2 Y_{\ell m}=-2(\cot\theta+m/\sin\theta)\,\partial_\theta Y_{\ell m}+\left[2m\cot\theta/\sin\theta+2m^2/\sin^2\theta-\ell(\ell+1)\right]Y_{\ell m}$ and its conjugate, whose $1/\sin\theta$ factors cancel analytically at the poles but not in floating point. \texttt{GMaster} uses the float32 difference-form recurrence described in Section~\ref{sec:formalism}. For \texttt{SHTns}, we time float64 throughout and float32 throughout; in the latter the recurrence itself is float32 (its \texttt{SHT\_FP32} mode otherwise keeps the recurrence in float64 on this GPU). The \texttt{SHTns} timings were taken on a second, identical RTX~PRO~6000 in the same machine as the \texttt{GMaster} timings.
+
+% We first benchmark the performance of the spherical harmonic transforms against existing implementations. We compare \texttt{GMaster} with \texttt{NaMaster} using the \texttt{ducc0} backend on an AMD Threadripper~PRO~9995WX with 32 and 96 CPU cores, and with \texttt{SHTns} running on a single NVIDIA RTX~PRO~6000 Blackwell GPU. \texttt{GMaster} also runs on the same GPU and uses the default float32 implementation described above. A \texttt{map2alm} transform converts a pixel-space scalar or spin field into its spherical-harmonic coefficients, while \texttt{alm2map} performs the inverse synthesis.
+
+Figure~\ref{fig:sht} compares the wall time of the forward \texttt{map2alm} and inverse \texttt{alm2map} transforms, with $\ell_{\max}=3N_{\mathrm{side}}-1$. Relative to 96-core \texttt{ducc0}, \texttt{GMaster} is $7.3$--$8.5\times$ faster for spin~0 and $6.7$--$9.0\times$ faster for spin~2 at $N_{\mathrm{side}}=1024$--$2048$ for \texttt{map2alm}, with similar gains for \texttt{alm2map}. At $N_{\mathrm{side}}=4096$, the corresponding \texttt{map2alm} speed-ups are $4.0\times$ and $5.1\times$ for spin~0 and spin~2, respectively. On the same GPU model, \texttt{GMaster} is $2.2$--$4.7\times$ faster than float64 \texttt{SHTns} for spin-0 \texttt{map2alm} at $N_{\mathrm{side}}=512$--$8192$ ($2.7$--$5.3\times$ for \texttt{alm2map}), and $9$--$13\times$ faster than the float64 \texttt{SHTns} spin-2 construction. With its recurrence in float32, \texttt{SHTns} is $1.3$--$2.4\times$ faster than \texttt{GMaster} for spin-0 \texttt{map2alm} and $1.8$--$4.6\times$ faster for \texttt{alm2map} at $N_{\mathrm{side}}=512$--$8192$; at spin~2, \texttt{GMaster} is $1.4$--$2.0\times$ faster for \texttt{map2alm} and the two are within $40\%$ for \texttt{alm2map}. That float32 recurrence is the plain three-term form. On a simulated full-sky CMB temperature map with an ACT-like beam and noise at $N_{\mathrm{side}}=4096$ it shifts $\Delta\ell=30$ bandpowers by up to $15$ times their cosmic variance, against $7\times10^{-4}$ for \texttt{GMaster}; on footprints that exclude the poles, such as the ACT footprint of Section~\ref{sec:application}, the difference disappears.
+
+% Figure~\ref{fig:sht} compares the wall time of the forward \texttt{map2alm} and inverse \texttt{alm2map} transforms over a range of HEALPix resolutions, with $\ell_{\max}=3N_{\mathrm{side}}-1$. Relative to 96-core \texttt{ducc0}, \texttt{GMaster} is $7.3$--$8.5\times$ faster for spin~0 and $6.7$--$9.0\times$ faster for spin~2 at $N_{\mathrm{side}}=1024$--$2048$ for \texttt{map2alm}, with similar gains for \texttt{alm2map}. At $N_{\mathrm{side}}=4096$, the corresponding \texttt{map2alm} speed-ups over 96-core \texttt{ducc0} are $4.0\times$ and $5.1\times$ for spin~0 and spin~2, respectively. We also compare against \texttt{SHTns} on the same GPU. Both implementations follow the same cubic scaling. \texttt{SHTns} is faster at $N_{\mathrm{side}}\le256$, while \texttt{GMaster} is faster from $N_{\mathrm{side}}=512$ upwards, reaching a $3.1$--$3.5\times$ speed-up at $N_{\mathrm{side}}=2048$ and $1.9$--$2.7\times$ at $N_{\mathrm{side}}=4096$--$8192$ in the spin-0 float64 comparison. \texttt{SHTns} cannot run an accurate all-float32 transform, because its standard recurrence loses accuracy in float32 at high $\ell$ (Figure~\ref{fig:sht_err}); its float32 mode, which keeps the recurrence in float64, is $1.3\times$ faster than its float64 mode at $N_{\mathrm{side}}=2048$--$4096$, and \texttt{GMaster} remains $1.5$--$2.7\times$ faster than it.
+
+% Both codes already do $\mathcal{O}(N_{\mathrm{side}}^{3})$ latitudinal work. Roofline \citep{williams2009} only asks which ceiling that cube sits under: $\min(\mathrm{peak\ FLOP/s},\,B\times\mathrm{AI})$, with an inner $\ell$ recurrence that is serial. The $v2$ march evaluates the Jacobi recurrence in registers and moves maps and $a_{\ell m}$, $\Theta(N_{\mathrm{side}}^{2})$; it does not stream a precomputed $P_{\ell m}(\theta)$ table. At $N_{\mathrm{side}}=1024$ spin~$0$ the map is $\sim50\,\mathrm{MB}$ and copies in $0.03\,\mathrm{ms}$ at the measured $1603\,\mathrm{GB\,s}^{-1}$, while \texttt{map2alm} is $7.53\,\mathrm{ms}$. The wall clock is a compute roof, not HBM. A latitudinal pass visits $\sim N_\theta(L+1)(L+2)/2\simeq1.93\times10^{10}$ updates ($N_\theta=4N_{\mathrm{side}}-1$, $L=3N_{\mathrm{side}}-1$). Four FMA per update at $7.53\,\mathrm{ms}$ is $\sim10$~TFMA$\,\mathrm{s}^{-1}$ of SIMT float32, about 30~per cent of the measured SIMT FMA roof --- expected for an $\ell$-dependent chain. The CPU latitudinal pass is $\sim1.5\,\mathrm{TFLOP\,s}^{-1}$ of float64. Then $10/1.5\simeq7$ is the $6.7$--$8.3\times$ of Fig.~\ref{fig:sht} at $N_{\mathrm{side}}=1024$--$2048$. It is not a tensor-core peak, a CUDA-core datasheet quotient, or $B_{\mathrm{HBM}}/B_{\mathrm{DDR}}\times2\simeq8.8$; the last of those is the wrong roof and only coincidentally close. At $N_{\mathrm{side}}=64$--$256$ launch and FFT still share the clock ($3$--$6\times$). At $N_{\mathrm{side}}=4096$ the GPU $\ell$-span worsens while the CPU fills AVX more fully, and the SHT ratio falls to $4.3$--$5.1\times$ --- expected. Thirty-two versus 96 cores is $1.9$--$2.4\times$: the CPU is compute/cache bound, not DRAM-bound.
+
+% \begin{figure*}
+% \centering
+% \includegraphics[width=\textwidth]{figures/fig_pipeline_memory.pdf}
+% \caption{End-to-end MASTER peak memory versus $N_{\mathrm{side}}$. Grey is NaMaster host RSS of one pipeline; blue is GMaster fp32 device high-water (\texttt{peak\_bytes\_in\_use}). The dotted guide is $\propto N_{\mathrm{side}}^{2}$, anchored on GMaster at $N_{\mathrm{side}}=2048$.}
+% \label{fig:mem}
+% \end{figure*}
+
+% Peak memory (Fig.~\ref{fig:mem}) follows $N_{\mathrm{side}}^{2}$ once the runtime floor is left behind: maps scale as $N_{\mathrm{side}}^{2}$ and the unbinned mode-coupling matrix as $[\mathrm{ncls}(\ell_{\max}+1)]^{2}$. The $v2$ march does not store Wigner-$d$ tables: each warp carries $(v,D)$ and emits into $a_{\ell m}$. The grey--blue offset is coupling on the device. \texttt{compute\_coupling\_matrix} budgets two copies of the matrix (blocks and the assembled form); at spin~$2$, $N_{\mathrm{side}}=4096$ that is $2\times[4(\ell_{\max}+1)]^{2}\times8\,\mathrm{B}\simeq37\,\mathrm{GiB}$ before GEMM scratch, against one host copy in NaMaster. The GPU number is a high-water mark. At $N_{\mathrm{side}}=4096$ the peaks are $53$ versus $23\,\mathrm{GiB}$ (spin~$0$) and $64$ versus $40\,\mathrm{GiB}$ (spin~$2$).
+
+% The same estimator was run, without attaching the maps, on two public fields at $N_{\mathrm{side}}=4096$: the ACT DR6 night PA4 $f150$ source-free Stokes~$I$ coadd \citep{naess2025}, degraded from native $N_{\mathrm{side}}=8192$, with the survey window as the mask ($f_{\mathrm{sky}}=0.481$), linear bins of width $50$ and $n_{\mathrm{iter}}=3$; and the FLAMINGO L2p8 unlensed Compton-$y$ lightcone \citep{schaye2023}, full sky. Decoupled TT agrees to $\mathrm{rms}(C_\ell^{\mathrm{GM}}/C_\ell^{\mathrm{NM}}-1)=1.41\times10^{-5}$ in $7.63\,\mathrm{s}$ versus $70.4\,\mathrm{s}$ on $192$ cores (ACT) and $2.32\times10^{-7}$ in $8.64\,\mathrm{s}$ versus $69.5\,\mathrm{s}$ (FLAMINGO). Both time only the estimator.
+\section{Applications}
+\label{sec:application}
+We now demonstrate the use of SHTs with GMaster in cosmological analysis workflows. We consider two applications: pseudo-$C_\ell$ power-spectrum estimation from masked CMB maps and CMB lensing reconstruction with the quadratic estimator. We compare the numerical accuracy and computational cost of \texttt{GMaster} with \texttt{NaMaster} for the pseudo-$C_\ell$ calculation and with \texttt{falafel} for the lensing reconstruction.
+
+\subsection{Pseudo-$C_\ell$ calculations}
+\begin{figure*}
+\centering
+\includegraphics[width=\textwidth]{figures/fig_act_spectra.pdf}
+\caption{Decoupled bandpowers of the ACT+Planck DR6 NILC blackbody temperature and $E$-mode maps at $N_{\mathrm{side}}=2048$, masked by the NILC footprint ($f_{\mathrm{sky}}=0.338$). Upper: $D_\ell$ for the TT and EE auto-spectra and the TE cross-spectrum of these two maps, in linear bins of width $\Delta\ell=30$, for $500\le\ell\le4000$. \texttt{NaMaster} and \texttt{GMaster} use masked HEALPix \texttt{NmtField} transforms with $n_{\mathrm{iter}}=3$. \texttt{SHTns} forms the same masked HEALPix fields with $n_{\mathrm{iter}}=3$, float32 throughout including its recurrence. The coupled spectra of those coefficients are binned and decoupled with the \texttt{GMaster} mode-coupling matrix of the same footprint; \texttt{SHTns} contributes the analysis, and the matrix and the decoupling are \texttt{GMaster}'s. Lower: $\Delta D_\ell/D_\ell=(D_\ell-D_\ell^{\mathrm{NaMaster}})/D_\ell^{\mathrm{NaMaster}}$. The grey band is the cosmic variance of one bin.}
+\label{fig:act_spectra}
+\end{figure*}
+\begin{figure}
+\centering
+\includegraphics[width=\columnwidth]{figures/fig_act_perf.pdf}
+\caption{Wall time of the complete power-spectrum stage, from the masked maps of Figure~\ref{fig:act_tqu} to binned decoupled bandpowers, on the masked ACT DR6 maps. \texttt{GMaster} (red) is the shipped default latitudinal engine: divide-and-conquer at $N_{\mathrm{side}}=2048$ and $4096$, and the float32 difference-form Wigner-$d$ march at the other resolutions. \texttt{NaMaster} is black and grey. \texttt{SHTns} has no estimator of its own: its curves add the \texttt{SHTns} analysis of the masked maps ($n_{\mathrm{iter}}=3$, HEALPix, float64 or float32 throughout) to the \texttt{GMaster} mask transform, mode-coupling matrix and decoupling. \texttt{SHTns} fp64 at spin~2 and $N_{\mathrm{side}}=8192$ does not fit in GPU memory. The upper axis is $\ell_{\max}=3N_{\mathrm{side}}-1$. The dotted guide is $\propto N_{\mathrm{side}}^{3}$, anchored on GMaster at $N_{\mathrm{side}}=2048$.}
+\label{fig:perf}
+\end{figure}
+Figure~\ref{fig:act_spectra} shows this estimator on the ACT+Planck DR6 NILC blackbody temperature and $E$-mode maps at $N_{\mathrm{side}}=2048$, masked by the NILC footprint ($f_{\mathrm{sky}}=0.338$). The TT and EE spectra are the auto-spectra of those two maps, and TE is their cross-spectrum. \texttt{GMaster} and \texttt{NaMaster} both form the masked coefficients with \texttt{NmtField} at $n_{\mathrm{iter}}=3$, build the mode-coupling matrix of the footprint, and decouple linear bins of width $\Delta\ell=30$. Over $500\le\ell\le4000$ the \texttt{GMaster} bandpowers differ from \texttt{NaMaster} by at most $1.7\times10^{-3}$ in TT, $1.2\times10^{-5}$ in EE and $1.5\times10^{-2}$ in TE. \texttt{SHTns} has no pseudo-$C_\ell$ estimator of its own. We form the same masked HEALPix fields with $n_{\mathrm{iter}}=3$ using its float32 transforms, recurrence included, bin the coupled spectra at $\Delta\ell=30$ and decouple them with the \texttt{GMaster} mode-coupling matrix of the footprint. Over $500\le\ell\le4000$ the result differs from \texttt{NaMaster} by at most $1.7\times10^{-3}$ in TT, $6.9\times10^{-6}$ in EE and $1.4\times10^{-2}$ in TE, the same as \texttt{GMaster}: the NILC footprint excludes the poles, where the plain float32 recurrence loses its accuracy.
+
+Figure~\ref{fig:perf} measures the wall time of the complete pseudo-$C_\ell$ calculation on the masked ACT DR6 night PA4 $f150$ Stokes maps of Figure~\ref{fig:act_tqu}, from those maps to the final binned, decoupled bandpowers. This includes construction of the masked harmonic fields, calculation of the mode-coupling matrix from the mask, evaluation of the coupled spectra, and decoupling into linear bins of width $\Delta\ell=30$. The spin-0 calculation uses the masked temperature map and produces the TT spectrum. The spin-2 calculation uses the masked $(Q,U)$ maps and produces EE, EB, BE, and BB, including the $E$--$B$ mixing induced by the mask. The red curve is the shipped default. For $\ell_{\max}=3N_{\mathrm{side}}-1$ that engine is divide-and-conquer at $N_{\mathrm{side}}=2048$ and $4096$ ($6144\le L\le12288$) and the float32 difference-form march at every other resolution in the figure, where the march is the faster engine or the band limit lies above the divide-and-conquer window. The $N_{\mathrm{side}}=2048$ and $4096$ points are warm medians of two calls of that divide-and-conquer route on one RTX~PRO~6000. \texttt{NaMaster} and the \texttt{GMaster} points outside the window are the 27~September board: 96-core \texttt{ducc0}, and the march. At $N_{\mathrm{side}}=2048$ the default route takes $0.175\,\mathrm{s}$ and $0.328\,\mathrm{s}$ for spin~0 and spin~2, $58.6\times$ and $56.3\times$ faster than 96-core \texttt{NaMaster}. At $N_{\mathrm{side}}=4096$ the times are $0.728\,\mathrm{s}$ and $1.52\,\mathrm{s}$, $96.5\times$ and $72.5\times$. The difference-form march on the same maps is slower at these two resolutions, by $2.7\times$ and $4.2\times$ at $N_{\mathrm{side}}=2048$ and by $5.8\times$ for both spins at $N_{\mathrm{side}}=4096$. From $N_{\mathrm{side}}=512$ to $1024$, and at $N_{\mathrm{side}}=8192$, the march is $12.1$--$20.8\times$ faster than 96-core \texttt{NaMaster}. Decoupled TT and EE from the divide-and-conquer runs differ from the 96-core \texttt{NaMaster} spectra by at most $1.5\times10^{-5}$ at $N_{\mathrm{side}}=2048$ and $1.7\times10^{-4}$ at $N_{\mathrm{side}}=4096$. Replacing only the masked-map analysis by \texttt{SHTns}, and keeping the \texttt{GMaster} mask transform, mode-coupling matrix and decoupling, is slower than this default route inside the divide-and-conquer window: $8.8\times$ and $14.8\times$ for spin~0 in float64 at $N_{\mathrm{side}}=2048$ and $4096$ ($24.5\times$ and $39.7\times$ for spin~2), and $1.7\times$ and $2.2\times$ in float32 ($3.3\times$ and $4.7\times$ for spin~2). At $N_{\mathrm{side}}=8192$, where the march is the default, the float32 hybrid is $1.4\times$ faster than \texttt{GMaster} for spin~0.
+
+\subsection{Quadratic Estimator for CMB lensing reconstruction}
+The curved-sky quadratic estimator reconstructs the CMB lensing potential from a pair of filtered maps \citep{hu2002,okamoto2003}. \texttt{falafel} is the implementation used by the ACT DR6 and Simons Observatory lensing pipelines \citep{falafel}. \texttt{GMaster} evaluates the same unnormalised estimators --- TT, TE, EE, EB, TB, the minimum-variance combination and its polarisation-only form --- on the GPU. Temperature uses spin-0 and spin-1 transforms, and polarisation adds spin-2 and spin-3. The divide-and-conquer engine is validated for spin~2 only, so these reconstructions use the float32 difference-form march, which is the fastest implemented route for the odd spins.
+
+\begin{figure}
+\centering
+\includegraphics[width=\columnwidth]{figures/fig_lensing_qe.pdf}
+\caption{Quadratic estimator against \texttt{falafel}, warm medians of three calls. Upper: wall time of TT, TE, EE, EB, TB, mv and mvpol together. \texttt{GMaster} is the float32 march on HEALPix. \texttt{falafel} CAR is its production Fejer1 grid (4~arcmin at $\ell_{\max}=2000$, 2~arcmin at $\ell_{\max}=4000$); \texttt{falafel} HEALPix uses the same $N_{\mathrm{side}}$ as \texttt{GMaster}. Lower: maximum relative difference of each unnormalised estimator from \texttt{falafel} on that HEALPix grid.}
+\label{fig:qe}
+\end{figure}
+
+Figure~\ref{fig:qe} compares those wall times on one RTX~PRO~6000 with \texttt{falafel} on the Threadripper~PRO~9995WX (192 threads, \texttt{OMP\_NUM\_THREADS} unset). The $C^{-1}$-filtered alm coefficients are identical, and the multipoles that enter the estimator run from $\ell=100$ to $1500$ at $\ell_{\max}=2000$ ($N_{\mathrm{side}}=1024$) and to $3000$ at $\ell_{\max}=4000$ ($N_{\mathrm{side}}=2048$). The seven estimators take $0.103\,\mathrm{s}$ in \texttt{GMaster} at $\ell_{\max}=2000$, against $6.27\,\mathrm{s}$ for \texttt{falafel} on CAR ($61\times$) and $9.92\,\mathrm{s}$ on HEALPix ($96.5\times$). At $\ell_{\max}=4000$ the times are $0.594\,\mathrm{s}$, $24.5\,\mathrm{s}$ ($41\times$) and $38.0\,\mathrm{s}$ ($64\times$). On the shared HEALPix grid the maximum relative difference, over gradient and curl and over the seven estimators, is $2.8\times10^{-5}$ at $\ell_{\max}=2000$ and $7.0\times10^{-5}$ at $\ell_{\max}=4000$, both in TB. The difference from the CAR run reaches $3.3\times10^{-3}$. That offset is the pixelisation: \texttt{falafel} on HEALPix and \texttt{falafel} on CAR differ by the same amount.
+
+\section{Conclusions}
+\label{sec:conclusion}
+We have introduced a difference-form Jacobi recurrence for accurate single-precision evaluation of Wigner-$d$ functions in high-resolution spherical harmonic transforms. By suppressing the $1/|\sin\phi|$ amplification of floating-point errors and accurately evaluating the small recurrence coefficient, the method retains the low-memory, on-the-fly structure of recurrence-based SHTs while remaining efficient in float32 on GPUs.
+
+The float32 march is the transform timed in Section~\ref{sec:performance}. On one RTX~PRO~6000, \texttt{map2alm} at $N_{\mathrm{side}}=1024$--$2048$ is $7.3$--$8.5\times$ faster for spin~0 and $6.7$--$9.0\times$ faster for spin~2 than \texttt{ducc0} on 96 CPU cores, and $2.2$--$4.7\times$ faster than float64 HEALPix \texttt{SHTns} for spin-0 \texttt{map2alm} over $N_{\mathrm{side}}=512$--$8192$. The shipped default switches to a divide-and-conquer latitudinal engine for $6144\le L\le12288$. On the ACT DR6 maps that route takes $0.175\,\mathrm{s}$ and $0.328\,\mathrm{s}$ at $N_{\mathrm{side}}=2048$ and $0.728\,\mathrm{s}$ and $1.52\,\mathrm{s}$ at $N_{\mathrm{side}}=4096$ (spin~0 and spin~2), $56.3$--$96.5\times$ faster than 96-core \texttt{NaMaster}, with TT and EE agreeing to at most $1.5\times10^{-5}$ at $N_{\mathrm{side}}=2048$ and $1.7\times10^{-4}$ at $N_{\mathrm{side}}=4096$. The same march evaluates the lensing quadratic estimator. At $\ell_{\max}=2000$ and $4000$ the seven estimators take $0.103\,\mathrm{s}$ and $0.594\,\mathrm{s}$, $61\times$ and $41\times$ faster than \texttt{falafel} on CAR and $96.5\times$ and $64\times$ faster than \texttt{falafel} on HEALPix, agreeing with the HEALPix run to $2.8\times10^{-5}$ and $7.0\times10^{-5}$. The implementation is publicly available as \texttt{GMaster}.
+
+\section*{Acknowledgements}
+Generative AI systems were used extensively in the development of this work, including the derivation of the numerical method and the generation of its software implementation. The author defined the scientific problem and computational objectives, carried out the numerical experiments and benchmarking reported in this paper, and prepared the manuscript. The resulting method and implementation were evaluated through the numerical accuracy and performance tests presented here.
+
+% The methods and codes in this letter were produced entirely by coding agents. OpenAI Codex (\texttt{gpt-5.6-sol}) built the initial NaMaster-compatible API; Qwen Code with Qwen3.8-27B and Qwen3.8-Flash-Next; Claude Code with Claude Fable~5.1; OpenCode with GLM-5.3-Flash (OpenCode preview \texttt{ox-alpha}); Grok Build with Grok~4.6; and Cursor with Grok~4.6 for manuscript preparation. The author directed the agents, verified the output, and measured every numerical claim on the hardware of Section~3. NaMaster, DUCC/libsharp, s2fft, threej\_cosmo and SHTns are the reference stack. Code and bandpowers: \url{https://github.com/licongxu/GMaster}. 
+
+\bibliographystyle{mnras}
+{\footnotesize\bibliography{refs}}
+
+\bsp
+\label{lastpage}
+\end{document}

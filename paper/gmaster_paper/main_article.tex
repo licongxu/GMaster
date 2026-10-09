@@ -1,0 +1,988 @@
+\documentclass[usenatbib,useAMS]{mnras}
+
+\usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+\IfFileExists{newtxtext.sty}{%
+  \usepackage{newtxtext,newtxmath}%
+}{}
+\usepackage[T1]{fontenc}
+\usepackage{booktabs}
+\usepackage{bm}
+
+\newtheorem{proposition}{Proposition}
+\newtheorem{lemma}{Lemma}
+
+\title[GMaster: GPU MASTER and general SHT]{GMaster: exact HEALPix ring reductions, memory-gated Legendre tables, and a table-free difference-form Wigner-$d$ march for GPU MASTER estimation and general spherical harmonic transforms}
+
+\author[Xu]{
+Licong Xu$^{1}$\thanks{E-mail: lx256@cam.ac.uk}\\
+$^{1}$Institute of Astronomy, University of Cambridge, Madingley Road, Cambridge CB3 0HA, UK
+}
+
+\date{Accepted XXX. Received YYY; in original form ZZZ}
+\pubyear{2026}
+
+\begin{document}
+\label{firstpage}
+\pagerange{\pageref{firstpage}--\pageref{lastpage}}
+\maketitle
+
+\begin{abstract}
+Pseudo-$C_\ell$ estimation on HEALPix maps is dominated by two cubic operators: the latitudinal spherical-harmonic transform and the MASTER mode-coupling matrix. This paper records three exact reductions of those operators and one float32 latitudinal kernel with a proved error argument, implemented in GMaster, a GPU library with the public API of NaMaster. First, real HEALPix ring synthesis is rewritten from a centred chirp-$Z$ transform of width $2L$ to a positive-$m$ half-spectrum of length $L$, using $\sum_m F_m\exp(2\pi i p m/n_\phi)=2P(p)-F_0$. The convolution length halves at every $N_{\mathrm{side}}$. Secondly, rings in the equatorial belt have $n_\phi=4N_{\mathrm{side}}$ as a contiguous power-of-two run covering two thirds of the map; those rings are ordinary FFTs of length $4N_{\mathrm{side}}$, and only the polar caps retain Bluestein's algorithm. The two forms agree to $\sim10^{-15}$. Thirdly, a scalar MASTER contribution labelled by offset $o$ vanishes unless $o\le\min(\ell_1,\ell_2)$, so blocking offsets visits $\sim n^3/3$ cells rather than $n^3$. The fourth device is the latitudinal transform itself. Each order $m$ is the Jacobi row attached to $d^\ell_{m,-s}(\theta)$, and the kernel marches not the pair $(v_n,v_{n-1})$ but the difference pair $(v_n,\,D_n=v_n-v_{n-1})$, with the southern hemisphere marching the reflected row $(-1)^n v_n$ through the same code. Near the poles and at every turning point the characteristic roots of the three-term recurrence collide and a plain float32 march amplifies every rounding by $1/\sin\phi$; the difference form injects error at the scale of $D\sim\phi\,v$ and adds it back unamplified, so the float32 floor is the random walk $\sqrt{n}\,u$ rather than a coherent phase drift. Carrying the lane coordinate $\lvert x\rvert-1$ and the coefficients as (high, low) float32 pairs removes the residual drift: against the float64 recurrence at $N_{\mathrm{side}}=1024$ over every lane, $4.2\times10^{-2}$ (plain float32), $4.1\times10^{-5}$ (difference form, single-word $C$) and $2.8\times10^{-6}$ (shipped). The recurrence, the reflection, the exactness of the per-block power-of-two rescale and the factorisation of the emit are proved in Lean~4 with Mathlib. The kernel is CUDA, called through the XLA FFI from inside \texttt{jit}, one warp per (order, ring tile); a field and its mask are one transform of the same rows, bit-identical to two launches on the synthesis side. On one RTX~PRO~6000 Blackwell against NaMaster on a 96-core Threadripper~PRO~9995WX, the shipped default is $10$--$21\times$ NaMaster at $N_{\mathrm{side}}=128$--$2048$ in both spins; the two cells outside that range are $N_{\mathrm{side}}=64$, at $5.0$--$5.8\times$, where the pipeline is launch-latency bound rather than compute bound, and $N_{\mathrm{side}}=4096$ spin~$0$, at $9.5\times$. Coupled spectra agree to $1.2\times10^{-7}$--$1.2\times10^{-5}$; one isolated latitudinal pass is $5.6$--$8.5\times$ CPU \texttt{ducc0} at $N_{\mathrm{side}}=1024$--$4096$. The polarised $N_{\mathrm{side}}=4096$ pipeline finishes in $8.8\,\mathrm{s}$, where stock NaMaster cannot run at all. With the reference pinned to 32 cores the same board is $19.5$--$59.6\times$. The exact float64 route is one flag away and still reproduces $4.8\times10^{-13}$ at $N_{\mathrm{side}}=256$ spin~$0$. The same march also serves a second operator, the general (non-uniform) transform of a band-limited field at arbitrary points and its adjoint, through a double-Fourier-sphere factorisation and cufinufft: it is $2.8$--$6.0\times$ CPU \texttt{ducc0} on synthesis and $2.7$--$5.1\times$ on the adjoint at $\epsilon_{\mathrm{eff}}\sim10^{-6}$ to $2\times10^{-5}$, a regime in which \texttt{ducc0} is the more accurate code by $1.3$--$5\times$ and can go on to $10^{-13}$ where GMaster cannot. No other GPU spherical-harmonic code was timed, and no claim is made against one.
+\end{abstract}
+
+\begin{keywords}
+methods: numerical -- cosmology: cosmic microwave background -- cosmology: large-scale structure of Universe
+\end{keywords}
+
+\section{Introduction}
+
+The MASTER estimator \citep{hivon2002} recovers binned angular power spectra from masked spherical maps in four stages: spherical-harmonic analysis of the masked fields, formation of coupled pseudo-spectra, construction of a mode-coupling matrix from the mask, and decoupling. The fields may be scalars (spin~$0$) or spin-weighted (CMB polarization is spin~$2$). NaMaster \citep{alonso2019} is the reference CPU implementation. Its transforms run through DUCC, the successor of libsharp \citep{reinecke2013}, on the HEALPix pixelisation \citep{gorski2005}. The coupling algebra has been rewritten around structured Wigner-$3j$ recurrences \citep{kiddier2026}.
+
+On a GPU the same two cubic stages remain. An on-the-fly associated-Legendre recurrence, as in SHTns \citep{schaeffer2013} and DUCC, is a serial chain in $\ell$ with a reduction over colatitude at every degree. That pattern matches AVX-512 CPUs and mismatches GPU SIMT. A precomputed Legendre matrix, as in the precompute mode of s2fft \citep{price2024}, inverts the bottleneck: the transform becomes a streaming contraction, provided the table fits in device memory. Related GPU spherical-harmonic work for non-iso-latitude or partial-sky problems \citep{belkner2024,carron2026} retains an on-the-fly latitudinal factor and is not a drop-in replacement for a full-sky HEALPix MASTER pipeline. That non-uniform operator is a separate problem, and Section~\ref{sec:nusht} reports a separate implementation of it, built on the same latitudinal kernel and measured against \texttt{ducc0}'s general transforms \citep{reinecke2023}.
+
+GMaster is a JAX implementation of the NaMaster public API. This paper isolates three exact algebraic reductions of the HEALPix MASTER operators, the float32 latitudinal kernel that replaced every resident-table route, and the host-side compiler findings without which the kernel change would not have been visible. The reductions were isolated by a coding-agent loop (Section~\ref{sec:agents}); the acceptance test was always a GPU measurement against NaMaster or DUCC, not the language model.
+
+\begin{enumerate}
+\item \textbf{Hermitian half-spectrum ring synthesis.} Real HEALPix rings have Hermitian azimuthal spectra. A chirp-$Z$ synthesis that first mirrors $m\ge0$ into a centred window of width $2L$ therefore transforms an array already determined by half of its entries \citep{bluestein1970}. The identity $2P-F_0$ removes that copy and halves the convolution length.
+\item \textbf{Equatorial-belt FFT.} Two thirds of a HEALPix RING map occupy a contiguous block of rings with $n_\phi=4N_{\mathrm{side}}$, a power of two strictly wider than the default band limit $L=3N_{\mathrm{side}}-1$. Those rings are a reshape and one unnormalised FFT. Only the polar caps keep Bluestein's algorithm.
+\item \textbf{Offset-blocked MASTER assembly.} In the scalar three-term $3j$ product of \citet{kiddier2026}, a coupling contribution labelled by offset $o$ is identically zero unless $o\le\min(\ell_1,\ell_2)$. The assembly loop can write only into the trailing block $[\ell\ge o_0]$.
+\item \textbf{Table-free difference-form Wigner-$d$ march.} Each order $m$ is the Jacobi polynomial attached to $d^\ell_{m,-s}$ \citep{olver2010}, marched in $\ell$ from $\ell=\max(m,s)$. The shipped kernel marches the difference pair $(v_n,v_n-v_{n-1})$ rather than $(v_n,v_{n-1})$, sends the southern hemisphere through the same code by a reflection, rescales each lane by an exact power of two every eight degrees, and emits a plain float32 number whose normalisation is factorised into a per-lane power of two and a per-degree mantissa of bounded range (Section~\ref{sec:v2}). For $s=2$ it contracts four polarised channels on the full $\theta$ grid; for $s=0$, Section~\ref{sec:fold} folds the southern hemisphere into the northern recurrence. It is a CUDA kernel called through the XLA FFI from inside \texttt{jit}. Its identities are proved in Lean~4 (Section~\ref{sec:formal}), and a counting bound (Section~\ref{sec:wall}) shows why the arithmetic has to be float32-class on this card.
+\end{enumerate}
+
+Earlier versions of the library chose between the march and a resident Legendre or Wigner-$d$ table by a live-pool fit test, and the table won wherever it fitted. With the kernel of Section~\ref{sec:v2} it no longer does: both resident routes were re-timed against the march and both were declined at every size that can run them (Section~\ref{sec:route}). The march now serves every geometry with $L=\ell_{\max}+1\ge192$, that is $N_{\mathrm{side}}\ge64$; below that gate the exact float64 routes keep the call, and they remain available at any size behind a flag. The memory arithmetic of Section~\ref{sec:tables} is what that decision was made against and is why no table is resident above $N_{\mathrm{side}}=512$ in any case. Pipeline-level devices --- the map--mask pairing of Section~\ref{sec:pair}, size-gated ring and coupling precision, and four XLA fusion traps that cost more than the kernel change itself --- are recorded in Section~\ref{sec:pipeline}.
+
+A blocked parallel-prefix form of the associated-Legendre recurrence is stated and shown to be exact on CPU. It is not a shipped GPU kernel, and no wall-clock claim is made for it.
+
+Figure~\ref{fig:schematic} summarises the dispatch.
+
+\begin{figure*}
+\centering
+\includegraphics[width=\textwidth]{figures/fig_schematic.pdf}
+\caption{Dispatch of a HEALPix analysis. Equatorial rings use a contiguous FFT of length $4N_{\mathrm{side}}$. Polar caps use a batched chirp-$Z$ transform of the positive-$m$ block. The latitudinal step is the difference-form CUDA march for $L\ge192$ (northern fold at spin~$0$); below that gate, or when the march is opted out, an exact float64 route runs instead --- a resident Legendre or Wigner-$d$ contraction where the table fits, a generic scatter loop otherwise. Coefficients then enter an offset-blocked MASTER matrix.}
+\label{fig:schematic}
+\end{figure*}
+
+\section{Preliminaries}
+
+A HEALPix map of resolution $N_{\mathrm{side}}$ has $N_{\mathrm{pix}}=12N_{\mathrm{side}}^2$ pixels on $N_\theta=4N_{\mathrm{side}}-1$ iso-latitude rings \citep{gorski2005}. Ring $j$ has $n_{\phi,j}$ samples. We take $\ell_{\max}=L-1=3N_{\mathrm{side}}-1$ unless stated. The scoreboard reports auto-spectra of spin~$0$ and spin~$2$ fields; the notation below is that of \citet{alonso2019}, derived from spin-weighted harmonics in the helicity basis.
+
+\subsection{Spin-weighted fields}
+
+A quantity $f_s$ has spin weight $s$ if a rotation of the local tangent basis by an angle $\psi$ sends $f_s\to e^{-is\psi}f_s$. Temperature is $s=0$. Linear polarization is carried by
+\begin{equation}
+  P_\pm=Q\pm iU
+\end{equation}
+of spin $\pm2$. Expand the helicity maps as
+\begin{equation}
+  f_\pm(\hat n)=\sum_{\ell m}a^\pm_{\ell m}\,{_{\pm s}Y}_{\ell m}(\hat n),
+\end{equation}
+and set $a^\pm_{\ell m}=E_{\ell m}\pm iB_{\ell m}$. For $s=0$ there is a single real coefficient $T_{\ell m}$ and $B=0$. On HEALPix, analysis is a ring Fourier transform in $\phi$ followed by a quadrature in $\theta$ against Wigner-$d$ functions $d^\ell_{m,-s}(\theta)$. For $s=0$ this is the associated-Legendre transform against $P_\ell^m(\cos\theta)$. Synthesis is the adjoint, with ring weights absorbed on the analysis side. Real spin-$0$ rings have Hermitian azimuthal spectra; spin-$2$ rings are complex. That is why the half-spectrum identity and the equatorial-belt FFT of Sections~3--4 apply only to scalar maps.
+
+\subsection{Mode coupling}
+
+A scalar weight $w(\hat n)$ multiplies each field in pixel space. The resulting pseudo-spectra $\tilde C_\ell$ are linearly related to the true spectra by a matrix that depends only on the weights and the spins \citep{hivon2002,alonso2019}. Write
+\begin{equation}
+  J^{s}_{\ell\ell'L}
+  =\begin{pmatrix}\ell&\ell'&L\\ s&-s&0\end{pmatrix}.
+  \label{eq:Js}
+\end{equation}
+For two fields of spins $s_a$ and $s_b$, the even- and odd-parity kernels are
+\begin{equation}
+\begin{split}
+  M^\pm_{\ell\ell'}(s_a,s_b)
+  &=\frac{2\ell'+1}{4\pi}\sum_L(2L+1)\,W_L\\
+  &\quad\times J^{s_a}_{\ell\ell'L}\,
+  J^{s_b}_{\ell\ell'L}\,
+  \frac{1\pm(-1)^{\ell+\ell'+L}}{2},
+\end{split}
+\label{eq:Mpm}
+\end{equation}
+where $W_L$ is the mask power spectrum. Vectorizing $(C^{EE},C^{EB},C^{BE},C^{BB})$, the odd block $M^-$ is the $E\leftrightarrow B$ leakage operator. The scalar limit $s_a=s_b=0$ has vanishing $M^-$ and reduces to
+\begin{equation}
+  M^{TT}_{\ell\ell'}
+  =\frac{2\ell'+1}{4\pi}
+  \sum_L(2L+1)\,W_L\,
+  \bigl(J^{0}_{\ell\ell'L}\bigr)^2.
+  \label{eq:Mtt}
+\end{equation}
+Polarization ($s_a=s_b=2$) keeps both sectors. A scalar--spin cross ($s_a=0$, $s_b=2$) has $M^-=0$, so $TE$ and $TB$ do not mix under a scalar mask. \citet{kiddier2026} evaluate the $3j$ squares from a short recurrence in an offset index; GMaster uses that recurrence for~\eqref{eq:Mtt} and a Wigner-$d$ quadrature for~\eqref{eq:Mpm} at spin~$2$.
+
+All timings are on one NVIDIA RTX PRO 6000 Blackwell (about $96\,\mathrm{GiB}$), process isolated with \texttt{CUDA\_VISIBLE\_DEVICES=1}, default XLA pool $71.2\,\mathrm{GiB}$. Its float64 issue rate is $1/64$ of float32: a fused multiply-add kernel with eight independent accumulators measures $0.45\times10^{12}$ float64 and $30.5\times10^{12}$ float32 FMA per second (datasheet float64 ceiling $0.94\times10^{12}$). The CPU reference is NaMaster~3.0 / \texttt{ducc0}~0.39.1 on the same host, a 96-core Threadripper PRO 9995WX running 192 threads, which sustains about $1.5\,\mathrm{TFLOP\,s^{-1}}$ of float64 on one latitudinal pass. End-to-end totals are $\mathrm{field}+\mathrm{coupling}+\mathrm{coupled\_cell}+\mathrm{decouple}$. Relative error on coupled spectra is the maximum relative deviation from NaMaster. Isolated spherical-harmonic transforms are timed against DUCC through NaMaster's own helpers, both calls in one process; a concurrent JAX context can move a DUCC number by several milliseconds, which is why the isolated table is quoted with its absolute DUCC times. NaMaster wall times vary by about $8$~per cent under load, so ratios are quoted with the GMaster milliseconds attached.
+
+\section{Hermitian half-spectrum chirp-\texorpdfstring{$Z$}{Z} synthesis}
+
+\subsection{Centred form}
+
+HEALPix rings have unequal $n_\phi$. A uniform batched chirp-$Z$ transform \citep{bluestein1970} evaluates every ring DFT at the frequencies required by $\ell_{\max}$ without one FFT plan per ring length. Write $F_m$ for the azimuthal coefficient of a real ring, $m\in\{-(L-1),\ldots,L-1\}$, with $F_{-m}=\overline{F_m}$. The centred synthesis pads the Hermitian pair into a window of length $2L$ and convolves against a chirp of length at least $2L-1+w$, where $w$ is the ring width. At $N_{\mathrm{side}}=512$ that bound is $8192$; at $N_{\mathrm{side}}=1024$ it is $16384$.
+
+\subsection{Half-spectrum form}
+
+Define the one-sided sum
+\begin{equation}
+  P(p)=\sum_{m=0}^{L-1} F_m\,e^{2\pi i p m/n_\phi}.
+\end{equation}
+
+\begin{proposition}[Real-ring collapse]
+\label{prop:herm}
+For a real ring, $F_{-m}=\overline{F_m}$ and $F_0\in\mathbb{R}$. Then
+\begin{equation}
+  \sum_{\lvert m\rvert<L} F_m\,e^{2\pi i p m/n_\phi}
+  = 2\,\mathrm{Re}\,P(p)-F_0.
+\end{equation}
+\end{proposition}
+
+\begin{proof}
+Split the sum at $m=0$. Substituting $F_{-m}=\overline{F_m}$ into the negative orders and taking the real part of a real-valued ring yields $P(p)+\overline{P(p)}-F_0$.
+\end{proof}
+
+The chirp-$Z$ convolution therefore needs only $L$ coefficients and a bound $L+w-1$: $4096$ at $N_{\mathrm{side}}=512$ and $8192$ at $N_{\mathrm{side}}=1024$. The centred form's wrap-phase correction is the bookkeeping for an $L$-sample index shift and disappears, because the window is extracted at $L-1+p$ rather than $2L-1+p$.
+
+The two implementations agree to $1.3\times10^{-15}$ at $N_{\mathrm{side}}=512$. The synthesis stage itself is $2.07\times$ faster at that resolution before the belt split of Section~\ref{sec:belt}. Analysis already used the positive-$m$ block; returning that block directly, rather than filling a centred window and slicing it off, saves $100\,\mathrm{MiB}$ at $N_{\mathrm{side}}=512$ and $400\,\mathrm{MiB}$ at $N_{\mathrm{side}}=1024$, with a $1.02$--$1.05\times$ stage change.
+
+\section{Equatorial-belt FFT}
+\label{sec:belt}
+
+The remaining cost of the azimuthal stage, after Proposition~\ref{prop:herm}, is not the FFT arithmetic. At $N_{\mathrm{side}}=1024$ a pair of batched length-$8192$ transforms on $4095$ rings measures $4.73\,\mathrm{ms}$, while the ring stage as a whole was $13.6\,\mathrm{ms}$. Two facts remove most of the difference.
+
+\subsection{Constants are not folded}
+
+The convolution kernel and both chirp ramps depend only on $(L,N_{\mathrm{side}})$. Written inline inside a compiled transform they are still executed on every call: a compiled program whose body is only the chirp FFT of a constant array launches a real batched FFT of a two-dimensional constant and costs $2.03\,\mathrm{ms}$ at $N_{\mathrm{side}}=1024$. Closing over pre-built arrays would only move them into the jaxpr as literals. The production path therefore builds the three arrays once, keyed on $(L,N_{\mathrm{side}},\mathrm{device})$, and passes them as arguments of the compiled kernel. That change is bit-identical (difference exactly zero) and about $2\times$ on the stage by itself.
+
+The builders run under compile-time evaluation on the device of the map. Fetching the tables inside the compiled transform would recapture tracers and poison the next geometry; the public ring functions are therefore ordinary Python wrappers around a compiled core.
+
+\subsection{The belt does not need Bluestein}
+
+Rings $N_{\mathrm{side}}-1$ through $3N_{\mathrm{side}}-1$ all have $n_\phi=4N_{\mathrm{side}}$. In RING ordering their pixels are one contiguous run: the start index advances by exactly $4N_{\mathrm{side}}$, and the belt is $2N_{\mathrm{side}}+1$ rings, or two thirds of the map. For those rings, and provided $L\le 4N_{\mathrm{side}}$,
+\begin{equation}
+\begin{split}
+  F_m
+  &=\sum_{p<n_\phi}x_p\,e^{-2\pi i p m/n_\phi}\\
+  &=\mathrm{FFT}(x)[m],\qquad m<L.
+\end{split}
+\end{equation}
+No input chirp, no zero-pad, no kernel multiply, and no second transform. Synthesis on the belt combines Proposition~\ref{prop:herm} with the inverse FFT. Let $\tilde F$ be the $m$ block zero-padded to length $4N_{\mathrm{side}}$. Then
+\begin{equation}
+\begin{split}
+  x_p
+  &= 2\,\mathrm{Re}\,P(p)-F_0\\
+  &= 2\,n_\phi\,\mathrm{Re}\,\mathrm{IFFT}(\tilde F)_p-F_0.
+\end{split}
+\label{eq:belt-synth}
+\end{equation}
+Only the $2(N_{\mathrm{side}}-1)$ polar rings keep the half-spectrum chirp-$Z$, so the constant tables cover the caps only.
+
+\begin{lemma}[$m$-periodicity]
+\label{lem:alias}
+For any ring of length $n_\phi$, the azimuthal coefficients satisfy $F_m=F_{m\bmod n_\phi}$.
+\end{lemma}
+
+\begin{proof}
+The kernel $e^{-2\pi i p m/n_\phi}$ is $n_\phi$-periodic in $m$ because $e^{-2\pi i p}=1$.
+\end{proof}
+
+The gate $L\le 4N_{\mathrm{side}}$ is required because a length-$4N_{\mathrm{side}}$ transform returns the band $m<4N_{\mathrm{side}}$. An overset band would have to be tiled by Lemma~\ref{lem:alias}; the implementation declines the belt in that case and sends every ring through the chirp-$Z$. Direct DFT checks on cap, boundary, and belt rings at several $(N_{\mathrm{side}},L)$, including both sides of the gate, agree to $10^{-14}$ or better. Lemma~\ref{lem:alias} also makes a per-$n_\phi$ size-class split of the polar caps exact (relative alias $\sim3\times10^{-16}$); that split is not implemented.
+
+Together the two changes take the ring stage from $0.77/3.28/13.60\,\mathrm{ms}$ to $0.21/0.82/4.29\,\mathrm{ms}$ at $N_{\mathrm{side}}=256/512/1024$ (analysis), with a matching factor on synthesis and a maximum relative difference of $1.3\times10^{-15}$ against the pre-split path. After both changes the ring stage is about $12$~per cent of a $N_{\mathrm{side}}=1024$ analysis call. The latitudinal contraction already streams at the card's measured floor ($1506\,\mathrm{GB\,s}^{-1}$ against a $1488\,\mathrm{GB\,s}^{-1}$ pure-sum control), so further isolated-transform gains sit in the polar caps, not in the table.
+
+Spin-$2$ rings are genuinely complex and, at the default band, have $2L-1>4N_{\mathrm{side}}$. They still use a full-width chirp-$Z$ and do not take either change.
+
+\section{Offset-blocked MASTER assembly}
+
+\citet{kiddier2026} reduce the $3j$ square in~\eqref{eq:Mtt} to a product of three recurrence factors $g$ indexed by $(\ell_1,\ell_2,o)$, where $o$ is an offset along the triangle. The summand is zero unless the triangle inequalities hold. For the scalar $(0,0,0)$ configuration this is equivalent to
+\begin{equation}
+  o\le\min(\ell_1,\ell_2).
+  \label{eq:offset}
+\end{equation}
+
+\begin{lemma}[Trailing support]
+If offsets are processed in blocks $[o_0,o_0+C)$, then every surviving term lies in the principal submatrix $[\ell\ge o_0]\times[\ell\ge o_0]$.
+\end{lemma}
+
+\begin{proof}
+If $o\ge o_0$ and $o\le\min(\ell_1,\ell_2)$, then $\ell_1\ge o_0$ and $\ell_2\ge o_0$.
+\end{proof}
+
+A dense loop over all $(\ell_1,\ell_2,o)$ visits $n^3$ cells with $n=\ell_{\max}+1$. Restricting each block to the trailing submatrix visits
+\begin{equation}
+  \sum_{k=0}^{n/C-1} C\,(n-kC)^2 \sim \frac{n^3}{3}
+\end{equation}
+cells (Fig.~\ref{fig:offset}). With $C=16$ the construction is $3.0$--$3.6\times$ faster than the per-offset loop at $\ell_{\max}=383$, $767$ and $1535$ ($10.05\to3.23\,\mathrm{ms}$ at $\ell_{\max}=767$), agreeing to $10^{-16}$. Polarised coupling~\eqref{eq:Mpm} already used matrix multiplies of Wigner-$d$ tables and needed no analogous blocking.
+
+\begin{figure}
+\centering
+\includegraphics[width=\columnwidth]{figures/fig_offset.pdf}
+\caption{Cells visited while assembling an $n\times n$ scalar MASTER matrix. The offset vanishing condition~(\ref{eq:offset}) reduces the work from $n^3$ to $\sim n^3/3$.}
+\label{fig:offset}
+\end{figure}
+
+\section{Memory-gated Legendre tables}
+\label{sec:tables}
+
+\subsection{Fit, not speed}
+
+This section is the memory arithmetic of the resident-table routes. They are no longer the shipped default at any size (Section~\ref{sec:route}), but they are the exact route the accuracy statements of Section~\ref{sec:exp} are made against, and the sizes at which they cannot even be built are what forced a table-free kernel in the first place. The table path stores $d^\ell_{m,0}(\theta_j)$ (spin~$0$) or windowed Wigner-$d$ triangles (spin~$2$), generated by the same normalised recurrence as the kernel. Contractions accumulate in float64. Storage width is user-selected: float64 by default, float32 as an option. A geometry is accepted only if estimated bytes plus a synthesis reserve fit the live pool; refusals are cached so a failed build is not retried on every latitudinal pass.
+
+At $N_{\mathrm{side}}=1024$ the float64 scalar band is $73.5\,\mathrm{GiB}$ and is declined. The float32 band is $36.8\,\mathrm{GiB}$ and fits the default $71.2\,\mathrm{GiB}$ pool (Fig.~\ref{fig:memory}). Synthesis reuses the analysis layout by a strided reduction when a second copy would not fit; the two layouts are bit-identical. Compilation caches are dropped every eight $m$-blocks during the build, because a cached XLA executable pins a second copy of the buffers it produced.
+
+Raising \texttt{XLA\_PYTHON\_CLIENT\_MEM\_FRACTION} from the default $71.2\,\mathrm{GiB}$ to $90$--$93\,\mathrm{GiB}$ causes the $N_{\mathrm{side}}=1024$ float32 band to fail: the CUDA context and cuBLAS workspaces live outside the pool, so a larger fraction starves the build of headroom.
+
+\begin{figure}
+\centering
+\includegraphics[width=\columnwidth]{figures/fig_memory.pdf}
+\caption{Resident table size versus $N_{\mathrm{side}}$ for a full $(L,N_\theta,L)$ layout, together with the coefficient window of the table-free march. The dashed line is the default XLA pool. Polar $N_{\mathrm{side}}=1024$ and scalar $N_{\mathrm{side}}\ge2048$ exceed the pool even in float32, so no table route exists there at all; below those sizes a table can be built but is slower than the march (Section~\ref{sec:route}).}
+\label{fig:memory}
+\end{figure}
+
+\subsection{Representation error}
+
+Float32 storage is a rounding of an exact float64 table, not mixed-precision arithmetic in the recurrence. An earlier probe reported isolated \texttt{map2alm} relative errors of $2.8\times10^{-2}$ (float32) versus $1.2\times10^{-7}$ (float64) at $N_{\mathrm{side}}=512$. That comparison divided the residual by $\lVert\mathrm{ref}\rVert$ after fitting a global convention scale $s$ between GMaster and DUCC. DUCC's adjoint differs by $\lvert s\rvert\sim2.5\times10^5$ (the quadrature scale), so the quoted float32 number was $\lvert s\rvert$ times the true relative error.
+
+Two independent corrections agree. With the residual normalised by the fitted magnitude, and with a same-implementation comparison of float32-table alms against float64-table alms in one process, the analysis error is $4.8\times10^{-13}$ (float64) to $1.1\times10^{-7}$ (float32) at $N_{\mathrm{side}}=512$, and is flat in $\ell$. Synthesis, for which $\lvert s\rvert\approx1$, was never inflated. The $1.1\times10^{-7}$ is the cost of the storage-width reduction in the latitudinal contraction, not of the table build. Coupled pseudo-spectra after MASTER remain at $7.2\times10^{-9}$ ($N_{\mathrm{side}}=512$ spin~$0$ float32 tables) and $5.6\times10^{-8}$ ($N_{\mathrm{side}}=1024$ spin~$0$ float32 tables). The shipped route sits at $\sim10^{-6}$ (Table~\ref{tab:acc}) because it is the float32 march, not because of storage width.
+
+\subsection{Polar capacity}
+
+The spin-$2$ layout after dropping unread negative-$m$ rows is $(L,N_\theta,L)$. At $N_{\mathrm{side}}=1024$ that is $73.48\,\mathrm{GiB}$ in float32. The build peak sits about $13\,\mathrm{GiB}$ above the layout because per-chunk tables and the join output coexist. Every tested pool fraction, allocator, and reserve failed on a single $\sim2.7\,\mathrm{GiB}$ window block. That geometry is therefore declined, and the default latitudinal operator is the Jacobi march of Section~\ref{sec:march} rather than s2fft's generic scatter loop (previously $13.3\,\mathrm{s}$ against DUCC at $\sim110\,\mathrm{ms}$). Streaming a table is not a remedy: table production is $\sim23\,\mathrm{GB\,s}^{-1}$ against $\sim1238\,\mathrm{GB\,s}^{-1}$ consumption. Polarised $N_{\mathrm{side}}\le512$ could keep a resident slab, and did until the kernel of Section~\ref{sec:v2}; Section~\ref{sec:route} is the measurement that retired it.
+
+\subsection{Blocked prefix (prototype)}
+
+The two-term associated-Legendre step used by the fused kernel is a linear $2\times2$ transfer. For fixed $m$ and colatitude $\theta$, write $c_1=c_1(\ell,m)$, $c_2=c_2(\ell,m)$ and
+\begin{equation}
+  T_\ell(\theta)
+  =
+  \begin{pmatrix}
+    c_1\cos\theta & -c_2\\
+    1 & 0
+  \end{pmatrix}.
+  \label{eq:transfer}
+\end{equation}
+The march is then
+\begin{equation}
+  \begin{pmatrix} q_{\ell}\\ q_{\ell-1}\end{pmatrix}
+  =T_\ell(\theta)
+  \begin{pmatrix} q_{\ell-1}\\ q_{\ell-2}\end{pmatrix}.
+\end{equation}
+Sequential depth is $L-\lvert m\rvert$. Partitioning $\ell$ into $G$ contiguous blocks, emitting data-weighted partials and the composed transfer $M_j=\prod_{\ell\in I_j}T_\ell$, and scanning the $M_j$ reduces the depth to $L/G+G$, minimised at $G\sim\sqrt{L}$ (Fig.~\ref{fig:prefix}). A NumPy prototype is identical to the sequential recurrence (difference $0$). It has not been implemented as a GPU kernel. Expected transform gain, if a GPU kernel matched the prototype, is $3$--$6\times$ relative to the fused recurrence. That figure is a projection, not a measurement.
+
+\begin{figure}
+\centering
+\includegraphics[width=\columnwidth]{figures/fig_prefix.pdf}
+\caption{Sequential depth of the associated-Legendre march. On-the-fly recurrence has depth $L$. Blocked prefix with $G=\sqrt{L}$ has depth $2\sqrt{L}$. Marker: $L=3072$ ($N_{\mathrm{side}}=1024$).}
+\label{fig:prefix}
+\end{figure}
+
+\section{Table-free Wigner-\texorpdfstring{$d$}{d} march}
+\label{sec:march}
+
+The closed form, the three-term recurrence, the polar skip and the antipodal fold of this section are what both generations of the kernel march; they are unchanged. The arithmetic that carries the recurrence, and the kernel that runs it, are not: Section~\ref{sec:v2} replaces the compensated-limb Pallas kernel described in Sections~\ref{sec:kernel1}--\ref{sec:emit} with a difference-form CUDA kernel. We record the first kernel because the measurements it forced --- in particular that a handful of float64 instructions in the emit, not the float32 recurrence, were $40$~per cent of it --- are what the second was designed against.
+
+\subsection{Closed form}
+
+Write $s$ for the spin. Every Wigner function $d^\ell_{m,-s}(\theta)$ is an algebraic multiple of a Jacobi polynomial \citep[NIST DLMF 14.9.16, 18.3]{olver2010}:
+\begin{equation}
+\label{eq:wigner-jacobi}
+\begin{split}
+  d^\ell_{m,-s}(\theta)
+  &= (-1)^m\,2^{\varepsilon_m\,\mathrm{LG2N}}\\
+  &\quad\times
+    \Bigl(\sin\tfrac{\theta}{2}\Bigr)^\alpha
+    \Bigl(\cos\tfrac{\theta}{2}\Bigr)^\beta
+    P_n^{(\alpha,\beta)}(\cos\theta),
+\end{split}
+\end{equation}
+with
+\begin{equation}
+\begin{split}
+  \alpha&=m+s,\qquad
+  \beta=\lvert m-s\rvert,\\
+  n&=\ell-\max(m,s),\\
+  \mathrm{LG2N}
+  &=\log_2\sqrt{\frac{(\ell+m)!\,(\ell-m)!}{(\ell-s)!\,(\ell+s)!}}.
+\end{split}
+\end{equation}
+The polynomial degree $n$ counts from $\max(m,s)$, not from $m$: a row with $m<s$ starts at $\ell=s$. The sign $\varepsilon_m$ is $+1$ for $m\ge s$ and $-1$ for $m<s$. The second case is the pair-swapped branch of the same DLMF identity, which inverts the factorial ratio; omitting it leaves rows $m=0$ and $m=1$ wrong by relative error $1.0$ and $2.6\times10^{-2}$ against the resident slice, while every row $m\ge s$ is unaffected. The sign is $(-1)^{m+s}$ in general; the kernel writes $(-1)^m$, which agrees for the even spins it serves, and a spin-$1$ or spin-$3$ march would have to restore $(-1)^s$.
+
+\subsection{Three-term recurrence}
+
+The Jacobi family obeys a three-term recurrence in $n$ \citep[NIST DLMF 18.9.1]{olver2010}. In degree $\ell$, with $x=\cos\theta$,
+\begin{equation}
+\label{eq:jacobi-march}
+  v_\ell
+  =(c_1(\ell,m)\,x+c_0(\ell,m))\,v_{\ell-1}
+   -c_2(\ell,m)\,v_{\ell-2}.
+\end{equation}
+The coefficients $c_1,c_0,c_2$ depend only on $(\ell,m)$ and are independent of $\theta$. With $S=2n+\alpha+\beta$ and $D=2n(n+\alpha+\beta)(S-2)$ they are
+\begin{equation}
+\label{eq:coef}
+\begin{split}
+c_1&=\frac{(S-1)S(S-2)}{D},\qquad
+c_0=\frac{(S-1)(\alpha^2-\beta^2)}{D},\\
+c_2&=\frac{2(n+\alpha-1)(n+\beta-1)S}{D},
+\end{split}
+\end{equation}
+and $\alpha^2-\beta^2=4ms$ exactly, so no coefficient is a difference of large numbers; a float32 (high, low) split carries each to $2^{-48}$. The seed at $\ell=M\equiv\max(m,s)$ is the half-angle prefactor of~\eqref{eq:wigner-jacobi}; the seed at $\ell=M+1$ is that prefactor times
+\begin{equation}
+\label{eq:p1}
+\begin{split}
+  P_1^{(\alpha,\beta)}(x)
+  &=\frac{\alpha+\beta+2}{2}\,x+\frac{\alpha-\beta}{2}\\
+  &=(m+1)x+2
+\end{split}
+\end{equation}
+for $s=2$ and $m\ge2$. The linear coefficient of $P_1$ is $(\alpha+\beta+2)/2$, not $(\alpha+\beta)/2$; using the latter is exact at $\ell=M$ and already a few per cent off at $\ell=M+1$.
+
+A float64 march of~\eqref{eq:jacobi-march} against a numpy oracle of the same coefficients agrees to $1.5\times10^{-15}$ at $N_{\mathrm{side}}=1024$; that is the reference every float32 scheme below is measured against. Plain float32 of the same recurrence is $\sim9\times10^{-5}$ at $m=0$ over a restricted set of lanes and $4.2\times10^{-2}$ over all of them (Table~\ref{tab:dform}). The first kernel carried a (value, limb) pair for the state \emph{and} high/low float32 limbs for the coefficients, with products evaluated by a fused multiply-add residual \citep{dekker1971}; each buys about a factor of two alone, and together they reached $1.3\times10^{-7}$ at $N_{\mathrm{side}}=1024$ against the float64 march with no anchor table, with each lane renormalised against a $2^{\pm24}$ band every degree. Section~\ref{sec:diff} shows that the amplification those limbs were paying for is a property of the \emph{form} of the recurrence, not of the width of its words, and can be removed instead of compensated.
+
+\subsection{The first kernel: shape}
+\label{sec:kernel1}
+
+One program owns one $(m\text{-row},\,\theta\text{-tile})$ pair. The loop in $\ell$ starts at $\ell=M$, so a pass costs $\sum_m(L-m)\sim L^2/2$ live degrees rather than the $L^2$ rectangle of a segmented map. At $N_{\mathrm{side}}=1024$ that factor is $24$ windows of $128$ orders. Inside the loop the four real polarised channels (real/imaginary $\times$ direct/mirror) share one reduction tree; each degree emits a float32 partial and an int32 binade (Section~\ref{sec:emit}), and the driver forms their float64 product and sums it across tiles. Synthesis uses the same row at the mirrored ring: the HEALPix $\theta$ grid satisfies $\theta_{N_\theta-1-i}=\pi-\theta_i$, so one march feeds both order signs and only the store index differs. The synthesis accumulator is plain float32 with a fixed binade: the coefficients of a window are divided by the power of two at their maximum, so $\lvert c\rvert<4$ and the accumulator over $L$ degrees stays below $2^{2+\log_2L}$ with no per-degree block exponent, and the alignment of the marched row is one exact power of two shared by both order signs. Powers of two commute with rounding, so this is bit-identical to the earlier guarded form except for terms below $2^{-126}$ of the window scale; the map error against DUCC is unchanged to the printed digit ($2.3\times10^{-4}$ at $N_{\mathrm{side}}=1024$ spin~2, $8.2\times10^{-4}$ at $2048$ spin~0, relative to the map maximum). Dropping the accumulator limb had earlier cost $5.5\times10^{-7}$ at map level, about $350\times$ below the march's own error versus DUCC.
+
+The kernel reads only $\cos\theta$ and static $(L,N_{\mathrm{side}})$. Coefficient limbs for one $128$-order window are a few megabytes at $N_{\mathrm{side}}=1024$ (Fig.~\ref{fig:memory}). One program covers one $(m,\theta\text{-tile})$ pair, so the window width splits a fixed program count across launches. A launch of more than $2048$ programs measured slower, and the width was $128$ wherever $m_b N_{\mathrm{tile}}\le2048$ and $64$ otherwise.
+
+One limitation of this kernel was arithmetic and is removed in Section~\ref{sec:v2}: isolated \texttt{map2alm} against DUCC at $N_{\mathrm{side}}=1024$ had relative alm error $3.7\times10^{-5}$, versus $4\times10^{-7}$ on the generic scatter loop. The other is structural and survives: the recurrence starts at $\ell=\max(m,s)$ and therefore contributes nothing from $\ell<\lvert s\rvert$. DUCC and s2fft will consume such terms if they are handed them; spin-$2$ analyses emit none at a level that moves a map, so a pipeline never sees the difference, but a hand-built \texttt{alm} with sub-spin power will silently drop it.
+
+Removing every compensated limb from the analysis recurrence (plain float32 three-term step) is $1.004\times$ at $N_{\mathrm{side}}=1024$ and was not shipped. That measurement was read for several sessions as ``the kernel is warp-issue bound''; Section~\ref{sec:emit} shows what it was actually measuring.
+
+\subsection{The first kernel: binade-split emit}
+\label{sec:emit}
+
+This subsection is the emit of the first kernel. Section~\ref{sec:emitv2} replaces it with a factorisation that leaves no exponent lane in the interface at all; the measurement that motivates both is here.
+
+At degree $\ell$ a program holds $(v_\theta,e_\theta)$ on its $256$ lanes, with $v_\theta$ a float32 mantissa kept in $[2^{-24},2^{24}]$ by the range guard and $e_\theta$ an int32 exponent. The tile partial of the transform is
+\begin{equation}
+\label{eq:tile}
+\begin{split}
+A^{\mathrm{tile}}_c(\ell,m)
+&=(-1)^{m+s}\,2^{\varepsilon_m\mathrm{LG2N}+e_{\max}}\\
+&\quad\times\sum_\theta\bigl[v_\theta\,2^{e_\theta-e_{\max}}\bigr]\,r_c(\theta),
+\end{split}
+\end{equation}
+with $e_{\max}=\max_\theta e_\theta$; lanes with $e_\theta-e_{\max}<-126$ are flushed and change the partial by less than $2^{-70}$ of its largest term. The shipped kernel evaluated $2^{e_{\max}+\varepsilon_m\mathrm{LG2N}}$ with a float64 \texttt{exp2}, converted four float32 partials to float64 and multiplied them in float64, once per degree. On a card with float64 at $1/64$ of the float32 issue rate that tail was $40$~per cent of the analysis kernel, and it is what the limb ablation could not see: deleting the float32 arithmetic cannot move a kernel whose cost sits in a handful of float64 instructions.
+
+The replacement splits $\varepsilon_m\mathrm{LG2N}=\mathrm{lex}+\mathrm{frac}$ into an integer and a fraction in $[0,1)$, tabulates $\mathrm{fl}_{32}\bigl((-1)^{m+s}2^{\mathrm{frac}}\bigr)$, of magnitude in $[1,2)$, once per $(\ell,m)$, and stores per degree a float32 partial
+\begin{equation}
+\label{eq:p}
+p=\mathrm{fl}_{32}\Bigl(\mathrm{fl}_{32}\bigl(\textstyle\sum_\theta\mathrm{val}_\theta\,r_c(\theta)\bigr)\cdot\mathrm{fl}_{32}\bigl((-1)^{m+s}2^{\mathrm{frac}}\bigr)\Bigr)
+\end{equation}
+and an int32 binade $e=\mathrm{lex}+e_{\max}$. The driver returns $\mathrm{fl}_{64}(p)\,2^e$ with an exact bit-assembled power of two and sums tiles in float64. The result equals~\eqref{eq:tile} to relative error $(1+u)^2(1+\delta)-1$, with $u=2^{-24}$ and $\delta$ the float32 tree-sum error the old kernel already carried; multiplication by $2^e$ is exact for $-1022\le e\le1023$, and a partial with $e<-1022$ is below the float64 resolution of any $O(1)$ sum it enters and is dropped. The loop is also unrolled eight degrees per iteration: consecutive emits are independent of the recurrence and of each other, so their reduction trees overlap the next degrees' arithmetic.
+
+Table~\ref{tab:emit} gives the kernel time per $128$-order window. The measured relative change against the float64-emit kernel over every lane is $7.5\times10^{-8}$, $7.3\times10^{-8}$ and $6.6\times10^{-8}$ at $N_{\mathrm{side}}=1024$, $2048$ and $4096$, i.e.\ the $\sim2u$ the bound predicts, and the agreement with DUCC is unchanged to the printed digit.
+
+\begin{table}
+\centering
+\caption{Analysis march kernel, milliseconds per $128$-order window starting at order $m_0$ (warm medians). ``Ship'' is the float64 emit; ``fp32'' the binade split; ``unroll'' adds eight degrees per loop iteration; ``rec.'' marches without emitting.}
+\label{tab:emit}
+\small
+\begin{tabular}{@{}rrrrrr@{}}
+\toprule
+$N_{\mathrm{side}}$ & $m_0$ & Ship & fp32 & Unroll & Rec. \\
+\midrule
+1024 & 0    & 3.74  & 2.26 & 1.92  & 1.23  \\
+1024 & 1024 & 2.51  & ---  & 1.30  & ---   \\
+1024 & 2560 & 0.65  & ---  & 0.37  & ---   \\
+2048 & 0    & 10.15 & ---  & 7.36  & 3.56  \\
+4096 & 0    & 43.23 & ---  & 22.51 & 13.68 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Polar skip}
+\label{sec:polar}
+
+For $m>(\ell+\tfrac12)\sin\theta$ the function $d^\ell_{m,-s}(\theta)$ is in its forbidden region and decays as $\exp(-S)$ with WKB action
+\begin{equation}
+\label{eq:wkb}
+S\sim\frac{2\sqrt2}{3}\,\frac{\delta^{3/2}}{\sqrt{\ell'\sin\theta}\,\cos\theta},
+\qquad \ell'=\ell+\tfrac12,\quad \delta=m-\ell'\sin\theta .
+\end{equation}
+DUCC (\texttt{sharp\_get\_mlim}) neglects, on the ring at $\theta$, every order above
+\begin{equation}
+\label{eq:mlim}
+m_{\mathrm{lim}}=s\lvert\cos\theta\rvert+\sqrt{(\ell_{\max}\sin\theta+\mathrm{ofs})^2-s^2\sin^2\theta},
+\end{equation}
+$\mathrm{ofs}=\max(100,\,0.01\,\ell_{\max})$, the larger root of the quadratic it solves. Every $\ell\le\ell_{\max}$ then has $\delta\ge\mathrm{ofs}$; at $\ell_{\max}=12287$, $\sin\theta=\tfrac12$ the action is $S\gtrsim19$, so the neglected values sit below $\sim10^{-8}$ of the oscillatory amplitude. The march had computed every $(m,\theta)$ lane of the triangle. It now applies the same rule per $(m,\theta\text{-tile})$ program, skipping the program when $m>\max_{\mathrm{tile}}m_{\mathrm{lim}}(\theta)$. Because the neglected set is the reference's own, the agreement with DUCC does not move (relative alm $3.76\times10^{-5}$ at $N_{\mathrm{side}}=1024$ spin~2 and $7.20\times10^{-5}$ at $2048$ spin~0, with and without the skip). The work removed is $13.9$, $17.5$ and $19.3$~per cent of the analysis march at $N_{\mathrm{side}}=1024$, $2048$ and $4096$ (tile $256$), and $2.5$--$15.1$~per cent (spin~0, tile $1024$) and $9.3$--$17.9$~per cent (spin~2, tile $512$) of the synthesis march; a pass shrinks by $2$--$8$~per cent, because the ring stage and the assembly do not.
+
+\subsection{The float64 wall}
+\label{sec:wall}
+
+Let $N$ be the number of $(m,\ell,\theta)$ triples a pass visits: $\sum_{m<L}(L-m)=L(L+1)/2$ live degrees per ring, times $\lceil N_\theta/2\rceil$ rings on the folded spin-$0$ route and $N_\theta$ at spin~$2$, before the polar skip. At $N_{\mathrm{side}}=4096$ that is $6.2\times10^{11}$ (spin~$0$) and $1.2\times10^{12}$ (spin~$2$). A three-term recurrence needs two fused multiply-adds per new value and each channel one more per triple, so an $n_c$-channel analysis pass costs at least $(2+n_c)N$ FMAs. At the datasheet float64 rate, any float64 SIMT implementation of the spin-$0$ analysis at $N_{\mathrm{side}}=4096$ therefore needs
+\begin{equation}
+\label{eq:wall}
+T\ge\frac{6\times6.2\times10^{11}}{0.94\times10^{12}}\,\mathrm{s}=4.0\,\mathrm{s}
+\end{equation}
+($8.3\,\mathrm{s}$ at the measured rate; $1.3$--$2.8\,\mathrm{s}$ for the recurrence alone), against DUCC's measured $1.8$--$2.0\,\mathrm{s}$ per pass on the 96-core host. No float64 kernel on this card can beat the CPU reference at the top of the board; only float32-class arithmetic can, which is why the march is a compensated float32 recurrence. Its per-triple cost is about $30$ float32 instructions against an issue rate of $\sim6\times10^{13}$ lane-instructions per second, a floor of $\sim0.3\,\mathrm{s}$ per pass at $N_{\mathrm{side}}=4096$. After the binade split the analysis kernel is $22.5\,\mathrm{ms}$ per window at $N_{\mathrm{side}}=4096$ against a recurrence-only $13.7\,\mathrm{ms}$: the emit is now $39$~per cent of the kernel and the compensated recurrence $61$~per cent.
+
+\subsection{Antipodal fold at spin~$0$}
+\label{sec:fold}
+
+The same kernel at $s=0$ marches $d^\ell_{m,0}$. The associated-Legendre identity
+\begin{equation}
+  d^\ell_{m,0}(\pi-\theta)=(-1)^{\ell+m}\,d^\ell_{m,0}(\theta)
+\end{equation}
+is exact on the HEALPix ring grid, which satisfies $\theta_{N_\theta-1-j}=\pi-\theta_j$. Write $N_{\mathrm{north}}=\lfloor(N_\theta+1)/2\rfloor$, $j'=N_\theta-1-j$, and
+\begin{equation}
+  G_m(j)=w_j\,e^{im\phi_j}\,F_m(\theta_j)
+\end{equation}
+for the weighted ring-FFT coefficient. The latitudinal analysis sum over the whole sphere is then a northern contraction against two right-hand sides:
+\begin{equation}
+\label{eq:fold}
+  a_{\ell m}
+  =\sqrt{\frac{2\ell+1}{4\pi}}
+  \sum_{j<N_{\mathrm{north}}}
+  d^\ell_{m,0}(\theta_j)\,
+  \bigl[G_m(j)+(-1)^{\ell+m}G_m(j')\bigr],
+\end{equation}
+with the equator lane counted once ($G_m(j')=0$ when $j'=j$). Synthesis is the transpose: one northern march feeds a direct coefficient set and a southern set carrying $(-1)^{\ell+m}$. Negative orders never appear; they follow from the real-map symmetry after the latitudinal step.
+
+The Jacobi coefficient $c_0$ is proportional to $m s$ and vanishes at $s=0$, so the recurrence is the symmetric three-term Jacobi (Legendre at $m=0$). The kernel still marches only the northern $N_{\mathrm{north}}\approx N_\theta/2$ rings. The fold is spin-$0$ only: a spin-$2$ analogue that halved flops would require negative orders to come from a real-map identity they do not satisfy. The four-channel layout already feeds $+m$ and $-m$ from one $|m|$ lane; that saves table bytes, not MACs.
+
+At spin~$2$ the kernel's mirror channel contracts the same row against the ring-reversed map. It rests on the reflection $P_n^{(\alpha,\beta)}(-x)=(-1)^nP_n^{(\beta,\alpha)}(x)$, which under $\theta\mapsto\pi-\theta$ swaps the two half-angle powers in~\eqref{eq:wigner-jacobi}: for $s\le m\le\ell$,
+\begin{equation}
+\label{eq:mirror}
+d^\ell_{m,-s}(\pi-\theta)=(-1)^{\ell+m}d^\ell_{m,s}(\theta)=(-1)^{\ell+s}d^\ell_{-m,-s}(\theta),
+\end{equation}
+so the negative orders come from one march with the sign $(-1)^{\ell+s}$ applied outside the kernel (measured residual $2.3\times10^{-12}$ over every row).
+
+The fold was originally selected only where the scalar Legendre band was refused for size --- $N_{\mathrm{side}}\ge2048$ at float32 --- because with the first kernel forcing it at $N_{\mathrm{side}}=512$ was a loss ($4.4\to12.7\,\mathrm{ms}$ on \texttt{map2alm}). With the kernel of Section~\ref{sec:v2} it is the route at every $N_{\mathrm{side}}\ge64$ (Section~\ref{sec:route}).
+
+\section{The v2 march: difference form, reflection, and a CUDA kernel}
+\label{sec:v2}
+
+The shipped kernel marches the same Jacobi row~\eqref{eq:jacobi-march} as Section~\ref{sec:march}. Four things differ. The pair carried is $(v,D)$ with $D_n=v_n-v_{n-1}$ instead of $(v_n,v_{n-1})$; the southern hemisphere marches the reflected row $(-1)^nv_n$ through the same code; the lane binade is renormalised every eight degrees to the exponent field of $\max(\lvert v\rvert,\lvert D\rvert)$ instead of every degree to a $2^{\pm24}$ band; and the emit forms a plain float32 number, with the normalisation folded into the tables, so no exponent lane leaves the kernel. The human-readable note is \texttt{docs/march\_v2\_maths}; the proofs of record are \texttt{formal/lean/GMasterMarch/DiffForm.lean} and \texttt{EmitV2.lean}, and each statement below names its theorem. Throughout, $L=\ell_{\max}+1$, $\alpha=m+s$, $\beta=\lvert m-s\rvert$, $M=\max(m,s)$, $n=\ell-M$ and $x=\cos\theta$, and we abbreviate the coefficients of~\eqref{eq:jacobi-march} as $A_n=c_1x+c_0$ and $B_n=c_2$.
+
+\subsection{Difference form}
+\label{sec:diff}
+
+\begin{proposition}[Difference form]
+\label{prop:diff}
+Let $v_n=A_nv_{n-1}-B_nv_{n-2}$ for $n\ge2$ and $D_n=v_n-v_{n-1}$ for $n\ge1$. Then for every $n\ge2$
+\begin{equation}
+\label{eq:diff}
+  D_n=(A_n-1-B_n)\,v_{n-1}+B_n D_{n-1},\qquad v_n=v_{n-1}+D_n .
+\end{equation}
+\end{proposition}
+
+\begin{proof}
+$D_n=A_nv_{n-1}-B_nv_{n-2}-v_{n-1}=(A_n-1-B_n)v_{n-1}+B_n(v_{n-1}-v_{n-2})$. The second identity is the definition of $D_n$.
+\end{proof}
+
+Lean: \texttt{DiffForm.diff\_form\_step} for one step. Starting from $(v_1,D_1)=(v_1,v_1-v_0)$ and iterating $(v,D)\mapsto(v+D',D')$ with $D'=C_nv+B_nD$ and $C_n=A_n-1-B_n$, the pair after $n-1$ iterations is $(v_n,v_n-v_{n-1})$ for every $n\ge1$ (\texttt{diff\_march\_eq\_rec2}, stated for a generic two-term recurrence). Specialised to~\eqref{eq:jacobi-march},
+\begin{equation}
+\label{eq:Cn}
+  C_n=c_1(x-1)+E^+_n,\qquad E^+_n=c_1-1-c_2+c_0
+\end{equation}
+(\texttt{jacobi\_C\_eq}). This is what the kernel evaluates: the lane carries $x-1$ and the table carries $c_1$ and $E^+$. \texttt{diff\_march\_eq\_march} states that the kernel's march with the coefficients~\eqref{eq:Cn}, $B=c_2$ and seeds $1,\,v_1$ equals $(v_{k+1},v_{k+1}-v_k)$ at every index, hence its value lane is $P^{(\alpha,\beta)}_{k+1}(x)$ (\texttt{diff\_march\_value}). The seed is $D_1=v_1-v_0=\tfrac{\alpha+\beta+2}{2}(x-1)+\alpha$ (\texttt{seed\_D1\_north}).
+
+\subsection{Why the difference form is accurate}
+\label{sec:why}
+
+This subsection is asymptotic reasoning, validated numerically, and is the one part of the kernel's design that is not formalised.
+
+Over a few degrees the coefficients of~\eqref{eq:jacobi-march} are nearly constant and $c_2\to1$, so the row is locally $v_n\approx Av_{n-1}-v_{n-2}$ with characteristic roots $e^{\pm i\phi}$, $2\sqrt{c_2}\cos\phi=A$. In the oscillatory region $\lvert A\rvert<2$, and $\phi\to0$ both at the poles and at every turning point $m\approx(\ell+\tfrac12)\sin\theta$, the boundary of the forbidden region of Section~\ref{sec:polar}. In terms of $\phi$,
+\begin{equation}
+  C=A-1-c_2=-(1-\sqrt{c_2})^2-2\sqrt{c_2}\,(1-\cos\phi)\approx-\phi^2,
+\end{equation}
+so the difference coefficient vanishes quadratically exactly where the march is ill-conditioned, and $D\approx\phi\,\lvert v\rvert$.
+
+A rounding of $\mathrm{fl}(Av_{k-1}-Bv_{k-2})$ perturbs the state of the plain march by $(\delta,0)$ with $\delta\sim2u\lvert v\rvert$. That decomposes on the modes $(e^{\pm i\phi},1)$ with amplitude $\delta/(2\sin\phi)$ each and evolves as $\delta\sin((n-k+1)\phi)/\sin\phi$: every rounding is amplified by $1/\sin\phi$, and over $n$ steps with random signs the relative error is $\sim\sqrt{n}\,u/\sin\phi$. On the first HEALPix ring at $N_{\mathrm{side}}=4096$, $\theta\approx2\times10^{-4}$, $1/\sin\phi\approx5\times10^3$ and $\sqrt{12288}\approx110$, giving $\sim4\times10^{-2}$ --- the measured $4$~per cent of Table~\ref{tab:dform}. A \emph{systematic} error is worse: a relative error $\epsilon$ in $x$ perturbs $A$ by $c_1x\epsilon$ at every step, and $2\cos\phi=A$ turns that into a coherent phase drift $\sim n\,c_1x\,\epsilon/(2\sin\phi)$, of order a radian at $n=12288$, $\sin\phi=2\times10^{-4}$ and $\epsilon=u$.
+
+The difference form has roundings of two kinds. In $v\leftarrow\mathrm{fl}(v+D)$ an error $\delta\sim u\lvert v\rvert$ lands on $v_n$ \emph{with $D_n$ fixed}, i.e.\ it shifts $v_{n-1}$ by the same $\delta$; the perturbation $(\delta,\delta)$ has modal amplitude $\delta e^{-i\phi/2}/(2\cos(\phi/2))\approx\delta/2$ and is not amplified. In $D\leftarrow\mathrm{fl}(c_2D+Cv)$ an error $\eta\sim u(\lvert D\rvert+\lvert Cv\rvert)\sim u\,\phi\lvert v\rvert$ lands on $D_n$ with $v_n$ fixed; the perturbation $(0,-\eta)$ is amplified by $1/(2\sin\phi)$ to $\sim u\lvert v\rvert/2$. Both kinds therefore contribute $O(u\lvert v\rvert)$ per step irrespective of $\phi$, and the total is the random-walk floor $\sqrt{n}\,u$: $\sqrt{3072}\,u\approx3.3\times10^{-6}$ at $N_{\mathrm{side}}=1024$ and $\sqrt{12288}\,u\approx6.6\times10^{-6}$ at $4096$, against the measured $2.8\times10^{-6}$ and $5.7\times10^{-6}$.
+
+The only coefficient on the amplified path is $C$, and the argument needs its error to be $O(u\lvert C\rvert)$, not $O(u\lvert A\rvert)$. Near a pole $x-1\sim-\theta^2/2$, so a single-word $x$ carries an absolute error $u$ into $x-1$, a relative error $u/(\theta^2/2)$ in the leading term of $C$; and a single-word $E$ leaves an error $\sim u\lvert c_1\rvert$ that does not shrink with $C$. Both are systematic and drift the phase. The kernel therefore stores $\lvert x\rvert-1=x_h+x_l$, $c_1=c_{1h}+c_{1l}$ and $E^\pm=E_h+E_l$ as float32 pairs, each split exactly from float64 to $2^{-48}$ relative, and forms
+\begin{equation}
+\label{eq:Cfma}
+  C=\mathrm{fma}(c_{1h},x_h,E_h)+\bigl[\mathrm{fma}(c_{1h},x_l,\mathrm{fma}(c_{1l},x_h,E_l))\bigr].
+\end{equation}
+The first \texttt{fma} rounds once, by $u\lvert C\rvert$, and that rounding vanishes with $C$ at the turning point where the amplification peaks; the bracket is $\sim2^{-24}$ of the leading terms and its own roundings are $\sim2^{-48}\lvert c_1(x-1)\rvert$. A $C$ formed from single words instead leaves the coherent $u\lvert c_1\rvert$-class error, whose drift grows like $n$ rather than $\sqrt{n}$: that is the $4\times10^{-5}$ floor in the middle row of Table~\ref{tab:dform}. The coefficient $c_2$ is single-word, because its error enters through $c_2D$, i.e.\ as $u\lvert D\rvert\sim u\phi\lvert v\rvert$ on $D$, which is the unamplified kind.
+
+\begin{table}
+\centering
+\caption{Relative error of a float32 march against the float64 recurrence, maximum over every lane of the row, at $N_{\mathrm{side}}=1024$ spin~$0$. $C$ is the difference coefficient~\eqref{eq:Cn}; the two-word row is the split~\eqref{eq:Cfma} of the shipped kernel, which is $5.7\times10^{-6}$ at $N_{\mathrm{side}}=4096$.}
+\label{tab:dform}
+\footnotesize
+\setlength{\tabcolsep}{3pt}
+\begin{tabular}{@{}lccc@{}}
+\toprule
+Float32 march & $m=0$ & $m=1000$ & $m=L/2$ \\
+\midrule
+Plain, single word          & $4.2\times10^{-2}$ & $8.8\times10^{-5}$ & $3.1\times10^{-5}$ \\
+Difference form, 1-word $C$ & $4.1\times10^{-5}$ & $8.6\times10^{-5}$ & $5.1\times10^{-5}$ \\
+Difference form, 2-word $C$ & $2.8\times10^{-6}$ & $2.9\times10^{-6}$ & $1.6\times10^{-5}$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Reflection: the southern hemisphere}
+\label{sec:refl}
+
+\begin{proposition}[Reflection]
+\label{prop:refl}
+If $v_n=(c_1x+c_0)v_{n-1}-c_2v_{n-2}$ for all $n\ge2$, then $w_n:=(-1)^nv_n$ satisfies
+\begin{equation}
+\label{eq:refl}
+  w_n=\bigl(c_1(-x)-c_0\bigr)w_{n-1}-c_2w_{n-2}.
+\end{equation}
+\end{proposition}
+
+\begin{proof}
+Multiply the recurrence by $(-1)^n$: $(-1)^nv_n=(c_1x+c_0)(-1)^nv_{n-1}-c_2(-1)^nv_{n-2}=-(c_1x+c_0)w_{n-1}-c_2w_{n-2}$.
+\end{proof}
+
+Lean: \texttt{DiffForm.reflect\_step}, \texttt{reflect\_recurrence}, and \texttt{rec2\_reflect} at the level of a generic two-term recurrence. For a southern ring $x<0$ put $y=\lvert x\rvert=-x$. Then~\eqref{eq:refl} is the \emph{same} recurrence~\eqref{eq:jacobi-march} with $y$ for $x$ and $-c_0$ for $c_0$, and its difference form has $C_n=c_1(y-1)+E^-_n$ with $E^-_n=c_1-1-c_2-c_0$. Every lane, northern or southern, therefore marches $\lvert x\rvert-1\in(-1,0]$ with the same instructions and the table column $E^+$ or $E^-$, seeded with $w_1=-v_1$ and $D_1=w_1-1=\tfrac{\alpha+\beta+2}{2}(y-1)+\beta$ (\texttt{seed\_D1\_south}); \texttt{south\_march\_eq\_reflect} gives the value lane as $(-1)^{k+1}v_{k+1}$ at $y=-x$, and the emit restores the sign on odd $n$.
+
+Because $c_1$ and $c_2$ are symmetric in $(\alpha,\beta)$ and $c_0\propto\alpha^2-\beta^2$ flips sign, the reflected lane is literally the $(\beta,\alpha)$ Jacobi row at $\lvert x\rvert$ --- the closed-form identity $(-1)^nP^{(\alpha,\beta)}_n(x)=P^{(\beta,\alpha)}_n(-x)$ already used for the mirror channel~\eqref{eq:mirror} (\texttt{march\_reflect\_eq\_swapped}). The kernel needs~\eqref{eq:refl} rather than the closed form because it never swaps the half-angle prefactor: its seed is the \emph{northern} $(\sin\tfrac\theta2)^\alpha(\cos\tfrac\theta2)^\beta$ evaluated at the southern $\theta$. The gain is not flops but instruction uniformity: one code path, one table layout, and a lane coordinate confined to $(-1,0]$ where the cancellation analysis of Section~\ref{sec:why} applies.
+
+\subsection{Exact block scaling}
+\label{sec:scale}
+
+Every lane stores $v\cdot2^{ex}$ with $v,D$ float32 and $ex$ int32, initialised from the half-angle prefactor as $v=2^{f-\lfloor f\rfloor}$, $ex=\lfloor f\rfloor$, $f=\alpha\log_2\sin\tfrac\theta2+\beta\log_2\cos\tfrac\theta2$. After each block of $\mathrm{UNR}=8$ degrees, with $e_b$ the biased exponent field of $\max(\lvert v\rvert,\lvert D\rvert)$ clamped to $\ge1$, both lanes are multiplied by $2^{127-e_b}$ and $ex$ is incremented by $e_b-127$.
+
+\begin{lemma}[Homogeneity]
+\label{lem:homog}
+The map $(v,D)\mapsto(v+D',D')$ with $D'=Cv+BD$ is linear, so the difference march from seeds $(\lambda s_0,\lambda s_1)$ is $\lambda$ times the march from $(s_0,s_1)$ in both lanes at every degree.
+\end{lemma}
+
+\begin{proof}
+Induction on the degree; one step is $C(\lambda v)+B(\lambda D)=\lambda(Cv+BD)$.
+\end{proof}
+
+Lean: \texttt{diff\_step\_homogeneous}, \texttt{diff\_march\_scaled}, and \texttt{block\_rescale} (rescaling $(v,D)$ by $2^{-k}$ and adding $k$ to $ex$ leaves every represented value $v\cdot2^{ex}$ unchanged), built on the \texttt{ExponentCarry.lane\_rescale} of the first kernel. As an IEEE remark, not formalised: multiplication by a power of two changes only the exponent field, so the rescale is exact unless it overflows or underflows. After a normalisation $\max(\lvert v\rvert,\lvert D\rvert)\in[1,2)$, and the per-degree growth of the pair is bounded by $1+\lvert C\rvert+\lvert c_2\rvert\le2^{15}$ for $m<2^{14}$, so eight degrees grow by at most $2^{120}<2^{126}$: no overflow before the next normalisation. A lane cannot fall into the denormal range either, because marched forward from $\ell=M$ the row is the dominant solution and $\lvert D\rvert\le2\max\lvert v\rvert$. Renormalising once per eight degrees rather than once per degree is what makes the emit's exponent bookkeeping a per-block constant.
+
+\subsection{The emit: factorisation and the range of the mantissa}
+\label{sec:emitv2}
+
+At degree $\ell$ of a block with base $b$ the lane's true magnitude is $v\cdot2^{ex}\,N(\ell)$, with $N(\ell)=2^{\varepsilon_m\mathrm{LG2N}(\ell,m)}$ as in~\eqref{eq:wigner-jacobi}. The kernel forms it as
+\begin{equation}
+\label{eq:emitfac}
+\begin{split}
+ \mathrm{val}&=v\cdot2^{ex+\mathrm{lex}_b},\qquad \mathrm{lex}_b=\lfloor\log_2N(b)\rfloor,\\
+ A^{\mathrm{tile}}_c&=\Bigl(\sum_{\mathrm{lanes}}\mathrm{val}\cdot r_c\Bigr)\,u(\ell),\qquad
+ u(\ell)=2^{\log_2N(\ell)-\mathrm{lex}_b},
+\end{split}
+\end{equation}
+the per-lane factor by exponent-field assembly (the table stores $\mathrm{lex}_b+127$) and $u(\ell)$ once per $(\ell,\mathrm{channel})$ after the warp reduction, folded into the coefficients on the synthesis side.
+
+\begin{lemma}[Factorisation]
+\label{lem:fac}
+For real $v,g$ and integers $ex,l_b$, $\;v\cdot2^{ex}\cdot2^{g}=v\cdot2^{ex+l_b}\cdot2^{g-l_b}$.
+\end{lemma}
+
+Lean: \texttt{EmitV2.emit\_factorisation}, with \texttt{biased\_exponent} for the $+127-127$ of the assembly. The point is that the lane-dependent factor is an exact power of two while the only non-trivial mantissa depends on $(\ell,m)$ alone and can be applied after the sum over lanes.
+
+\begin{lemma}[Range of the mantissa]
+\label{lem:urange}
+For every degree of a block, $u(\ell)\in[2^{-45.5},2)$; in particular it is a normal float32.
+\end{lemma}
+
+\begin{proof}
+$\log_2N(\ell)-\mathrm{lex}_b=(\log_2N(\ell)-\log_2N(b))+\mathrm{frac}_b$ with $\mathrm{frac}_b\in[0,1)$, and the first bracket is a sum of at most seven per-degree steps $t(\ell')=\tfrac12\varepsilon_m\log_2\rho(\ell')$ with $\rho=(\ell'+m)(\ell'-m)/((\ell'-s)(\ell'+s))$. For $m\ge s$, $\rho\le1$ and is increasing in $\ell'$, so it is smallest at $\ell'=m+1$ where $\rho\ge(2m+1)/(m+1)^2\ge2/(m+2)$, giving $t\in[-6.5,0]$ for $m+2\le2^{14}$ (which holds at $L=12288$, $N_{\mathrm{side}}=4096$). For $m<s$, $1\le\rho\le(s+1)^2/(2s+1)=9/5$ and $t\in[-0.5,0]$. Seven steps in $[-6.5,0]$ plus $\mathrm{frac}_b$ give an exponent in $[-45.5,1)$.
+\end{proof}
+
+Lean: \texttt{u\_range}, with \texttt{seven\_steps}, \texttt{step\_ratio\_bounds\_ge}, \texttt{step\_ratio\_bounds\_lt} and \texttt{step\_bound\_ge}. The product $v\cdot2^{ex+\mathrm{lex}_b}$ is exact; the lane product enters the float32 tree sum as before; $u$ is rounded once when tabulated and once in the product, so the tile partial carries $(1+u)^2(1+\delta)-1$ exactly as in Section~\ref{sec:emit}, with $u=2^{-24}$ and $\delta$ the tree-sum error. Lanes with $ex+\mathrm{lex}_b\le-127$ are flushed to zero by the exponent assembly; at the block base such a lane's true magnitude is below $2^{-124}$, and every emitted value is a $\lvert d\rvert\le1$ contracted against $O(1)$ right-hand sides, so a dropped term is far below the float32 resolution of the partial it enters. The driver applies the $(-1)^{m+s}$ of~\eqref{eq:wigner-jacobi} and $\sqrt{(2\ell+1)/4\pi}$ in float64 and sums the tile partials into float64 with no exponent bookkeeping at all: the int32 binade of Section~\ref{sec:emit} has left the interface.
+
+\subsection{The CUDA kernel and the XLA FFI}
+\label{sec:cuda}
+
+The kernel is \texttt{gmaster/\_cuda/march\_v2.cu}, compiled by \texttt{nvcc} on first use into a user cache keyed on the source text, the compute capability and the JAX version, and exposed as six XLA FFI handlers --- folded spin-$0$ analysis and synthesis, their paired variants, and spin-$2$ analysis and synthesis. \texttt{gmaster/\_march\_v2.py} is the driver: it builds the coefficient tables, chooses the window, and issues \texttt{jax.ffi.ffi\_call}, so the kernel is an ordinary primitive inside a traced program rather than a callback outside it.
+
+One warp owns one (order $m$, tile of $32\times\mathrm{LPT}$ rings). The shipped shape is $\mathrm{LPT}=16$ for analysis, $8$ for synthesis and $\mathrm{UNR}=8$ degrees per loop iteration, with a reduce-scatter over the unrolled block so that one warp reduction serves every degree and every channel of the block; it is the best of six $(\mathrm{LPT}_{\mathrm{ana}},\mathrm{LPT}_{\mathrm{syn}},\mathrm{UNR})$ combinations swept at $N_{\mathrm{side}}=2048$. The polar skip of Section~\ref{sec:polar} and the hemisphere fold of Section~\ref{sec:fold} carry over unchanged.
+
+Writing the kernel in CUDA rather than in Pallas is not a claim that Pallas cannot express it. What CUDA made available, and what the arithmetic of Sections~\ref{sec:diff}--\ref{sec:emitv2} needs, is the exponent field of a float32 as an integer, the \texttt{fma} chain of~\eqref{eq:Cfma} with its rounding structure intact, and a warp-level reduce-scatter over an unrolled degree block.
+
+\subsection{Map--mask pairing}
+\label{sec:pair}
+
+A field and its mask are two transforms of the same rows: the recurrence depends on $(m,\ell,\theta)$ alone and is the expensive operand. The analysis kernel therefore takes two maps as extra emit channels. That is not free --- the extra accumulators halve the ring tile, and the paired call is $1.35\times$ one unpaired call rather than $1\times$ --- but it is well below the $2\times$ of two launches. The spin-$0$ synthesis kernel takes the second map in the accumulator lanes that the spin-$2$ kernel uses for its second helicity, which costs nothing and is \emph{bit-identical} to two separate launches. At $N_{\mathrm{side}}=4096$ spin~$0$, building an \texttt{NmtField} is $4006\,\mathrm{ms}$ as two transforms, $3596\,\mathrm{ms}$ with the synthesis paired and $3107\,\mathrm{ms}$ with both: unlike the first kernel's pairing, which was gated by a footprint estimate and declined at the top of the board, there is no size cap. Spin-$2$ fields carry a spin-$0$ mask and do not pair.
+
+\section{Proofs of record}
+\label{sec:formal}
+
+The statements the march relies on were validated numerically as they were found and never derived. They are now a Lean~4 project on Mathlib \citep{demoura2021,mathlib2020}, \texttt{formal/lean/} in the repository, with two human-readable notes (\texttt{docs/latitudinal\_march\_maths} for the material of Section~\ref{sec:march}, \texttt{docs/march\_v2\_maths} for Section~\ref{sec:v2}) that name the theorem for every statement. The project builds with no \texttt{sorry}, and every main theorem depends only on the standard axioms \texttt{propext}, \texttt{Classical.choice} and \texttt{Quot.sound}. It proves: the index combinatorics of~\eqref{eq:wigner-jacobi} ($\alpha+\beta=2\max(m,s)$, $\alpha^2-\beta^2=4ms$, both factorial branches and the $\varepsilon_m$ flip, the $(-1)^{m+s}$ sign); that Wigner's explicit sum for $d^j_{m,-s}$ equals the Jacobi closed form in both branches, by matching the half-angle powers term by term and the coefficients through a factorial identity; DLMF~18.9.2 for the explicit DLMF~18.5.7 sum, by three binomial ratio identities between consecutive summands and a telescoping certificate found with a computer algebra system and checked by \texttt{ring}, so that the marched sequence from the seeds $P_0=1$ and~\eqref{eq:p1} with the coefficients~\eqref{eq:coef} equals the Jacobi polynomial at every degree; that rescaling a lane by a power of two is exact and commutes with the homogeneous recurrence, with no overflow before the $2^{\pm24}$ guard; the $2^{-71}$ flush bound, the binade split, the $[1,2)$ range of the fractional factor and the two-rounding bound of Section~\ref{sec:emit}; the symmetric-Jacobi parity behind the fold~\eqref{eq:fold} and the paired-ring sums with the equator counted once; the reflection $P_n^{(\alpha,\beta)}(-x)=(-1)^nP_n^{(\beta,\alpha)}(x)$ and the mirror identity~\eqref{eq:mirror}; the live-degree count and the time bound~\eqref{eq:wall}; and that~\eqref{eq:mlim} is the larger root of DUCC's quadratic, with the number of degrees a cutoff removes. The v2 kernel added two files. \texttt{GMasterMarch/DiffForm.lean} proves the difference form (Proposition~\ref{prop:diff}) for a generic two-term recurrence and then for the Jacobi row, the identification~\eqref{eq:Cn} of its difference coefficient, the northern and southern seeds, the reflection (Proposition~\ref{prop:refl}) at three levels of generality, the agreement of the reflected march with the $(\beta,\alpha)$ Jacobi row, and the homogeneity and block rescale of Lemma~\ref{lem:homog}. \texttt{GMasterMarch/EmitV2.lean} proves the factorisation of Lemma~\ref{lem:fac}, the biased-exponent assembly, and the bound of Lemma~\ref{lem:urange} through the per-degree ratio bounds in both branches of $\varepsilon_m$.
+
+The statements without a Lean counterpart are the WKB estimate~\eqref{eq:wkb}, which is asymptotic analysis justifying a rule that is the reference's own; the IEEE scaling remarks on the synthesis accumulator and on Section~\ref{sec:scale}; and the whole of the error analysis of Section~\ref{sec:why}, which is a modal argument validated by Table~\ref{tab:dform} rather than a theorem. The proofs also fixed a convention: the kernel's $(-1)^m$ is $(-1)^{m+s}$ only for even spin.
+
+\section{Routing, precision, and the host side}
+\label{sec:pipeline}
+
+The kernel of Section~\ref{sec:v2} changed which route is taken, what precision each stage runs in, and --- once it was fast enough to stop dominating --- what the rest of the program costs. All three are inside the end-to-end numbers of Section~\ref{sec:exp}.
+
+\subsection{Routing}
+\label{sec:route}
+
+Both resident-table routes were re-timed against the march and both declined. The polarised slab of Section~\ref{sec:tables} at $N_{\mathrm{side}}=512$ is $41.5\,\mathrm{ms}$ per pass with a $43.9\,\mathrm{GiB}$ device peak; the march is $3.9\,\mathrm{ms}$ with $1.1\,\mathrm{GiB}$. The resident $\theta$-band route for scalars is slower than the march at every size at which it can be built. The march therefore serves every geometry with $L\ge192$, i.e.\ $N_{\mathrm{side}}\ge64$.
+
+Below that gate it is switched off, and the exact float64 routes keep the call: the geometry pads to one $512$-lane tile whatever the ring count, so at $N_{\mathrm{side}}=32$ three quarters of every lane is padding and the march stops paying. The small-geometry tests pin those routes to $10^{-13}$.
+
+The coefficient tables of a window depend on the geometry alone, so they stay resident while their bytes plus six ring spectra fit half the pool. That admits $N_{\mathrm{side}}=4096$ spin~$0$ ($7.5\,\mathrm{GiB}$ of tables) and refuses $N_{\mathrm{side}}=4096$ spin~$2$ ($8.25\,\mathrm{GiB}$ beside a pipeline that peaks above $56\,\mathrm{GiB}$, and whose mask geometry at $L=24575$ would be $30\,\mathrm{GiB}$ if it were materialised at once). Building those windows inside the trace instead is what let the polarised $N_{\mathrm{side}}=4096$ pipeline finish; the eviction path frees them last, after the Wigner-$d$ cache and the ring tables.
+
+\subsection{Precision defaults are size-gated}
+
+Ring and coupling precision are \texttt{auto} by default and resolve to float32 exactly where the march serves and float64 below it. The two are not independent choices: once the latitudinal operator is a float32-class kernel, a float64 ring stage buys nothing, and it was $55$~per cent of a polarised pass and halves in \texttt{complex64}. The coupling matrix's float64 contractions run at $1/64$ of the float32 rate on this card (Section~\ref{sec:wall}).
+
+The exact route still exists and is one flag away. Setting \texttt{GMASTER\_MARCH\_V2=0} with float64 rings and float64 coupling reproduces the previous generation's agreement with NaMaster digit for digit (Table~\ref{tab:acc}).
+
+\subsection{The coupling stage is one contraction}
+
+At $N_{\mathrm{side}}=2048$ spin~$2$ the decoupling product is $(1636,24576)\times(24576,24576)$, $2.0\,\mathrm{TFLOP}$, and in float64 on this card it is $567\,\mathrm{ms}$ of a $661\,\mathrm{ms}$ stage against $58\,\mathrm{ms}$ for the coupling matrices it contracts. Under the same \texttt{auto} rule it runs with float32 operands at \texttt{Precision.HIGHEST} and the stage is $141\,\mathrm{ms}$.
+
+A rewrite of the scalar coupling build into an upper-triangle form, with three of its four per-element gathers turned into broadcasts, was written, verified to $4.8\times10^{-16}$, and rejected on measurement: $223$ against $200\,\mathrm{ms}$ at $\ell_{\max}=6143$ and $1895$ against $1761\,\mathrm{ms}$ at $12287$. The pass is not gather-issue bound the way its operand count suggests.
+
+\subsection{Four fusion traps}
+\label{sec:fusion}
+
+Each of the following cost more wall clock than the kernel change of Section~\ref{sec:v2}, and none of them is visible when the kernel is timed alone. They are properties of JAX and XLA rather than of MASTER, and are recorded for that reason.
+
+\textit{A \texttt{jit} inside a \texttt{jit} is not a fusion boundary.} The forward implementation is inlined into its caller's trace, and XLA then re-derived the transposed ring spectrum inside every window's lane gather: $48$ strided passes over a $1.6\,\mathrm{GiB}$ array, $73\,\mathrm{ms}$ of a $156\,\mathrm{ms}$ $N_{\mathrm{side}}=2048$ spin-$2$ analysis. An inner \texttt{jit} does not stop this; \texttt{lax.optimization\_barrier} on the two transposed blocks and on the folded right-hand side does. The pass went $155.7\to82.2\,\mathrm{ms}$.
+
+\textit{A diagonal-in-$\ell$ finish must be one pass.} The degree normalisation, the spin sign and the sub-spin zeroing are all diagonal in $\ell$ and were three separate passes over a $1.2\,\mathrm{GiB}$ block. Multiplied into one $(L,)$ vector they are one read and one write.
+
+\textit{An output reversal belongs in the producer.} The spin-$2$ output assembly reversed the assembled matrix after building it. Stacking the mirror half in descending order at float32, before the transpose, removes the reversal entirely.
+
+\textit{A per-window \texttt{jax.jit(partial(...))} recompiles.} A \texttt{partial} object is a new callable at every call, so the JIT cache misses every time. With the window origin traced and only the block count static, the geometry compiles once. This was a $57\,\mathrm{s}$ pass at $N_{\mathrm{side}}=4096$ --- $24$ windows at about $2\,\mathrm{s}$ of compilation each.
+
+A fifth of the same kind, a scatter-add whose masked-out half addressed a single element and thereby serialised $8.4$ million atomic additions, is stated in Section~\ref{sec:scatter}, where the layout it arose from is defined.
+
+\subsection{Devices inherited from the table routes}
+
+Two earlier pipeline devices survive. \emph{Traced refinement loops}: the $1+2n_{\mathrm{iter}}$ passes of an analysis are one compiled program below a measured gate ($L\le1536$ polarised, $L\le768$ scalar), bit-identical to the per-pass loop and worth $6$--$9$~per cent of the transform stage where they apply; on the generic route the same trace is $13$~per cent slower and is not taken. \emph{Shared field and mask transforms}: where a Legendre band was resident, one band read served both maps with four accumulators instead of two, bit-identical, at $0.53$--$0.56$ of two calls at $N_{\mathrm{side}}=256$--$1024$. That device is now the kernel-level pairing of Section~\ref{sec:pair}.
+
+\section{Experiments}
+\label{sec:exp}
+
+All measurements below are single-tenant runs on GPU1 of the machine described in Section~2, on 13 September 2026, with the shipped defaults: float64 tables where a table is built, \texttt{ring\_precision} and \texttt{coupling\_precision} on \texttt{auto}, the \texttt{cuda\_async} allocator, and the v2 march for $L\ge192$. End-to-end totals are warmed medians of the blocked TOTAL (field, coupling, coupled cell, decouple) from \texttt{benchmarks/benchmark\_pipeline.py}. Relative error is the maximum relative deviation of the coupled spectrum from \texttt{pymaster}. NaMaster wall times move by about $8$~per cent between runs at $N_{\mathrm{side}}=2048$ and by $\pm15$~per cent at $N_{\mathrm{side}}\le256$, so ratios are quoted with the GMaster milliseconds attached.
+
+\subsection{End-to-end MASTER}
+
+Figure~\ref{fig:scoreboard} and Table~\ref{tab:e2e} are the board against NaMaster using the whole 96-core host. The shipped route is $10.2$--$21.2\times$ NaMaster at $N_{\mathrm{side}}=128$--$2048$ in both spins, $5.0$--$5.8\times$ at $N_{\mathrm{side}}=64$, and $9.5$--$9.6\times$ at $N_{\mathrm{side}}=4096$ spin~$0$. Every cell the reference can run has GMaster TOTAL strictly below NaMaster TOTAL.
+
+\begin{figure*}
+\centering
+\includegraphics[width=\textwidth]{figures/fig_scoreboard.pdf}
+\caption{End-to-end MASTER wall time. Grey is NaMaster on the full 96-core host, light grey the same reference pinned to 32 cores (Table~\ref{tab:e2e32}), blue GMaster. NaMaster is absent at $N_{\mathrm{side}}=4096$ spin~$2$, where it segfaults on its own coupling matrix, and the 32-core board was not run above $N_{\mathrm{side}}=2048$.}
+\label{fig:scoreboard}
+\end{figure*}
+
+\begin{table}
+\centering
+\setlength{\tabcolsep}{4pt}
+\caption{End-to-end MASTER on the full 96-core host. NM and GM are NaMaster and GMaster milliseconds; rel is the maximum relative deviation of the coupled spectrum from \texttt{pymaster}. At $N_{\mathrm{side}}=4096$ spin~$2$ stock NaMaster segfaults on 32-bit MCM indices (Section~\ref{sec:sht}) and no paired run exists; the GMaster entry is a GMaster-only pipeline returning finite decoupled bandpowers of shape $(4,409)$ at a $63.6\,\mathrm{GiB}$ device peak. Both TOTALs release the compile-time field before the warm pipeline.}
+\label{tab:e2e}
+\small
+\begin{tabular}{@{}rrrrrl@{}}
+\toprule
+$N_{\mathrm{side}}$ & spin & NM & GM & Ratio & rel \\
+\midrule
+64   & 0 & $9$     & $2$    & $5.8$  & $1.15\times10^{-7}$ \\
+64   & 2 & $12$    & $2$    & $5.0$  & $2.72\times10^{-7}$ \\
+128  & 0 & $20$    & $1$    & $13.3$ & $4.92\times10^{-7}$ \\
+128  & 2 & $40$    & $3$    & $13.1$ & $4.37\times10^{-7}$ \\
+256  & 0 & $58$    & $4$    & $15.0$ & $6.36\times10^{-7}$ \\
+256  & 2 & $161$   & $8$    & $20.7$ & $6.30\times10^{-7}$ \\
+512  & 0 & $314$   & $17$   & $18.1$ & $7.07\times10^{-7}$ \\
+512  & 2 & $641$   & $30$   & $21.2$ & $2.99\times10^{-6}$ \\
+1024 & 0 & $1682$  & $102$  & $16.5$ & $1.45\times10^{-6}$ \\
+1024 & 2 & $3017$  & $212$  & $14.2$ & $7.79\times10^{-6}$ \\
+2048 & 0 & $10311$ & $1014$ & $10.2$ & $7.25\times10^{-6}$ \\
+2048 & 2 & $17767$ & $1244$ & $14.3$ & $1.19\times10^{-5}$ \\
+4096 & 0 & $71583$ & $7458$ & $9.6$  & $7.0\times10^{-6}$ \\
+4096 & 2 & ---     & $8805$ & ---    & finite, $(4,409)$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The polarised $N_{\mathrm{side}}=4096$ cell is the one place where there is no pair to quote. Stock NaMaster cannot compute it at all, for the indexing reason of Section~\ref{sec:sht}; a previous session patched the reference's binning kernel to 64-bit indices and measured $107.6\,\mathrm{s}$ against GMaster's $50.6\,\mathrm{s}$, but that patched reference was not re-run here. What did change is the GMaster side: the same cell is now $8.805\,\mathrm{s}$, a $5.7\times$ reduction against the $50.6\,\mathrm{s}$ of the previous kernel, with a $63.6\,\mathrm{GiB}$ device peak. The scalar $N_{\mathrm{side}}=4096$ cell should be read as two numbers. Inside the benchmark harness it is $7.46\,\mathrm{s}$ against NaMaster's $71.2$--$71.6\,\mathrm{s}$, i.e.\ $9.5$--$9.6\times$; run on its own with \texttt{--skip-reference}, the same pipeline is $4.90\,\mathrm{s}$. The gap is a harness artifact rather than a property of the pipeline: the stage columns keep about ten throw-away fields alive across the measurement, and that is enough to evict the march's resident window tables under the residency rule of Section~\ref{sec:route}. The tabulated ratio is the harness one, which is the conservative choice.
+
+\subsection{A real ACT DR6 temperature map}
+\label{sec:act}
+
+Table~\ref{tab:e2e} is a synthetic board. Figure~\ref{fig:act} is the same estimator on the ACT DR6 night-time PA4 $f150$ source-free coadd \citep{naess2025}, Stokes $I$, degraded from native $N_{\mathrm{side}}=8192$ to $N_{\mathrm{side}}=4096$. Panel~(a) is the survey window used as the mask (finite non-zero pixels of the coadd; $f_{\mathrm{sky}}=0.481$), shown in equatorial coordinates over the same declination strip as Fig.~1 of \citet{naess2025}. Panel~(b) is Stokes $I$ on that footprint. GMaster and NaMaster share the mask, linear bins of width $50$, and $n_{\mathrm{iter}}=3$. Only the estimator is timed. The decoupled TT spectrum in panel~(c) agrees to $\mathrm{rms}(C_\ell^{\mathrm{GM}}/C_\ell^{\mathrm{NM}}-1)=1.41\times10^{-5}$ (maximum $4.9\times10^{-5}$; panel~(d)). Wall-clock after compilation: $7.63\,\mathrm{s}$ GMaster versus $70.4\,\mathrm{s}$ NaMaster on $192$ cores ($9.2\times$). This is a methods overlay, not an ACT science product: one coadd auto-spectrum, no beam deconvolution, no split cross-spectrum, and no covariance.
+
+\begin{figure*}
+\centering
+\includegraphics[width=\textwidth]{figures/fig_act_overlay.pdf}
+\caption{(a)~Survey window of the ACT DR6 night PA4 $f150$ source-free coadd \citep{naess2025}, equatorial coordinates, east left, RA~$=0^\circ$ at centre, $\mathrm{Dec}\in[-70^\circ,30^\circ]$. The estimator uses this window as a binary mask at $N_{\mathrm{side}}=4096$; the panel is the same window degraded to $N_{\mathrm{side}}=256$ for display ($f_{\mathrm{sky}}=0.481$). (b)~Stokes $I$ on that footprint (colour scale clipped at the 95th percentile of $\lvert I\rvert$). (c)~Decoupled TT $D_\ell$ from GMaster and NaMaster, linear bins of width $50$, $n_{\mathrm{iter}}=3$. (d)~Fractional difference. Reproduce with \texttt{python paper/gmaster\_paper/figures/make\_figures.py}.}
+\label{fig:act}
+\end{figure*}
+
+The split across stages is not uniform (Fig.~\ref{fig:stages}). At $N_{\mathrm{side}}=1024$ spin~$0$ the field transform is $456\to80\,\mathrm{ms}$, the mask transform $421\to0\,\mathrm{ms}$ (it is paired into the field, Section~\ref{sec:pair}), and the coupling matrix $777\to22\,\mathrm{ms}$. At spin~$2$, where the mask is a separate spin-$0$ transform and does not pair, they are $833\to118$, $405\to67$ and $1685\to25\,\mathrm{ms}$. At $N_{\mathrm{side}}=2048$ spin~$2$ the same three are $4497\to734$, $2203\to358$ and $10188\to143\,\mathrm{ms}$, and at $N_{\mathrm{side}}=4096$ spin~$0$, $14368\to4357$, $14045\to8$ and $42481\to3055\,\mathrm{ms}$. The coupled-cell stage is two orders of magnitude faster at every size and never matters. The weakest stage ratio on the board is now the same one it has always been, the latitudinal transform at the top of the board, which is exactly the ratio Table~\ref{tab:sht} isolates.
+
+\begin{figure*}
+\centering
+\includegraphics[width=\textwidth]{figures/fig_stages.pdf}
+\caption{Stage marginals at $N_{\mathrm{side}}=1024$ and $2048$ from the board of Table~\ref{tab:e2e}. ``Field + mask'' is the transform stage; at spin~$0$ the mask is paired into the field on the GMaster side, so its column is the pair. Coupling is the strongest stage ratio, the transform the weakest.}
+\label{fig:stages}
+\end{figure*}
+
+\subsection{The same board with a 32-core reference}
+
+Table~\ref{tab:e2e32} repeats the board with \texttt{--reference-cpus 32}. This is a statement about a smaller \emph{host}, not a different GMaster: the flag pins CPU affinity and \texttt{OMP\_NUM\_THREADS} for the whole benchmark process, so GMaster's own host side --- the Python driver, the table builds, the compile-time work --- is limited in exactly the same way, and several GMaster cells are slower than in Table~\ref{tab:e2e} for that reason. Ratios are $19.5$--$59.6\times$.
+
+The table is included because a 96-core Threadripper is not the machine most NaMaster users have, not because it is a reproduction of anyone else's measurement: a 9995WX core is not a Xeon Gold 8358 core, and these numbers say nothing about what NaMaster does on a cluster node. Read together, the two boards bracket the reference's thread scaling rather than settling it.
+
+\begin{table}
+\centering
+\setlength{\tabcolsep}{5pt}
+\caption{End-to-end MASTER with the reference pinned to 32 cores (\texttt{--reference-cpus 32}: CPU affinity and \texttt{OMP\_NUM\_THREADS} for the whole benchmark, GMaster's host side included). Milliseconds.}
+\label{tab:e2e32}
+\small
+\begin{tabular}{@{}rrrrr@{}}
+\toprule
+$N_{\mathrm{side}}$ & spin & NM (32 cores) & GM & Ratio \\
+\midrule
+64   & 0 & $35$    & $1$    & $25.6$ \\
+64   & 2 & $40$    & $2$    & $22.1$ \\
+128  & 0 & $54$    & $2$    & $32.8$ \\
+128  & 2 & $84$    & $3$    & $27.3$ \\
+256  & 0 & $130$   & $4$    & $32.4$ \\
+256  & 2 & $490$   & $8$    & $59.6$ \\
+512  & 0 & $549$   & $18$   & $30.8$ \\
+512  & 2 & $1467$  & $30$   & $48.7$ \\
+1024 & 0 & $3194$  & $159$  & $20.1$ \\
+1024 & 2 & $5485$  & $212$  & $25.8$ \\
+2048 & 0 & $19717$ & $1013$ & $19.5$ \\
+2048 & 2 & $31622$ & $1244$ & $25.4$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Isolated SHT versus DUCC}
+\label{sec:sht}
+
+Table~\ref{tab:sht} and Fig.~\ref{fig:ducc} strip the pipeline away and time one warmed latitudinal pass --- \texttt{map2alm} at $n_{\mathrm{iter}}=0$ and \texttt{alm2map} --- against the exact \texttt{ducc0} call NaMaster issues, in one process on GPU1. The margin is $5.6$--$8.5\times$ across $N_{\mathrm{side}}=1024$--$4096$ in both spins and both directions, against $1.13$--$1.92\times$ for the same rows with the first kernel. The largest single transform on the board, polarised $N_{\mathrm{side}}=4096$, is $3.81\,\mathrm{s}\to0.68\,\mathrm{s}$ on analysis and $3.87\to0.66\,\mathrm{s}$ on synthesis.
+
+The margin narrows toward the top of the board, from $8.1\times$ to $7.2\times$ on scalar analysis and from $8.2\times$ to $5.6\times$ on polarised analysis, for the same reason as before: doubling $N_{\mathrm{side}}$ multiplies the triple count by eight, while DUCC recurses along the ring instead of building the row and pays about $6.3$--$6.5\times$ per doubling. The agreement with DUCC is $\sim1.2\times10^{-7}$ on the coefficients at every cell, roughly two decades better than the first kernel's $10^{-5}$--$10^{-4}$, which is the difference form of Section~\ref{sec:diff} showing up at map level.
+
+\begin{figure*}
+\centering
+\includegraphics[width=\textwidth]{figures/fig_ducc.pdf}
+\caption{One warmed latitudinal pass against \texttt{ducc0}~0.39.1 on the 96-core host, from Table~\ref{tab:sht}. Only the cells the shipped route serves are plotted; earlier resident-table cells are not, because they are no longer the route taken.}
+\label{fig:ducc}
+\end{figure*}
+
+\begin{table}
+\centering
+\caption{One warmed latitudinal pass against \texttt{ducc0} (ms), GPU1, $n_{\mathrm{iter}}=0$. ``$a$'' is \texttt{map2alm}, ``$m$'' is \texttt{alm2map}; ratios are DUCC time over GMaster time. The last column is the maximum absolute coefficient difference against DUCC \texttt{map2alm}.}
+\label{tab:sht}
+\footnotesize
+\setlength{\tabcolsep}{2.5pt}
+\begin{tabular}{@{}rrrrcrrcc@{}}
+\toprule
+$N_{\mathrm{side}}$ & $s$ & DUCC $a$ & GM $a$ & $\times$ & DUCC $m$ & GM $m$ & $\times$ & $\max\lvert\Delta a_{\ell m}\rvert$ \\
+\midrule
+1024 & 0 & $58.2$   & $7.2$   & $8.1$ & $57.1$   & $7.1$   & $8.0$ & $1.03\times10^{-7}$ \\
+1024 & 2 & $107.6$  & $13.1$  & $8.2$ & $110.2$  & $12.9$  & $8.5$ & $1.04\times10^{-7}$ \\
+2048 & 0 & $310.2$  & $42.0$  & $7.4$ & $295.7$  & $36.6$  & $8.1$ & $1.15\times10^{-7}$ \\
+2048 & 2 & $603.2$  & $82.3$  & $7.3$ & $576.9$  & $81.5$  & $7.1$ & $1.18\times10^{-7}$ \\
+4096 & 0 & $1917.3$ & $266.4$ & $7.2$ & $1962.6$ & $302.6$ & $6.5$ & $1.22\times10^{-7}$ \\
+4096 & 2 & $3811.9$ & $676.5$ & $5.6$ & $3873.3$ & $658.8$ & $5.9$ & $1.22\times10^{-7}$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The polarised $N_{\mathrm{side}}=4096$ MASTER cell has no NaMaster pair because stock NaMaster segfaults in \texttt{nmt\_bin\_mcm}, which indexes the flattened MCM with a signed 32-bit \texttt{int}: for a spin-$2$ auto-spectrum, $n_{\mathrm{cls}}=4$ and $\ell_{\max}+1=12288$ give $n_{\mathrm{cls}}^2(\ell_{\max}+1)^2=2.42\times10^{9}$ entries, past $2^{31}-1$. The $3j$ build and the $6.0\times10^{8}$-element $0\times2$ cross-spectrum are below that threshold, and the cross finishes in $115\,\mathrm{s}$. Replacing only the binning kernel with 64-bit NumPy indexing, leaving the reference's tree and $3j$ coefficients untouched, made the auto-spectrum complete in $107.6\,\mathrm{s}$ in a previous session.
+
+\subsection{Accuracy, and the exact route}
+
+The shipped route is a float32-class route. Table~\ref{tab:acc} states what that costs and what turning it off recovers. With the march disabled and both ring and coupling precision forced to float64, the coupled spectra reproduce the previous generation's agreement digit for digit --- $4.79\times10^{-13}$ at $N_{\mathrm{side}}=256$ spin~$0$ and $1.71\times10^{-12}$ at $512$ spin~$0$, the same values an earlier session recorded for the exact route.
+
+The shipped column is $\sim10^{-6}$ relative on the decoupled bandpowers. That is five to six orders below NaMaster's own $n_{\mathrm{iter}}=3$ truncation, which moves the decoupled $C_\ell$ by $9$--$13$~per cent, so for the use the estimator is put to the default is not the limiting approximation. It is nonetheless a real change of contract against NaMaster, and Section~\ref{sec:lim} says so.
+
+\begin{table}
+\centering
+\caption{Maximum relative deviation of the decoupled bandpowers from \texttt{pymaster}, for the shipped route and for the exact route (\texttt{GMASTER\_MARCH\_V2=0} with float64 rings and float64 coupling).}
+\label{tab:acc}
+\small
+\begin{tabular}{@{}rrll@{}}
+\toprule
+$N_{\mathrm{side}}$ & spin & Shipped & Exact route \\
+\midrule
+256 & 0 & $7.12\times10^{-7}$ & $4.79\times10^{-13}$ \\
+256 & 2 & $6.30\times10^{-7}$ & $2.74\times10^{-8}$  \\
+512 & 0 & $6.20\times10^{-7}$ & $1.71\times10^{-12}$ \\
+512 & 2 & $3.13\times10^{-6}$ & $3.56\times10^{-7}$  \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Figure~\ref{fig:accuracy} puts the two statements side by side: the float32 error floors of the march itself (Table~\ref{tab:dform}), and the pipeline-level agreement of the two routes.
+
+\begin{figure}
+\centering
+\includegraphics[width=\columnwidth]{figures/fig_accuracy.pdf}
+\caption{Left: relative error of a float32 march against the float64 recurrence at $N_{\mathrm{side}}=1024$ spin~$0$, for the plain three-term form, the difference form with a single-word $C$, and the shipped two-word $C$. Right: maximum relative deviation of the decoupled bandpowers from NaMaster for the shipped route and for the exact route.}
+\label{fig:accuracy}
+\end{figure}
+
+The test suite is $181$ passed and $52$ skipped on CPU, and $133$ passed and $3$ skipped on the GPU transform, workspace and utility suites, including a pairing identity that pins the paired synthesis march to bit equality with two separate launches, and a bar on the default route at $N_{\mathrm{side}}=64$ and $128$. The Lean project builds with no \texttt{sorry}.
+
+\subsection{Closed GPU levers}
+
+A hand-written Pallas kernel for the four-channel Wigner contraction reached only $180$--$240\,\mathrm{GB\,s}^{-1}$ against XLA's $664$--$1572\,\mathrm{GB\,s}^{-1}$ on the same buffers and was not shipped. Padding the odd HEALPix reduce length $N_\theta=4N_{\mathrm{side}}-1$ to an aligned multiple changed bandwidth by at most $4.8$~per cent. Tensor-core fp64 emulation and limb schemes were slower than SIMT fp64 at the accuracy required for NaMaster agreement. Five-smooth FFT lengths lost to powers of two on this card ($7200$ points at $2.51\,\mathrm{ms}$ versus $8192$ at $2.02\,\mathrm{ms}$). Polar-cap size classes promised by Lemma~\ref{lem:alias} are not implemented. A sweep of the analysis block shape (tiles $128$--$2048$, one to eight warps) found the shipped tile of $256$ lanes with one warp at the bottom of both curves, every arm agreeing to $10^{-7}$. Deleting recurrence limbs and hoisting the spin-$2$ right-hand side were measured and not shipped. What did move the first kernel was not a launch-shape knob but the float64 tail of the emit (Section~\ref{sec:emit}), which none of the earlier ablations had separated from the reduction trees, and the polar cutoff the reference had always applied (Section~\ref{sec:polar}). The v2 kernel added three more rejections: the resident polarised slab and the resident $\theta$-band, both slower than the march at every size that can build them (Section~\ref{sec:route}); five of six swept $(\mathrm{LPT}_{\mathrm{ana}},\mathrm{LPT}_{\mathrm{syn}},\mathrm{UNR})$ shapes; and an upper-triangle rewrite of the scalar coupling build that was exact to $4.8\times10^{-16}$ and slower (Section~\ref{sec:pipeline}). What moved it was the form of the recurrence, not the width of its words.
+
+\section{A second operator: the general (non-uniform) SHT}
+\label{sec:nusht}
+
+\subsection{What this is, and what it is not}
+
+Everything above is the isolatitude HEALPix transform and the MASTER algebra built on it. This section is a \emph{different operator}: evaluate a band-limited field at arbitrary points on the sphere, and apply its adjoint. It is what \texttt{ducc0} exposes as \texttt{synthesis\_general} and \texttt{adjoint\_synthesis\_general} \citep{reinecke2023}, and what cunuSHT computes on the GPU \citep{belkner2024}. It is the operator those papers benchmark, and it is the one that lensing pipelines call.
+
+GMaster did not implement it at all until now. Earlier sessions of this project read the cunuSHT paper and declined to adopt its method for full-sky ring transforms; that was an algorithm-selection argument about the HEALPix pipeline, and it was never a benchmark against cunuSHT or against anything else. We say so explicitly because the two things are easy to conflate, and because the numbers below are the first measurement of this operator that GMaster has ever produced.
+
+\subsection{The method}
+
+The factorisation is the standard double-Fourier-sphere one, $Y=NFDS$, with the march of Section~\ref{sec:v2} in the latitudinal slot.
+
+$S$, the latitudinal factor, is the same kernel. It is geometry-agnostic once its lane layout is built from an arbitrary symmetric latitude grid rather than from the HEALPix rings; we use the Fej\'er-1 grid $\theta_j=(2j+1)\pi/(2N_\theta)$, which is equidistant, symmetric about $\pi/2$ and excludes the poles, so the kernel's north--south fold is exactly the ring reversal. On that grid it agrees with \texttt{ducc0}'s isolatitude synthesis on the same rings to $2.9\times10^{-7}$ at $\ell_{\max}=255$.
+
+$D$ and $F$ take the ring spectrum to a Fourier series on the torus. The doubling
+\begin{equation}
+\label{eq:double}
+  F(2\pi-\theta,m)=(-1)^{m+s}F(\theta,m)
+\end{equation}
+extends the stack to the full circle, and a latitude FFT with a half-sample phase gives the two-dimensional Fourier coefficients. This step is exact: the composition through it, checked against \texttt{ducc0}'s own general synthesis at arbitrary points, agrees to $4.9\times10^{-14}$. The grid bound is $N_\theta\ge\ell_{\max}+1$, and that is the correct bound rather than a convenience: $F(\theta,m)$ is a trigonometric polynomial of degree $\ell_{\max}$ in $\theta$, so the doubled stack carries the $2\ell_{\max}+1$ modes $\lvert k\rvert\le\ell_{\max}$, which $2N_\theta\ge2\ell_{\max}+2$ equispaced samples resolve with one slot to spare. Taking it at equality is what makes the latitude FFT a power of two at $\ell_{\max}=2^k-1$ ($4096$ rather than $4320$ at $\ell_{\max}=4095$), worth about $20$~per cent of that FFT and $10$~per cent of the NUFFT, and the extra ring buys no accuracy ($6.29\times10^{-6}$ against $6.15\times10^{-6}$, both float32 march noise). The doubled stack is the largest array in the transform, $1.07\,\mathrm{GiB}$ in \texttt{complex128} at $\ell_{\max}=4095$; running the latitude FFT in \texttt{complex64} costs $3\times10^{-7}$ relative, a decade under the march's own noise, and is $2.7\times$ faster on that stage ($7.1\to2.7\,\mathrm{ms}$).
+
+$N$ is cufinufft, two-dimensional type 2 for synthesis and type 1 for the adjoint, with upsampling factor $1.25$ and tolerance $10^{-6}$.
+
+Two identities had to be established numerically rather than assumed, and both are now tested. First, the analysis march is the transpose of the synthesis march only after an explicit $(-1)^{\ell+s}$ on the mirror channel; without it the bilinear-form test fails. Secondly, \texttt{ducc0}'s \texttt{adjoint\_synthesis\_general} is the \emph{analysis-shaped} adjoint $\bar a_{\ell m}=\sum_p f_p\,\overline{Y_{\ell m}(p)}$ and is therefore not the transpose of its own synthesis: the $m<0$ half of the Hermitian \texttt{alm} is not folded back onto $m>0$, which would double it. We match \texttt{ducc0}'s convention. The implementation is \texttt{gmaster/nusht.py} with twelve tests in \texttt{tests/test\_nusht.py}.
+
+\subsection{A fifth fusion trap: the one-address scatter}
+\label{sec:scatter}
+
+This belongs with the host-side findings of Section~\ref{sec:fusion} and is the sharpest of them; it is recorded here because it needs the packing layout above to state.
+
+Packing the $(L,L)$ coefficient block into the flat \texttt{mstart} layout was written as \texttt{zeros(nalm).at[idx.ravel()].add(...)}. The $\ell<m$ half of the block has no destination, so it is masked to index $0$ --- and a masked scatter-add still \emph{adds}. Half of $L^2$ entries, $8.4$ million \texttt{complex128} atomic additions at $\ell_{\max}=4095$, therefore serialised onto a single address: $26.75\,\mathrm{ms}$ of a $45.4\,\mathrm{ms}$ adjoint. The same permutation written as its inverse gather --- precompute, for each packed slot, the flat index it comes from --- is $0.31\,\mathrm{ms}$. A scatter whose destination index is degenerate is not a slow scatter; it is a serial loop wearing a parallel primitive's clothing, and the fix is to invert the map, not to tune the scatter. With that and the two grid levers above, the adjoint went $83.4\to47.6\,\mathrm{ms}$.
+
+\subsection{Against \texttt{ducc0} on this box}
+
+Table~\ref{tab:nusht} is the measured board: one RTX~PRO~6000 Blackwell against \texttt{ducc0}~0.39.1 on the same host, uniform random points with $N=\ell_{\max}^2$, warm minimum of five, with plans and tables pre-built and excluded and host--device copies excluded on both sides. The two codes are compared at matched \emph{measured} effective accuracy: $\epsilon_{\mathrm{eff}}$ is the error definition of \citet{belkner2024}, evaluated by brute force at $10^5$ points against \texttt{ducc0} at $\epsilon=10^{-12}$, and \texttt{ducc0} is run at the tolerance whose realised error lands nearest ours, which is $\epsilon=10^{-4}$ in every cell.
+
+Synthesis is $2.8$--$6.0\times$ \texttt{ducc0} on all 96 cores and $3.4$--$5.2\times$ on 32; the adjoint is $2.7$--$5.1\times$ and $3.0$--$4.3\times$. Both directions are NUFFT-bound at the top of the board: cufinufft is $76$--$77$~per cent of the time at $\ell_{\max}=4095$, so the march is no longer the operator's cost centre here.
+
+The accuracy comparison goes the other way, and it is not close. \emph{\texttt{ducc0} is $1.3$--$5\times$ more accurate than GMaster in every cell of Table~\ref{tab:nusht}}: it is being run at the tolerance nearest ours and it overshoots it. More importantly, GMaster cannot be asked for better. Its floor is $\sim2\times10^{-6}$ on synthesis and $\sim5\times10^{-6}$ on the adjoint, and that floor is the float32 march of Section~\ref{sec:v2}, not the NUFFT: $\epsilon_{\mathrm{eff}}$ does not move across cufinufft tolerances from $10^{-6}$ to $10^{-8}$, nor between upsampling factors $1.25$ and $2.0$. \texttt{ducc0} reaches $10^{-13}$. The speed-ups in Table~\ref{tab:nusht} are therefore speed-ups \emph{at a fixed, and not very demanding, accuracy}, and they say nothing about a regime that needs more.
+
+\begin{table*}
+\centering
+\caption{General (non-uniform) SHT: GMaster against \texttt{ducc0}~0.39.1 on the same host, milliseconds, warm minimum of five, $N=\ell_{\max}^2$ uniform random points, plans and tables excluded. Type 2 is synthesis, type 1 the adjoint. $\epsilon_{\mathrm{eff}}$ is the measured effective accuracy of \citet{belkner2024}; \texttt{ducc0} is run at $\epsilon=10^{-4}$, the tolerance whose realised error is nearest GMaster's, and it overshoots it in every cell. The 32-thread columns were run at spin~$0$ only.}
+\label{tab:nusht}
+\small
+\begin{tabular}{@{}rrrrrrrrrr@{}}
+\toprule
+$\ell_{\max}$ & spin & type & GMaster & \texttt{ducc0} 96 thr & $\times$ & \texttt{ducc0} 32 thr & $\times$ & GMaster $\epsilon_{\mathrm{eff}}$ & \texttt{ducc0} $\epsilon_{\mathrm{eff}}$ \\
+\midrule
+1023 & 0 & 2 & $3.0$  & $8.4$   & $2.80$ & $10.3$  & $3.43$ & $1.88\times10^{-6}$ & $1.46\times10^{-6}$ \\
+1023 & 0 & 1 & $2.8$  & $7.6$   & $2.69$ & $8.3$   & $2.96$ & $4.64\times10^{-6}$ & $3.24\times10^{-6}$ \\
+1023 & 2 & 2 & $3.1$  & $15.7$  & $5.03$ & ---     & ---    & $1.90\times10^{-6}$ & $1.57\times10^{-6}$ \\
+1023 & 2 & 1 & $3.3$  & $16.1$  & $4.91$ & ---     & ---    & $4.49\times10^{-6}$ & $3.37\times10^{-6}$ \\
+2047 & 0 & 2 & $9.3$  & $37.5$  & $4.03$ & $48.3$  & $5.19$ & $3.44\times10^{-6}$ & $1.44\times10^{-6}$ \\
+2047 & 0 & 1 & $10.8$ & $34.1$  & $3.15$ & $44.3$  & $4.10$ & $8.84\times10^{-6}$ & $3.42\times10^{-6}$ \\
+2047 & 2 & 2 & $10.6$ & $63.7$  & $6.04$ & ---     & ---    & $3.47\times10^{-6}$ & $1.48\times10^{-6}$ \\
+2047 & 2 & 1 & $12.1$ & $61.8$  & $5.11$ & ---     & ---    & $8.79\times10^{-6}$ & $3.37\times10^{-6}$ \\
+4095 & 0 & 2 & $41.3$ & $150.5$ & $3.65$ & $211.5$ & $5.12$ & $6.30\times10^{-6}$ & $1.32\times10^{-6}$ \\
+4095 & 0 & 1 & $47.6$ & $139.0$ & $2.92$ & $204.0$ & $4.29$ & $1.65\times10^{-5}$ & $3.27\times10^{-6}$ \\
+4095 & 2 & 2 & $49.5$ & $279.4$ & $5.65$ & ---     & ---    & $6.40\times10^{-6}$ & $1.43\times10^{-6}$ \\
+4095 & 2 & 1 & $56.5$ & $249.9$ & $4.42$ & ---     & ---    & $1.68\times10^{-5}$ & $3.39\times10^{-6}$ \\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+\subsection{Against cunuSHT's published model, which is not a head-to-head}
+
+cunuSHT was \textbf{not installed and not run}. It is not on PyPI, it needs pyCUDA together with a CUDA build of SHTns and nanobind, and it has been unmaintained since 2024. It also publishes no timing table; its only hard numbers are the Table~D1 fits $C(\ell)=\alpha\,\ell^3/\ell_{\mathrm{norm}}^3+\beta\,\ell^2\ln\ell/(\ell_{\mathrm{norm}}^2\ln\ell_{\mathrm{norm}})$ with $\ell_{\mathrm{norm}}=6067$. Table~\ref{tab:cunusht} evaluates that fit at $\epsilon=10^{-6}$, spin~$0$ (the only spin cunuSHT implements), and places our measurements beside it.
+
+Read the last column with care, and preferably not at all: it divides our measured milliseconds on one RTX~PRO~6000 Blackwell by their modelled milliseconds on an A100~80\,GB. The CPU baselines differ too --- our \texttt{ducc0} on 32 Zen5 cores is about $1.5\times$ faster than theirs on 32 Xeon Gold 8358 cores, which is visible by comparing columns 4 and 7. For the type-1 rows there is an accuracy mismatch on top of that: our $\epsilon_{\mathrm{eff}}$ is $4.6\times10^{-6}$ to $1.7\times10^{-5}$, five to seventeen times looser than the $\epsilon=10^{-6}$ column those rows are placed against; for type 2 ($1.9$--$6.4\times10^{-6}$) the placement is fair to within a factor of a few.
+
+The one quantity that transfers, because it cancels much of the hardware difference, is the speed-up each code reports over a 32-core CPU running the same operator: theirs is $2.4$--$4.3\times$, ours is $3.0$--$5.2\times$. The defensible statement is that the two codes are in the same class, with GMaster ahead, and that GMaster's margin is larger on the adjoint --- consistent with cunuSHT's own statement that the adjoint is its weaker direction. It is not a benchmark victory, and it must not be read as one. A head-to-head needs cunuSHT built and run on this box.
+
+\begin{table*}
+\centering
+\caption{GMaster against cunuSHT's \emph{published model}, spin~$0$, milliseconds. \textbf{cunuSHT was not installed and not run}: it publishes no timing table, and column~3 is its Table~D1 fit evaluated at $\epsilon=10^{-6}$, as is column~4 for the \texttt{ducc0} baseline of \citet{belkner2024}. Columns 6 and 7 are measured here. The GPUs differ (A100~80\,GB against one RTX~PRO~6000 Blackwell) and so do the CPUs (32 Xeon Gold 8358 cores against 32 Zen5 cores, ours about $1.5\times$ faster), so the last column divides measured milliseconds by modelled milliseconds on different hardware and is not a comparison. The transferable quantity is the speed-up over a 32-core CPU, columns 5 and 8. For the type-1 rows GMaster's $\epsilon_{\mathrm{eff}}$ is $5$--$17\times$ looser than the $\epsilon=10^{-6}$ these rows are placed against.}
+\label{tab:cunusht}
+\small
+\begin{tabular}{@{}rrrrrrrrr@{}}
+\toprule
+$\ell_{\max}$ & type & cunuSHT A100 (fit) & their \texttt{ducc0}, 32 thr (fit) & their $\times$ & GMaster & our \texttt{ducc0}, 32 thr & our $\times$ & GM / their GPU \\
+\midrule
+1023 & 2 & $3.7$   & $14.6$  & $3.98$ & $3.0$  & $10.3$  & $3.43$ & $1.22$ \\
+1023 & 1 & $6.4$   & $15.6$  & $2.43$ & $2.8$  & $8.3$   & $2.96$ & $2.29$ \\
+2047 & 2 & $16.3$  & $66.8$  & $4.09$ & $9.3$  & $48.3$  & $5.19$ & $1.76$ \\
+2047 & 1 & $28.3$  & $70.5$  & $2.49$ & $10.8$ & $44.3$  & $4.10$ & $2.62$ \\
+4095 & 2 & $72.9$  & $311.3$ & $4.27$ & $41.3$ & $211.5$ & $5.12$ & $1.76$ \\
+4095 & 1 & $123.5$ & $322.7$ & $2.61$ & $47.6$ & $204.0$ & $4.29$ & $2.60$ \\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+\section{Agentic search}
+\label{sec:agents}
+
+From 2026 August~19 to September~12 the library was developed by coding agents that proposed an operator change, timed it against NaMaster or DUCC on one GPU, and kept it only if it was exact at the documented tolerance \emph{and} moved the scoreboard. Thirty-six recorded sessions and several hundred measurement scripts are the audit trail. The loop rejected more operators than it shipped: a hand-written Pallas contraction, tensor-core float64 emulation, five-smooth FFT lengths, a tile-parallel recurrence, a segmented Wigner-$d$ anchor map, a wider analysis $\theta$-tile, a limb-free march, a traced generic-route refinement loop and a paired synthesis march all failed that test.
+
+Table~\ref{tab:tokens} is read from the Codex session snapshot and the Qwen per-call logs. Cached prompts dominate because each call reloads the same tree; uncached input plus output is the better proxy for new work. Codex on 19~August wrote the NaMaster-compatible API and the fused scalar recurrence. A local Qwen-27B session on 24--25~August added guarded spin kernels and the blocked-prefix prototype. Qwen-flash, 1--9~September, produced the half-spectrum identity, the belt FFT, offset-blocked coupling, memory-gated float32 tables, the compensated Jacobi march of Section~\ref{sec:march}, and the spin-$0$ fold of Section~\ref{sec:fold}. Sessions 30--37, 9--13~September, ran under Claude Code and produced the binade-split emit, the polar skip, the fixed-binade synthesis accumulator, the $N_{\mathrm{side}}=4096$ polarised fixes, the Lean project of Section~\ref{sec:formal}, and then the difference-form CUDA kernel of Section~\ref{sec:v2} with the routing, precision and fusion findings of Section~\ref{sec:pipeline}; their token logs are not in the per-call format of Table~\ref{tab:tokens} and are not tabulated. Those sessions also found that four earlier closures (``the kernel is issue bound'', ``there is nothing to batch'', ``the fp32-ring knob is forward-only'', ``the resident table wins wherever it fits'') were descriptions of the implementation rather than measurements of the cost, and reversed each with a number. This manuscript was typeset from those logs; it did not generate them.
+
+\begin{table}
+\centering
+\caption{Coding-agent token logs for GMaster. Codex (\texttt{gpt-5.6}) is the last \texttt{total\_token\_usage} of the 19~August session. Qwen rows are sums of per-call records. Total and New are token counts; New is uncached input plus output.}
+\label{tab:tokens}
+\small
+\begin{tabular}{@{}lcccc@{}}
+\toprule
+Phase & Dates & Calls & Total & New \\
+\midrule
+Codex & 19 Aug & --- & $2.17\times10^8$ & $3.5\times10^6$ \\
+Qwen-27B & 24--25 Aug & 1890 & $2.58\times10^8$ & $2.58\times10^8$ \\
+Qwen-flash & 1--5 Sep & 4060 & $5.45\times10^8$ & $3.6\times10^7$ \\
+\bottomrule
+\end{tabular}
+
+\vspace{2pt}
+{\raggedright\small Codex cached $2.13\times10^8$ prompt tokens; Qwen-flash cached $5.09\times10^8$. The 27B logger did not report cache hits, so its new-token column equals the total.\par}
+\end{table}
+
+The language model proposed Proposition~\ref{prop:herm}, Lemma~\ref{lem:alias}, the Jacobi identification~\eqref{eq:wigner-jacobi}, the fold~\eqref{eq:fold}, the binade split, the difference form of Proposition~\ref{prop:diff} with the modal argument of Section~\ref{sec:why}, and the Lean proofs; the GPU measurements reported throughout, and the Lean kernel for Section~\ref{sec:formal}, are what decided what entered the library.
+
+\section{Limitations, and what is not claimed}
+\label{sec:lim}
+
+\textit{$N_{\mathrm{side}}=64$ is the one size below $10\times$ on the 96-core host.} At $5.0$--$5.8\times$ it is not a transform result at all. A CUDA trace of the scalar pipeline at that size (\texttt{nsys profile -t cuda} on the shipped route, summarised in \texttt{.qwen/tmp/nside64\_profile\_s37.log} of the working tree) shows the device busy for $0.45\,\mathrm{ms}$ inside a $1.61\,\mathrm{ms}$ warm pipeline, median of nine warm repetitions, spread over $160$ kernel launches --- about $7\,\mu\mathrm{s}$ of gap per launch. The pipeline is launch-latency bound, not compute bound. The two march kernels together are $0.163\,\mathrm{ms}$ of the $0.45$ ($0.099\,\mathrm{ms}$ over four paired analysis launches and $0.064\,\mathrm{ms}$ over three paired synthesis launches), and $89$ of the $160$ launches are each under $13\,\mu\mathrm{s}$. The identified route to improving it is to fuse the azimuthal stage into a single kernel, which would remove $76$ of the $160$ launches --- the chirp-$Z$ FFTs, their cuBLAS scalings and the chirp multiplies. That was not attempted here. The march is nonetheless worth $1.5\times$ even at this size: the same cell is $2.44\,\mathrm{ms}$ with the v2 march disabled and the exact band route taken. On the 32-core board the same cell is $25.6\times$ (spin~$0$) and $22.1\times$ (spin~$2$), so the shortfall is specific to putting one GPU against 96 CPU cores on a $49\,152$-pixel map, not a property of the kernel. Below $N_{\mathrm{side}}=64$ the march is switched off entirely (Section~\ref{sec:route}), and $N_{\mathrm{side}}=32$ remains at parity with NaMaster.
+
+\textit{The shipped default is a float32-class route.} Its agreement with NaMaster on decoupled bandpowers is $\sim10^{-6}$ relative ($1.2\times10^{-7}$ to $1.2\times10^{-5}$ across Table~\ref{tab:e2e}), not the $10^{-12}$--$10^{-13}$ of a float64 pipeline. The exact route is one flag away and reproduces those figures (Table~\ref{tab:acc}), but it is not what a user gets by default, and anyone who needs NaMaster's float64 contract must ask for it. The error argument of Section~\ref{sec:why} is asymptotic and validated numerically; it is not proved, and the Lean project does not cover it.
+
+\textit{The march's structural approximations survive.} It starts at $\ell=\max(m,s)$ and contributes nothing from $\ell<\lvert s\rvert$, so a hand-built \texttt{alm} with sub-spin power loses it silently. It applies DUCC's own polar cutoff, so it inherits whatever that cutoff neglects. The float64 counting bound of Section~\ref{sec:wall} is a statement about this card; a device with a higher float64 rate changes the arithmetic that makes sense. Spin-$2$ rings do not take the belt FFT. Multi-GPU ring transforms on this machine stage through host memory and do not help. The blocked prefix recurrence of Section~\ref{sec:tables} is an exact CPU prototype, not a timed GPU kernel.
+
+\textit{The reference implementations are two, and only two.} Every number in this paper is measured against NaMaster (the MASTER pipeline), against CPU \texttt{ducc0} for the isolatitude HEALPix transform, and --- in Section~\ref{sec:nusht} --- against CPU \texttt{ducc0}'s general transforms \citep{reinecke2023}, all on the box of Section~2. We did \emph{not} time cunuSHT \citep{belkner2024}, SHTns-GPU \citep{schaeffer2013}, s2fft \citep{price2024} or cuHPX. Table~\ref{tab:cunusht} places GMaster beside cunuSHT's published performance \emph{model} on different hardware; that is not a head-to-head measurement and is labelled as not being one, and a real comparison needs cunuSHT built and run here. No number in this paper supports a claim about being the fastest GPU spherical-harmonic code. The comparison against NaMaster is also a comparison of a GPU against a CPU: the $9995$WX numbers of Table~\ref{tab:e2e} and the 32-core numbers of Table~\ref{tab:e2e32} differ by up to $3\times$ on the same GMaster binary, which is the size of the effect a different host would have. A partial-sky observational footprint is in Section~\ref{sec:act} (ACT DR6, $f_{\mathrm{sky}}=0.481$); that overlay is a methods check, not a science spectrum.
+
+\textit{The general operator has a hard accuracy floor.} GMaster's non-uniform transform cannot be driven below $\epsilon_{\mathrm{eff}}\approx2\times10^{-6}$ on synthesis or $5\times10^{-6}$ on the adjoint, at any cufinufft tolerance or upsampling factor, because the floor is the float32 march rather than the NUFFT. \texttt{ducc0} is $1.3$--$5\times$ more accurate in every cell of Table~\ref{tab:nusht} and continues to $10^{-13}$. Any application that needs that --- the high-precision end of the lensing work of \citet{reinecke2023} is the obvious one --- should use \texttt{ducc0} and not GMaster, and the speed-ups of Section~\ref{sec:nusht} are speed-ups at a fixed and undemanding accuracy only. Unlike the MASTER pipeline, this operator has no exact float64 route to fall back on: the march is the only latitudinal factor it has.
+
+\textit{Reproducibility caveats.} NaMaster wall times vary by about $8$~per cent under load, so ratios should be read with the GMaster milliseconds attached. The $N_{\mathrm{side}}=4096$ cells are measured inside a harness that also runs the reference and holds its stage columns alive; the scalar cell is $7.46\,\mathrm{s}$ there and $4.90\,\mathrm{s}$ as a standalone pipeline, for the eviction reason given in Section~\ref{sec:exp}, and the tabulated ratio is the slower of the two. The polarised $N_{\mathrm{side}}=4096$ cell has no paired reference at all, and the $107.6\,\mathrm{s}$ quoted for a 64-bit-binned NaMaster is a previous session's measurement, not this board's. The library matches NaMaster's public API on CPU and GPU; this paper reports only the HEALPix MASTER path that the reductions change.
+
+\section{Conclusions}
+
+Three exact reductions change the arithmetic of a GPU MASTER pipeline. Hermitian half-spectrum chirp-$Z$ synthesis halves the polar-cap convolution without changing the values. The equatorial belt, two thirds of a HEALPix RING map, is an ordinary FFT of length $4N_{\mathrm{side}}$. Offset-blocked scalar coupling visits one third of the naive $(\ell_1,\ell_2,o)$ cube.
+
+The fourth device is the latitudinal transform itself, and it is not exact: it is a float32 Jacobi march whose error is argued rather than eliminated. Marching the difference pair $(v_n,v_n-v_{n-1})$ instead of $(v_n,v_{n-1})$ moves the injection point of every rounding from $v$ to $D\sim\phi v$, where $\phi$ is the local phase step, so the $1/\sin\phi$ amplification that makes a plain float32 march useless near the poles disappears and the floor becomes the random walk $\sqrt{n}\,u$. Reflecting the southern hemisphere puts every lane on one code path with a coordinate in $(-1,0]$; rescaling the pair by an exact power of two every eight degrees keeps it in range; factorising the normalisation into a per-lane power of two and a per-degree mantissa of proved bounded range removes the exponent lane from the interface. Those four statements are proved in Lean~4 with Mathlib. Carried as a CUDA kernel behind the XLA FFI, with a field and its mask transformed together, the result is $10$--$21\times$ NaMaster at $N_{\mathrm{side}}=128$--$2048$ in both spins on a 96-core host, with $N_{\mathrm{side}}=64$ ($5.0$--$5.8\times$) and $N_{\mathrm{side}}=4096$ spin~$0$ ($9.5\times$) the two cells outside that range; $5.6$--$8.5\times$ CPU \texttt{ducc0} on one isolated latitudinal pass at $N_{\mathrm{side}}=1024$--$4096$; and $8.8\,\mathrm{s}$ for the polarised $N_{\mathrm{side}}=4096$ MASTER pipeline that stock NaMaster cannot run. With the reference pinned to 32 cores the board is $19.5$--$59.6\times$.
+
+Four host-side findings are worth as much as the kernel to anyone writing JAX/XLA GPU code: an inner \texttt{jit} is not a fusion boundary and \texttt{lax.optimization\_barrier} is load-bearing; a finish that is diagonal in $\ell$ must be one pass; an output reversal belongs in the producer's stacking order; and a per-call \texttt{jax.jit(partial(...))} recompiles every time.
+
+The same kernel then carried a second operator. Evaluating a band-limited field at arbitrary points on the sphere, and its adjoint, is the transform of \citet{reinecke2023} and \citet{belkner2024} rather than the isolatitude one; GMaster had never implemented it. With the march in the latitudinal slot of a double-Fourier-sphere factorisation and cufinufft in the last, it is $2.8$--$6.0\times$ CPU \texttt{ducc0} on synthesis and $2.7$--$5.1\times$ on the adjoint. The march's float32 floor follows it there and becomes the binding constraint: \texttt{ducc0} is the more accurate code in every cell and reaches an accuracy GMaster cannot.
+
+What is not shown is as specific as what is. No other GPU spherical-harmonic implementation was timed, no non-uniform or arbitrary-point transform was run, and the shipped default trades NaMaster's float64 contract for $\sim10^{-6}$ relative agreement, with the exact route available by flag.
+
+\section*{Acknowledgements}
+
+NaMaster, s2fft, threej\_cosmo, DUCC/libsharp, and SHTns are the reference stack against which every number in this paper was measured. Coding agents (OpenAI Codex \texttt{gpt-5.6}, local Qwen-27B, Qwen-flash, Claude Code) proposed the operator changes in Section~\ref{sec:agents}; GPU measurements against those references decided which changes shipped, and the Lean~4 kernel with Mathlib checked the proofs of Section~\ref{sec:formal}. Cursor and Claude Code drafted the \LaTeX\ source and figures from the same logs; citations were checked against publisher DOIs.
+
+\section*{Data Availability}
+
+The measurements in this paper are those of the GMaster working tree. Figure~\ref{fig:act} uses the public ACT DR6 maps \citep{naess2025}. Figure scripts are supplied with the \LaTeX\ source.
+
+\section*{Code Availability}
+
+GMaster is a GPU implementation of the NaMaster public API. CPU reference: \citet{alonso2019}. Spherical-harmonic and Wigner primitives follow \citet{price2024}. Coupling recurrences follow \citet{kiddier2026}. The shipped march kernel is \texttt{gmaster/\_cuda/march\_v2.cu} with the driver \texttt{gmaster/\_march\_v2.py}; the first kernel of Section~\ref{sec:march} is \texttt{gmaster/\_spin\_march\_pallas.py}. The general (non-uniform) transform of Section~\ref{sec:nusht} is \texttt{gmaster/nusht.py}, with \texttt{benchmarks/benchmark\_nusht.py} and \texttt{tests/test\_nusht.py}. The proofs of record are the Lean~4 project \texttt{formal/lean/} and the notes \texttt{docs/latitudinal\_march\_maths} and \texttt{docs/march\_v2\_maths}.
+
+\bibliographystyle{mnras}
+\bibliography{refs}
+
+\bsp
+\label{lastpage}
+\end{document}
